@@ -1,0 +1,55 @@
+.ROM_SIZE 524288
+
+.BANK SYSTEM
+.ORG 0x8000
+START:
+    ORCC #0x50
+    LDA #0x00
+    STA 0x3ff2
+    LDY #0x0400
+    LDX #TABLE
+    JSR SUBROUTINE
+    BNE START
+    JMP DONE
+TABLE:
+    .DW DONE
+SUBROUTINE:
+    RTS
+DONE:
+    CLR 0x1748
+    LEAY ,0x84
+    LEAX ,0x88,0x24
+    LDA ,0x89,0x004c
+    LEAU ,U
+    LEAS 5,S
+    LDB -2,X
+    LDA A,Y
+    LDD D,U
+    STA ,X+
+    STB ,--S
+    LDX 36,X
+    LDY 76,PC
+    LDA [4660,X]
+    EXG A,B
+    TFR D,X
+    PSHS A,B,X
+    PULU CC,DP,S,PC
+    LSR <0x12
+    INC 0x1748
+    LBHI DONE
+    DAA
+    SEX
+    CWAI #0x7f
+    SWI2
+    SWI3
+    ADDA #0x11
+    SBCB #0x22
+    EORB #0x33
+    ADDB #0x44
+    SUBA 0x1748
+    LDU 0x1748
+    CMPY <0x12
+    STY 0x1748
+    BRN DONE
+    LBRA DONE
+    JMP <0x12

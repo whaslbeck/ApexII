@@ -1,0 +1,26 @@
+.ROM_SIZE 524288
+
+.BANK 0x01
+.ORG 0x4000
+BANK_ID 0x01
+
+DmdFarTable:
+    TABLE_FAR_DMD_FULLFRAME DmdAsset
+
+DmdPtrTable:
+    TABLE_PTR_DMD_FULLFRAME DmdAsset
+
+DmdFarRef:
+    FAR_DMD_FULLFRAME DmdAsset
+
+    .DB 0x00
+
+.ORG 0x4200
+DmdAsset:
+    .DB 0x01, 0xaa, 0xaa, 0x00, 0x00, 0xaa, 0x00, 0x00
+
+    FILL_TO_BANK_END
+
+.BANK SYSTEM
+.ORG 0x8000
+    FILL_TO_BANK_END

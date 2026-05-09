@@ -1,0 +1,311 @@
+#include "apex_project.h"
+#include "apex_render.h"
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+static int contains(const char *haystack, const char *needle)
+{
+    return strstr(haystack, needle) != NULL;
+}
+
+static int line_contains(const ApexRenderedLine *line, const char *needle)
+{
+    size_t needle_len = strlen(needle);
+    size_t i;
+
+    if (needle_len == 0 || line->length < needle_len) {
+        return 0;
+    }
+    for (i = 0; i + needle_len <= line->length; i++) {
+        if (memcmp(line->text + i, needle, needle_len) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int main(int argc, char **argv)
+{
+    const ApexRenderedDocument *doc1;
+    const ApexRenderedDocument *doc2;
+    const ApexRenderedDocument *doc3;
+    const ApexRenderedDocument *doc4;
+    ApexProject *project;
+    size_t i;
+    size_t removed;
+    int saw_source_coords = 0;
+    int saw_location_line = 0;
+    int saw_located_instruction = 0;
+    int saw_code_block_line = 0;
+    int saw_inline_line_location = 0;
+    int saw_data_line_location = 0;
+    size_t entry_line_index = 0;
+    size_t transition_line_index = 0;
+    const ApexRenderedLine *line;
+    FILE *saved;
+    char overlay_buf[512];
+    size_t overlay_len;
+
+    if (argc != 3 && argc != 5 && argc != 7) {
+        fprintf(stderr, "usage: %s ROM CONFIG [BANK_ROM BANK_CONFIG] [PRUNE_ROM PRUNE_CONFIG]\n",
+                argv[0]);
+        return 2;
+    }
+
+    project = apex_project_open(argv[1], argv[2]);
+    if (apex_project_analyze(project) != 0) {
+        fprintf(stderr, "analyze failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    doc1 = apex_project_render(project, 0, 0);
+    doc2 = apex_project_render(project, 0, 0);
+    if (!doc1 || !doc2 || doc1 != doc2) {
+        fprintf(stderr, "render cache unavailable\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (!contains(doc1->text, "Entry:") || !contains(doc1->text, "JSR Helper")) {
+        fprintf(stderr, "baseline render missing expected labels\n");
+        apex_project_free(project);
+        return 1;
+    }
+    line = apex_render_find_line_by_address(doc1, 0xffu, 0x8000u, &entry_line_index);
+    if (!line || line->kind != APEX_RENDER_LINE_LOCATION) {
+        fprintf(stderr, "address lookup failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    for (i = 0; i < doc1->line_count; i++) {
+        if (doc1->lines[i].kind == APEX_RENDER_LINE_LOCATION && doc1->lines[i].has_location &&
+            doc1->lines[i].bank == 0xffu && doc1->lines[i].cpu_addr >= 0x8000u) {
+            saw_location_line = 1;
+        }
+        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION &&
+            doc1->lines[i].has_location && line_contains(&doc1->lines[i], "JSR Helper")) {
+            saw_located_instruction = 1;
+        }
+        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION &&
+            doc1->lines[i].has_location && line_contains(&doc1->lines[i], "RTS") &&
+            doc1->lines[i].block_kind == APEX_RENDER_BLOCK_CODE) {
+            saw_code_block_line = 1;
+        }
+        if (doc1->lines[i].has_location && line_contains(&doc1->lines[i], "INLINE_BYTE") &&
+            doc1->lines[i].cpu_addr == 0x8003u) {
+            saw_inline_line_location = 1;
+        }
+        if (doc1->lines[i].has_location && line_contains(&doc1->lines[i], ".DB 0x00") &&
+            doc1->lines[i].cpu_addr == 0x8004u) {
+            saw_data_line_location = 1;
+        }
+    }
+    if (!saw_location_line || !saw_located_instruction || !saw_code_block_line ||
+        !saw_inline_line_location || !saw_data_line_location) {
+        fprintf(stderr, "render line metadata missing\n");
+        apex_project_free(project);
+        return 1;
+    }
+    line = apex_render_find_next_transition(doc1, entry_line_index,
+                                            APEX_RENDER_TRANSITION_CODE_TO_DATA,
+                                            &transition_line_index);
+    if (!line || !line->has_location || line->cpu_addr != 0x8004u) {
+        fprintf(stderr, "next transition lookup failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    line = apex_render_find_prev_transition(doc1, transition_line_index,
+                                            APEX_RENDER_TRANSITION_CODE_TO_DATA, NULL);
+    if (!line || !line->has_location || line->cpu_addr != 0x8004u) {
+        fprintf(stderr, "prev transition lookup failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    for (i = 0; i < project->refs.count; i++) {
+        if (project->refs.items[i].source_bank == 0xffu &&
+            project->refs.items[i].source_addr >= 0x8000u) {
+            saw_source_coords = 1;
+            break;
+        }
+    }
+    if (!saw_source_coords) {
+        fprintf(stderr, "reference source coordinates missing\n");
+        apex_project_free(project);
+        return 1;
+    }
+    removed = remove_references_from_source_range(&project->refs, 0xffu, 0x8000u, 0x800bu);
+    if (removed == 0) {
+        fprintf(stderr, "reference pruning failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    apex_project_invalidate(project, APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER);
+    if (apex_project_analyze(project) != 0) {
+        fprintf(stderr, "reanalyze after pruning failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    if (apex_project_set_label(project, 0, 0xffu, 0x8005u, "HelperRenamed") != 0) {
+        fprintf(stderr, "set_label failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc3 = apex_project_render(project, 0, 0);
+    if (!doc3 || !contains(doc3->text, "HelperRenamed:") ||
+        !contains(doc3->text, "JSR HelperRenamed")) {
+        fprintf(stderr, "renamed label not reflected in render\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    if (apex_project_set_doc(project, 0, 0, 0xffu, 0x8005u, "Helper doc") != 0) {
+        fprintf(stderr, "set_doc failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "; doc Helper doc")) {
+        fprintf(stderr, "doc not reflected in render\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (apex_project_save_overlay(project, "out/project_api_test_overlay.ini") != 0) {
+        fprintf(stderr, "save_overlay failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    saved = fopen("out/project_api_test_overlay.ini", "rb");
+    if (!saved) {
+        fprintf(stderr, "failed to reopen saved overlay\n");
+        apex_project_free(project);
+        return 1;
+    }
+    overlay_len = fread(overlay_buf, 1, sizeof(overlay_buf) - 1u, saved);
+    fclose(saved);
+    overlay_buf[overlay_len] = '\0';
+    if (!contains(overlay_buf, "[labels]") || !contains(overlay_buf, "HelperRenamed") ||
+        !contains(overlay_buf, "[routine_docs]") || !contains(overlay_buf, "Helper doc")) {
+        fprintf(stderr, "saved overlay missing expected content\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    if (apex_project_clear_doc(project, 0, 0, 0xffu, 0x8005u) != 0 ||
+        apex_project_clear_label(project, 0, 0xffu, 0x8005u) != 0) {
+        fprintf(stderr, "clear operation failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || contains(doc4->text, "HelperRenamed") || contains(doc4->text, "Helper doc")) {
+        fprintf(stderr, "clear operations not reflected in render\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    if (apex_project_set_label(project, 0, 0xffu, 0x8005u, "HelperInline") != 0 ||
+        apex_project_set_inline(project, 0, 0xffu, 0x8005u, "byte:newmode") != 0) {
+        fprintf(stderr, "set_inline failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (project->analysis_scope != APEX_ANALYZE_SCOPE_SYSTEM_ONLY) {
+        fprintf(stderr, "system inline edit did not select system-only scope\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "HelperInline:") ||
+        !contains(doc4->text, "JSR HelperInline") ||
+        !contains(doc4->text, "newmode=0x42")) {
+        fprintf(stderr, "inline update not reflected in render\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    if (apex_project_set_label(project, 0, 0xffu, 0x8004u, "GapData") != 0 ||
+        apex_project_set_kind(project, 1, 0xffu, 0x8004u, APEX_KIND_DATA, "bytes[1]") != 0) {
+        fprintf(stderr, "set_kind(data) failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (project->analysis_scope != APEX_ANALYZE_SCOPE_SYSTEM_ONLY) {
+        fprintf(stderr, "system data edit did not select system-only scope\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "GapData:") ||
+        !contains(doc4->text, "; data type=bytes length=1")) {
+        fprintf(stderr, "data kind update not reflected in render\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    apex_project_free(project);
+
+    if (argc >= 5) {
+        project = apex_project_open(argv[3], argv[4]);
+        if (apex_project_analyze(project) != 0) {
+            fprintf(stderr, "bank analyze failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        if (apex_project_set_inline(project, 1, 0x20u, 0x4006u, "byte:newmode") != 0) {
+            fprintf(stderr, "bank set_inline failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        if (project->analysis_scope != APEX_ANALYZE_SCOPE_BANK_ONLY ||
+            project->analysis_bank_id != 0x20u) {
+            fprintf(stderr, "bank inline edit did not select bank-only scope\n");
+            apex_project_free(project);
+            return 1;
+        }
+        doc1 = apex_project_render(project, 0, 0);
+        if (!doc1 || !contains(doc1->text, "newmode=0x42")) {
+            fprintf(stderr, "bank inline update not reflected in render\n");
+            apex_project_free(project);
+            return 1;
+        }
+        apex_project_free(project);
+    }
+
+    if (argc == 7) {
+        project = apex_project_open(argv[5], argv[6]);
+        if (apex_project_analyze(project) != 0) {
+            fprintf(stderr, "prune analyze failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        doc1 = apex_project_render(project, 0, 0);
+        if (!doc1 || !contains(doc1->text, "INLINE_FAR_CODE B21_A4001")) {
+            fprintf(stderr, "expected far target reference missing\n");
+            apex_project_free(project);
+            return 1;
+        }
+        if (apex_project_set_inline(project, 1, 0x20u, 0x4008u, "byte:newmode") != 0) {
+            fprintf(stderr, "prune set_inline failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        if (project->analysis_scope != APEX_ANALYZE_SCOPE_BANK_ONLY ||
+            project->analysis_bank_id != 0x20u) {
+            fprintf(stderr, "prune edit did not select bank-only scope\n");
+            apex_project_free(project);
+            return 1;
+        }
+        doc1 = apex_project_render(project, 0, 0);
+        if (!doc1 || contains(doc1->text, "INLINE_FAR_CODE B21_A4001")) {
+            fprintf(stderr, "stale far target reference was not pruned\n");
+            apex_project_free(project);
+            return 1;
+        }
+        apex_project_free(project);
+    }
+
+    return 0;
+}

@@ -1,0 +1,614 @@
+#include "apeximgui_core.h"
+#include <algorithm>
+#include <cstring>
+#include <strings.h>
+#include <cctype>
+#include <cstdio>
+#include <cstdlib>
+
+static int is_symbol_boundary_char(char ch) { return !std::isalnum((unsigned char)ch) && ch != '_' && ch != '.' && ch != '$'; }
+static const char *inline_mode_name_internal(int mode);
+
+static std::string line_target_search_text(const ApexRenderedLine *line) {
+    std::string text = line_to_string(line); size_t cp = text.find(';'); if (cp != std::string::npos) text.resize(cp); return text;
+}
+
+static void update_label_index(const ApexRenderedDocument *document, UiState *state) {
+    state->cached_labels.clear();
+    for (size_t i = 0; i < document->line_count; i++) {
+        const ApexRenderedLine *l = &document->lines[i];
+        if (l->kind != APEX_RENDER_LINE_LABEL || !l->has_location) continue;
+        state->cached_labels.push_back({i, l->bank, l->cpu_addr, label_name(l), l->block_kind});
+    }
+    std::sort(state->cached_labels.begin(), state->cached_labels.end(), [](const LabelIndexEntry &a, const LabelIndexEntry &b) {
+        if (a.bank != b.bank) return a.bank < b.bank;
+        if (a.cpu_addr != b.cpu_addr) return a.cpu_addr < b.cpu_addr;
+        return a.name < b.name;
+    });
+    state->labels_valid = true;
+}
+
+static int get_or_create_graph_node(UiState *state, const ApexRenderedDocument *document, uint8_t bank, uint32_t addr, int layer) {
+    size_t lidx; if (!find_routine_start(document, bank, addr, &lidx)) return -1;
+    const ApexRenderedLine *l = &document->lines[lidx];
+    for (size_t i = 0; i < state->graph_nodes.size(); i++) if (state->graph_nodes[i].bank == l->bank && state->graph_nodes[i].addr == l->cpu_addr) return (int)i;
+    GraphNode node = {}; node.bank = l->bank; node.addr = l->cpu_addr; node.name = label_name(l); node.layer = layer;
+    if (node.name.empty()) { char buf[32]; snprintf(buf, 32, "B%02x_%04x", node.bank, node.addr); node.name = buf; }
+    state->graph_nodes.push_back(node); return (int)state->graph_nodes.size() - 1;
+}
+
+static void traverse_graph_incoming(ApexProject *project, const ApexRenderedDocument *document, UiState *state, int node_idx, int depth) {
+    if (depth <= 0) return;
+    auto refs = find_incoming_refs(project, document, state, state->graph_nodes[node_idx].bank, state->graph_nodes[node_idx].addr);
+    for (auto &ref : refs) {
+        int p_idx = get_or_create_graph_node(state, document, ref.bank, ref.cpu_addr, state->graph_nodes[node_idx].layer - 1);
+        if (p_idx >= 0 && p_idx != node_idx) {
+            bool exists = false; for (auto idx : state->graph_nodes[p_idx].callee_indices) if (idx == (size_t)node_idx) exists = true;
+            if (!exists) { state->graph_nodes[p_idx].callee_indices.push_back(node_idx); state->graph_nodes[node_idx].caller_indices.push_back(p_idx); traverse_graph_incoming(project, document, state, p_idx, depth - 1); }
+        }
+    }
+}
+
+static void traverse_graph_outgoing(ApexProject *project, const ApexRenderedDocument *document, UiState *state, int node_idx, int depth) {
+    if (depth <= 0) return;
+    size_t lidx; if (!apex_render_find_line_by_address(document, state->graph_nodes[node_idx].bank, state->graph_nodes[node_idx].addr, &lidx)) return;
+    for (size_t i = lidx; i < document->line_count; i++) {
+        const ApexRenderedLine *l = &document->lines[i]; if (i > lidx && l->kind == APEX_RENDER_LINE_LABEL) break;
+        auto refs = find_outgoing_refs(project, document, state, l->bank, l->cpu_addr);
+        for (auto &ref : refs) {
+            if (ref.kind == "JSR" || ref.kind == "JMP" || (ref.kind.size() > 0 && ref.kind[0] == 'B')) {
+                int c_idx = get_or_create_graph_node(state, document, ref.bank, ref.cpu_addr, state->graph_nodes[node_idx].layer + 1);
+                if (c_idx >= 0 && c_idx != node_idx) {
+                    bool exists = false; for (auto idx : state->graph_nodes[node_idx].callee_indices) if (idx == (size_t)c_idx) exists = true;
+                    if (!exists) { state->graph_nodes[node_idx].callee_indices.push_back(c_idx); state->graph_nodes[c_idx].caller_indices.push_back(node_idx); traverse_graph_outgoing(project, document, state, c_idx, depth - 1); }
+                }
+            }
+        }
+        if (l->kind == APEX_RENDER_LINE_INSTRUCTION && (strstr(l->text, "RTS") || strstr(l->text, "RTI"))) break;
+    }
+}
+
+static const SnapshotLabel *find_snapshot_label(const OriginalSnapshot *s, int hb, uint8_t b, uint32_t a) { for (auto &i : s->labels) if (i.has_bank == hb && i.bank == b && i.addr == a) return &i; return NULL; }
+static const SnapshotEntry *find_snapshot_entry(const OriginalSnapshot *s, int hb, uint8_t b, uint32_t a) { for (auto &i : s->entries) if (i.has_bank == hb && i.bank == b && i.addr == a) return &i; return NULL; }
+static const SnapshotData *find_snapshot_data(const OriginalSnapshot *s, uint8_t b, uint32_t a) { for (auto &i : s->data) if (i.bank == b && i.addr == a) return &i; return NULL; }
+static const SnapshotTable *find_snapshot_table(const OriginalSnapshot *s, uint8_t b, uint32_t a) { for (auto &i : s->tables) if (i.bank == b && i.addr == a) return &i; return NULL; }
+static const SnapshotDoc *find_snapshot_doc(const std::vector<SnapshotDoc> &ds, int hb, uint8_t b, uint32_t a) { for (auto &i : ds) if (i.has_bank == hb && i.bank == b && i.addr == a) return &i; return NULL; }
+
+static const char *basename_ptr(const char *p) { const char *s = strrchr(p, '/'); return s ? s + 1 : p; }
+static void write_config_address(FILE *o, int hb, uint8_t b, uint32_t a) { if (hb) fprintf(o, "B%02x_A%04x", b, (unsigned)a & 0xffff); else fprintf(o, "0x%04x", (unsigned)a & 0xffff); }
+static void write_escaped_value(FILE *o, const char *v) {
+    int q = 0; for (const char *p = v; *p; p++) if (*p == '\n' || *p == ';' || *p == '#' || *p == '\\' || *p == '"' || isspace((unsigned char)*p)) { q = 1; break; }
+    if (!q) { fputs(v, o); return; } fputc('"', o);
+    for (const char *p = v; *p; p++) { switch (*p) { case '\n': fputs("\\n", o); break; case ';': fputs("\\;", o); break; case '#': fputs("\\#", o); break; case '\\': fputs("\\\\", o); break; case '"': fputs("\\\"", o); break; default: fputc(*p, o); break; } }
+    fputc('"', o);
+}
+
+static const char *table_field_kind_name(TableFieldKind k) {
+    switch (k) { case TABLE_PTR16_STRING: return "ptr16_string"; case TABLE_PTR16_DATA: return "ptr16_data"; case TABLE_PTR16_CODE: return "ptr16_code"; case TABLE_PTR16_TABLE: return "ptr16_table"; case TABLE_PTR16_DMD_FULLFRAME: return "ptr16_dmd_fullframe"; case TABLE_FAR_STRING: return "far_string"; case TABLE_FAR_DATA: return "far_data"; case TABLE_FAR_TABLE: return "far_table"; case TABLE_FAR_CODE: return "far_code"; case TABLE_FAR_DMD_FULLFRAME: return "far_dmd_fullframe"; case TABLE_BYTE: return "byte"; case TABLE_WORD: return "word"; default: return "byte"; }
+}
+
+static std::string table_schema_to_string(const TableSchema *s) {
+    std::string t; for (size_t i = 0; i < s->count; i++) { if (i != 0) t += ", "; t += table_field_kind_name(s->items[i].kind); if (s->items[i].count != 1u) t += "[" + std::to_string(s->items[i].count) + "]"; } return t;
+}
+
+static std::string data_range_spec_string(const DataRange *r) {
+    if (r->kind == DATA_BYTES) return "bytes[" + std::to_string(r->length) + "]";
+    switch (r->kind) { case DATA_STRING: return "string"; case DATA_FAR_STRING: return "far_string"; case DATA_FAR_DATA: return "far_data"; case DATA_FAR_TABLE: return "far_table"; case DATA_FAR_CODE: return "far_code"; case DATA_DMD_FULLFRAME: return "dmd_fullframe"; case DATA_FAR_DMD_FULLFRAME: return "far_dmd_fullframe"; default: return "bytes[1]"; }
+}
+
+std::string table_def_spec_string(const TableDef *t) {
+    std::string s = table_schema_to_string(&t->schema); if (t->has_header) return "counted(" + s + ")"; return "rows[" + std::to_string(t->rows) + "](" + s + ")";
+}
+
+static std::string inline_signature_spec_string(const InlineSignature *s) {
+    if (!s) return ""; if (s->schema.count == 1u && s->schema.items[0].count == 1u && s->raw_param && s->schema.items[0].kind == TABLE_BYTE) return std::string("byte:") + s->raw_param;
+    if (s->schema.count == 1u && s->schema.items[0].count == 1u && s->far_param) return std::string(table_field_kind_name(s->schema.items[0].kind)) + ":" + s->far_param;
+    return table_schema_to_string(&s->schema);
+}
+
+void select_line(UiState *s, size_t i, int r) {
+    if (r) s->request_scroll_to_selection = 1; if (s->selected_line == i) return;
+    if (!s->suppress_history_push) { s->history_back.push_back(s->selected_line); s->history_forward.clear(); }
+    s->selected_line = i; s->selection_end = i; s->graph_needs_rebuild = true;
+}
+
+void handle_line_selection(UiState *s, size_t i, bool sh) { if (sh) s->selection_end = i; else select_line(s, i, 0); }
+
+void history_jump(UiState *s, int b) {
+    size_t t; if (b) { if (s->history_back.empty()) return; s->history_forward.push_back(s->selected_line); t = s->history_back.back(); s->history_back.pop_back(); }
+    else { if (s->history_forward.empty()) return; s->history_back.push_back(s->selected_line); t = s->history_forward.back(); s->history_forward.pop_back(); }
+    s->suppress_history_push = 1; s->selected_line = t; s->request_scroll_to_selection = 1; s->graph_needs_rebuild = true; s->suppress_history_push = 0;
+}
+
+void set_status(UiState *s, const char *m) { snprintf(s->status_message, sizeof(s->status_message), "%s", m); }
+
+int selected_address(const ApexRenderedDocument *d, const UiState *s, uint8_t *b, uint32_t *a) {
+    if (!d || s->selected_line >= d->line_count) return 0; const auto *l = &d->lines[s->selected_line]; if (!l->has_location) return 0; *b = l->bank; *a = l->cpu_addr; return 1;
+}
+
+LineByteSpan selected_line_span(const ApexProject *p, const ApexRenderedDocument *d, const UiState *s) {
+    LineByteSpan sp = {0,0,0}; if (!p || !d || s->selected_line >= d->line_count || !d->lines[s->selected_line].has_location) return sp;
+    size_t st = d->lines[s->selected_line].rom_addr; if (st >= p->rom.size) return sp;
+    size_t en = st + 1; for (size_t i = s->selected_line + 1; i < d->line_count; i++) if (d->lines[i].has_location && d->lines[i].rom_addr > st) { en = d->lines[i].rom_addr; break; }
+    if (en > p->rom.size) en = p->rom.size; sp.valid = 1; sp.start = st; sp.end = en; return sp;
+}
+
+int project_locate_rom_bytes(const ApexProject *p, uint8_t b, uint32_t a, const uint8_t **s, size_t *l, size_t *ro) {
+    size_t o; if (b == 0xffu) { if (a < 0x8000 || a >= 0x10000) return 0; o = p->paged_size + (a - 0x8000); }
+    else { if (a < 0x4000 || a >= 0x8000) return 0; int bi = bank_index_for_far_ref(p->rom.data, p->banks, b); if (bi < 0) return 0; o = (size_t)bi * 0x4000 + (a - 0x4000); }
+    if (o >= p->rom.size) return 0; *s = p->rom.data + o; *l = p->rom.size - o; if (ro) *ro = o; return 1;
+}
+
+std::string line_to_string(const ApexRenderedLine *l) { return std::string(l->text, l->length); }
+
+std::string label_name(const ApexRenderedLine *l) {
+    std::string n; for (size_t i = 0; i < l->length; i++) { char c = l->text[i]; if (c == ':' || c == ';' || isspace((unsigned char)c)) break; n += c; } return n;
+}
+
+void ensure_label_index(const ApexRenderedDocument *d, UiState *s) { if (!s->labels_valid) update_label_index(d, s); }
+
+int label_entry_matches_filter(const LabelIndexEntry &e, const char *f) {
+    if (!f || !*f) return 1; size_t fl = strlen(f); if (e.name.size() < fl) return 0;
+    for (size_t i = 0; i + fl <= e.name.size(); i++) { size_t j; for (j = 0; j < fl; j++) if (tolower((unsigned char)e.name[i+j]) != tolower((unsigned char)f[j])) break; if (j == fl) return 1; } return 0;
+}
+
+std::string label_at_address(const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a) {
+    ensure_label_index(d, s); for (auto &e : s->cached_labels) if (e.bank == b && e.cpu_addr == a) return e.name; return "";
+}
+
+std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, UiState *s, const ApexRenderedLine *l) {
+    std::vector<LineTargetEntry> ts; std::string t = line_target_search_text(l); size_t p = 0; ensure_label_index(d, s);
+    while (p < t.size()) {
+        while (p < t.size() && is_symbol_boundary_char(t[p])) p++; if (p >= t.size()) break;
+        size_t st = p; while (p < t.size() && !is_symbol_boundary_char(t[p])) p++; size_t en = p;
+        for (auto &e : s->cached_labels) {
+            if (e.name.size() != en - st || strncasecmp(t.data() + st, e.name.data(), en - st) != 0) continue;
+            if (l->kind == APEX_RENDER_LINE_LABEL && e.line_index == (size_t)(l - d->lines)) continue;
+            bool dupe = false; for (auto &ti : ts) if (ti.line_index == e.line_index) dupe = true;
+            if (!dupe) ts.push_back({e.line_index, e.bank, e.cpu_addr, e.name, st});
+        }
+    }
+    std::sort(ts.begin(), ts.end(), [](const LineTargetEntry &a, const LineTargetEntry &b) { if (a.match_pos != b.match_pos) return a.match_pos < b.match_pos; return a.name.size() > b.name.size(); }); return ts;
+}
+
+int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l, uint8_t *tb, uint32_t *ta, int *f) {
+    const uint8_t *src; size_t len; if (!l->has_location) return 0;
+    if (strstr(l->text, "PTR") || strstr(l->text, "CODE")) {
+        if (!project_locate_rom_bytes(p, l->bank, l->cpu_addr, &src, &len, NULL) || len < 2u) return 0;
+        *ta = read_be16(src); *tb = l->bank; *f = 0; if (strstr(l->text, "FAR")) { if (len < 3u) return 0; *tb = src[2]; *f = 1; } return 1;
+    } return 0;
+}
+
+int jump_to_first_line_target(const ApexRenderedDocument *d, UiState *s, const ApexRenderedLine *l) {
+    auto ts = find_line_targets(d, s, l); if (ts.empty()) return 0; select_line(s, ts[0].line_index, 1); return 1;
+}
+
+void follow_selected_link(const ApexRenderedDocument *d, UiState *s) { if (d && s->selected_line < d->line_count) jump_to_first_line_target(d, s, &d->lines[s->selected_line]); }
+
+std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a) {
+    std::vector<RefEntry> rs; for (size_t i = 0; i < p->refs.count; i++) {
+        const auto &r = p->refs.items[i]; size_t li; if (r.bank != b || r.addr != a) continue;
+        if (apex_render_find_line_by_address(d, r.source_bank, r.source_addr, &li)) rs.push_back({li, r.source_bank, r.source_addr, label_at_address(d, s, r.source_bank, r.source_addr), r.kind ? r.kind : ""});
+    }
+    std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) { if (a.bank != b.bank) return a.bank < b.bank; return a.cpu_addr < b.cpu_addr; }); return rs;
+}
+
+std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a) {
+    std::vector<RefEntry> rs; for (size_t i = 0; i < p->refs.count; i++) {
+        const auto &r = p->refs.items[i]; size_t li; if (r.source_bank != b || r.source_addr != a) continue;
+        if (apex_render_find_line_by_address(d, r.bank, r.addr, &li)) rs.push_back({li, r.bank, r.addr, label_at_address(d, s, r.bank, r.addr), r.kind ? r.kind : ""});
+    }
+    std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) { if (a.bank != b.bank) return a.bank < b.bank; return a.cpu_addr < b.cpu_addr; }); return rs;
+}
+
+int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, size_t *o) {
+    size_t li; if (!apex_render_find_line_by_address(d, b, a, &li)) return 0;
+    while (li > 0) { if (d->lines[li].kind == APEX_RENDER_LINE_LABEL && d->lines[li].has_location) { *o = li; return 1; } li--; }
+    *o = 0; return 1;
+}
+
+void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
+    uint8_t b; uint32_t a; if (!selected_address(d, s, &b, &a)) return; s->graph_nodes.clear();
+    s->graph_root_idx = get_or_create_graph_node(s, d, b, a, 0); if (s->graph_root_idx < 0) return;
+    traverse_graph_incoming(p, d, s, s->graph_root_idx, s->graph_depth_in); traverse_graph_outgoing(p, d, s, s->graph_root_idx, s->graph_depth_out); s->graph_needs_rebuild = false;
+}
+
+bool select_line_by_address(const ApexRenderedDocument *d, UiState *s) {
+    uint8_t b; uint32_t a; size_t li; if (!parse_target_address(s->goto_input, &b, &a)) return false;
+    if (!apex_render_find_line_by_address(d, b, a, &li)) return false; select_line(s, li, 1); return true;
+}
+
+void jump_to_transition(const ApexRenderedDocument *d, UiState *s, ApexRenderedTransitionKind k, int f) {
+    size_t li = s->selected_line; const auto *l = f ? apex_render_find_next_transition(d, li, k, &li) : apex_render_find_prev_transition(d, li, k, &li);
+    if (l) select_line(s, li, 1);
+}
+
+void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delta) {
+    if (!d || d->line_count == 0) return;
+    size_t n; if (delta < 0) { size_t st = (size_t)-delta; n = (s->selected_line > st) ? s->selected_line - st : 0; }
+    else { n = s->selected_line + (size_t)delta; if (n >= d->line_count) n = d->line_count - 1; } select_line(s, n, 1);
+}
+
+void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f) {
+    if (!d || d->line_count == 0) return;
+    if (f) { for (size_t i = s->selected_line + 1; i < d->line_count; i++) if (d->lines[i].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA || d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA) { select_line(s, i, 1); return; } }
+    else { for (size_t i = s->selected_line + 1; i > 0; i--) if (d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA || d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA) { select_line(s, i-1, 1); return; } }
+}
+
+void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
+    uint8_t b; uint32_t a; if (s->editor_bound_line == s->selected_line) return; s->editor_bound_line = s->selected_line; s->edit_label_input[0] = '\0'; s->edit_inline_input[0] = '\0';
+    if (!selected_address(d, s, &b, &a)) { s->edit_spec_input[0] = '\0'; sync_spec_presets(s, ""); sync_inline_presets(s, ""); s->edit_doc_input[0] = '\0'; return; }
+    std::string l = label_at_address(d, s, b, a); if (!l.empty()) snprintf(s->edit_label_input, 128, "%s", l.c_str());
+    const auto *is = inline_signature_for(&p->inline_sigs, b, a); if (is) { std::string spec = inline_signature_spec_string(is); snprintf(s->edit_inline_input, 128, "%s", spec.c_str()); }
+    sync_inline_presets(s, s->edit_inline_input); s->edit_doc_mode = d->lines[s->selected_line].block_kind == APEX_RENDER_BLOCK_TABLE ? EDIT_DOC_TABLE : EDIT_DOC_ROUTINE;
+    load_doc_editor_buffer(p, s, b, a); const char *m = strstr(d->lines[s->selected_line].text, "; data type="); s->edit_spec_input[0] = '\0';
+    if (m) { char sp[128]; size_t pos = 0; m += 12; while (*m && *m != '\n' && pos < 127) sp[pos++] = *m++; sp[pos] = '\0'; snprintf(s->edit_spec_input, 128, "%s", sp); } sync_spec_presets(s, s->edit_spec_input);
+}
+
+void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiState *s, uint8_t b, uint32_t a) {
+    size_t li = 0; *dp = apex_project_render(p, 0, 0); s->labels_valid = false;
+    if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) { s->suppress_history_push = 1; s->selected_line = li; s->request_scroll_to_selection = 1; s->editor_bound_line = (size_t)-1; s->suppress_history_push = 0; }
+    sync_editor_state(p, *dp, s);
+}
+
+void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
+    uint8_t b; uint32_t a; if (!selected_address(*dp, s, &b, &a)) { set_status(s, "no addressable line"); return; }
+    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_CODE, NULL) == 0) rerender_and_reselect(p, dp, s, b, a);
+}
+
+void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s, const char *sp) {
+    uint8_t b; uint32_t a; if (!selected_address(*dp, s, &b, &a)) return;
+    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_DATA, sp) == 0) rerender_and_reselect(p, dp, s, b, a);
+}
+
+void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
+    uint8_t b; uint32_t a; if (!selected_address(*dp, s, &b, &a)) return;
+    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_STRING, "string") == 0) rerender_and_reselect(p, dp, s, b, a);
+}
+
+void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s, const char *sp) {
+    uint8_t b; uint32_t a; if (!selected_address(*dp, s, &b, &a)) return;
+    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_TABLE, sp) == 0) rerender_and_reselect(p, dp, s, b, a);
+}
+
+void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
+    uint8_t b; uint32_t a; if (!selected_address(*dp, s, &b, &a)) return;
+    if (apex_project_clear_kind(p, 1, b, a) == 0) rerender_and_reselect(p, dp, s, b, a);
+}
+
+const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *d, uint8_t b, size_t *li) {
+    for (size_t i = 0; i < d->line_count; i++) if (d->lines[i].has_location && d->lines[i].bank == b) { if (li) *li = i; return &d->lines[i]; } return NULL;
+}
+
+int find_line_by_rom_offset(const ApexRenderedDocument *d, size_t o, size_t *li) {
+    for (size_t i = 0; i < d->line_count; i++) {
+        if (!d->lines[i].has_location) continue;
+        if (o == d->lines[i].rom_addr) { *li = i; return 1; }
+        if (o < d->lines[i].rom_addr && i > 0 && d->lines[i-1].has_location) { *li = i - 1; return 1; }
+    }
+    if (d->line_count > 0 && d->lines[d->line_count-1].has_location) { *li = d->line_count - 1; return 1; } return 0;
+}
+
+int rom_offset_to_cpu_address(const ApexProject *project, size_t offset, uint8_t *bank, uint32_t *cpu_addr)
+{
+    if (offset >= project->rom.size) return 0;
+    if (offset >= project->paged_size) {
+        *bank = 0xffu;
+        *cpu_addr = 0x8000u + (uint32_t)(offset - project->paged_size);
+        return 1;
+    }
+    int bank_idx = (int)(offset / 0x4000);
+    *bank = bank_id_for_index(project->rom.data, bank_idx);
+    *cpu_addr = 0x4000u + (uint32_t)(offset % 0x4000);
+    return 1;
+}
+
+void save_session(const char *rp, const char *cp, const UiState *s, const ApexRenderedDocument *d) {
+    FILE *f = fopen(".apeximgui_session", "w"); if (!f) return;
+    fprintf(f, "[Global]\nlast_rom=%s\nlast_config=%s\n\n[%s]\n", rp, cp, rp);
+    uint8_t b; uint32_t a; if (selected_address(d, s, &b, &a)) fprintf(f, "selected=0x%02x:%04x\n", b, a);
+    fprintf(f, "filter=%s\nlabel_filter=%s\ndmd_scrub=%d\ngraph_depth_in=%d\ngraph_depth_out=%d\nhistory=", s->filter_input, s->label_filter_input, s->dmd_scrub_offset, s->graph_depth_in, s->graph_depth_out);
+    for (size_t i = 0; i < s->history_back.size(); i++) if (s->history_back[i] < d->line_count && d->lines[s->history_back[i]].has_location) fprintf(f, "0x%02x:%04x,", d->lines[s->history_back[i]].bank, (unsigned)d->lines[s->history_back[i]].cpu_addr);
+    fprintf(f, "\n"); for (auto &bm : s->bookmarks) fprintf(f, "bookmark=0x%02x:%04x:%s\n", bm.bank, bm.addr, bm.name.c_str()); fclose(f);
+}
+
+int load_global_session(char *rp, char *cp) {
+    FILE *f = fopen(".apeximgui_session", "r"); char l[1024]; int fo = 0; if (!f) return 0;
+    while (fgets(l, 1024, f)) { if (strncmp(l, "last_rom=", 9) == 0) { strcpy(rp, l + 9); rp[strcspn(rp, "\r\n")] = 0; fo++; } else if (strncmp(l, "last_config=", 12) == 0) { strcpy(cp, l + 12); cp[strcspn(cp, "\r\n")] = 0; fo++; } if (fo == 2) break; }
+    fclose(f); return fo == 2;
+}
+
+void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d) {
+    FILE *f = fopen(".apeximgui_session", "r"); char l[1024], sec[1024]; int in = 0; if (!f) return;
+    snprintf(sec, 1024, "[%s]", rp); while (fgets(l, 1024, f)) {
+        l[strcspn(l, "\r\n")] = 0; if (l[0] == '[') { in = (strcmp(l, sec) == 0); continue; } if (!in) continue;
+        if (strncmp(l, "selected=", 9) == 0) { unsigned b, a; size_t li; if (sscanf(l + 9, "0x%x:%x", &b, &a) == 2 && apex_render_find_line_by_address(d, (uint8_t)b, a, &li)) { s->selected_line = li; s->request_scroll_to_selection = 1; } }
+        else if (strncmp(l, "filter=", 7) == 0) strncpy(s->filter_input, l + 7, 127);
+        else if (strncmp(l, "label_filter=", 13) == 0) strncpy(s->label_filter_input, l + 13, 127);
+        else if (strncmp(l, "dmd_scrub=", 10) == 0) s->dmd_scrub_offset = atoi(l + 10);
+        else if (strncmp(l, "graph_depth_in=", 15) == 0) s->graph_depth_in = atoi(l + 15);
+        else if (strncmp(l, "graph_depth_out=", 16) == 0) s->graph_depth_out = atoi(l + 16);
+        else if (strncmp(l, "history=", 8) == 0) { char *p = l + 8; unsigned b, a; size_t li; s->history_back.clear(); while (sscanf(p, "0x%x:%x", &b, &a) == 2) { if (apex_render_find_line_by_address(d, (uint8_t)b, a, &li)) s->history_back.push_back(li); p = strchr(p, ','); if (!p) break; p++; } }
+        else if (strncmp(l, "bookmark=", 9) == 0) { unsigned b, a; char n[256]; if (sscanf(l + 9, "0x%x:%x:%255[^\r\n]", &b, &a, n) == 3) s->bookmarks.push_back({(uint8_t)b, (uint32_t)a, n}); }
+    } fclose(f);
+}
+
+void clear_session() { remove(".apeximgui_session"); }
+
+// --- Table Search (from apextab.c) ---
+
+static bool is_valid_string_internal(const uint8_t *rom, uint32_t size, uint32_t offset) {
+    if (offset >= size) return false;
+    uint32_t len = 0;
+    while (offset + len < size && len <= 50) {
+        uint8_t c = rom[offset + len];
+        if (c == 0x00) return len > 0;
+        if (c < 0x20 || c > 0x7F) return false;
+        len++;
+    }
+    return false;
+}
+
+static uint32_t translate_ptr16_internal(uint16_t ptr, int phys_bank, int total_banks) {
+    if (ptr >= 0x4000 && ptr <= 0x7FFF) return (uint32_t)phys_bank * 0x4000 + (ptr - 0x4000);
+    if (ptr >= 0x8000) {
+        int sys_st = total_banks - 2; if (sys_st < 0) sys_st = 0;
+        if (ptr < 0xC000) return (uint32_t)sys_st * 0x4000 + (ptr - 0x8000);
+        return (uint32_t)(sys_st + 1) * 0x4000 + (ptr - 0xC000);
+    }
+    return 0xFFFFFFFF;
+}
+
+static bool is_text_table_at_internal(const uint8_t *rom, uint32_t size, uint32_t offset, int total_banks) {
+    if (offset + 3 > size) return false;
+    uint16_t rows = (rom[offset] << 8) | rom[offset + 1];
+    uint8_t width = rom[offset + 2];
+    if (width != 2 || rows == 0 || rows > 1000) return false;
+    uint32_t data_off = offset + 3; if (data_off + rows * 2 > size) return false;
+    int phys_bank = offset / 0x4000;
+    for (int i = 0; i < rows; i++) {
+        uint16_t ptr = (rom[data_off + i * 2] << 8) | rom[data_off + i * 2 + 1];
+        uint32_t str_off = translate_ptr16_internal(ptr, phys_bank, total_banks);
+        if (str_off == 0xFFFFFFFF || !is_valid_string_internal(rom, size, str_off)) return false;
+    }
+    return true;
+}
+
+void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    int total_banks = (int)(p->rom.size / 0x4000);
+    std::vector<uint32_t> found_text_table_offsets;
+    int count = 0;
+
+    // Step 1: Text Tables
+    for (uint32_t i = 0; i <= p->rom.size - 3; i++) {
+        if (is_text_table_at_internal(p->rom.data, (uint32_t)p->rom.size, i, total_banks)) {
+            int phys_bank = i / 0x4000;
+            uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
+            uint16_t addr = 0x4000 + (i % 0x4000);
+            if (phys_bank >= total_banks - 2) addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000) : 0xC000 + (i % 0x4000);
+            if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE, "counted(ptr16_string)") == 0) {
+                found_text_table_offsets.push_back(i); count++;
+            }
+        }
+    }
+
+    // Step 2: Far-Pointer Tables (simplified: look for 3 pointers to text tables)
+    for (uint32_t i = 0; i <= p->rom.size - 9; i++) {
+        bool match = true;
+        for (int j = 0; j < 3; j++) {
+            uint16_t addr = (p->rom.data[i + j * 3] << 8) | p->rom.data[i + j * 3 + 1];
+            uint8_t bid = p->rom.data[i + j * 3 + 2];
+            uint32_t target_off = 0xFFFFFFFF;
+            for (int b = 0; b < total_banks; b++) { if (p->rom.data[b * 0x4000] == bid) { if (addr >= 0x4000 && addr <= 0x7FFF) { target_off = (uint32_t)b * 0x4000 + (addr - 0x4000); break; } } }
+            if (addr >= 0x8000 && bid == 0xFF) target_off = translate_ptr16_internal(addr, 0, total_banks);
+            
+            bool known = false;
+            if (target_off != 0xFFFFFFFF) for (auto to : found_text_table_offsets) if (to == target_off) { known = true; break; }
+            if (!known) { match = false; break; }
+        }
+        if (match) {
+            int phys_bank = i / 0x4000;
+            uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
+            uint16_t addr = 0x4000 + (i % 0x4000);
+            if (phys_bank >= total_banks - 2) addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000) : 0xC000 + (i % 0x4000);
+            if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE, "rows[3](far_data)") == 0) { count++; i += 8; }
+        }
+    }
+
+    if (count > 0) {
+        rerender_and_reselect(p, dp, s, 0, 0);
+        char msg[64]; snprintf(msg, 64, "Found %d tables", count); set_status(s, msg);
+    } else set_status(s, "No new tables found");
+}
+
+std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document)
+{
+    std::vector<HardwareAccess> accesses;
+    std::map<uint32_t, std::vector<size_t>> mapping;
+    
+    // 1. Scan analyzer references (fast, covers explicit absolute accesses)
+    for (size_t i = 0; i < project->refs.count; i++) {
+        const Reference &ref = project->refs.items[i];
+        if (ref.addr >= 0x3F00 && ref.addr <= 0x3FFF) {
+            size_t lidx;
+            if (apex_render_find_line_by_address(document, ref.source_bank, ref.source_addr, &lidx)) {
+                bool exists = false;
+                for (size_t ex : mapping[ref.addr]) if (ex == lidx) exists = true;
+                if (!exists) mapping[ref.addr].push_back(lidx);
+            }
+        }
+    }
+    
+    // 2. Heuristic: Deep Instruction Scan
+    // Scan all identified instructions for any mention of $3Fxx in their bytes.
+    // This catches cases where the instruction wasn't correctly linked as a reference.
+    for (size_t i = 0; i < document->line_count; i++) {
+        const auto *line = &document->lines[i];
+        if (line->kind != APEX_RENDER_LINE_INSTRUCTION || !line->has_location) continue;
+        
+        // Use a 16-byte buffer (max 6809 instr size is small, but safety first)
+        uint8_t instr_bytes[16];
+        const uint8_t *rom_ptr;
+        size_t rom_len;
+        if (project_locate_rom_bytes(project, line->bank, line->cpu_addr, &rom_ptr, &rom_len, NULL)) {
+            // We only need to check the immediate/operand bytes of the instruction.
+            // A simple way is to check every possible 16-bit big-endian word in the first 5 bytes.
+            size_t scan_len = (rom_len < 5) ? rom_len : 5;
+            for (size_t b = 0; b + 1 < scan_len; b++) {
+                uint16_t word = (uint16_t)((rom_ptr[b] << 8) | rom_ptr[b+1]);
+                if (word >= 0x3F00 && word <= 0x3FFF) {
+                    bool exists = false;
+                    for (size_t ex : mapping[word]) if (ex == i) exists = true;
+                    if (!exists) mapping[word].push_back(i);
+                }
+            }
+        }
+    }
+    
+    size_t reg_count = hardware_register_count();
+    for (size_t i = 0; i < reg_count; i++) {
+        const auto *reg = get_hardware_register(i);
+        std::sort(mapping[reg->addr].begin(), mapping[reg->addr].end());
+        HardwareAccess acc = { reg, mapping[reg->addr] };
+        accesses.push_back(acc);
+    }
+    
+    return accesses;
+}
+
+void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s) {
+    size_t st = std::min(s->selected_line, s->selection_end), en = std::max(s->selected_line, s->selection_end); std::string t;
+    if (st >= d->line_count) return; if (en >= d->line_count) en = d->line_count - 1;
+    for (size_t i = st; i <= en; i++) {
+        const auto *l = &d->lines[i]; if (l->has_location) { char buf[32]; snprintf(buf, 32, "B%02x_A%04x  ", l->bank, (unsigned)l->cpu_addr & 0xffff); t += buf; } else t += "             ";
+        t.append(l->text, l->length); t += "\n";
+    } ImGui::SetClipboardText(t.c_str());
+}
+
+int address_is_dmd_fullframe_start(const ApexProject *p, uint8_t b, uint32_t a) {
+    if (data_range_at(b, a, &p->data_ranges) && (data_range_at(b, a, &p->data_ranges)->kind == DATA_DMD_FULLFRAME || data_range_at(b, a, &p->data_ranges)->kind == DATA_FAR_DMD_FULLFRAME)) return 1;
+    const auto *ls = (b == 0xffu) ? &p->system_labels : NULL; if (!ls) { int bi = bank_index_for_far_ref(p->rom.data, p->banks, b); if (bi >= 0) ls = &p->bank_labels[bi]; }
+    if (!ls) return 0;
+    for (size_t i = 0; i < ls->count; i++) if (ls->items[i].addr == a && ((ls->items[i].kind_explain && strstr(ls->items[i].kind_explain, "dmd_fullframe")) || (ls->items[i].explain && strstr(ls->items[i].explain, "dmd_fullframe")))) return 1; return 0;
+}
+
+int decode_dmd_preview_at(const ApexProject *p, uint8_t b, uint32_t a, DmdPreviewInfo *pr) {
+    const uint8_t *src; size_t len, con, ro; uint8_t type; if (!project_locate_rom_bytes(p, b, a, &src, &len, &ro)) return 0;
+    if (!apexdmd_decode_fullframe(src, len, pr->plane, &con, &type)) return 0;
+    pr->valid = true; pr->bank = b; pr->cpu_addr = a; pr->rom_offset = ro; pr->decoder_type = type; pr->consumed = con; return 1;
+}
+
+DmdPreviewInfo find_dmd_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
+    DmdPreviewInfo pr = {}; uint8_t b; uint32_t a; if (!selected_address(d, s, &b, &a)) return pr;
+    if (s->dmd_scrub_offset != 0) { int64_t sa = (int64_t)a + s->dmd_scrub_offset; if (sa >= 0 && sa <= 0xffff && decode_dmd_preview_at(p, b, (uint32_t)sa, &pr)) { snprintf(pr.title, 128, "Scrubbed DMD (Offset %d)", s->dmd_scrub_offset); return pr; } }
+    if (decode_dmd_preview_at(p, b, a, &pr)) { snprintf(pr.title, 128, "Selected DMD"); return pr; }
+    if (s->selected_line < d->line_count) { auto ts = find_line_targets(d, s, &d->lines[s->selected_line]); for (auto &t : ts) if (address_is_dmd_fullframe_start(p, t.bank, t.cpu_addr) && decode_dmd_preview_at(p, t.bank, t.cpu_addr, &pr)) { pr.from_target = true; snprintf(pr.title, 128, "Target DMD: %s", t.name.c_str()); return pr; } } return pr;
+}
+
+int parse_target_address(const char *i, uint8_t *b, uint32_t *a) {
+    unsigned pb, pa; while (*i == ' ' || *i == '\t') i++;
+    if (sscanf(i, "B%x_A%x", &pb, &pa) == 2) { *b = (uint8_t)pb; *a = pa; return 1; }
+    if (strncasecmp(i, "0x", 2) == 0 && sscanf(i + 2, "%x", &pa) == 1) { *b = 0xffu; *a = pa; return 1; } return 0;
+}
+
+int line_matches_filter(const ApexRenderedLine *l, const char *f) {
+    if (!f || !*f) return 1; size_t fl = strlen(f); if (l->length < fl) return 0;
+    for (size_t i = 0; i + fl <= l->length; i++) { size_t j; for (j = 0; j < fl; j++) if (tolower((unsigned char)l->text[i+j]) != tolower((unsigned char)f[j])) break; if (j == fl) return 1; } return 0;
+}
+
+const char *block_name(ApexRenderedBlockKind k) { switch (k) { case APEX_RENDER_BLOCK_CODE: return "code"; case APEX_RENDER_BLOCK_DATA: return "data"; case APEX_RENDER_BLOCK_TABLE: return "table"; default: return "-"; } }
+
+const char *transition_name(ApexRenderedTransitionKind k) {
+    switch (k) { case APEX_RENDER_TRANSITION_CODE_TO_DATA: return "code_to_data"; case APEX_RENDER_TRANSITION_DATA_TO_CODE: return "data_to_code"; case APEX_RENDER_TRANSITION_CODE_TO_TABLE: return "code_to_table"; case APEX_RENDER_TRANSITION_TABLE_TO_CODE: return "table_to_code"; case APEX_RENDER_TRANSITION_TABLE_TO_DATA: return "table_to_data"; case APEX_RENDER_TRANSITION_DATA_TO_TABLE: return "data_to_table"; default: return "-"; }
+}
+
+static const char *table_schema_mode_name(int m) {
+    switch (m) { case EDIT_SCHEMA_PTR16_DATA: return "ptr16_data"; case EDIT_SCHEMA_PTR16_CODE: return "ptr16_code"; case EDIT_SCHEMA_PTR16_STRING: return "ptr16_string"; case EDIT_SCHEMA_FAR_DATA: return "far_data"; case EDIT_SCHEMA_FAR_CODE: return "far_code"; case EDIT_SCHEMA_FAR_STRING: return "far_string"; default: return ""; }
+}
+
+void apply_data_preset(UiState *s) {
+    switch (s->edit_data_mode) { case EDIT_DATA_BYTES: if (s->edit_data_length < 1) s->edit_data_length = 1; snprintf(s->edit_spec_input, 128, "bytes[%d]", s->edit_data_length); break; case EDIT_DATA_STRING: strcpy(s->edit_spec_input, "string"); break; case EDIT_DATA_FAR_STRING: strcpy(s->edit_spec_input, "far_string"); break; case EDIT_DATA_FAR_DATA: strcpy(s->edit_spec_input, "far_data"); break; case EDIT_DATA_FAR_TABLE: strcpy(s->edit_spec_input, "far_table"); break; case EDIT_DATA_FAR_CODE: strcpy(s->edit_spec_input, "far_code"); break; }
+}
+
+void apply_inline_preset(UiState *s) {
+    const char *m = inline_mode_name_internal(s->edit_inline_mode); if (!m || !*m) return;
+    if (s->edit_inline_name_input[0]) snprintf(s->edit_inline_input, 128, "%s:%s", m, s->edit_inline_name_input); else snprintf(s->edit_inline_input, 128, "%s", m);
+}
+
+void apply_table_preset(UiState *s) {
+    const char *sc = table_schema_mode_name(s->edit_table_schema_mode); if (s->edit_table_schema_mode == EDIT_SCHEMA_CUSTOM) sc = s->edit_table_schema_input;
+    if (!sc || !*sc) sc = "ptr16_data"; char buf[128];
+    if (s->edit_table_mode == EDIT_TABLE_COUNTED) snprintf(buf, 128, "counted(%s)", sc);
+    else if (s->edit_table_mode == EDIT_TABLE_ROWS) { if (s->edit_table_rows < 1) s->edit_table_rows = 1; snprintf(buf, 128, "rows[%d](%s)", s->edit_table_rows, sc); }
+    else return; strcpy(s->edit_spec_input, buf);
+}
+
+void sync_spec_presets(UiState *s, const char *sp) {
+    int r = 0; char in[128]; s->edit_data_mode = EDIT_DATA_CUSTOM; s->edit_data_length = 1; s->edit_table_mode = EDIT_TABLE_CUSTOM; s->edit_table_rows = 1; s->edit_table_schema_mode = EDIT_SCHEMA_CUSTOM; s->edit_table_schema_input[0] = '\0';
+    if (!sp || !*sp) return; if (sscanf(sp, "bytes[%d]", &r) == 1) { s->edit_data_mode = EDIT_DATA_BYTES; s->edit_data_length = r > 0 ? r : 1; return; }
+    if (strcmp(sp, "string") == 0) { s->edit_data_mode = EDIT_DATA_STRING; return; } if (strcmp(sp, "far_string") == 0) { s->edit_data_mode = EDIT_DATA_FAR_STRING; return; }
+    if (strcmp(sp, "far_data") == 0) { s->edit_data_mode = EDIT_DATA_FAR_DATA; return; } if (strcmp(sp, "far_table") == 0) { s->edit_data_mode = EDIT_DATA_FAR_TABLE; return; }
+    if (strcmp(sp, "far_code") == 0) { s->edit_data_mode = EDIT_DATA_FAR_CODE; return; } in[0] = '\0';
+    if (sscanf(sp, "counted(%127[^)])", in) == 1) s->edit_table_mode = EDIT_TABLE_COUNTED;
+    else if (sscanf(sp, "rows[%d](%127[^)])", &r, in) == 2) { s->edit_table_mode = EDIT_TABLE_ROWS; s->edit_table_rows = r > 0 ? r : 1; } else return;
+    if (strcmp(in, "ptr16_data") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_DATA; else if (strcmp(in, "ptr16_code") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_CODE;
+    else if (strcmp(in, "ptr16_string") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_STRING; else if (strcmp(in, "far_data") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_FAR_DATA;
+    else if (strcmp(in, "far_code") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_FAR_CODE; else if (strcmp(in, "far_string") == 0) s->edit_table_schema_mode = EDIT_SCHEMA_FAR_STRING;
+    else { s->edit_table_schema_mode = EDIT_SCHEMA_CUSTOM; snprintf(s->edit_table_schema_input, 128, "%s", in); }
+}
+
+void sync_inline_presets(UiState *s, const char *sp) {
+    const char *col; std::string m; const char *n = ""; s->edit_inline_mode = EDIT_INLINE_CUSTOM; s->edit_inline_name_input[0] = '\0'; if (!sp || !*sp) return;
+    col = strchr(sp, ':'); if (col) { m.assign(sp, (size_t)(col - sp)); n = col + 1; } else m = sp;
+    if (m == "byte") s->edit_inline_mode = EDIT_INLINE_BYTE; else if (m == "ptr16_data") s->edit_inline_mode = EDIT_INLINE_PTR16_DATA; else if (m == "ptr16_code") s->edit_inline_mode = EDIT_INLINE_PTR16_CODE; else if (m == "ptr16_string") s->edit_inline_mode = EDIT_INLINE_PTR16_STRING; else if (m == "far_data") s->edit_inline_mode = EDIT_INLINE_FAR_DATA; else if (m == "far_code") s->edit_inline_mode = EDIT_INLINE_FAR_CODE; else if (m == "far_string") s->edit_inline_mode = EDIT_INLINE_FAR_STRING;
+    if (*n) snprintf(s->edit_inline_name_input, 64, "%s", n);
+}
+
+void load_doc_editor_buffer(const ApexProject *p, UiState *s, uint8_t b, uint32_t a) {
+    const char *d = (s->edit_doc_mode == EDIT_DOC_TABLE) ? config_doc_at(&p->table_docs, b, a) : config_doc_at(&p->routine_docs, b, a);
+    s->edit_doc_input[0] = '\0'; if (d) snprintf(s->edit_doc_input, 1024, "%s", d);
+}
+
+OriginalSnapshot build_original_snapshot(const ApexProject *p) {
+    OriginalSnapshot s; for (size_t i = 0; i < p->config_labels.count; i++) s.labels.push_back({p->config_labels.items[i].has_bank, p->config_labels.items[i].bank, p->config_labels.items[i].addr, p->config_labels.items[i].name});
+    for (size_t i = 0; i < p->config_entries.count; i++) s.entries.push_back({p->config_entries.items[i].has_bank, p->config_entries.items[i].bank, p->config_entries.items[i].addr});
+    for (size_t i = 0; i < p->data_ranges.count; i++) s.data.push_back({p->data_ranges.items[i].bank, p->data_ranges.items[i].addr, data_range_spec_string(&p->data_ranges.items[i])});
+    for (size_t i = 0; i < p->tables.count; i++) s.tables.push_back({p->tables.items[i].bank, p->tables.items[i].addr, table_def_spec_string(&p->tables.items[i])});
+    for (size_t i = 0; i < p->routine_docs.count; i++) s.routine_docs.push_back({p->routine_docs.items[i].has_bank, p->routine_docs.items[i].bank, p->routine_docs.items[i].addr, p->routine_docs.items[i].text});
+    for (size_t i = 0; i < p->table_docs.count; i++) s.table_docs.push_back({p->table_docs.items[i].has_bank, p->table_docs.items[i].bank, p->table_docs.items[i].addr, p->table_docs.items[i].text}); return s;
+}
+
+int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const char *path, std::string *st) {
+    std::vector<SnapshotLabel> cl; std::vector<SnapshotEntry> ce; std::vector<SnapshotData> cd; std::vector<SnapshotTable> ct; std::vector<SnapshotDoc> crd, ctd;
+    for (auto &i : s->labels) { int sp = 0; for (size_t j = 0; j < p->config_labels.count; j++) if (p->config_labels.items[j].has_bank == i.has_bank && p->config_labels.items[j].bank == i.bank && p->config_labels.items[j].addr == i.addr) { sp = 1; break; } if (!sp) { *st = "deletion needs full snapshot"; return 0; } }
+    for (size_t i = 0; i < p->config_labels.count; i++) { const auto *o = find_snapshot_label(s, p->config_labels.items[i].has_bank, p->config_labels.items[i].bank, p->config_labels.items[i].addr); if (!o || o->name != p->config_labels.items[i].name) cl.push_back({p->config_labels.items[i].has_bank, p->config_labels.items[i].bank, p->config_labels.items[i].addr, p->config_labels.items[i].name}); }
+    for (size_t i = 0; i < p->config_entries.count; i++) if (!find_snapshot_entry(s, p->config_entries.items[i].has_bank, p->config_entries.items[i].bank, p->config_entries.items[i].addr)) ce.push_back({p->config_entries.items[i].has_bank, p->config_entries.items[i].bank, p->config_entries.items[i].addr});
+    for (size_t i = 0; i < p->data_ranges.count; i++) { std::string spec = data_range_spec_string(&p->data_ranges.items[i]); const auto *o = find_snapshot_data(s, p->data_ranges.items[i].bank, p->data_ranges.items[i].addr); if (!o || o->spec != spec) cd.push_back({p->data_ranges.items[i].bank, p->data_ranges.items[i].addr, spec}); }
+    for (size_t i = 0; i < p->tables.count; i++) { std::string spec = table_def_spec_string(&p->tables.items[i]); const auto *o = find_snapshot_table(s, p->tables.items[i].bank, p->tables.items[i].addr); if (!o || o->spec != spec) ct.push_back({p->tables.items[i].bank, p->tables.items[i].addr, spec}); }
+    for (size_t i = 0; i < p->routine_docs.count; i++) { const auto *o = find_snapshot_doc(s->routine_docs, p->routine_docs.items[i].has_bank, p->routine_docs.items[i].bank, p->routine_docs.items[i].addr); if (!o || o->text != p->routine_docs.items[i].text) crd.push_back({p->routine_docs.items[i].has_bank, p->routine_docs.items[i].bank, p->routine_docs.items[i].addr, p->routine_docs.items[i].text}); }
+    for (size_t i = 0; i < p->table_docs.count; i++) { const auto *o = find_snapshot_doc(s->table_docs, p->table_docs.items[i].has_bank, p->table_docs.items[i].bank, p->table_docs.items[i].addr); if (!o || o->text != p->table_docs.items[i].text) ctd.push_back({p->table_docs.items[i].has_bank, p->table_docs.items[i].bank, p->table_docs.items[i].addr, p->table_docs.items[i].text}); }
+    FILE *o = fopen(path, "w"); if (!o) { *st = "open failed"; return -1; } fputs("; Apex ImGui overlay\n", o);
+    if (p->config_path && *p->config_path) fprintf(o, "include = %s\n", basename_ptr(p->config_path));
+    if (!cl.empty()) { fputs("\n[labels]\n", o); for (auto &i : cl) { write_config_address(o, i.has_bank, i.bank, i.addr); fputs(" = ", o); write_escaped_value(o, i.name.c_str()); fputc('\n', o); } }
+    if (!ce.empty()) { fputs("\n[entries]\n", o); for (auto &i : ce) { write_config_address(o, i.has_bank, i.bank, i.addr); fputs(" = code\n", o); } }
+    if (!cd.empty()) { fputs("\n[data]\n", o); for (auto &i : cd) { write_config_address(o, 1, i.bank, i.addr); fputs(" = ", o); fputs(i.spec.c_str(), o); fputc('\n', o); } }
+    if (!ct.empty()) { fputs("\n[tables]\n", o); for (auto &i : ct) { write_config_address(o, 1, i.bank, i.addr); fputs(" = ", o); fputs(i.spec.c_str(), o); fputc('\n', o); } }
+    if (!crd.empty()) { fputs("\n[routine_docs]\n", o); for (auto &i : crd) { write_config_address(o, i.has_bank, i.bank, i.addr); fputs(" = ", o); write_escaped_value(o, i.text.c_str()); fputc('\n', o); } }
+    if (!ctd.empty()) { fputs("\n[table_docs]\n", o); for (auto &i : ctd) { write_config_address(o, i.has_bank, i.bank, i.addr); fputs(" = ", o); write_escaped_value(o, i.text.c_str()); fputc('\n', o); } }
+    fclose(o); *st = "saved delta"; return 1;
+}
+
+static const char *inline_mode_name_internal(int mode)
+{
+    switch (mode) {
+    case EDIT_INLINE_BYTE: return "byte";
+    case EDIT_INLINE_PTR16_DATA: return "ptr16_data";
+    case EDIT_INLINE_PTR16_CODE: return "ptr16_code";
+    case EDIT_INLINE_PTR16_STRING: return "ptr16_string";
+    case EDIT_INLINE_FAR_DATA: return "far_data";
+    case EDIT_INLINE_FAR_CODE: return "far_code";
+    case EDIT_INLINE_FAR_STRING: return "far_string";
+    default: return "";
+    }
+}

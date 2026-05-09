@@ -1,0 +1,7 @@
+build/*
+out/*
+roms/*
+tmp/*
+.DS_Store
+imgui.ini
+.apeximgui_session

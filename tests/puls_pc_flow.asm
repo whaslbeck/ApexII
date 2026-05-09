@@ -1,0 +1,10 @@
+.ROM_SIZE 524288
+
+.BANK SYSTEM
+.ORG 0x8000
+START:
+    PULS PC
+    .DB 0x86, 0x00
+
+.ORG 0xfffe
+    .DW START
