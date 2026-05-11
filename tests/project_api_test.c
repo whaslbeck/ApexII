@@ -172,7 +172,7 @@ int main(int argc, char **argv)
         apex_project_free(project);
         return 1;
     }
-    if (apex_project_save_overlay(project, "out/project_api_test_overlay.ini") != 0) {
+    if (apex_project_save_overlay(project, "out/project_api_test_overlay.ini", NULL) != 0) {
         fprintf(stderr, "save_overlay failed\n");
         apex_project_free(project);
         return 1;

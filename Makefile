@@ -12,7 +12,6 @@ UNAME_S := $(shell uname -s 2>/dev/null)
 
 COMMON_OBJS := $(BUILD_DIR)/cpu6809.o $(BUILD_DIR)/util.o
 APEXDIS_CORE_OBJS := $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
-APEXGUI_OBJS := $(BUILD_DIR)/apexgui.o $(BUILD_DIR)/apexgui_html.o $(APEXDIS_CORE_OBJS)
 APEXDMD_OBJS := $(COMMON_OBJS) $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o
 
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
@@ -43,7 +42,7 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexgui $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
 
 apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd
 
@@ -52,6 +51,8 @@ $(BUILD_DIR):
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/apex.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
+
+$(BUILD_DIR)/apeximgui.o $(BUILD_DIR)/apeximgui_data.o $(BUILD_DIR)/apeximgui_analysis.o $(BUILD_DIR)/apeximgui_views.o: $(SRC_DIR)/apeximgui_core.h
 
 $(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
 	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
@@ -83,9 +84,6 @@ $(BUILD_DIR)/apexdmd_test.o: tests/apexdmd_test.c $(SRC_DIR)/apexdmd.h | $(BUILD
 $(BUILD_DIR)/apexdis: $(BUILD_DIR)/apexdis_main.o $(APEXDIS_CORE_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
-$(BUILD_DIR)/apexgui: $(APEXGUI_OBJS)
-	$(CC) $(LDFLAGS) $^ -o $@
-
 $(BUILD_DIR)/apeximgui: $(APEXIMGUI_OBJS)
 	$(CXX) $(LDFLAGS) $^ $(APEXIMGUI_LDLIBS) -o $@
 
@@ -97,12 +95,6 @@ $(BUILD_DIR)/project_api_test: $(BUILD_DIR)/project_api_test.o $(APEXDIS_CORE_OB
 
 $(BUILD_DIR)/apexdmd_test: $(BUILD_DIR)/apexdmd_test.o $(BUILD_DIR)/apexdmd.o $(COMMON_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
-
-$(BUILD_DIR)/apexgui_html.c: $(SRC_DIR)/apexgui.html tools/embed_file.sh | $(BUILD_DIR)
-	sh tools/embed_file.sh $< $@ apexgui_html
-
-$(BUILD_DIR)/apexgui_html.o: $(BUILD_DIR)/apexgui_html.c | $(BUILD_DIR)
-	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(COMMON_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@

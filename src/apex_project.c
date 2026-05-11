@@ -1351,9 +1351,10 @@ const ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_x
     return project->render_cache;
 }
 
-int apex_project_save_overlay(const ApexProject *project, const char *path)
+int apex_project_save_overlay(const ApexProject *project, const char *path, const char *include_path)
 {
     FILE *out;
+    const char *inc;
 
     if (!project || !path || !*path) {
         return 1;
@@ -1363,8 +1364,9 @@ int apex_project_save_overlay(const ApexProject *project, const char *path)
         return 1;
     }
     fputs("; Apex ImGui overlay\n", out);
-    if (project->config_path && *project->config_path) {
-        fprintf(out, "include = %s\n", basename_ptr(project->config_path));
+    inc = (include_path && *include_path) ? include_path : project->config_path;
+    if (inc && *inc) {
+        fprintf(out, "include = %s\n", basename_ptr(inc));
     }
     write_labels_section(out, &project->config_labels);
     write_entries_section(out, &project->config_entries);

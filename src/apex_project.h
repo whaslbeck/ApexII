@@ -78,6 +78,6 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                                   int emit_explain);
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
                            int emit_explain);
-int apex_project_save_overlay(const ApexProject *project, const char *path);
+int apex_project_save_overlay(const ApexProject *project, const char *path, const char *include_path);
 
 #endif

@@ -138,6 +138,7 @@ struct UiState {
     char edit_doc_input[1024];
     char edit_table_schema_input[128];
     char save_path_input[512];
+    char base_config_path[1024];
     char status_message[256];
     char global_search_input[128];
     bool show_search_window;
@@ -159,6 +160,24 @@ struct UiState {
 
     size_t hex_selected_offset;
     bool hex_active;
+    int hex_request_follow;
+    size_t hex_prev_selected_line;
+
+    bool show_navigator;
+    bool show_labels;
+    bool show_banks;
+    bool show_transitions;
+    bool show_bookmarks;
+    bool show_disasm;
+    bool show_details;
+    bool show_refs;
+    bool show_dmd;
+    bool show_call_graph;
+    bool show_tables;
+    bool show_hardware;
+    bool show_edit;
+    bool show_hex;
+    bool request_layout_reset;
 
     std::vector<struct LabelIndexEntry> cached_labels;
     bool labels_valid;
@@ -169,6 +188,16 @@ struct UiState {
     int graph_depth_in;
     int graph_depth_out;
     bool graph_needs_rebuild;
+
+    bool show_pattern_search;
+    char pattern_search_input[128];
+    std::vector<size_t> pattern_search_results;
+    int request_focus_pattern_search;
+
+    bool show_ram_refs;
+    char ram_ref_input[32];
+    std::vector<size_t> ram_ref_results;
+    int request_focus_ram_refs;
 };
 
 struct SnapshotLabel {
@@ -203,6 +232,13 @@ struct SnapshotDoc {
     std::string text;
 };
 
+struct SnapshotInline {
+    int has_bank;
+    uint8_t bank;
+    uint32_t addr;
+    std::string spec;
+};
+
 struct OriginalSnapshot {
     std::vector<SnapshotLabel> labels;
     std::vector<SnapshotEntry> entries;
@@ -210,6 +246,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotTable> tables;
     std::vector<SnapshotDoc> routine_docs;
     std::vector<SnapshotDoc> table_docs;
+    std::vector<SnapshotInline> inline_sigs;
 };
 
 struct LineByteSpan {
@@ -295,6 +332,7 @@ void clear_kind_at_selection(ApexProject *project, const ApexRenderedDocument **
 const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *document, uint8_t bank, size_t *line_index);
 int find_line_by_rom_offset(const ApexRenderedDocument *document, size_t rom_offset, size_t *line_index);
 int rom_offset_to_cpu_address(const ApexProject *project, size_t offset, uint8_t *bank, uint32_t *cpu_addr);
+ApexRenderedBlockKind get_offset_kind(const ApexProject *project, const ApexRenderedDocument *document, size_t offset);
 
 // Data
 const CpuHelpInfo *lookup_cpu_help(const char *mnemonic);
@@ -303,7 +341,8 @@ std::vector<const HardwareRegister*> find_hardware_in_text(const char *text, siz
 
 // Project & Snapshot
 OriginalSnapshot build_original_snapshot(const ApexProject *project);
-int write_delta_overlay(const ApexProject *project, const OriginalSnapshot *snapshot, const char *path, std::string *status);
+OriginalSnapshot build_config_snapshot(const char *config_path);
+int write_delta_overlay(const ApexProject *project, const OriginalSnapshot *snapshot, const char *path, const char *include_path, std::string *status);
 
 // Session
 void clear_session();
@@ -327,7 +366,7 @@ void render_transition_list(const ApexRenderedDocument *document, UiState *state
 void render_xref_popup(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_bookmark_list(const ApexRenderedDocument *document, UiState *state);
 void render_global_search(const ApexRenderedDocument *document, UiState *state);
-void render_hex_view(const ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_hex_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_call_graph(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_editor(ApexProject *project, const ApexRenderedDocument **document_ptr, const OriginalSnapshot *snapshot, UiState *state);
 void render_dmd_view(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
@@ -341,5 +380,11 @@ void auto_search_tables(ApexProject *project, const ApexRenderedDocument **docum
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document);
 size_t hardware_register_count();
 const HardwareRegister *get_hardware_register(size_t index);
+
+// Analysis: Pattern Search & RAM XRefs
+std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input);
+std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const char *addr_input);
+void render_pattern_search(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 #endif
