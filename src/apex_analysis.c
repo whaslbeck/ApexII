@@ -69,11 +69,15 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
             if (!name || strcmp(set->items[i].name, name) == 0) {
                 if (is_code && !set->items[i].is_data) {
                     set->items[i].is_code = 1;
+                } else if (is_code && set->items[i].is_data) {
+                    set->items[i].is_conflict = 1;
                 }
                 return &set->items[i];
             }
             if (is_code && !set->items[i].is_data) {
                 set->items[i].is_code = 1;
+            } else if (is_code && set->items[i].is_data) {
+                set->items[i].is_conflict = 1;
             }
         }
     }
@@ -95,6 +99,7 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
     set->items[set->count].is_code = is_code;
     set->items[set->count].is_data = 0;
     set->items[set->count].is_string = 0;
+    set->items[set->count].is_conflict = 0;
     set->items[set->count].scanned = 0;
     set->items[set->count].explain = NULL;
     set->items[set->count].kind_explain = NULL;
@@ -120,6 +125,9 @@ void mark_label_data(Label *label)
 {
     if (!label) {
         return;
+    }
+    if (label->is_code) {
+        label->is_conflict = 1;
     }
     label->is_data = 1;
     label->is_code = 0;

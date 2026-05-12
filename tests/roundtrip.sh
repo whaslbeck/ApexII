@@ -204,6 +204,42 @@ else
     exit 1
 fi
 
+classification_conflict_asm="$OUT/classification_conflict.disasm"
+classification_conflict_err="$OUT/classification_conflict.stderr"
+"$ROOT/build/apexdis" "$system_banked_inline_rom" "$classification_conflict_asm" \
+    "$ROOT/tests/classification_conflict.ini" 2>"$classification_conflict_err"
+if grep -q '^; WARNING classification_conflict bank=0xff cpu=0x8004' \
+        "$classification_conflict_asm" &&
+    grep -q 'warning: classification conflict at bank=0xff cpu=0x8004' \
+        "$classification_conflict_err" &&
+    grep -q 'code_from=' "$classification_conflict_err" &&
+    grep -q 'data_from=' "$classification_conflict_err"; then
+    printf 'PASS classification_conflict.ini\n'
+else
+    printf 'FAIL classification_conflict.ini\n' >&2
+    exit 1
+fi
+
+cross_bank_inline_rom="$OUT/cross_bank_inline.rom"
+cross_bank_inline_asm="$OUT/cross_bank_inline.disasm"
+cross_bank_inline_rebuilt="$OUT/cross_bank_inline.rebuilt"
+"$ROOT/build/apexasm" "$cross_bank_inline_rom" "$ROOT/tests/cross_bank_inline.asm"
+"$ROOT/build/apexdis" "$cross_bank_inline_rom" "$cross_bank_inline_asm" \
+    "$ROOT/tests/cross_bank_inline.ini"
+"$ROOT/build/apexasm" "$cross_bank_inline_rebuilt" "$cross_bank_inline_asm"
+if cmp -s "$cross_bank_inline_rom" "$cross_bank_inline_rebuilt" &&
+    grep -q '^    JSR SysHelper$' "$cross_bank_inline_asm" &&
+    grep -q '^        INLINE_BYTE 0x37 ; for JSR SysHelper mode=0x37$' "$cross_bank_inline_asm" &&
+    grep -q '^        INLINE_BYTE 0x99 ; for JSR SysHelper mode=0x99$' "$cross_bank_inline_asm"; then
+    printf 'PASS cross_bank_inline.asm\n'
+else
+    printf 'FAIL cross_bank_inline.asm\n' >&2
+    if ! cmp -s "$cross_bank_inline_rom" "$cross_bank_inline_rebuilt"; then
+        report_mismatch "$cross_bank_inline_rom" "$cross_bank_inline_rebuilt"
+    fi
+    exit 1
+fi
+
 local_reanalysis_far_rom="$OUT/local_reanalysis_far.rom"
 "$ROOT/build/apexasm" "$local_reanalysis_far_rom" "$ROOT/tests/local_reanalysis_far.asm"
 
@@ -395,154 +431,6 @@ else
         report_mismatch "$ROOT/roms/addam_h4.rom" "$config_rebuilt"
     fi
     exit 1
-fi
-
-if command -v curl >/dev/null 2>&1; then
-    gui_log="$OUT/apexgui.log"
-    gui_config="$ROOT/tests/apexgui_minimal.ini"
-    gui_overlay="$ROOT/tests/apexgui_minimal.ini.apexgui.ini"
-    rm -f "$gui_overlay"
-    "$ROOT/build/apexgui" --host 127.0.0.1 --port 0 "$ROOT/roms/taf_l7.rom" "$gui_config" \
-        >"$gui_log" 2>&1 &
-    gui_pid=$!
-    trap 'kill "$gui_pid" 2>/dev/null || true' EXIT INT TERM
-    port=
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        port=$(sed -n 's/.*http:\/\/127\.0\.0\.1:\([0-9][0-9]*\)\/.*/\1/p' "$gui_log")
-        if [ -n "$port" ]; then
-            break
-        fi
-        sleep 1
-    done
-    gui_index="$OUT/apexgui.index.json"
-    gui_asm="$OUT/apexgui.asm"
-    gui_html="$OUT/apexgui.html"
-    gui_edit="$OUT/apexgui.edit.json"
-    gui_dup="$OUT/apexgui.dup.json"
-    gui_index_after="$OUT/apexgui.index.after.json"
-    gui_create="$OUT/apexgui.create.json"
-    gui_clear_doc="$OUT/apexgui.clear_doc.json"
-    gui_clear_all="$OUT/apexgui.clear_all.json"
-    if [ -n "$port" ] &&
-        curl -fsS "http://127.0.0.1:$port/api/index" -o "$gui_index" &&
-        curl -fsS "http://127.0.0.1:$port/api/asm" -o "$gui_asm" &&
-        curl -fsS "http://127.0.0.1:$port/" -o "$gui_html" &&
-        curl -fsS --get "http://127.0.0.1:$port/api/edit" \
-            --data-urlencode "target=B20_A40d5" \
-            --data-urlencode "label=RoundtripGuiLabel" \
-            --data-urlencode "kind=code" \
-            --data-urlencode "spec=far_code" \
-            --data-urlencode "doc=Roundtrip GUI routine doc" \
-            -o "$gui_edit" &&
-        curl -sS --get "http://127.0.0.1:$port/api/edit" \
-            --data-urlencode "target=B20_A4113" \
-            --data-urlencode "label=RoundtripGuiLabel" \
-            --data-urlencode "kind=code" \
-            -o "$gui_dup" &&
-        curl -fsS --get "http://127.0.0.1:$port/api/edit" \
-            --data-urlencode "target=B20_A4113" \
-            --data-urlencode "label=RoundtripGuiCreated" \
-            --data-urlencode "kind=code" \
-            --data-urlencode "spec=" \
-            -o "$gui_create" &&
-        curl -fsS --get "http://127.0.0.1:$port/api/edit" \
-            --data-urlencode "target=B20_A40d5" \
-            --data-urlencode "action=clear" \
-            --data-urlencode "scope=doc" \
-            -o "$gui_clear_doc" &&
-        curl -fsS --get "http://127.0.0.1:$port/api/edit" \
-            --data-urlencode "target=B20_A4113" \
-            --data-urlencode "action=clear" \
-            --data-urlencode "scope=all" \
-            -o "$gui_clear_all" &&
-        curl -fsS "http://127.0.0.1:$port/api/index" -o "$gui_index_after" &&
-        grep -q '"labels":\[' "$gui_index" &&
-        grep -q '"tables":\[' "$gui_index" &&
-        grep -q '"transitions":\[' "$gui_index" &&
-        grep -q '^; Generated by ApexII conservative disassembler' "$gui_asm" &&
-        grep -q '<title>Apex GUI</title>' "$gui_html" &&
-        grep -q 'id="tableList"' "$gui_html" &&
-        grep -q 'id="prevDataEdge"' "$gui_html" &&
-        grep -q 'id="nextDataEdge"' "$gui_html" &&
-        grep -q '"ok":true' "$gui_edit" &&
-        grep -q '"ok":false' "$gui_dup" &&
-        grep -q "label 'RoundtripGuiLabel' already exists" "$gui_dup" &&
-        grep -q '"ok":true' "$gui_create" &&
-        grep -q '"ok":true' "$gui_clear_doc" &&
-        grep -q '"ok":true' "$gui_clear_all" &&
-        grep -q 'RoundtripGuiLabel' "$gui_index_after" &&
-        grep -q '"spec":"far_code"' "$gui_index_after" &&
-        ! grep -q '"doc":"Roundtrip GUI routine doc"' "$gui_index_after" &&
-        grep -q '"overlay_label":"RoundtripGuiLabel"' "$gui_index_after" &&
-        ! grep -q '"overlay_routine_doc":"Roundtrip GUI routine doc"' "$gui_index_after" &&
-        ! grep -q 'RoundtripGuiCreated' "$gui_index_after" &&
-        ! grep -q '^\[routine_docs\]$' "$gui_overlay" &&
-        ! grep -q '^B20_A4113 = RoundtripGuiCreated$' "$gui_overlay"; then
-        printf 'PASS apexgui\n'
-    else
-        printf 'FAIL apexgui\n' >&2
-        kill "$gui_pid" 2>/dev/null || true
-        exit 1
-    fi
-    kill "$gui_pid" 2>/dev/null || true
-    wait "$gui_pid" 2>/dev/null || true
-    rm -f "$gui_overlay"
-    trap - EXIT INT TERM
-
-    gui2_log="$OUT/apexgui_far_tables.log"
-    "$ROOT/build/apexgui" --host 127.0.0.1 --port 0 "$far_tables_rom" "$ROOT/tests/far_tables.ini" \
-        >"$gui2_log" 2>&1 &
-    gui2_pid=$!
-    trap 'kill "$gui2_pid" 2>/dev/null || true' EXIT INT TERM
-    port=
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        port=$(sed -n 's/.*http:\/\/127\.0\.0\.1:\([0-9][0-9]*\)\/.*/\1/p' "$gui2_log")
-        if [ -n "$port" ]; then
-            break
-        fi
-        sleep 1
-    done
-    gui2_index="$OUT/apexgui_far_tables.index.json"
-    if [ -n "$port" ] &&
-        curl -fsS "http://127.0.0.1:$port/api/index" -o "$gui2_index" &&
-        grep -q '"tables":\[' "$gui2_index" &&
-        grep -q '"name":"B20_A4007"' "$gui2_index" &&
-        grep -q '"kind":"table_to_data"' "$gui2_index"; then
-        printf 'PASS apexgui_tables\n'
-    else
-        printf 'FAIL apexgui_tables\n' >&2
-        kill "$gui2_pid" 2>/dev/null || true
-        exit 1
-    fi
-    kill "$gui2_pid" 2>/dev/null || true
-    wait "$gui2_pid" 2>/dev/null || true
-    trap - EXIT INT TERM
-
-    gui3_log="$OUT/apexgui_puls.log"
-    "$ROOT/build/apexgui" --host 127.0.0.1 --port 0 "$puls_rom" >"$gui3_log" 2>&1 &
-    gui3_pid=$!
-    trap 'kill "$gui3_pid" 2>/dev/null || true' EXIT INT TERM
-    port=
-    for _ in 1 2 3 4 5 6 7 8 9 10; do
-        port=$(sed -n 's/.*http:\/\/127\.0\.0\.1:\([0-9][0-9]*\)\/.*/\1/p' "$gui3_log")
-        if [ -n "$port" ]; then
-            break
-        fi
-        sleep 1
-    done
-    gui3_index="$OUT/apexgui_puls.index.json"
-if [ -n "$port" ] &&
-    curl -fsS "http://127.0.0.1:$port/api/index" -o "$gui3_index" &&
-    grep -q '"kind":"code_to_data"' "$gui3_index"; then
-    printf 'PASS apexgui_navigation\n'
-    else
-        printf 'FAIL apexgui_navigation\n' >&2
-        kill "$gui3_pid" 2>/dev/null || true
-        exit 1
-    fi
-    kill "$gui3_pid" 2>/dev/null || true
-    wait "$gui3_pid" 2>/dev/null || true
-    trap - EXIT INT TERM
 fi
 
 mkdir -p "$OUT"

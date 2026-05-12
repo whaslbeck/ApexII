@@ -139,6 +139,11 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 bool in_range = (line_idx >= sel_min && line_idx <= sel_max);
                 ImGui::PushID((int)line_idx);
                 ImGui::TableNextRow();
+                if (line->has_conflict) {
+                    ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.85f, 0.45f, 0.05f, 0.28f));
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                }
                 ImGui::TableSetColumnIndex(0);
                 char addr_buf[32];
                 const char *addr_text = "##line";

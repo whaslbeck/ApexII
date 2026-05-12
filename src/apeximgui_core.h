@@ -199,6 +199,10 @@ struct UiState {
     std::vector<size_t> ram_ref_results;
     int request_focus_ram_refs;
 
+    bool refs_pinned;
+    uint8_t refs_pinned_bank;
+    uint32_t refs_pinned_addr;
+
     bool overlay_dirty;
 };
 

@@ -13,6 +13,7 @@ typedef struct {
     int is_code;
     int is_data;
     int is_string;
+    int is_conflict;
     int scanned;
     const char *explain;
     const char *kind_explain;

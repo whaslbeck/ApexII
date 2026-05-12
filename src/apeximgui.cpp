@@ -368,44 +368,93 @@ int main(int argc, char **argv)
 
         if (state.show_refs) {
             ImGui::Begin("References", &state.show_refs);
-            if (state.selected_line < document->line_count &&
-                document->lines[state.selected_line].has_location) {
-                const auto *l = &document->lines[state.selected_line];
-                auto in  = find_incoming_refs(project, document, &state, l->bank, l->cpu_addr);
-                auto out = find_outgoing_refs(project, document, &state, l->bank, l->cpu_addr);
-                ImGui::TextUnformatted("Incoming");
-                if (in.empty()) {
-                    ImGui::TextDisabled("none");
+            {
+                uint8_t refs_bank = 0;
+                uint32_t refs_addr = 0;
+                bool has_refs_addr = false;
+
+                if (state.refs_pinned) {
+                    refs_bank = state.refs_pinned_bank;
+                    refs_addr = state.refs_pinned_addr;
+                    has_refs_addr = true;
+                } else if (state.selected_line < document->line_count &&
+                           document->lines[state.selected_line].has_location) {
+                    const auto *l = &document->lines[state.selected_line];
+                    refs_bank = l->bank;
+                    refs_addr = l->cpu_addr;
+                    has_refs_addr = true;
+                }
+
+                if (state.refs_pinned) {
+                    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.35f, 0.05f, 1.0f));
+                    if (ImGui::SmallButton("Unpin")) {
+                        state.refs_pinned = false;
+                    }
+                    ImGui::PopStyleColor();
+                    ImGui::SameLine();
+                    std::string lbl = label_at_address(document, &state, refs_bank, refs_addr);
+                    char hdr[192];
+                    if (lbl.empty()) {
+                        snprintf(hdr, sizeof(hdr), "Pinned: B%02x_A%04x",
+                                 refs_bank, (unsigned)refs_addr & 0xffffu);
+                    } else {
+                        snprintf(hdr, sizeof(hdr), "Pinned: %s", lbl.c_str());
+                    }
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.70f, 0.20f, 1.0f));
+                    ImGui::TextUnformatted(hdr);
+                    ImGui::PopStyleColor();
                 } else {
-                    for (size_t ri = 0; ri < in.size(); ri++) {
-                        const auto &r = in[ri];
-                        char c[192];
-                        snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
-                        ImGui::PushID((int)ri);
-                        if (ImGui::SmallButton(c)) {
-                            select_line(&state, r.line_index, 1);
+                    if (has_refs_addr) {
+                        if (ImGui::SmallButton("Pin")) {
+                            state.refs_pinned = true;
+                            state.refs_pinned_bank = refs_bank;
+                            state.refs_pinned_addr = refs_addr;
                         }
-                        ImGui::PopID();
+                    } else {
+                        ImGui::BeginDisabled();
+                        ImGui::SmallButton("Pin");
+                        ImGui::EndDisabled();
                     }
                 }
                 ImGui::Separator();
-                ImGui::TextUnformatted("Outgoing");
-                if (out.empty()) {
-                    ImGui::TextDisabled("none");
-                } else {
-                    for (size_t ri = 0; ri < out.size(); ri++) {
-                        const auto &r = out[ri];
-                        char c[192];
-                        snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
-                        ImGui::PushID((int)(1000 + ri));
-                        if (ImGui::SmallButton(c)) {
-                            select_line(&state, r.line_index, 1);
+
+                if (has_refs_addr) {
+                    auto in  = find_incoming_refs(project, document, &state, refs_bank, refs_addr);
+                    auto out = find_outgoing_refs(project, document, &state, refs_bank, refs_addr);
+                    ImGui::TextUnformatted("Incoming");
+                    if (in.empty()) {
+                        ImGui::TextDisabled("none");
+                    } else {
+                        for (size_t ri = 0; ri < in.size(); ri++) {
+                            const auto &r = in[ri];
+                            char c[192];
+                            snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
+                            ImGui::PushID((int)ri);
+                            if (ImGui::SmallButton(c)) {
+                                select_line(&state, r.line_index, 1);
+                            }
+                            ImGui::PopID();
                         }
-                        ImGui::PopID();
                     }
+                    ImGui::Separator();
+                    ImGui::TextUnformatted("Outgoing");
+                    if (out.empty()) {
+                        ImGui::TextDisabled("none");
+                    } else {
+                        for (size_t ri = 0; ri < out.size(); ri++) {
+                            const auto &r = out[ri];
+                            char c[192];
+                            snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
+                            ImGui::PushID((int)(1000 + ri));
+                            if (ImGui::SmallButton(c)) {
+                                select_line(&state, r.line_index, 1);
+                            }
+                            ImGui::PopID();
+                        }
+                    }
+                } else {
+                    ImGui::TextDisabled("No selection.");
                 }
-            } else {
-                ImGui::TextDisabled("No selection.");
             }
             ImGui::End();
         }
@@ -469,6 +518,33 @@ int main(int argc, char **argv)
                     ImGui::Text("Address: B%02x_A%04x  ROM: 0x%06lx",
                                 line->bank, (unsigned)line->cpu_addr & 0xffffu,
                                 (unsigned long)line->rom_addr);
+                    const LabelSet *ls = (line->bank == 0xffu) ? &project->system_labels : NULL;
+                    if (!ls) {
+                        int bi = bank_index_for_far_ref(project->rom.data, project->banks,
+                                                        line->bank);
+                        if (bi >= 0) {
+                            ls = &project->bank_labels[bi];
+                        }
+                    }
+                    if (ls) {
+                        for (size_t li = 0; li < ls->count; li++) {
+                            if (ls->items[li].addr == line->cpu_addr) {
+                                const Label *lbl = &ls->items[li];
+                                if (lbl->explain) {
+                                    ImGui::Text("Origin: %s", lbl->explain);
+                                }
+                                if (lbl->kind_explain) {
+                                    ImGui::Text("Classification: %s", lbl->kind_explain);
+                                }
+                                if (lbl->is_conflict) {
+                                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.55f, 0.1f, 1.0f));
+                                    ImGui::TextUnformatted("CONFLICT: address has contradictory classifications");
+                                    ImGui::PopStyleColor();
+                                }
+                                break;
+                            }
+                        }
+                    }
                 }
                 if (span.valid) {
                     ImGui::Text("Span: %lu bytes", (unsigned long)(span.end - span.start));

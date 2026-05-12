@@ -45,6 +45,7 @@ typedef struct {
     ApexRenderedBlockKind block_kind;
     ApexRenderedTransitionKind transition_kind;
     int has_location;
+    int has_conflict;
     uint8_t bank;
     uint32_t cpu_addr;
     size_t rom_addr;

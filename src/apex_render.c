@@ -334,6 +334,7 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
     size_t line_count = 0;
     size_t start = 0;
     int current_has_location = 0;
+    int current_has_conflict = 0;
     uint8_t current_bank = 0;
     uint32_t current_cpu_addr = 0;
     size_t current_rom_addr = 0;
@@ -365,6 +366,7 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
                 parse_location_comment(document->lines[line_count].text,
                                        document->lines[line_count].length, &current_bank,
                                        &current_cpu_addr, &current_rom_addr)) {
+                static const char conflict_prefix[] = "; WARNING classification_conflict ";
                 ApexRenderedBlockKind transition_block =
                     parse_transition_target_block(document->lines[line_count].text,
                                                   document->lines[line_count].length);
@@ -372,6 +374,13 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
                     parse_transition_kind(document->lines[line_count].text,
                                           document->lines[line_count].length);
 
+                if (document->lines[line_count].length >= sizeof(conflict_prefix) - 1 &&
+                    memcmp(document->lines[line_count].text, conflict_prefix,
+                           sizeof(conflict_prefix) - 1) == 0) {
+                    current_has_conflict = 1;
+                } else {
+                    current_has_conflict = 0;
+                }
                 if (transition_block != APEX_RENDER_BLOCK_UNKNOWN) {
                     current_block = transition_block;
                 }
@@ -389,6 +398,7 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
                 size_t size;
 
                 document->lines[line_count].has_location = 1;
+                document->lines[line_count].has_conflict = current_has_conflict;
                 document->lines[line_count].block_kind = current_block;
                 document->lines[line_count].bank = current_bank;
                 document->lines[line_count].cpu_addr = current_cpu_addr;
@@ -410,6 +420,7 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
             parse_location_comment(document->lines[line_count].text,
                                    document->lines[line_count].length, &current_bank,
                                    &current_cpu_addr, &current_rom_addr)) {
+            static const char conflict_prefix[] = "; WARNING classification_conflict ";
             ApexRenderedBlockKind transition_block =
                 parse_transition_target_block(document->lines[line_count].text,
                                               document->lines[line_count].length);
@@ -417,6 +428,13 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
                 parse_transition_kind(document->lines[line_count].text,
                                       document->lines[line_count].length);
 
+            if (document->lines[line_count].length >= sizeof(conflict_prefix) - 1 &&
+                memcmp(document->lines[line_count].text, conflict_prefix,
+                       sizeof(conflict_prefix) - 1) == 0) {
+                current_has_conflict = 1;
+            } else {
+                current_has_conflict = 0;
+            }
             if (transition_block != APEX_RENDER_BLOCK_UNKNOWN) {
                 current_block = transition_block;
             }
@@ -433,6 +451,7 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
             size_t size;
 
             document->lines[line_count].has_location = 1;
+            document->lines[line_count].has_conflict = current_has_conflict;
             document->lines[line_count].block_kind = current_block;
             document->lines[line_count].bank = current_bank;
             document->lines[line_count].cpu_addr = current_cpu_addr;

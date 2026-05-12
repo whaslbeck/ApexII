@@ -409,6 +409,22 @@ static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uin
     emit_doc_comment(out, doc);
 }
 
+static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, size_t rom_addr,
+                                   const char *code_from, const char *data_from)
+{
+    const char *cf = code_from ? code_from : "unknown";
+    const char *df = data_from ? data_from : "unknown";
+
+    fprintf(stderr,
+            "warning: classification conflict at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
+            "code_from=%s data_from=%s\n",
+            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df);
+    fprintf(out,
+            "; WARNING classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
+            "code_from=%s data_from=%s\n",
+            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df);
+}
+
 static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
                            uint8_t bank, uint32_t base_addr, size_t rom_base,
                            const InlineSignatures *inline_sigs, const TableDef *table,
@@ -421,6 +437,7 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
     size_t i;
     int emitted_block = 0;
     int emitted_label = 0;
+    int emitted_conflict = 0;
     const InlineSignature *inline_sig = inline_signature_for(inline_sigs, bank, addr);
 
     for (i = 0; i < label_count; i++) {
@@ -467,6 +484,12 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                                          &labels[i], inline_sig);
                 }
                 emitted_block = 1;
+            }
+            if (labels[i].is_conflict && !emitted_conflict) {
+                emit_conflict_warning(out, bank, addr,
+                                      rom_base + (size_t)(addr - base_addr),
+                                      labels[i].explain, labels[i].kind_explain);
+                emitted_conflict = 1;
             }
             fprintf(out, "%s:\n", labels[i].name);
             emitted_label = 1;
