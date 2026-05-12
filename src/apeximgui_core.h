@@ -198,6 +198,8 @@ struct UiState {
     char ram_ref_input[32];
     std::vector<size_t> ram_ref_results;
     int request_focus_ram_refs;
+
+    bool overlay_dirty;
 };
 
 struct SnapshotLabel {
@@ -323,6 +325,7 @@ void jump_to_transition(const ApexRenderedDocument *document, UiState *state, Ap
 void move_selection_relative(const ApexRenderedDocument *document, UiState *state, int delta);
 void jump_primary_transition(const ApexRenderedDocument *document, UiState *state, int forward);
 void sync_editor_state(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+void auto_label_targets(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void rerender_and_reselect(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, uint8_t bank, uint32_t cpu_addr);
 void apply_code_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_data_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);

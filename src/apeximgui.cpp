@@ -8,6 +8,25 @@
 #include <cstring>
 #include <string>
 #include <algorithm>
+#include <signal.h>
+
+static ApexProject *g_crash_project = NULL;
+static const OriginalSnapshot *g_crash_snapshot = NULL;
+static char g_crash_overlay_path[512] = "";
+static char g_crash_base_config[1024] = "";
+
+static void handle_fatal_signal(int sig)
+{
+    if (g_crash_project && g_crash_snapshot && g_crash_overlay_path[0]) {
+        char backup_path[524];
+        snprintf(backup_path, sizeof(backup_path), "%s.crash", g_crash_overlay_path);
+        std::string st;
+        write_delta_overlay(g_crash_project, g_crash_snapshot, backup_path,
+                            g_crash_base_config, &st);
+    }
+    signal(sig, SIG_DFL);
+    raise(sig);
+}
 
 int main(int argc, char **argv)
 {
@@ -18,6 +37,7 @@ int main(int argc, char **argv)
     SDL_GLContext gl_context = NULL;
     UiState state = {};
     bool done = false;
+    bool want_quit = false;
     char rom_path[1024] = "";
     char config_path[1024] = "";
 
@@ -131,17 +151,26 @@ int main(int argc, char **argv)
         state.base_config_path[0] = '\0';
     }
 
+    g_crash_project  = project;
+    g_crash_snapshot = &original_snapshot;
+    snprintf(g_crash_overlay_path, sizeof(g_crash_overlay_path), "%s", state.save_path_input);
+    snprintf(g_crash_base_config,  sizeof(g_crash_base_config),  "%s", state.base_config_path);
+    signal(SIGSEGV, handle_fatal_signal);
+    signal(SIGABRT, handle_fatal_signal);
+    signal(SIGFPE,  handle_fatal_signal);
+    signal(SIGILL,  handle_fatal_signal);
+
     while (!done) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             ImGui_ImplSDL2_ProcessEvent(&event);
             if (event.type == SDL_QUIT) {
-                done = true;
+                if (state.overlay_dirty) { want_quit = true; } else { done = true; }
             }
             if (event.type == SDL_WINDOWEVENT &&
                 event.window.event == SDL_WINDOWEVENT_CLOSE &&
                 event.window.windowID == SDL_GetWindowID(window)) {
-                done = true;
+                if (state.overlay_dirty) { want_quit = true; } else { done = true; }
             }
         }
         ImGui_ImplOpenGL3_NewFrame();
@@ -156,7 +185,7 @@ int main(int argc, char **argv)
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Alt+F4")) {
-                    done = true;
+                    if (state.overlay_dirty) { want_quit = true; } else { done = true; }
                 }
                 ImGui::EndMenu();
             }
@@ -275,6 +304,39 @@ int main(int argc, char **argv)
             if (ImGui::Button("Prev table_to_data")) {
                 jump_to_transition(document, &state, APEX_RENDER_TRANSITION_TABLE_TO_DATA, 0);
             }
+            ImGui::Separator();
+            ImGui::TextUnformatted("Recent");
+            {
+                size_t hcount = state.history_back.size();
+                size_t hshow  = hcount > 15 ? 15 : hcount;
+                for (size_t hi = 0; hi < hshow; hi++) {
+                    size_t hli = state.history_back[hcount - 1 - hi];
+                    if (hli >= (size_t)document->line_count) {
+                        continue;
+                    }
+                    const auto *hl = &document->lines[hli];
+                    char hbuf[64];
+                    if (hl->has_location) {
+                        snprintf(hbuf, sizeof(hbuf), "B%02x_A%04x",
+                                 hl->bank, (unsigned)hl->cpu_addr & 0xffff);
+                    } else {
+                        snprintf(hbuf, sizeof(hbuf), "line %lu", (unsigned long)hli);
+                    }
+                    ImGui::PushID((int)(2000 + hi));
+                    if (ImGui::SmallButton(hbuf)) {
+                        select_line(&state, hli, 1);
+                    }
+                    if (hl->has_location) {
+                        std::string lbl = label_at_address(document, &state,
+                                                           hl->bank, hl->cpu_addr);
+                        if (!lbl.empty()) {
+                            ImGui::SameLine();
+                            ImGui::TextDisabled("%s", lbl.c_str());
+                        }
+                    }
+                    ImGui::PopID();
+                }
+            }
             ImGui::End();
         }
 
@@ -315,12 +377,15 @@ int main(int argc, char **argv)
                 if (in.empty()) {
                     ImGui::TextDisabled("none");
                 } else {
-                    for (auto &r : in) {
+                    for (size_t ri = 0; ri < in.size(); ri++) {
+                        const auto &r = in[ri];
                         char c[192];
                         snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
+                        ImGui::PushID((int)ri);
                         if (ImGui::SmallButton(c)) {
                             select_line(&state, r.line_index, 1);
                         }
+                        ImGui::PopID();
                     }
                 }
                 ImGui::Separator();
@@ -328,12 +393,15 @@ int main(int argc, char **argv)
                 if (out.empty()) {
                     ImGui::TextDisabled("none");
                 } else {
-                    for (auto &r : out) {
+                    for (size_t ri = 0; ri < out.size(); ri++) {
+                        const auto &r = out[ri];
                         char c[192];
                         snprintf(c, 192, "%s B%02x_A%04x", r.kind.c_str(), r.bank, r.cpu_addr);
+                        ImGui::PushID((int)(1000 + ri));
                         if (ImGui::SmallButton(c)) {
                             select_line(&state, r.line_index, 1);
                         }
+                        ImGui::PopID();
                     }
                 }
             } else {
@@ -564,6 +632,33 @@ int main(int argc, char **argv)
                     }
                 }
             }
+        }
+
+        if (want_quit) {
+            ImGui::OpenPopup("Unsaved Changes##quit");
+            want_quit = false;
+        }
+        if (ImGui::BeginPopupModal("Unsaved Changes##quit", NULL,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::TextUnformatted("The overlay has unsaved changes.");
+            ImGui::Separator();
+            if (ImGui::Button("Save & Exit")) {
+                std::string st;
+                write_delta_overlay(project, &original_snapshot,
+                                    state.save_path_input, state.base_config_path, &st);
+                done = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Exit Without Saving")) {
+                done = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
         }
 
         ImGui::Render();

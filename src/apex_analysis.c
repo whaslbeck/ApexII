@@ -852,18 +852,20 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                                   source);
                 }
             }
-            if (info.has_target && inline_signature_for(inline_sigs, current_bank, info.target) &&
-                pos + info.size +
-                        inline_signature_for(inline_sigs, current_bank, info.target)->length <=
-                    used &&
-                paged_rom && bank_labels) {
+            {
                 const InlineSignature *sig =
                     inline_signature_for(inline_sigs, current_bank, info.target);
-                size_t inline_pos = pos + info.size;
 
-                collect_inline_refs(sig, data, used, &inline_pos, current_bank, paged_rom, banks,
-                                    bank_labels, system_labels ? system_labels : labels, source,
-                                    instr_addr, refs);
+                if (info.has_target && sig &&
+                    pos + info.size + sig->length <= used &&
+                    paged_rom && bank_labels) {
+                    size_t inline_pos = pos + info.size;
+
+                    collect_inline_refs(sig, data, used, &inline_pos, current_bank, paged_rom,
+                                        banks, bank_labels,
+                                        system_labels ? system_labels : labels, source,
+                                        instr_addr, refs);
+                }
             }
             pos += info.size;
             pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used);

@@ -15,7 +15,7 @@ static ApexRenderedLineKind classify_line(const char *text, size_t length)
         return APEX_RENDER_LINE_BLANK;
     }
     if (text[0] == ';') {
-        if (length > 2 && text[0] == ';' && text[1] == ' ') {
+        if (length > 2 && text[1] == ' ') {
             char *copy = xmalloc(length + 1u);
             ApexRenderedLineKind kind = APEX_RENDER_LINE_COMMENT;
 

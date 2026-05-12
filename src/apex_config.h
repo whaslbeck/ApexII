@@ -36,9 +36,9 @@ typedef struct {
     uint32_t addr;
     unsigned length;
     TableSchema schema;
-    const char *alias;
-    const char *raw_param;
-    const char *far_param;
+    char *alias;
+    char *raw_param;
+    char *far_param;
 } InlineSignature;
 
 typedef struct {
@@ -51,7 +51,7 @@ typedef struct {
     int has_bank;
     uint8_t bank;
     uint32_t addr;
-    const char *text;
+    char *text;
 } ConfigDoc;
 
 typedef struct {
@@ -75,7 +75,7 @@ typedef struct {
     int has_bank;
     uint8_t bank;
     uint32_t addr;
-    const char *name;
+    char *name;
 } ConfigLabel;
 
 typedef struct {

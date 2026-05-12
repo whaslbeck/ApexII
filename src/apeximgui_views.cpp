@@ -649,11 +649,16 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 }
                 li++;
             }
-            /* Fill kinds: walk forward, filling spans between consecutive located lines. */
+            /* Fill kinds: walk forward, filling spans between consecutive located lines.
+               Non-located lines (comments, section headers) carry no ROM bytes and must
+               be skipped — otherwise they'd prematurely terminate the fill at vis_end. */
             size_t fill = vis_start;
             for (; li <= d->line_count; li++) {
+                if (li < d->line_count && !d->lines[li].has_location) {
+                    continue;
+                }
                 size_t boundary = vis_end;
-                if (li < d->line_count && d->lines[li].has_location) {
+                if (li < d->line_count) {
                     boundary = std::min(vis_end, d->lines[li].rom_addr);
                 }
                 for (size_t o = fill; o < boundary; o++) {
@@ -663,7 +668,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (fill >= vis_end) {
                     break;
                 }
-                if (li < d->line_count && d->lines[li].has_location) {
+                if (li < d->line_count) {
                     cur_kind = d->lines[li].block_kind;
                 }
             }
@@ -915,6 +920,10 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
             rerender_and_reselect(p, dp, s, b, a);
         }
     }
+    ImGui::SameLine();
+    if (ImGui::Button("Auto-Label Targets")) {
+        auto_label_targets(p, dp, s);
+    }
     ImGui::InputText("Spec", s->edit_spec_input, 128);
     ImGui::Separator();
     ImGui::TextUnformatted("Inline");
@@ -1013,9 +1022,11 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         int rc = write_delta_overlay(p, sn, s->save_path_input, s->base_config_path, &st);
         if (rc > 0) {
             set_status(s, st.c_str());
+            s->overlay_dirty = false;
         } else if (rc == 0) {
             if (apex_project_save_overlay(p, s->save_path_input, s->base_config_path) == 0) {
                 set_status(s, "saved full");
+                s->overlay_dirty = false;
             }
         } else {
             set_status(s, "failed");

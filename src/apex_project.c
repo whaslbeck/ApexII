@@ -936,10 +936,6 @@ static void analyze_system_region(ApexProject *project)
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
                          &project->system_labels, &project->data_ranges, 0xffu, &project->refs);
-    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
-                         APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
-                         project->rom.data, project->banks, project->bank_labels,
-                         &project->system_labels, &project->data_ranges, 0xffu, &project->refs);
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);

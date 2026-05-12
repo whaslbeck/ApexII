@@ -608,8 +608,14 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
         if (a.bank != b.bank) {
             return a.bank < b.bank;
         }
-        return a.cpu_addr < b.cpu_addr;
+        if (a.cpu_addr != b.cpu_addr) {
+            return a.cpu_addr < b.cpu_addr;
+        }
+        return a.kind < b.kind;
     });
+    rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
+        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
+    }), rs.end());
     return rs;
 }
 
@@ -633,8 +639,14 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
         if (a.bank != b.bank) {
             return a.bank < b.bank;
         }
-        return a.cpu_addr < b.cpu_addr;
+        if (a.cpu_addr != b.cpu_addr) {
+            return a.cpu_addr < b.cpu_addr;
+        }
+        return a.kind < b.kind;
     });
+    rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
+        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
+    }), rs.end());
     return rs;
 }
 
@@ -680,11 +692,30 @@ bool select_line_by_address(const ApexRenderedDocument *d, UiState *s)
     if (!parse_target_address(s->goto_input, &b, &a)) {
         return false;
     }
-    if (!apex_render_find_line_by_address(d, b, a, &li)) {
-        return false;
+    if (apex_render_find_line_by_address(d, b, a, &li)) {
+        select_line(s, li, 1);
+        return true;
     }
-    select_line(s, li, 1);
-    return true;
+    /* No line starts at this exact address (e.g. mid-instruction or inside a
+       multi-byte data block). Find the last line in the same bank with
+       cpu_addr <= a — that is the line whose bytes span this address. */
+    size_t best = (size_t)-1;
+    for (size_t i = 0; i < d->line_count; i++) {
+        const auto *l = &d->lines[i];
+        if (!l->has_location || l->bank != b) {
+            continue;
+        }
+        if (l->cpu_addr <= a) {
+            best = i;
+        } else {
+            break;
+        }
+    }
+    if (best != (size_t)-1) {
+        select_line(s, best, 1);
+        return true;
+    }
+    return false;
 }
 
 void jump_to_transition(const ApexRenderedDocument *d, UiState *s,
@@ -799,6 +830,7 @@ void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiSt
         s->editor_bound_line = (size_t)-1;
         s->suppress_history_push = 0;
     }
+    s->overlay_dirty = true;
     sync_editor_state(p, *dp, s);
 }
 
@@ -829,6 +861,8 @@ void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     }
     if (apex_project_set_kind(p, 1, b, a, APEX_KIND_CODE, NULL) == 0) {
         rerender_and_reselect(p, dp, s, b, a);
+    } else {
+        set_status(s, "set code failed (conflict with existing range?)");
     }
 }
 
@@ -848,6 +882,8 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     }
     if (apex_project_set_kind(p, 1, b, a, APEX_KIND_DATA, sp) == 0) {
         rerender_and_reselect(p, dp, s, b, a);
+    } else {
+        set_status(s, "set data failed");
     }
 }
 
@@ -2065,6 +2101,118 @@ std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const ch
         }
     }
     return results;
+}
+
+void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    uint8_t cur_bank;
+    uint32_t cur_addr;
+    if (!selected_address(*dp, s, &cur_bank, &cur_addr)) {
+        return;
+    }
+    const auto *line = &(*dp)->lines[s->selected_line];
+    if (line->kind != APEX_RENDER_LINE_INSTRUCTION) {
+        set_status(s, "select an instruction line first");
+        return;
+    }
+
+    /* Only scan up to the ';' comment delimiter. */
+    size_t text_len = line->length;
+    for (size_t k = 0; k < line->length; k++) {
+        if (line->text[k] == ';') {
+            text_len = k;
+            break;
+        }
+    }
+
+    int labeled = 0;
+    for (size_t pos = 0; pos < text_len; pos++) {
+        if (line->text[pos] != '$') {
+            continue;
+        }
+        /* Skip immediate-mode values: #$XX is a literal, not an address. */
+        if (pos > 0 && line->text[pos - 1] == '#') {
+            continue;
+        }
+        /* Collect hex digits. */
+        size_t end = pos + 1;
+        while (end < text_len && isxdigit((unsigned char)line->text[end])) {
+            end++;
+        }
+        size_t hex_len = end - (pos + 1);
+        if (hex_len < 1 || hex_len > 4) {
+            pos = end - 1;
+            continue;
+        }
+        unsigned addr_val = 0;
+        sscanf(line->text + pos + 1, "%x", &addr_val);
+        addr_val &= 0xFFFF;
+        pos = end - 1;
+
+        /* Determine addressing context. */
+        uint8_t tgt_bank;
+        int has_bank;
+        if (addr_val < 0x4000) {
+            /* RAM — non-banked label. */
+            tgt_bank = 0;
+            has_bank = 0;
+        } else if (addr_val < 0x8000) {
+            /* Paged ROM: inherits the current instruction's bank. */
+            tgt_bank = cur_bank;
+            has_bank = 1;
+        } else {
+            /* System ROM, bank 0xFF. */
+            tgt_bank = 0xFF;
+            has_bank = 1;
+        }
+
+        /* Skip if already labeled. */
+        if (has_bank) {
+            if (!label_at_address(*dp, s, tgt_bank, addr_val).empty()) {
+                continue;
+            }
+        } else {
+            bool found = false;
+            for (size_t i = 0; i < p->config_labels.count; i++) {
+                if (!p->config_labels.items[i].has_bank &&
+                    p->config_labels.items[i].addr == addr_val) {
+                    found = true;
+                    break;
+                }
+            }
+            if (found) {
+                continue;
+            }
+        }
+
+        /* Choose a prefix based on the block kind at the target. */
+        const char *prefix = has_bank ? "Loc_" : "Ram_";
+        if (has_bank) {
+            size_t tli;
+            if (apex_render_find_line_by_address(*dp, tgt_bank, addr_val, &tli)) {
+                switch ((*dp)->lines[tli].block_kind) {
+                case APEX_RENDER_BLOCK_CODE:  prefix = "Sub_"; break;
+                case APEX_RENDER_BLOCK_DATA:  prefix = "Dat_"; break;
+                case APEX_RENDER_BLOCK_TABLE: prefix = "Tab_"; break;
+                default:                      prefix = "Loc_"; break;
+                }
+            }
+        }
+
+        char name[32];
+        snprintf(name, sizeof(name), "%s%04X", prefix, addr_val);
+        apex_project_set_label(p, has_bank, tgt_bank, (uint32_t)addr_val, name);
+        labeled++;
+    }
+
+    if (labeled > 0) {
+        rerender_and_reselect(p, dp, s, cur_bank, cur_addr);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "auto-labeled %d target(s)", labeled);
+        set_status(s, msg);
+    } else {
+        set_status(s, "no unlabeled address targets found");
+    }
 }
 
 static const char *inline_mode_name_internal(int mode)
