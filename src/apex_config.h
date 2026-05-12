@@ -20,8 +20,28 @@ typedef enum {
 } TableFieldKind;
 
 typedef struct {
+    const char *name;   /* owned string */
+    uint32_t value;
+} ConfigTypeValue;
+
+typedef struct {
+    char *name;             /* owned */
+    TableFieldKind kind;    /* TABLE_BYTE or TABLE_WORD only */
+    ConfigTypeValue *values;
+    size_t value_count;
+    size_t value_cap;
+} ConfigType;
+
+typedef struct {
+    ConfigType *items;
+    size_t count;
+    size_t cap;
+} ConfigTypes;
+
+typedef struct {
     TableFieldKind kind;
     size_t count;
+    const char *type_name;  /* borrowed ptr into ConfigType.name, NULL if no type */
 } TableField;
 
 typedef struct {
@@ -36,9 +56,6 @@ typedef struct {
     uint32_t addr;
     unsigned length;
     TableSchema schema;
-    char *alias;
-    char *raw_param;
-    char *far_param;
 } InlineSignature;
 
 typedef struct {
@@ -161,25 +178,29 @@ size_t table_schema_width(const TableSchema *schema);
 int table_kind_is_far(TableFieldKind kind);
 
 void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema, const char *alias,
-                                 const char *raw_param, const char *far_param);
+                                 uint32_t addr, const TableSchema *schema);
 void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                             unsigned length, TableFieldKind kind, const char *alias,
-                             const char *raw_param, const char *far_param);
+                             unsigned length, TableFieldKind kind);
 
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options);
+                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types);
+void free_config_types(ConfigTypes *types);
+const ConfigType *find_config_type(const ConfigTypes *types, const char *name);
+const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value);
+void config_set_type(ConfigTypes *types, const char *name, TableFieldKind kind,
+                     const char *values_str);
+int config_remove_type(ConfigTypes *types, const char *name);
 int config_set_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr);
 int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr);
 int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                           const char *spec);
+                           const char *spec, const ConfigTypes *types);
 int config_clear_inline(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr);
 int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const char *spec);
 int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr);
 int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t bank, uint32_t addr,
-                          const char *spec);
+                          const char *spec, const ConfigTypes *types);
 int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr);
 
 #endif

@@ -135,8 +135,13 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
         die("invalid table address: %s", table_text);
     }
 
-    load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &routine_docs,
-                &table_docs, &symbols, &data_ranges, &options);
+    {
+        ConfigTypes types = {0};
+
+        load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &routine_docs,
+                    &table_docs, &symbols, &data_ranges, &options, &types);
+        free_config_types(&types);
+    }
     table = find_table(&tables, table_bank, table_addr);
     if (!table) {
         die("table not found in config: %s", table_text);

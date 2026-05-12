@@ -15,6 +15,7 @@ typedef struct {
     size_t size;
 } Buffer;
 
+extern void (*apex_die_hook)(const char *msg);
 void die(const char *fmt, ...);
 void *xmalloc(size_t size);
 Buffer read_file(const char *path);

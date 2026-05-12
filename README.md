@@ -90,6 +90,40 @@ apexasm game.asm output.rom
 ### `apexdmd` (DMD Utility)
 A utility to decode and extract DMD frames from binary data.
 
+### `apexini` (Config File Utilities)
+
+A set of utilities for inspecting and maintaining `.ini` config files.
+
+**Usage:**
+```bash
+apexini check   <file.ini> ...
+apexini overlaps <file.ini>
+apexini merge   <out.ini> <file.ini> ...
+```
+
+**`check`** — validates one or more config files and reports any errors (bad addresses, invalid specs, duplicate label names, etc.). Prints entry counts on success:
+
+```text
+myconfig.ini: OK  labels=42  entries=7  inline=15  data=3  tables=6  types=2
+myconfig.ini: error: label 'FarCall' is defined at more than one address
+```
+
+**`overlaps`** — detects address conflicts and byte-range overlaps within a config:
+
+- same address classified in two different sections (e.g. both `[inline]` and `[entries]`)
+- a ranged entry (inline sig, `bytes[N]`, `far_*`, `rows[N](schema)`) extending into another entry
+
+```text
+conflict: Bff_A8005  [entries] code  vs  [inline] 1 bytes
+overlap:  [inline] B3d_A7840 (byte, 4 bytes, ends 0x7843) into [data] B3d_A7842 (bytes[10])
+```
+
+**`merge`** — combines multiple config files into one clean sorted output. Later files override earlier ones for the same address. Sections are sorted alphabetically (types, schemas, symbols) or by bank+address (all others). Useful for flattening an `include =` chain into a single self-contained file:
+
+```bash
+apexini merge combined.ini base.ini overlay.apexgui.ini
+```
+
 ---
 
 ## Build And Test
@@ -114,6 +148,7 @@ Build products:
 - `build/apexgui`
 - `build/apeximgui`
 - `build/apextab`
+- `build/apexini`
 
 ### Dependencies
 
@@ -639,6 +674,8 @@ Now you can modify the assembly and rebuild an WPC Rom with apexasm. NOTE: check
 
 ApexII uses a simple INI-based format to persist your analysis. These files can be shared and are used by `apexdis` to generate commented code.
 
+See [docs/config-format.md](docs/config-format.md) for the full reference.
+
 Example:
 ```ini
 [labels]
@@ -670,5 +707,4 @@ This project is licensed under the **MIT License**. See the [LICENSE](LICENSE) f
 
 ## Authors
 
-Supervisor: Walter Haslbeck (redball@haslbeck.org)
-Code: OpenAI Codex + Google Gemini
+Supervisor: Walter Haslbeck (redball@haslbeck.org), Code: Codex, Gemini, Sonnet

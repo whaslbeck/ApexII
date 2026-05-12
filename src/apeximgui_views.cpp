@@ -259,16 +259,28 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         apply_code_at_selection(project, document_ptr, state);
                     }
                     if (ImGui::MenuItem("Mark as Data", "D")) {
-                        apply_data_at_selection(project, document_ptr, state,
-                            state->edit_spec_input[0] ? state->edit_spec_input : "bytes[1]");
+                        char spec[32];
+                        snprintf(spec, sizeof(spec), "bytes[%d]",
+                                 state->edit_data_length > 0 ? state->edit_data_length : 1);
+                        apply_data_at_selection(project, document_ptr, state, spec);
                     }
                     if (ImGui::MenuItem("Mark as String", "S")) {
                         apply_string_at_selection(project, document_ptr, state);
                     }
                     if (ImGui::MenuItem("Mark as Table", "T")) {
-                        apply_table_at_selection(project, document_ptr, state,
-                            state->edit_spec_input[0] ? state->edit_spec_input
-                                                       : "counted(ptr16_data)");
+                        char spec[320] = "counted(ptr16_data)";
+                        if (state->edit_schema_count > 0) {
+                            char schema[256];
+                            fields_to_spec(schema, sizeof(schema),
+                                           state->edit_schema_fields, state->edit_schema_count);
+                            if (state->edit_table_is_rows) {
+                                snprintf(spec, sizeof(spec), "rows[%d](%s)",
+                                         state->edit_table_rows, schema);
+                            } else {
+                                snprintf(spec, sizeof(spec), "counted(%s)", schema);
+                            }
+                        }
+                        apply_table_at_selection(project, document_ptr, state, spec);
                     }
                     if (ImGui::MenuItem("Clear Classification", "X")) {
                         clear_kind_at_selection(project, document_ptr, state);
@@ -888,16 +900,130 @@ void render_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s
     }
 }
 
+/* Renders a row of field-kind buttons and named-type buttons for the field builder.
+   Clicking a button appends a field to `fields`/`count` if there is room.
+   Returns true if any button was clicked. */
+static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *count,
+                                 int add_count)
+{
+    /* Row 1: primitive and 16-bit pointer kinds */
+    static const struct { int kind; const char *label; } kRow1[] = {
+        { TABLE_BYTE,         "byte"        },
+        { TABLE_WORD,         "word"        },
+        { TABLE_PTR16_STRING, "ptr16_string"},
+        { TABLE_PTR16_DATA,   "ptr16_data"  },
+        { TABLE_PTR16_CODE,   "ptr16_code"  },
+    };
+    /* Row 2: far pointer kinds */
+    static const struct { int kind; const char *label; } kRow2[] = {
+        { TABLE_FAR_STRING,   "far_string"  },
+        { TABLE_FAR_DATA,     "far_data"    },
+        { TABLE_FAR_TABLE,    "far_table"   },
+        { TABLE_FAR_CODE,     "far_code"    },
+    };
+
+    bool changed = false;
+    auto push_kind = [&](int kind, const char *label) {
+        if (ImGui::SmallButton(label)) {
+            if (*count < APEX_MAX_EDIT_FIELDS) {
+                ApexEditField f = {};
+                f.kind  = kind;
+                f.count = add_count > 0 ? add_count : 1;
+                fields[(*count)++] = f;
+                changed = true;
+            }
+        }
+    };
+
+    for (int i = 0; i < (int)(sizeof(kRow1)/sizeof(kRow1[0])); i++) {
+        if (i > 0) ImGui::SameLine();
+        push_kind(kRow1[i].kind, kRow1[i].label);
+    }
+    for (int i = 0; i < (int)(sizeof(kRow2)/sizeof(kRow2[0])); i++) {
+        if (i > 0) ImGui::SameLine();
+        push_kind(kRow2[i].kind, kRow2[i].label);
+    }
+    /* named types from config, appended to row 2 */
+    if (p) {
+        for (size_t ti = 0; ti < p->config_types.count; ti++) {
+            ImGui::SameLine();
+            const ConfigType *ct = &p->config_types.items[ti];
+            if (ImGui::SmallButton(ct->name)) {
+                if (*count < APEX_MAX_EDIT_FIELDS) {
+                    ApexEditField f = {};
+                    f.kind  = -1;
+                    f.count = add_count > 0 ? add_count : 1;
+                    snprintf(f.type_name, sizeof(f.type_name), "%s", ct->name);
+                    fields[(*count)++] = f;
+                    changed = true;
+                }
+            }
+            if (ImGui::IsItemHovered() && ct->value_count > 0) {
+                ImGui::BeginTooltip();
+                for (size_t vi = 0; vi < ct->value_count; vi++) {
+                    ImGui::Text("0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
+                }
+                ImGui::EndTooltip();
+            }
+        }
+    }
+    return changed;
+}
+
+/* Renders the visual chip list for a field array with a Clear-all button. */
+static void render_field_chips(ApexEditField *fields, int *count)
+{
+    for (int i = 0; i < *count; i++) {
+        char chip[48];
+        const char *kname = (fields[i].kind >= 0) ? fields[i].type_name : fields[i].type_name;
+        if (fields[i].kind >= 0) {
+            /* look up name from kind */
+            static const struct { int kind; const char *name; } kN[] = {
+                { TABLE_BYTE,              "byte"          },
+                { TABLE_WORD,              "word"          },
+                { TABLE_PTR16_STRING,      "ptr16_string"  },
+                { TABLE_PTR16_DATA,        "ptr16_data"    },
+                { TABLE_PTR16_CODE,        "ptr16_code"    },
+                { TABLE_PTR16_TABLE,       "ptr16_table"   },
+                { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd"    },
+                { TABLE_FAR_STRING,        "far_string"    },
+                { TABLE_FAR_DATA,          "far_data"      },
+                { TABLE_FAR_TABLE,         "far_table"     },
+                { TABLE_FAR_CODE,          "far_code"      },
+                { TABLE_FAR_DMD_FULLFRAME, "far_dmd"       },
+            };
+            kname = "?";
+            for (int k = 0; k < (int)(sizeof(kN)/sizeof(kN[0])); k++) {
+                if (kN[k].kind == fields[i].kind) { kname = kN[k].name; break; }
+            }
+        }
+        if (fields[i].count > 1) {
+            snprintf(chip, sizeof(chip), "%s[%d]##chip%d", kname, fields[i].count, i);
+        } else {
+            snprintf(chip, sizeof(chip), "%s##chip%d", kname, i);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.70f, 1.0f));
+        if (ImGui::SmallButton(chip)) {
+            /* click chip to remove it */
+            for (int j = i; j < *count - 1; j++) fields[j] = fields[j+1];
+            (*count)--;
+        }
+        ImGui::PopStyleColor();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("click to remove");
+        ImGui::SameLine();
+    }
+    if (*count > 0) {
+        if (ImGui::SmallButton("X##clrfields")) *count = 0;
+    }
+    if (*count == 0) {
+        ImGui::TextDisabled("(no fields)");
+    }
+}
+
 void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
                    const OriginalSnapshot *sn, UiState *s)
 {
-    static const char *dm[]  = {"custom", "bytes[n]", "string", "far_string",
-                                 "far_data", "far_table", "far_code"};
-    static const char *tm[]  = {"custom", "counted(...)", "rows[n](...)"};
-    static const char *sm[]  = {"custom", "ptr16_data", "ptr16_code", "ptr16_string",
-                                 "far_data", "far_code", "far_string"};
-    static const char *im[]  = {"custom", "byte", "ptr16_data", "ptr16_code", "ptr16_string",
-                                 "far_data", "far_code", "far_string"};
     static const char *dom[] = {"routine_docs", "table_docs"};
 
     uint8_t b;
@@ -906,13 +1032,17 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         ImGui::TextUnformatted("No addressable line selected.");
         return;
     }
-    ImGui::Text("Address: B%02x_A%04x", b, (unsigned)a & 0xffffu);
+
+    /* ── Label ──────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Label");
+    ImGui::Text("B%02x_A%04x", b, (unsigned)a & 0xffffu);
     if (s->request_focus_label) {
         ImGui::SetKeyboardFocusHere();
         s->request_focus_label = 0;
     }
-    ImGui::InputText("Label", s->edit_label_input, 128);
-    if (ImGui::Button("Apply Label")) {
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##label", s->edit_label_input, 128);
+    if (ImGui::Button("Apply##lbl")) {
         if (s->edit_label_input[0] == 0) {
             set_status(s, "empty");
         } else if (apex_project_set_label(p, 1, b, a, s->edit_label_input) == 0) {
@@ -920,7 +1050,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Clear Label")) {
+    if (ImGui::Button("Clear##lbl")) {
         if (apex_project_clear_label(p, 1, b, a) == 0) {
             rerender_and_reselect(p, dp, s, b, a);
         }
@@ -929,40 +1059,128 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::Button("Auto-Label Targets")) {
         auto_label_targets(p, dp, s);
     }
-    ImGui::InputText("Spec", s->edit_spec_input, 128);
-    ImGui::Separator();
-    ImGui::TextUnformatted("Inline");
-    ImGui::InputText("Inline Spec", s->edit_inline_input, 128);
-    ImGui::Combo("Inline Mode", &s->edit_inline_mode, im, 8);
-    ImGui::InputText("Inline Name", s->edit_inline_name_input, 64);
-    if (ImGui::Button("Use Inline Preset")) {
-        apply_inline_preset(s);
+
+    /* ── Classification ─────────────────────────────────────────── */
+    ImGui::SeparatorText("Classification");
+    if (ImGui::Button("Code")) {
+        apply_code_at_selection(p, dp, s);
     }
     ImGui::SameLine();
-    if (ImGui::Button("Apply Inline")) {
-        if (s->edit_inline_input[0]) {
-            if (apex_project_set_inline(p, 1, b, a, s->edit_inline_input) == 0) {
+    if (ImGui::Button("String")) {
+        apply_string_at_selection(p, dp, s);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear Kind")) {
+        clear_kind_at_selection(p, dp, s);
+    }
+
+    /* ── Data ───────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Data");
+    /* row 1: bytes[N] with N spinner */
+    ImGui::SetNextItemWidth(50);
+    if (ImGui::InputInt("##datalen", &s->edit_data_length, 1, 8)) {
+        if (s->edit_data_length < 1) s->edit_data_length = 1;
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("byte count for bytes[N]");
+    ImGui::SameLine();
+    if (ImGui::Button("bytes[N]##data")) {
+        char spec[32];
+        snprintf(spec, sizeof(spec), "bytes[%d]", s->edit_data_length);
+        apply_data_at_selection(p, dp, s, spec);
+    }
+    /* row 2: far pointer shortcuts */
+    if (ImGui::Button("far_code##data"))   { apply_data_at_selection(p, dp, s, "far_code");     }
+    ImGui::SameLine();
+    if (ImGui::Button("far_data##data"))   { apply_data_at_selection(p, dp, s, "far_data");     }
+    ImGui::SameLine();
+    if (ImGui::Button("far_string##data")) { apply_data_at_selection(p, dp, s, "far_string");   }
+    ImGui::SameLine();
+    if (ImGui::Button("far_table##data"))  { apply_data_at_selection(p, dp, s, "far_table");    }
+    ImGui::SameLine();
+    if (ImGui::Button("dmd##data"))        { apply_data_at_selection(p, dp, s, "dmd_fullframe"); }
+
+    /* ── Inline ─────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Inline Signature");
+    ImGui::TextDisabled("N:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(36);
+    ImGui::InputInt("##inln", &s->edit_field_add_count, 0, 0);
+    if (s->edit_field_add_count < 1) s->edit_field_add_count = 1;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("repeat count for next added field");
+    ImGui::PushID("inl");
+    render_field_buttons(p, s->edit_inline_fields, &s->edit_inline_count,
+                         s->edit_field_add_count);
+    render_field_chips(s->edit_inline_fields, &s->edit_inline_count);
+    ImGui::PopID();
+    if (ImGui::Button("Apply##inl")) {
+        if (s->edit_inline_count > 0) {
+            char spec[256];
+            fields_to_spec(spec, sizeof(spec), s->edit_inline_fields, s->edit_inline_count);
+            if (apex_project_set_inline(p, 1, b, a, spec) == 0) {
                 rerender_and_reselect(p, dp, s, b, a);
             }
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Clear Inline")) {
+    if (ImGui::Button("Clear##inl")) {
         if (apex_project_clear_inline(p, 1, b, a) == 0) {
             rerender_and_reselect(p, dp, s, b, a);
         }
     }
-    ImGui::Separator();
-    if (ImGui::Combo("Doc Type", &s->edit_doc_mode, dom, 2)) {
+
+    /* ── Table ──────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Table");
+    int is_rows = s->edit_table_is_rows;
+    if (ImGui::RadioButton("counted", &is_rows, 0)) s->edit_table_is_rows = 0;
+    ImGui::SameLine();
+    if (ImGui::RadioButton("rows", &is_rows, 1))    s->edit_table_is_rows = 1;
+    if (s->edit_table_is_rows) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(60);
+        if (ImGui::InputInt("##tblrows", &s->edit_table_rows, 1, 8)) {
+            if (s->edit_table_rows < 1) s->edit_table_rows = 1;
+        }
+        if (ImGui::IsItemHovered()) ImGui::SetTooltip("row count");
+    }
+    ImGui::TextDisabled("N:"); ImGui::SameLine();
+    ImGui::SetNextItemWidth(36);
+    ImGui::InputInt("##tbln", &s->edit_field_add_count, 0, 0);
+    if (s->edit_field_add_count < 1) s->edit_field_add_count = 1;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("repeat count for next added field");
+    ImGui::PushID("tbl");
+    render_field_buttons(p, s->edit_schema_fields, &s->edit_schema_count,
+                         s->edit_field_add_count);
+    render_field_chips(s->edit_schema_fields, &s->edit_schema_count);
+    ImGui::PopID();
+    if (ImGui::Button("Apply##tbl")) {
+        if (s->edit_schema_count > 0) {
+            char schema[256];
+            fields_to_spec(schema, sizeof(schema), s->edit_schema_fields, s->edit_schema_count);
+            char spec[320];
+            if (s->edit_table_is_rows) {
+                snprintf(spec, sizeof(spec), "rows[%d](%s)", s->edit_table_rows, schema);
+            } else {
+                snprintf(spec, sizeof(spec), "counted(%s)", schema);
+            }
+            apply_table_at_selection(p, dp, s, spec);
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##tbl")) {
+        clear_kind_at_selection(p, dp, s);
+    }
+
+    /* ── Doc ────────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Doc");
+    if (ImGui::Combo("##doctype", &s->edit_doc_mode, dom, 2)) {
         load_doc_editor_buffer(p, s, b, a);
     }
     if (s->request_focus_doc) {
         ImGui::SetKeyboardFocusHere();
         s->request_focus_doc = 0;
     }
-    ImGui::InputTextMultiline("Doc", s->edit_doc_input, 1024,
-                              ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 6));
-    if (ImGui::Button("Apply Doc")) {
+    ImGui::InputTextMultiline("##doc", s->edit_doc_input, 1024,
+                              ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5));
+    if (ImGui::Button("Apply##doc")) {
         if (s->edit_doc_input[0]) {
             if (apex_project_set_doc(p, s->edit_doc_mode == EDIT_DOC_TABLE, 1, b, a,
                                      s->edit_doc_input) == 0) {
@@ -971,56 +1189,16 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         }
     }
     ImGui::SameLine();
-    if (ImGui::Button("Clear Doc")) {
+    if (ImGui::Button("Clear##doc")) {
         if (apex_project_clear_doc(p, s->edit_doc_mode == EDIT_DOC_TABLE, 1, b, a) == 0) {
             rerender_and_reselect(p, dp, s, b, a);
         }
     }
-    ImGui::Separator();
-    ImGui::TextUnformatted("Presets");
-    ImGui::Combo("Data Mode", &s->edit_data_mode, dm, 7);
-    if (s->edit_data_mode == EDIT_DATA_BYTES) {
-        ImGui::InputInt("Bytes", &s->edit_data_length);
-    }
-    if (ImGui::Button("Use Data Preset")) {
-        apply_data_preset(s);
-    }
-    ImGui::Separator();
-    ImGui::Combo("Table Mode", &s->edit_table_mode, tm, 3);
-    if (s->edit_table_mode == EDIT_TABLE_ROWS) {
-        ImGui::InputInt("Rows", &s->edit_table_rows);
-    }
-    ImGui::Combo("Schema", &s->edit_table_schema_mode, sm, 7);
-    if (s->edit_table_schema_mode == EDIT_SCHEMA_CUSTOM) {
-        ImGui::InputText("Schema Text", s->edit_table_schema_input, 128);
-    }
-    if (ImGui::Button("Use Table Preset")) {
-        apply_table_preset(s);
-    }
-    ImGui::Separator();
-    if (ImGui::Button("Code")) {
-        apply_code_at_selection(p, dp, s);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Data")) {
-        apply_data_at_selection(p, dp, s,
-            s->edit_spec_input[0] ? s->edit_spec_input : "bytes[1]");
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("String")) {
-        apply_string_at_selection(p, dp, s);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Table")) {
-        apply_table_at_selection(p, dp, s,
-            s->edit_spec_input[0] ? s->edit_spec_input : "counted(ptr16_data)");
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Clear Kind")) {
-        clear_kind_at_selection(p, dp, s);
-    }
-    ImGui::Separator();
-    ImGui::InputText("Overlay Path", s->save_path_input, 512);
+
+    /* ── Save ───────────────────────────────────────────────────── */
+    ImGui::SeparatorText("Save");
+    ImGui::SetNextItemWidth(-1);
+    ImGui::InputText("##overlay", s->save_path_input, 512);
     if (ImGui::Button("Save Overlay") || s->request_save_overlay) {
         s->request_save_overlay = 0;
         std::string st;
@@ -1037,11 +1215,13 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
             set_status(s, "failed");
         }
     }
+    ImGui::SameLine();
     if (ImGui::Button("Clear Session")) {
         clear_session();
         set_status(s, "cleared");
     }
     if (s->status_message[0]) {
+        ImGui::Spacing();
         ImGui::TextWrapped("%s", s->status_message);
     }
 }
@@ -1205,6 +1385,289 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
                 rerender_and_reselect(p, dp, s, t->bank, t->addr);
             }
             ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* Build a values_str like "0x00:name, 0x01:other" from a ConfigType, excluding index `skip`.
+   If skip < 0 append the new_val/new_name pair. */
+static std::string build_values_str(const ConfigType *ct, int skip,
+                                    uint32_t new_val, const char *new_name)
+{
+    std::string out;
+    char tmp[64];
+    for (size_t i = 0; i < ct->value_count; i++) {
+        if ((int)i == skip) continue;
+        if (!out.empty()) out += ", ";
+        snprintf(tmp, sizeof(tmp), "0x%02x:%s", ct->values[i].value, ct->values[i].name);
+        out += tmp;
+    }
+    if (new_name && *new_name) {
+        if (!out.empty()) out += ", ";
+        snprintf(tmp, sizeof(tmp), "0x%02x:%s", new_val, new_name);
+        out += tmp;
+    }
+    return out;
+}
+
+static bool valid_identifier(const char *s)
+{
+    if (!s || !*s) return false;
+    if (!std::isalpha((unsigned char)*s) && *s != '_') return false;
+    for (const char *p = s + 1; *p; p++) {
+        if (!std::isalnum((unsigned char)*p) && *p != '_') return false;
+    }
+    return true;
+}
+
+void render_types_editor(ApexProject *p, UiState *s)
+{
+    static char new_type_name[64] = "";
+    static int  new_type_word     = 0;   /* 0=byte, 1=word */
+    /* per-type "add value" form state, keyed by selected type index */
+    static int  sel_type          = -1;
+    static char new_val_hex[16]   = "";
+    static char new_val_name[64]  = "";
+
+    /* ── Add new type ─────────────────────────────────────────── */
+    ImGui::SeparatorText("New Type");
+    ImGui::SetNextItemWidth(120);
+    ImGui::InputText("Name##nt", new_type_name, sizeof(new_type_name));
+    ImGui::SameLine();
+    ImGui::RadioButton("byte##nt", &new_type_word, 0); ImGui::SameLine();
+    ImGui::RadioButton("word##nt", &new_type_word, 1); ImGui::SameLine();
+    bool name_ok = valid_identifier(new_type_name) &&
+                   !find_config_type(&p->config_types, new_type_name);
+    ImGui::BeginDisabled(!name_ok);
+    if (ImGui::Button("Add Type")) {
+        apex_project_set_type(p, new_type_name, new_type_word, "");
+        s->overlay_dirty = true;
+        new_type_name[0] = '\0';
+    }
+    ImGui::EndDisabled();
+    if (!name_ok && new_type_name[0]) {
+        ImGui::SameLine();
+        ImGui::TextDisabled(find_config_type(&p->config_types, new_type_name)
+                            ? "(exists)" : "(invalid)");
+    }
+
+    /* ── Type list ────────────────────────────────────────────── */
+    ImGui::SeparatorText("Types");
+    if (p->config_types.count == 0) {
+        ImGui::TextDisabled("No types defined.");
+        return;
+    }
+
+    for (size_t ti = 0; ti < p->config_types.count; ti++) {
+        ConfigType *ct = &p->config_types.items[ti];
+        ImGui::PushID((int)ti);
+
+        /* header line: "TypeName : byte/word  [X]" */
+        bool open = ImGui::TreeNodeEx(ct->name,
+                        ImGuiTreeNodeFlags_DefaultOpen |
+                        ImGuiTreeNodeFlags_SpanAvailWidth);
+        ImGui::SameLine();
+        ImGui::TextDisabled(":%s", ct->kind == TABLE_WORD ? "word" : "byte");
+        ImGui::SameLine();
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+        if (ImGui::SmallButton("X##deltype")) {
+            apex_project_remove_type(p, ct->name);
+            s->overlay_dirty = true;
+            if (sel_type == (int)ti) sel_type = -1;
+            ImGui::PopStyleColor();
+            if (open) ImGui::TreePop();
+            ImGui::PopID();
+            break; /* array mutated, stop iterating */
+        }
+        ImGui::PopStyleColor();
+
+        if (open) {
+            /* existing enum values */
+            for (size_t vi = 0; vi < ct->value_count; vi++) {
+                ImGui::PushID((int)vi);
+                ImGui::Text("  0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
+                ImGui::SameLine();
+                ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.1f, 0.1f, 1.0f));
+                if (ImGui::SmallButton("x##delval")) {
+                    std::string vs = build_values_str(ct, (int)vi, 0, nullptr);
+                    apex_project_set_type(p, ct->name,
+                                         ct->kind == TABLE_WORD, vs.c_str());
+                    s->overlay_dirty = true;
+                    ImGui::PopStyleColor();
+                    ImGui::PopID();
+                    break;
+                }
+                ImGui::PopStyleColor();
+                ImGui::PopID();
+            }
+
+            /* add value form */
+            if (sel_type != (int)ti) {
+                if (ImGui::SmallButton("+ Add value")) {
+                    sel_type      = (int)ti;
+                    new_val_hex[0] = '\0';
+                    new_val_name[0] = '\0';
+                }
+            } else {
+                ImGui::SetNextItemWidth(60);
+                ImGui::InputText("hex##av", new_val_hex, sizeof(new_val_hex));
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(100);
+                ImGui::InputText("name##av", new_val_name, sizeof(new_val_name));
+                ImGui::SameLine();
+                uint32_t parsed_val = 0;
+                bool hex_ok = new_val_hex[0] &&
+                              sscanf(new_val_hex, "%i", (int *)&parsed_val) == 1;
+                bool val_name_ok = valid_identifier(new_val_name);
+                ImGui::BeginDisabled(!hex_ok || !val_name_ok);
+                if (ImGui::SmallButton("Add##av")) {
+                    std::string vs = build_values_str(ct, -1, parsed_val, new_val_name);
+                    apex_project_set_type(p, ct->name,
+                                         ct->kind == TABLE_WORD, vs.c_str());
+                    s->overlay_dirty = true;
+                    sel_type = -1;
+                }
+                ImGui::EndDisabled();
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Cancel##av")) sel_type = -1;
+            }
+            ImGui::TreePop();
+        }
+        ImGui::PopID();
+    }
+}
+
+void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    static char filter[128] = "";
+    ImGui::InputText("Filter##inllist", filter, sizeof(filter));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%zu)", p->inline_sigs.count);
+
+    if (ImGui::BeginTable("inlinesigs", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed, 130.0f);
+        ImGui::TableSetupColumn("Inline",  ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        /* build a filtered list first */
+        std::vector<size_t> rows;
+        for (size_t i = 0; i < p->inline_sigs.count; i++) {
+            const InlineSignature *sig = &p->inline_sigs.items[i];
+            uint8_t bank = sig->has_bank ? sig->bank : 0xffu;
+            uint32_t addr = sig->addr;
+            if (filter[0]) {
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+                std::string spec = inline_sig_spec_string(sig);
+                std::string lbl  = label_at_address(d, s, bank, addr);
+                bool match = strcasestr(addrstr, filter) ||
+                             strcasestr(spec.c_str(), filter) ||
+                             (!lbl.empty() && strcasestr(lbl.c_str(), filter));
+                if (!match) continue;
+            }
+            rows.push_back(i);
+        }
+
+        clipper.Begin((int)rows.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const InlineSignature *sig = &p->inline_sigs.items[rows[row]];
+                uint8_t bank = sig->has_bank ? sig->bank : 0xffu;
+                uint32_t addr = sig->addr;
+                std::string spec = inline_sig_spec_string(sig);
+                std::string lbl  = label_at_address(d, s, bank, addr);
+
+                size_t li = 0;
+                bool found = apex_render_find_line_by_address(d, bank, addr, &li) != NULL;
+
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+
+                ImGui::PushID((int)rows[row]);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                bool sel = found && s->selected_line == li;
+                if (ImGui::Selectable(addrstr, sel,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (found) {
+                        select_line(s, li, ImGui::IsMouseDoubleClicked(0) ? 1 : 0);
+                    }
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(lbl.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(spec.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+void render_entries_list(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    static char filter[128] = "";
+    ImGui::InputText("Filter##entlist", filter, sizeof(filter));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%zu)", p->config_entries.count);
+
+    if (ImGui::BeginTable("entries", 2,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        std::vector<size_t> rows;
+        for (size_t i = 0; i < p->config_entries.count; i++) {
+            const ConfigEntry *e = &p->config_entries.items[i];
+            uint8_t bank = e->has_bank ? e->bank : 0xffu;
+            uint32_t addr = e->addr;
+            if (filter[0]) {
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, bank, addr);
+                bool match = strcasestr(addrstr, filter) ||
+                             (!lbl.empty() && strcasestr(lbl.c_str(), filter));
+                if (!match) continue;
+            }
+            rows.push_back(i);
+        }
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const ConfigEntry *e = &p->config_entries.items[rows[row]];
+                uint8_t bank = e->has_bank ? e->bank : 0xffu;
+                uint32_t addr = e->addr;
+                std::string lbl = label_at_address(d, s, bank, addr);
+
+                size_t li = 0;
+                bool found = apex_render_find_line_by_address(d, bank, addr, &li) != NULL;
+
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+
+                ImGui::PushID((int)rows[row]);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                bool sel = found && s->selected_line == li;
+                if (ImGui::Selectable(addrstr, sel,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                    if (found) {
+                        select_line(s, li, ImGui::IsMouseDoubleClicked(0) ? 1 : 0);
+                    }
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(lbl.c_str());
+                ImGui::PopID();
+            }
         }
         ImGui::EndTable();
     }

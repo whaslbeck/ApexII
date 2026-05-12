@@ -17,42 +17,14 @@ extern "C" {
 
 // --- Constants and Enums ---
 
-enum {
-    EDIT_DATA_CUSTOM = 0,
-    EDIT_DATA_BYTES,
-    EDIT_DATA_STRING,
-    EDIT_DATA_FAR_STRING,
-    EDIT_DATA_FAR_DATA,
-    EDIT_DATA_FAR_TABLE,
-    EDIT_DATA_FAR_CODE
-};
+#define APEX_MAX_EDIT_FIELDS 12
 
-enum {
-    EDIT_TABLE_CUSTOM = 0,
-    EDIT_TABLE_COUNTED,
-    EDIT_TABLE_ROWS
-};
-
-enum {
-    EDIT_SCHEMA_CUSTOM = 0,
-    EDIT_SCHEMA_PTR16_DATA,
-    EDIT_SCHEMA_PTR16_CODE,
-    EDIT_SCHEMA_PTR16_STRING,
-    EDIT_SCHEMA_FAR_DATA,
-    EDIT_SCHEMA_FAR_CODE,
-    EDIT_SCHEMA_FAR_STRING
-};
-
-enum {
-    EDIT_INLINE_CUSTOM = 0,
-    EDIT_INLINE_BYTE,
-    EDIT_INLINE_PTR16_DATA,
-    EDIT_INLINE_PTR16_CODE,
-    EDIT_INLINE_PTR16_STRING,
-    EDIT_INLINE_FAR_DATA,
-    EDIT_INLINE_FAR_CODE,
-    EDIT_INLINE_FAR_STRING
-};
+/* A single field in an inline or table-schema field list. */
+typedef struct {
+    int  kind;          /* TableFieldKind cast to int, or -1 for a named type */
+    int  count;         /* repeat count (>= 1) */
+    char type_name[32]; /* valid when kind == -1 */
+} ApexEditField;
 
 enum {
     EDIT_DOC_ROUTINE = 0,
@@ -132,11 +104,7 @@ struct UiState {
     char filter_input[128];
     char label_filter_input[128];
     char edit_label_input[128];
-    char edit_spec_input[128];
-    char edit_inline_input[128];
-    char edit_inline_name_input[64];
     char edit_doc_input[1024];
-    char edit_table_schema_input[128];
     char save_path_input[512];
     char base_config_path[1024];
     char status_message[256];
@@ -147,12 +115,14 @@ struct UiState {
     bool request_xref_popup;
     uint8_t xref_popup_bank;
     uint32_t xref_popup_addr;
-    int edit_data_mode;
-    int edit_data_length;
-    int edit_table_mode;
-    int edit_table_rows;
-    int edit_table_schema_mode;
-    int edit_inline_mode;
+    int edit_data_length;      /* byte count for bytes[N] data button */
+    int edit_table_rows;       /* row count when edit_table_is_rows */
+    int edit_table_is_rows;    /* 0 = counted, 1 = rows[N] */
+    int edit_field_add_count;  /* repeat count used when clicking a field button */
+    ApexEditField edit_inline_fields[APEX_MAX_EDIT_FIELDS];
+    int edit_inline_count;
+    ApexEditField edit_schema_fields[APEX_MAX_EDIT_FIELDS];
+    int edit_schema_count;
     int edit_doc_mode;
     std::vector<size_t> history_back;
     std::vector<size_t> history_forward;
@@ -189,6 +159,9 @@ struct UiState {
     int graph_depth_out;
     bool graph_needs_rebuild;
 
+    bool show_inline_list;
+    bool show_entries_list;
+    bool show_types_editor;
     bool show_pattern_search;
     char pattern_search_input[128];
     std::vector<size_t> pattern_search_results;
@@ -245,6 +218,17 @@ struct SnapshotInline {
     std::string spec;
 };
 
+struct SnapshotTypeValue {
+    uint32_t value;
+    std::string name;
+};
+
+struct SnapshotType {
+    std::string name;
+    int is_word; /* 0=byte, 1=word */
+    std::vector<SnapshotTypeValue> values;
+};
+
 struct OriginalSnapshot {
     std::vector<SnapshotLabel> labels;
     std::vector<SnapshotEntry> entries;
@@ -253,6 +237,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotDoc> routine_docs;
     std::vector<SnapshotDoc> table_docs;
     std::vector<SnapshotInline> inline_sigs;
+    std::vector<SnapshotType> types;
 };
 
 struct LineByteSpan {
@@ -289,6 +274,9 @@ int address_is_dmd_fullframe_start(const ApexProject *project, uint8_t bank, uin
 int decode_dmd_preview_at(const ApexProject *project, uint8_t bank, uint32_t addr, DmdPreviewInfo *preview);
 DmdPreviewInfo find_dmd_preview(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
+// Inline spec string
+std::string inline_sig_spec_string(const InlineSignature *s);
+
 // Parsing & Utilities
 int parse_target_address(const char *input, uint8_t *bank, uint32_t *cpu_addr);
 int line_matches_filter(const ApexRenderedLine *line, const char *filter);
@@ -298,12 +286,9 @@ std::string line_to_string(const ApexRenderedLine *line);
 std::string label_name(const ApexRenderedLine *line);
 std::string table_def_spec_string(const TableDef *table);
 
-// Presets & Sync
-void apply_data_preset(UiState *state);
-void apply_inline_preset(UiState *state);
-void apply_table_preset(UiState *state);
-void sync_spec_presets(UiState *state, const char *spec);
-void sync_inline_presets(UiState *state, const char *spec);
+// Field builder helpers
+void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int count);
+void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max, const ApexProject *p);
 void load_doc_editor_buffer(const ApexProject *project, UiState *state, uint8_t bank, uint32_t cpu_addr);
 
 // Analysis: Labels & Pointers
@@ -387,6 +372,11 @@ void auto_search_tables(ApexProject *project, const ApexRenderedDocument **docum
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document);
 size_t hardware_register_count();
 const HardwareRegister *get_hardware_register(size_t index);
+
+// Analysis: Inline list, Entries list & Types editor
+void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+void render_entries_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+void render_types_editor(ApexProject *project, UiState *state);
 
 // Analysis: Pattern Search & RAM XRefs
 std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input);

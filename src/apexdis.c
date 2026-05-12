@@ -30,9 +30,9 @@ static void emit_vector_equates(FILE *out, const VectorInfo *vectors, size_t cou
 
 
 static void add_inline_signature(InlineSignatures *sigs, uint32_t addr, unsigned length,
-                                 TableFieldKind kind, const char *alias)
+                                 TableFieldKind kind)
 {
-    add_inline_signature_ex(sigs, 0, 0, addr, length, kind, alias, NULL, NULL);
+    add_inline_signature_ex(sigs, 0, 0, addr, length, kind);
 }
 
 
@@ -208,13 +208,16 @@ static void format_table_schema(const TableSchema *schema, char *out, size_t out
         int written;
         const char *sep = i == 0 ? "" : ", ";
 
-        if (schema->items[i].count == 1) {
-            written = snprintf(out + used, out_size - used, "%s%s", sep,
-                               table_field_name(schema->items[i].kind));
-        } else {
-            written = snprintf(out + used, out_size - used, "%s%s[%lu]", sep,
-                               table_field_name(schema->items[i].kind),
-                               (unsigned long)schema->items[i].count);
+        {
+            const char *fname = schema->items[i].type_name
+                                ? schema->items[i].type_name
+                                : table_field_name(schema->items[i].kind);
+            if (schema->items[i].count == 1) {
+                written = snprintf(out + used, out_size - used, "%s%s", sep, fname);
+            } else {
+                written = snprintf(out + used, out_size - used, "%s%s[%lu]", sep,
+                                   fname, (unsigned long)schema->items[i].count);
+            }
         }
         if (written < 0 || (size_t)written >= out_size - used) {
             out[out_size - 1] = '\0';
@@ -526,6 +529,40 @@ static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols)
     fputc('\n', out);
 }
 
+static void emit_type_equates(FILE *out, const ConfigTypes *types)
+{
+    size_t i, j;
+    int emitted = 0;
+
+    if (!types || types->count == 0) {
+        return;
+    }
+    for (i = 0; i < types->count; i++) {
+        const ConfigType *type = &types->items[i];
+        char upper_type[128];
+        size_t k;
+
+        for (k = 0; type->name[k] && k < sizeof(upper_type) - 1u; k++) {
+            upper_type[k] = (char)toupper((unsigned char)type->name[k]);
+        }
+        upper_type[k] = '\0';
+        for (j = 0; j < type->value_count; j++) {
+            char upper_val[128];
+
+            for (k = 0; type->values[j].name[k] && k < sizeof(upper_val) - 1u; k++) {
+                upper_val[k] = (char)toupper((unsigned char)type->values[j].name[k]);
+            }
+            upper_val[k] = '\0';
+            fprintf(out, "%s_%s = 0x%02x\n", upper_type, upper_val,
+                    (unsigned)type->values[j].value & 0xffu);
+            emitted = 1;
+        }
+    }
+    if (emitted) {
+        fputc('\n', out);
+    }
+}
+
 static void emit_inline_truncated_warning(FILE *out, uint8_t bank, uint32_t cpu_addr,
                                           size_t rom_addr, const char *inst, unsigned expected,
                                           size_t available)
@@ -642,13 +679,14 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
-                            const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels);
+                            const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
+                            const ConfigTypes *types);
 
 static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
                                uint32_t base_addr, size_t *pos, uint8_t bank, const Label *labels,
                                size_t label_count, const Label *extra_labels,
                                size_t extra_label_count, const uint8_t *paged_rom, size_t banks,
-                               const LabelSet *bank_labels)
+                               const LabelSet *bank_labels, const ConfigTypes *types)
 {
     uint16_t count;
     uint8_t row_width;
@@ -661,8 +699,9 @@ static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *
     row_width = data[*pos + 2u];
     emit_db_line(out, base_addr + (uint32_t)(*pos + 2u), data + *pos + 2u, 1);
     *pos += 3u;
-    emit_table_rows(out, table, data, len, base_addr, pos, bank, count, row_width, labels, label_count,
-                    extra_labels, extra_label_count, paged_rom, banks, bank_labels);
+    emit_table_rows(out, table, data, len, base_addr, pos, bank, count, row_width, labels,
+                    label_count, extra_labels, extra_label_count, paged_rom, banks, bank_labels,
+                    types);
 }
 
 static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint8_t bank,
@@ -809,7 +848,8 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
-                            const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels)
+                            const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
+                            const ConfigTypes *types)
 {
     size_t row;
 
@@ -819,15 +859,46 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
 
         for (i = 0; i < table->schema.count; i++) {
             size_t n;
+            const TableField *field = &table->schema.items[i];
 
-            for (n = 0; n < table->schema.items[i].count; n++) {
-                TableFieldKind kind = table->schema.items[i].kind;
+            for (n = 0; n < field->count; n++) {
+                TableFieldKind kind = field->kind;
 
                 if (kind == TABLE_BYTE) {
-                    emit_db_line(out, base_addr + (uint32_t)*pos, data + *pos, 1);
+                    uint8_t byte_val = data[*pos];
+
+                    if (field->type_name && types) {
+                        const char *ename = config_type_enum_name(types, field->type_name, byte_val);
+
+                        fprintf(out, "    .DB 0x%02x ; 0x%04x |%c|", byte_val,
+                                (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu,
+                                db_ascii_char(byte_val));
+                        if (ename) {
+                            fprintf(out, " %s=%s", field->type_name, ename);
+                        } else {
+                            fprintf(out, " %s=0x%02x", field->type_name, byte_val);
+                        }
+                        fputc('\n', out);
+                    } else {
+                        emit_db_line(out, base_addr + (uint32_t)*pos, data + *pos, 1);
+                    }
                     (*pos)++;
                 } else if (kind == TABLE_WORD) {
-                    fprintf(out, "    .DW 0x%04x\n", read_be16(data + *pos));
+                    uint16_t word_val = read_be16(data + *pos);
+
+                    if (field->type_name && types) {
+                        const char *ename = config_type_enum_name(types, field->type_name, word_val);
+
+                        fprintf(out, "    .DW 0x%04x ;", word_val);
+                        if (ename) {
+                            fprintf(out, " %s=%s", field->type_name, ename);
+                        } else {
+                            fprintf(out, " %s=0x%04x", field->type_name, word_val);
+                        }
+                        fputc('\n', out);
+                    } else {
+                        fprintf(out, "    .DW 0x%04x\n", word_val);
+                    }
                     *pos += 2u;
                 } else if (table_kind_is_far(kind)) {
                     uint16_t addr = read_be16(data + *pos);
@@ -925,27 +996,45 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                                const Label *labels, size_t label_count,
                                const Label *extra_labels, size_t extra_label_count,
                                const uint8_t *paged_rom, size_t banks,
-                               const LabelSet *bank_labels, uint32_t base_addr, size_t rom_base)
+                               const LabelSet *bank_labels, uint32_t base_addr, size_t rom_base,
+                               const ConfigTypes *types)
 {
     size_t i;
 
     for (i = 0; i < sig->schema.count; i++) {
         size_t n;
+        const TableField *field = &sig->schema.items[i];
 
-        for (n = 0; n < sig->schema.items[i].count; n++) {
-            TableFieldKind kind = sig->schema.items[i].kind;
+        for (n = 0; n < field->count; n++) {
+            TableFieldKind kind = field->kind;
 
             if (kind == TABLE_BYTE) {
-                fprintf(out, "        INLINE_BYTE 0x%02x ; for %s", data[*pos], inst);
-                if (i == 0 && n == 0 && sig->raw_param) {
-                    fprintf(out, " %s=0x%02x", sig->raw_param, data[*pos]);
+                uint8_t byte_val = data[*pos];
+
+                fprintf(out, "        INLINE_BYTE 0x%02x ; for %s", byte_val, inst);
+                if (field->type_name && types) {
+                    const char *ename = config_type_enum_name(types, field->type_name, byte_val);
+
+                    if (ename) {
+                        fprintf(out, " %s=%s", field->type_name, ename);
+                    } else {
+                        fprintf(out, " %s=0x%02x", field->type_name, byte_val);
+                    }
                 }
                 fputc('\n', out);
                 (*pos)++;
             } else if (kind == TABLE_WORD) {
-                fprintf(out, "        INLINE_WORD 0x%04x ; for %s", read_be16(data + *pos), inst);
-                if (i == 0 && n == 0 && sig->far_param) {
-                    fprintf(out, " %s", sig->far_param);
+                uint16_t word_val = read_be16(data + *pos);
+
+                fprintf(out, "        INLINE_WORD 0x%04x ; for %s", word_val, inst);
+                if (field->type_name && types) {
+                    const char *ename = config_type_enum_name(types, field->type_name, word_val);
+
+                    if (ename) {
+                        fprintf(out, " %s=%s", field->type_name, ename);
+                    } else {
+                        fprintf(out, " %s=0x%04x", field->type_name, word_val);
+                    }
                 }
                 fputc('\n', out);
                 *pos += 2u;
@@ -962,9 +1051,6 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 emit_far_code_ref(out, inline_far_pseudo(kind), target, bank, labels, label_count,
                                   extra_labels, extra_label_count, paged_rom, banks, bank_labels);
                 fprintf(out, " ; for %s", inst);
-                if (i == 0 && n == 0 && sig->far_param) {
-                    fprintf(out, " %s", sig->far_param);
-                }
                 if (kind == TABLE_FAR_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, target);
                 }
@@ -979,9 +1065,6 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                     fprintf(out, "        %s %s ; for %s", inline_ptr_pseudo(kind), label, inst);
                 } else {
                     fprintf(out, "        %s 0x%04x ; for %s", inline_ptr_pseudo(kind), ptr, inst);
-                }
-                if (i == 0 && n == 0 && sig->far_param) {
-                    fprintf(out, " %s", sig->far_param);
                 }
                 if (kind == TABLE_PTR16_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, current_bank, ptr);
@@ -1006,7 +1089,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
                                 uint8_t current_bank,
-                                size_t rom_base, int emit_explain)
+                                size_t rom_base, int emit_explain, const ConfigTypes *types)
 {
     size_t pos = 0;
     int decoding_code = 0;
@@ -1070,11 +1153,12 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             if (table->has_header) {
                 emit_counted_table(out, table, data, len, base_addr, &pos, current_bank, labels,
                                    label_count, extra_labels, extra_label_count, paged_rom, banks,
-                                   bank_labels);
+                                   bank_labels, types);
             } else {
                 emit_table_rows(out, table, data, len, base_addr, &pos, current_bank, table->rows,
                                 table_schema_width(&table->schema), labels, label_count,
-                                extra_labels, extra_label_count, paged_rom, banks, bank_labels);
+                                extra_labels, extra_label_count, paged_rom, banks, bank_labels,
+                                types);
             }
             decoding_code = 0;
             previous_kind = BLOCK_TABLE;
@@ -1120,7 +1204,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                         } else {
                             emit_inline_fields(out, inline_sig, data, len, &pos, current_bank, inst,
                                                labels, label_count, extra_labels, extra_label_count,
-                                               paged_rom, banks, bank_labels, base_addr, rom_base);
+                                               paged_rom, banks, bank_labels, base_addr, rom_base,
+                                               types);
                         }
                     }
                     if (info.flags & CPU6809_FLOW_STOP) {
@@ -1160,7 +1245,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
                                const TableDefs *tables, const ConfigDocs *routine_docs,
                                const ConfigDocs *table_docs, const ConfigSymbols *symbols,
                                const DataRanges *data_ranges, const ReferenceSet *refs,
-                               size_t rom_bank_base, int emit_explain)
+                               size_t rom_bank_base, int emit_explain, const ConfigTypes *types)
 {
     size_t used = last_non_ff(data, APEX_BANK_SIZE);
     uint8_t bank_id = data[0];
@@ -1178,7 +1263,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
                             labels->count, system_labels->items, system_labels->count, NULL, 0,
                             inline_sigs, paged_rom, banks, bank_labels, tables, routine_docs,
                             table_docs, symbols, data_ranges, refs, bank_id, rom_bank_base + 1u,
-                            emit_explain);
+                            emit_explain, types);
     }
     if (used < APEX_BANK_SIZE) {
         fprintf(out, "    FILL_TO_BANK_END\n");
@@ -1206,15 +1291,6 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
         explain_label(vector, "vector_table");
         explain_label_kind(vector, "vector_table");
     }
-    for (i = 0; i < inline_sigs->count; i++) {
-        if (inline_sigs->items[i].alias && in_system_addr(inline_sigs->items[i].addr)) {
-            Label *label =
-                add_label(labels, inline_sigs->items[i].addr, inline_sigs->items[i].alias, 1);
-
-            explain_label(label, "config_inline_alias");
-            explain_label_kind(label, "config_inline_alias");
-        }
-    }
     for (i = 0; i < config_labels->count; i++) {
         if (((!config_labels->items[i].has_bank) ||
              (config_labels->items[i].has_bank && config_labels->items[i].bank == 0xffu)) &&
@@ -1241,7 +1317,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
     }
     inline_dispatcher = detect_inline_dispatcher(data, used, vectors, vector_count);
     if (inline_dispatcher != 0 && !inline_signature_for(inline_sigs, 0xffu, inline_dispatcher)) {
-        add_inline_signature(inline_sigs, inline_dispatcher, 1, TABLE_BYTE, NULL);
+        add_inline_signature(inline_sigs, inline_dispatcher, 1, TABLE_BYTE);
     }
     collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom, banks,
                          bank_labels, labels, data_ranges, 0xff, refs);
@@ -1254,7 +1330,7 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
                                 const ConfigDocs *routine_docs, const ConfigDocs *table_docs,
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
-                                size_t rom_system_base, int emit_explain)
+                                size_t rom_system_base, int emit_explain, const ConfigTypes *types)
 {
     size_t used = last_non_ff(data, APEX_SYSTEM_SIZE);
 
@@ -1266,7 +1342,7 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
     if (used > 0) {        emit_db_with_labels(out, data, used, APEX_SYSTEM_ORG, labels->items, labels->count, NULL,
                             0, vectors, vector_count, inline_sigs, paged_rom, banks, bank_labels,
                             tables, routine_docs, table_docs, symbols, data_ranges, refs, 0xff,
-                            rom_system_base, emit_explain);
+                            rom_system_base, emit_explain, types);
     }
     if (used < APEX_SYSTEM_SIZE) {
         fprintf(out, "    FILL_TO_BANK_END\n");
@@ -1764,6 +1840,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
     fprintf(out, "; Generated by ApexII conservative disassembler\n");
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols);
+    emit_type_equates(out, &project->config_types);
     emit_vector_equates(out, project->vectors, sizeof(project->vectors) / sizeof(project->vectors[0]));
 
     for (i = 0; i < project->banks; i++) {
@@ -1774,7 +1851,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                           project->banks, project->bank_labels, &project->tables,
                           &project->routine_docs, &project->table_docs, &project->symbols,
                           &project->data_ranges, &project->refs, i * APEX_BANK_SIZE,
-                          emit_explain);
+                          emit_explain, &project->config_types);
         fputc('\n', out);
     }
 
@@ -1785,7 +1862,8 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                        &project->inline_sigs, &project->system_labels, project->rom.data,
                        project->banks, project->bank_labels, &project->tables,
                        &project->routine_docs, &project->table_docs, &project->symbols,
-                       &project->data_ranges, &project->refs, project->paged_size, emit_explain);
+                       &project->data_ranges, &project->refs, project->paged_size, emit_explain,
+                       &project->config_types);
     if (emit_xrefs) {
         emit_xref_index(out, project->rom.data, project->bank_labels, project->banks,
                         &project->system_labels, &project->refs);

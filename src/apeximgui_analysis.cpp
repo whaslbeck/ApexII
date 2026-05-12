@@ -11,7 +11,6 @@ static int is_symbol_boundary_char(char ch)
     return !std::isalnum((unsigned char)ch) && ch != '_' && ch != '.' && ch != '$';
 }
 
-static const char *inline_mode_name_internal(int mode);
 static std::string line_target_search_text(const ApexRenderedLine *line)
 {
     std::string text = line_to_string(line);
@@ -263,7 +262,9 @@ static std::string table_schema_to_string(const TableSchema *s)
         if (i != 0) {
             t += ", ";
         }
-        t += table_field_kind_name(s->items[i].kind);
+        const char *name = s->items[i].type_name ? s->items[i].type_name
+                                                  : table_field_kind_name(s->items[i].kind);
+        t += name;
         if (s->items[i].count != 1u) {
             t += "[" + std::to_string(s->items[i].count) + "]";
         }
@@ -297,17 +298,10 @@ std::string table_def_spec_string(const TableDef *t)
     return "rows[" + std::to_string(t->rows) + "](" + s + ")";
 }
 
-static std::string inline_signature_spec_string(const InlineSignature *s)
+std::string inline_sig_spec_string(const InlineSignature *s)
 {
     if (!s) {
         return "";
-    }
-    if (s->schema.count == 1u && s->schema.items[0].count == 1u &&
-        s->raw_param && s->schema.items[0].kind == TABLE_BYTE) {
-        return std::string("byte:") + s->raw_param;
-    }
-    if (s->schema.count == 1u && s->schema.items[0].count == 1u && s->far_param) {
-        return std::string(table_field_kind_name(s->schema.items[0].kind)) + ":" + s->far_param;
     }
     return table_schema_to_string(&s->schema);
 }
@@ -780,11 +774,12 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     }
     s->editor_bound_line = s->selected_line;
     s->edit_label_input[0] = '\0';
-    s->edit_inline_input[0] = '\0';
+    s->edit_inline_count = 0;
+    s->edit_schema_count = 0;
+    s->edit_data_length = 1;
+    s->edit_table_rows = 1;
+    s->edit_table_is_rows = 0;
     if (!selected_address(d, s, &b, &a)) {
-        s->edit_spec_input[0] = '\0';
-        sync_spec_presets(s, "");
-        sync_inline_presets(s, "");
         s->edit_doc_input[0] = '\0';
         return;
     }
@@ -794,26 +789,41 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     }
     const auto *is = inline_signature_for(&p->inline_sigs, b, a);
     if (is) {
-        std::string spec = inline_signature_spec_string(is);
-        snprintf(s->edit_inline_input, 128, "%s", spec.c_str());
+        std::string spec = inline_sig_spec_string(is);
+        spec_to_fields(spec.c_str(), s->edit_inline_fields, &s->edit_inline_count,
+                       APEX_MAX_EDIT_FIELDS, p);
     }
-    sync_inline_presets(s, s->edit_inline_input);
+    for (size_t i = 0; i < p->tables.count; i++) {
+        const TableDef *td = &p->tables.items[i];
+        if (td->bank == b && td->addr == a) {
+            std::string spec = table_def_spec_string(td);
+            spec_to_fields(spec.c_str(), s->edit_schema_fields, &s->edit_schema_count,
+                           APEX_MAX_EDIT_FIELDS, p);
+            s->edit_table_is_rows = td->has_header ? 0 : 1;
+            s->edit_table_rows = (int)td->rows;
+            break;
+        }
+    }
     s->edit_doc_mode = (d->lines[s->selected_line].block_kind == APEX_RENDER_BLOCK_TABLE)
                        ? EDIT_DOC_TABLE : EDIT_DOC_ROUTINE;
     load_doc_editor_buffer(p, s, b, a);
     const char *m = strstr(d->lines[s->selected_line].text, "; data type=");
-    s->edit_spec_input[0] = '\0';
     if (m) {
-        char sp[128];
-        size_t pos = 0;
         m += 12;
-        while (*m && *m != '\n' && pos < 127) {
-            sp[pos++] = *m++;
+        const char *end = m;
+        while (*end && *end != '\n') end++;
+        char sp[128];
+        size_t len = (size_t)(end - m);
+        if (len >= sizeof(sp)) len = sizeof(sp) - 1;
+        memcpy(sp, m, len);
+        sp[len] = '\0';
+        if (strcmp(sp, "string") == 0) {
+            s->edit_data_length = 0;
+        } else if (strncmp(sp, "bytes[", 6) == 0) {
+            s->edit_data_length = atoi(sp + 6);
+            if (s->edit_data_length < 1) s->edit_data_length = 1;
         }
-        sp[pos] = '\0';
-        snprintf(s->edit_spec_input, 128, "%s", sp);
     }
-    sync_spec_presets(s, s->edit_spec_input);
 }
 
 void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
@@ -1019,6 +1029,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
     for (auto &bm : s->bookmarks) {
         fprintf(f, "bookmark=0x%02x:%04x:%s\n", bm.bank, bm.addr, bm.name.c_str());
     }
+    fprintf(f, "show_types=%d\nshow_inline_list=%d\nshow_entries_list=%d\n",
+            s->show_types_editor, s->show_inline_list, s->show_entries_list);
     fclose(f);
 }
 
@@ -1107,6 +1119,12 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             if (sscanf(l + 9, "0x%x:%x:%255[^\r\n]", &b, &a, n) == 3) {
                 s->bookmarks.push_back({(uint8_t)b, (uint32_t)a, n});
             }
+        } else if (strncmp(l, "show_types=", 11) == 0) {
+            s->show_types_editor = atoi(l + 11) != 0;
+        } else if (strncmp(l, "show_inline_list=", 17) == 0) {
+            s->show_inline_list = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_entries_list=", 18) == 0) {
+            s->show_entries_list = atoi(l + 18) != 0;
         }
     }
     fclose(f);
@@ -1503,182 +1521,110 @@ const char *transition_name(ApexRenderedTransitionKind k)
     }
 }
 
-static const char *table_schema_mode_name(int m)
-{
-    switch (m) {
-    case EDIT_SCHEMA_PTR16_DATA:   return "ptr16_data";
-    case EDIT_SCHEMA_PTR16_CODE:   return "ptr16_code";
-    case EDIT_SCHEMA_PTR16_STRING: return "ptr16_string";
-    case EDIT_SCHEMA_FAR_DATA:     return "far_data";
-    case EDIT_SCHEMA_FAR_CODE:     return "far_code";
-    case EDIT_SCHEMA_FAR_STRING:   return "far_string";
-    default:                       return "";
-    }
-}
+/* Canonical kind names in the same order as TableFieldKind. */
+static const struct { int kind; const char *name; } kKindNames[] = {
+    { TABLE_BYTE,              "byte"         },
+    { TABLE_WORD,              "word"         },
+    { TABLE_PTR16_STRING,      "ptr16_string" },
+    { TABLE_PTR16_DATA,        "ptr16_data"   },
+    { TABLE_PTR16_CODE,        "ptr16_code"   },
+    { TABLE_PTR16_TABLE,       "ptr16_table"  },
+    { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd_fullframe" },
+    { TABLE_FAR_STRING,        "far_string"   },
+    { TABLE_FAR_DATA,          "far_data"     },
+    { TABLE_FAR_TABLE,         "far_table"    },
+    { TABLE_FAR_CODE,          "far_code"     },
+    { TABLE_FAR_DMD_FULLFRAME, "far_dmd_fullframe" },
+};
+static const int kKindCount = (int)(sizeof(kKindNames) / sizeof(kKindNames[0]));
 
-void apply_data_preset(UiState *s)
+static const char *kind_to_name(int kind)
 {
-    switch (s->edit_data_mode) {
-    case EDIT_DATA_BYTES:
-        if (s->edit_data_length < 1) {
-            s->edit_data_length = 1;
+    for (int i = 0; i < kKindCount; i++) {
+        if (kKindNames[i].kind == kind) {
+            return kKindNames[i].name;
         }
-        snprintf(s->edit_spec_input, 128, "bytes[%d]", s->edit_data_length);
-        break;
-    case EDIT_DATA_STRING:
-        strcpy(s->edit_spec_input, "string");
-        break;
-    case EDIT_DATA_FAR_STRING:
-        strcpy(s->edit_spec_input, "far_string");
-        break;
-    case EDIT_DATA_FAR_DATA:
-        strcpy(s->edit_spec_input, "far_data");
-        break;
-    case EDIT_DATA_FAR_TABLE:
-        strcpy(s->edit_spec_input, "far_table");
-        break;
-    case EDIT_DATA_FAR_CODE:
-        strcpy(s->edit_spec_input, "far_code");
-        break;
     }
+    return "byte";
 }
 
-void apply_inline_preset(UiState *s)
+void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int count)
 {
-    const char *m = inline_mode_name_internal(s->edit_inline_mode);
-    if (!m || !*m) {
-        return;
+    size_t pos = 0;
+    for (int i = 0; i < count; i++) {
+        if (i > 0 && pos + 2 < cap) {
+            buf[pos++] = ',';
+            buf[pos++] = ' ';
+        }
+        const char *name = (fields[i].kind < 0) ? fields[i].type_name
+                                                 : kind_to_name(fields[i].kind);
+        size_t nlen = strlen(name);
+        if (pos + nlen >= cap) { break; }
+        memcpy(buf + pos, name, nlen);
+        pos += nlen;
+        if (fields[i].count > 1) {
+            int written = snprintf(buf + pos, cap - pos, "[%d]", fields[i].count);
+            if (written > 0) { pos += (size_t)written; }
+        }
     }
-    if (s->edit_inline_name_input[0]) {
-        snprintf(s->edit_inline_input, 128, "%s:%s", m, s->edit_inline_name_input);
-    } else {
-        snprintf(s->edit_inline_input, 128, "%s", m);
-    }
+    if (pos < cap) { buf[pos] = '\0'; }
 }
 
-void apply_table_preset(UiState *s)
+void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max,
+                    const ApexProject *p)
 {
-    const char *sc = table_schema_mode_name(s->edit_table_schema_mode);
-    if (s->edit_table_schema_mode == EDIT_SCHEMA_CUSTOM) {
-        sc = s->edit_table_schema_input;
-    }
-    if (!sc || !*sc) {
-        sc = "ptr16_data";
-    }
+    *count = 0;
+    if (!spec || !*spec) { return; }
     char buf[256];
-    if (s->edit_table_mode == EDIT_TABLE_COUNTED) {
-        snprintf(buf, sizeof(buf), "counted(%s)", sc);
-    } else if (s->edit_table_mode == EDIT_TABLE_ROWS) {
-        if (s->edit_table_rows < 1) {
-            s->edit_table_rows = 1;
+    snprintf(buf, sizeof(buf), "%s", spec);
+    char *tok = buf;
+    while (tok && *tok && *count < max) {
+        char *comma = strchr(tok, ',');
+        if (comma) { *comma = '\0'; }
+        while (*tok == ' ') { tok++; }
+        char *end = tok + strlen(tok);
+        while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+        int cnt = 1;
+        char *bracket = strchr(tok, '[');
+        if (bracket) {
+            char *close = strchr(bracket, ']');
+            if (close) {
+                *bracket = '\0';
+                cnt = atoi(bracket + 1);
+                if (cnt < 1) { cnt = 1; }
+                end = bracket;
+                while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+            }
         }
-        snprintf(buf, sizeof(buf), "rows[%d](%s)", s->edit_table_rows, sc);
-    } else {
-        return;
-    }
-    strncpy(s->edit_spec_input, buf, 127);
-    s->edit_spec_input[127] = '\0';
-}
-
-void sync_spec_presets(UiState *s, const char *sp)
-{
-    int r = 0;
-    char in[128];
-    s->edit_data_mode = EDIT_DATA_CUSTOM;
-    s->edit_data_length = 1;
-    s->edit_table_mode = EDIT_TABLE_CUSTOM;
-    s->edit_table_rows = 1;
-    s->edit_table_schema_mode = EDIT_SCHEMA_CUSTOM;
-    s->edit_table_schema_input[0] = '\0';
-    if (!sp || !*sp) {
-        return;
-    }
-    if (sscanf(sp, "bytes[%d]", &r) == 1) {
-        s->edit_data_mode = EDIT_DATA_BYTES;
-        s->edit_data_length = r > 0 ? r : 1;
-        return;
-    }
-    if (strcmp(sp, "string") == 0) {
-        s->edit_data_mode = EDIT_DATA_STRING;
-        return;
-    }
-    if (strcmp(sp, "far_string") == 0) {
-        s->edit_data_mode = EDIT_DATA_FAR_STRING;
-        return;
-    }
-    if (strcmp(sp, "far_data") == 0) {
-        s->edit_data_mode = EDIT_DATA_FAR_DATA;
-        return;
-    }
-    if (strcmp(sp, "far_table") == 0) {
-        s->edit_data_mode = EDIT_DATA_FAR_TABLE;
-        return;
-    }
-    if (strcmp(sp, "far_code") == 0) {
-        s->edit_data_mode = EDIT_DATA_FAR_CODE;
-        return;
-    }
-    in[0] = '\0';
-    if (sscanf(sp, "counted(%127[^)])", in) == 1) {
-        s->edit_table_mode = EDIT_TABLE_COUNTED;
-    } else if (sscanf(sp, "rows[%d](%127[^)])", &r, in) == 2) {
-        s->edit_table_mode = EDIT_TABLE_ROWS;
-        s->edit_table_rows = r > 0 ? r : 1;
-    } else {
-        return;
-    }
-    if (strcmp(in, "ptr16_data") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_DATA;
-    } else if (strcmp(in, "ptr16_code") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_CODE;
-    } else if (strcmp(in, "ptr16_string") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_PTR16_STRING;
-    } else if (strcmp(in, "far_data") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_FAR_DATA;
-    } else if (strcmp(in, "far_code") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_FAR_CODE;
-    } else if (strcmp(in, "far_string") == 0) {
-        s->edit_table_schema_mode = EDIT_SCHEMA_FAR_STRING;
-    } else {
-        s->edit_table_schema_mode = EDIT_SCHEMA_CUSTOM;
-        snprintf(s->edit_table_schema_input, 128, "%s", in);
-    }
-}
-
-void sync_inline_presets(UiState *s, const char *sp)
-{
-    const char *col;
-    std::string m;
-    const char *n = "";
-    s->edit_inline_mode = EDIT_INLINE_CUSTOM;
-    s->edit_inline_name_input[0] = '\0';
-    if (!sp || !*sp) {
-        return;
-    }
-    col = strchr(sp, ':');
-    if (col) {
-        m.assign(sp, (size_t)(col - sp));
-        n = col + 1;
-    } else {
-        m = sp;
-    }
-    if (m == "byte") {
-        s->edit_inline_mode = EDIT_INLINE_BYTE;
-    } else if (m == "ptr16_data") {
-        s->edit_inline_mode = EDIT_INLINE_PTR16_DATA;
-    } else if (m == "ptr16_code") {
-        s->edit_inline_mode = EDIT_INLINE_PTR16_CODE;
-    } else if (m == "ptr16_string") {
-        s->edit_inline_mode = EDIT_INLINE_PTR16_STRING;
-    } else if (m == "far_data") {
-        s->edit_inline_mode = EDIT_INLINE_FAR_DATA;
-    } else if (m == "far_code") {
-        s->edit_inline_mode = EDIT_INLINE_FAR_CODE;
-    } else if (m == "far_string") {
-        s->edit_inline_mode = EDIT_INLINE_FAR_STRING;
-    }
-    if (*n) {
-        snprintf(s->edit_inline_name_input, 64, "%s", n);
+        if (*tok) {
+            ApexEditField f;
+            f.count = cnt;
+            f.kind = -1;
+            f.type_name[0] = '\0';
+            for (int i = 0; i < kKindCount; i++) {
+                if (strcmp(kKindNames[i].name, tok) == 0) {
+                    f.kind = kKindNames[i].kind;
+                    break;
+                }
+            }
+            if (f.kind < 0) {
+                /* named type — verify it exists in config */
+                if (p) {
+                    for (size_t ti = 0; ti < p->config_types.count; ti++) {
+                        if (strcmp(p->config_types.items[ti].name, tok) == 0) {
+                            snprintf(f.type_name, sizeof(f.type_name), "%s", tok);
+                            break;
+                        }
+                    }
+                } else {
+                    snprintf(f.type_name, sizeof(f.type_name), "%s", tok);
+                }
+            }
+            if (f.kind >= 0 || f.type_name[0]) {
+                fields[(*count)++] = f;
+            }
+        }
+        tok = comma ? comma + 1 : NULL;
     }
 }
 
@@ -1732,7 +1678,17 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
         s.inline_sigs.push_back({p->inline_sigs.items[i].has_bank,
                                  p->inline_sigs.items[i].bank,
                                  p->inline_sigs.items[i].addr,
-                                 inline_signature_spec_string(&p->inline_sigs.items[i])});
+                                 inline_sig_spec_string(&p->inline_sigs.items[i])});
+    }
+    for (size_t i = 0; i < p->config_types.count; i++) {
+        const ConfigType *ct = &p->config_types.items[i];
+        SnapshotType st;
+        st.name    = ct->name;
+        st.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
+        for (size_t j = 0; j < ct->value_count; j++) {
+            st.values.push_back({ct->values[j].value, ct->values[j].name});
+        }
+        s.types.push_back(std::move(st));
     }
     return s;
 }
@@ -1753,8 +1709,9 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     DataRanges data_ranges = {};
     ConfigOptions options = {};
     options.labels_are_entries = 1;
+    ConfigTypes types = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
-                &routine_docs, &table_docs, &symbols, &data_ranges, &options);
+                &routine_docs, &table_docs, &symbols, &data_ranges, &options, &types);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
                             labels.items[i].bank,
@@ -1792,8 +1749,19 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
         s.inline_sigs.push_back({sigs.items[i].has_bank,
                                  sigs.items[i].bank,
                                  sigs.items[i].addr,
-                                 inline_signature_spec_string(&sigs.items[i])});
+                                 inline_sig_spec_string(&sigs.items[i])});
     }
+    for (size_t i = 0; i < types.count; i++) {
+        const ConfigType *ct = &types.items[i];
+        SnapshotType stype;
+        stype.name    = ct->name;
+        stype.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
+        for (size_t j = 0; j < ct->value_count; j++) {
+            stype.values.push_back({ct->values[j].value, ct->values[j].name});
+        }
+        s.types.push_back(std::move(stype));
+    }
+    free_config_types(&types);
     return s;
 }
 
@@ -1806,6 +1774,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotTable> ct;
     std::vector<SnapshotDoc> crd, ctd;
     std::vector<SnapshotInline> ci;
+    std::vector<SnapshotType> ctype;
 
     for (auto &i : s->labels) {
         int sp = 0;
@@ -1881,7 +1850,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     }
 
     for (size_t i = 0; i < p->inline_sigs.count; i++) {
-        std::string spec = inline_signature_spec_string(&p->inline_sigs.items[i]);
+        std::string spec = inline_sig_spec_string(&p->inline_sigs.items[i]);
         int found = 0;
         for (auto &o : s->inline_sigs) {
             if (o.has_bank == p->inline_sigs.items[i].has_bank &&
@@ -1902,6 +1871,45 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new or changed types */
+    for (size_t i = 0; i < p->config_types.count; i++) {
+        const ConfigType *ct = &p->config_types.items[i];
+        const SnapshotType *orig = nullptr;
+        for (auto &snt : s->types) {
+            if (snt.name == ct->name) { orig = &snt; break; }
+        }
+        bool changed = !orig || (int)(ct->kind == TABLE_WORD) != orig->is_word ||
+                       ct->value_count != orig->values.size();
+        if (!changed && orig) {
+            for (size_t j = 0; j < ct->value_count && !changed; j++) {
+                if (ct->values[j].value != orig->values[j].value ||
+                    orig->values[j].name  != ct->values[j].name) {
+                    changed = true;
+                }
+            }
+        }
+        if (changed) {
+            SnapshotType stype;
+            stype.name    = ct->name;
+            stype.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
+            for (size_t j = 0; j < ct->value_count; j++) {
+                stype.values.push_back({ct->values[j].value, ct->values[j].name});
+            }
+            ctype.push_back(std::move(stype));
+        }
+    }
+    /* deletion of a type needs full save */
+    for (auto &snt : s->types) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->config_types.count; j++) {
+            if (p->config_types.items[j].name == snt.name) { still_there = true; break; }
+        }
+        if (!still_there) {
+            *st = "type deletion needs full snapshot";
+            return 0;
+        }
+    }
+
     FILE *o = fopen(path, "w");
     if (!o) {
         *st = "open failed";
@@ -1912,6 +1920,17 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         const char *inc = (include_path && *include_path) ? include_path : p->config_path;
         if (inc && *inc) {
             fprintf(o, "include = %s\n", basename_ptr(inc));
+        }
+    }
+    if (!ctype.empty()) {
+        fputs("\n[types]\n", o);
+        for (auto &t : ctype) {
+            fprintf(o, "%s:%s =", t.name.c_str(), t.is_word ? "word" : "byte");
+            for (size_t vi = 0; vi < t.values.size(); vi++) {
+                if (vi > 0) fputc(',', o);
+                fprintf(o, " 0x%02x:%s", t.values[vi].value, t.values[vi].name.c_str());
+            }
+            fputc('\n', o);
         }
     }
     if (!cl.empty()) {
@@ -2215,16 +2234,3 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
     }
 }
 
-static const char *inline_mode_name_internal(int mode)
-{
-    switch (mode) {
-    case EDIT_INLINE_BYTE:         return "byte";
-    case EDIT_INLINE_PTR16_DATA:   return "ptr16_data";
-    case EDIT_INLINE_PTR16_CODE:   return "ptr16_code";
-    case EDIT_INLINE_PTR16_STRING: return "ptr16_string";
-    case EDIT_INLINE_FAR_DATA:     return "far_data";
-    case EDIT_INLINE_FAR_CODE:     return "far_code";
-    case EDIT_INLINE_FAR_STRING:   return "far_string";
-    default:                       return "";
-    }
-}

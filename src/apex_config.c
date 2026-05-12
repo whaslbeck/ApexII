@@ -5,7 +5,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-static int parse_table_field(char *value, TableField *field);
+static int parse_table_field(char *value, TableField *field, const ConfigTypes *types);
 
 static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t item_addr,
                                int has_bank, uint8_t bank, uint32_t addr)
@@ -122,6 +122,7 @@ static void copy_inline_schema(TableSchema *dst, const TableSchema *src)
     memset(dst, 0, sizeof(*dst));
     for (i = 0; i < src->count; i++) {
         add_table_field(dst, src->items[i].kind, src->items[i].count);
+        dst->items[dst->count - 1u].type_name = src->items[i].type_name;
     }
 }
 
@@ -337,6 +338,7 @@ void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count)
     }
     schema->items[schema->count].kind = kind;
     schema->items[schema->count].count = count;
+    schema->items[schema->count].type_name = NULL;
     schema->count++;
 }
 
@@ -348,6 +350,7 @@ static TableSchema copy_table_schema(const TableSchema *src)
     memset(&copy, 0, sizeof(copy));
     for (i = 0; i < src->count; i++) {
         add_table_field(&copy, src->items[i].kind, src->items[i].count);
+        copy.items[copy.count - 1u].type_name = src->items[i].type_name;
     }
     return copy;
 }
@@ -516,8 +519,7 @@ static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr)
 }
 
 void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema, const char *alias,
-                                 const char *raw_param, const char *far_param)
+                                 uint32_t addr, const TableSchema *schema)
 {
     size_t i;
     unsigned length = (unsigned)table_schema_width(schema);
@@ -531,18 +533,6 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
             sigs->items[i].length = length;
             free(sigs->items[i].schema.items);
             copy_inline_schema(&sigs->items[i].schema, schema);
-            if (alias && *alias) {
-                free(sigs->items[i].alias);
-                sigs->items[i].alias = dup_string(alias);
-            }
-            if (raw_param && *raw_param) {
-                free(sigs->items[i].raw_param);
-                sigs->items[i].raw_param = dup_string(raw_param);
-            }
-            if (far_param && *far_param) {
-                free(sigs->items[i].far_param);
-                sigs->items[i].far_param = dup_string(far_param);
-            }
             return;
         }
     }
@@ -561,21 +551,17 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
     sigs->items[sigs->count].addr = addr;
     sigs->items[sigs->count].length = length;
     copy_inline_schema(&sigs->items[sigs->count].schema, schema);
-    sigs->items[sigs->count].alias = alias && *alias ? dup_string(alias) : NULL;
-    sigs->items[sigs->count].raw_param = raw_param && *raw_param ? dup_string(raw_param) : NULL;
-    sigs->items[sigs->count].far_param = far_param && *far_param ? dup_string(far_param) : NULL;
     sigs->count++;
 }
 
 void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                             unsigned length, TableFieldKind kind, const char *alias,
-                             const char *raw_param, const char *far_param)
+                             unsigned length, TableFieldKind kind)
 {
     TableSchema schema;
 
     memset(&schema, 0, sizeof(schema));
     add_table_field(&schema, kind, length);
-    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, alias, raw_param, far_param);
+    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
     free(schema.items);
 }
 
@@ -587,9 +573,6 @@ static int remove_inline_signature(InlineSignatures *sigs, int has_bank, uint8_t
         if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank,
                                 sigs->items[i].addr, has_bank, bank, addr)) {
             free(sigs->items[i].schema.items);
-            free((char *)sigs->items[i].alias);
-            free((char *)sigs->items[i].raw_param);
-            free((char *)sigs->items[i].far_param);
             memmove(&sigs->items[i], &sigs->items[i + 1],
                     (sigs->count - i - 1u) * sizeof(sigs->items[0]));
             sigs->count--;
@@ -599,55 +582,16 @@ static int remove_inline_signature(InlineSignatures *sigs, int has_bank, uint8_t
     return 0;
 }
 
-static int parse_mixed_inline_schema(char *value, TableSchema *schema)
-{
-    char *comma;
-    uint32_t length;
-    TableField tail;
-
-    value = trim(value);
-    if (strncmp(value, "bytes:", 6) != 0) {
-        return 0;
-    }
-    comma = strchr(value, ',');
-    if (!comma) {
-        die("invalid mixed inline signature '%s'", value);
-    }
-    *comma = '\0';
-    if (!parse_u32(trim(value + 6), &length) || length > 252u) {
-        die("invalid mixed inline byte count '%s'", value + 6);
-    }
-    memset(schema, 0, sizeof(*schema));
-    if (!parse_table_field(trim(comma + 1), &tail)) {
-        die("invalid mixed inline tail '%s'", trim(comma + 1));
-    }
-    add_table_field(schema, TABLE_BYTE, length);
-    add_table_field(schema, tail.kind, tail.count);
-    return 1;
-}
-
-static int parse_named_token(char *value, const char *prefix, char **name)
-{
-    size_t prefix_len = strlen(prefix);
-
-    value = trim(value);
-    if (strncmp(value, prefix, prefix_len) != 0 || value[prefix_len] != ':') {
-        return 0;
-    }
-    *name = trim(value + prefix_len + 1u);
-    return **name != '\0';
-}
-
 static int parse_table_kind(char *value, TableFieldKind *kind)
 {
     value = trim(value);
-    if (strcmp(value, "byte") == 0 || strcmp(value, "bytes") == 0) {
+    if (strcmp(value, "byte") == 0) {
         *kind = TABLE_BYTE;
     } else if (strcmp(value, "word") == 0) {
         *kind = TABLE_WORD;
     } else if (strcmp(value, "ptr16_string") == 0) {
         *kind = TABLE_PTR16_STRING;
-    } else if (strcmp(value, "ptr16_data") == 0 || strcmp(value, "ptr16_ptr") == 0) {
+    } else if (strcmp(value, "ptr16_data") == 0) {
         *kind = TABLE_PTR16_DATA;
     } else if (strcmp(value, "ptr16_code") == 0) {
         *kind = TABLE_PTR16_CODE;
@@ -657,7 +601,7 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
         *kind = TABLE_PTR16_DMD_FULLFRAME;
     } else if (strcmp(value, "far_string") == 0) {
         *kind = TABLE_FAR_STRING;
-    } else if (strcmp(value, "far_data") == 0 || strcmp(value, "far_ptr") == 0) {
+    } else if (strcmp(value, "far_data") == 0) {
         *kind = TABLE_FAR_DATA;
     } else if (strcmp(value, "far_table") == 0) {
         *kind = TABLE_FAR_TABLE;
@@ -671,11 +615,12 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
     return 1;
 }
 
-static int parse_table_field(char *value, TableField *field)
+static int parse_table_field(char *value, TableField *field, const ConfigTypes *types)
 {
     char *open;
     char *close;
     uint32_t count;
+    size_t i;
 
     value = trim(value);
     open = strchr(value, '[');
@@ -692,14 +637,25 @@ static int parse_table_field(char *value, TableField *field)
     } else {
         count = 1;
     }
-    if (!parse_table_kind(value, &field->kind)) {
-        return 0;
+    field->type_name = NULL;
+    if (parse_table_kind(value, &field->kind)) {
+        field->count = count;
+        return 1;
     }
-    field->count = count;
-    return 1;
+    if (types) {
+        for (i = 0; i < types->count; i++) {
+            if (strcmp(types->items[i].name, value) == 0) {
+                field->kind = types->items[i].kind;
+                field->count = count;
+                field->type_name = types->items[i].name;
+                return 1;
+            }
+        }
+    }
+    return 0;
 }
 
-static int parse_table_schema(char *value, TableSchema *schema)
+static int parse_table_schema(char *value, TableSchema *schema, const ConfigTypes *types)
 {
     char *p = value;
 
@@ -713,10 +669,11 @@ static int parse_table_schema(char *value, TableSchema *schema)
             *comma = '\0';
         }
         p = trim(p);
-        if (*p == '\0' || !parse_table_field(p, &field)) {
+        if (*p == '\0' || !parse_table_field(p, &field, types)) {
             return 0;
         }
         add_table_field(schema, field.kind, field.count);
+        schema->items[schema->count - 1u].type_name = field.type_name;
         p = comma ? comma + 1 : NULL;
     }
     return schema->count > 0;
@@ -764,7 +721,7 @@ static int parse_far_code_table_format(char *value, size_t *rows)
 }
 
 static int parse_rows_table_format(char *value, size_t *rows, TableSchema *schema,
-                                   const SchemaDefs *schemas)
+                                   const SchemaDefs *schemas, const ConfigTypes *types)
 {
     char *open;
     char *close;
@@ -790,7 +747,7 @@ static int parse_rows_table_format(char *value, size_t *rows, TableSchema *schem
         die("invalid rows table format '%s'", value);
     }
     *close = '\0';
-    if (!parse_table_schema(inner, schema) && !schema_def_named(schemas, inner, schema)) {
+    if (!parse_table_schema(inner, schema, types) && !schema_def_named(schemas, inner, schema)) {
         die("invalid rows table row format '%s'", inner);
     }
     *rows = parsed_rows;
@@ -863,10 +820,168 @@ size_t table_schema_width(const TableSchema *schema)
     return width;
 }
 
+void free_config_types(ConfigTypes *types)
+{
+    size_t i, j;
+
+    if (!types) {
+        return;
+    }
+    for (i = 0; i < types->count; i++) {
+        free(types->items[i].name);
+        for (j = 0; j < types->items[i].value_count; j++) {
+            free((char *)types->items[i].values[j].name);
+        }
+        free(types->items[i].values);
+    }
+    free(types->items);
+    memset(types, 0, sizeof(*types));
+}
+
+const ConfigType *find_config_type(const ConfigTypes *types, const char *name)
+{
+    size_t i;
+
+    if (!types || !name) {
+        return NULL;
+    }
+    for (i = 0; i < types->count; i++) {
+        if (strcmp(types->items[i].name, name) == 0) {
+            return &types->items[i];
+        }
+    }
+    return NULL;
+}
+
+const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value)
+{
+    const ConfigType *type = find_config_type(types, type_name);
+    size_t i;
+
+    if (!type) {
+        return NULL;
+    }
+    for (i = 0; i < type->value_count; i++) {
+        if (type->values[i].value == value) {
+            return type->values[i].name;
+        }
+    }
+    return NULL;
+}
+
+void config_set_type(ConfigTypes *types, const char *name, TableFieldKind kind,
+                     const char *values_str)
+{
+    ConfigType *type;
+    char *values_copy;
+    char *p;
+    size_t i;
+
+    if (!types) {
+        return;
+    }
+    for (i = 0; i < types->count; i++) {
+        if (strcmp(types->items[i].name, name) == 0) {
+            size_t j;
+
+            for (j = 0; j < types->items[i].value_count; j++) {
+                free((char *)types->items[i].values[j].name);
+            }
+            types->items[i].value_count = 0;
+            type = &types->items[i];
+            goto parse_values;
+        }
+    }
+    if (types->count == types->cap) {
+        size_t new_cap = types->cap == 0 ? 8 : types->cap * 2;
+        ConfigType *new_items = realloc(types->items, new_cap * sizeof(types->items[0]));
+
+        if (!new_items) {
+            die("out of memory");
+        }
+        types->items = new_items;
+        types->cap = new_cap;
+    }
+    types->items[types->count].name = dup_string(name);
+    types->items[types->count].kind = kind;
+    types->items[types->count].values = NULL;
+    types->items[types->count].value_count = 0;
+    types->items[types->count].value_cap = 0;
+    type = &types->items[types->count];
+    types->count++;
+
+parse_values:
+    values_copy = dup_string(values_str);
+    p = values_copy;
+    while (p && *p) {
+        char *comma = strchr(p, ',');
+        char *colon;
+        char *name_part;
+        uint32_t val;
+
+        if (comma) {
+            *comma = '\0';
+        }
+        p = trim(p);
+        colon = strchr(p, ':');
+        if (!colon) {
+            die("invalid type value '%s': expected numeric:name", p);
+        }
+        *colon = '\0';
+        name_part = trim(colon + 1);
+        if (!parse_u32(trim(p), &val)) {
+            die("invalid type value number '%s'", p);
+        }
+        if (!valid_symbol_name(name_part)) {
+            die("invalid type value name '%s'", name_part);
+        }
+        if (type->value_count == type->value_cap) {
+            size_t new_cap = type->value_cap == 0 ? 4 : type->value_cap * 2;
+            ConfigTypeValue *new_vals = realloc(type->values, new_cap * sizeof(type->values[0]));
+
+            if (!new_vals) {
+                die("out of memory");
+            }
+            type->values = new_vals;
+            type->value_cap = new_cap;
+        }
+        type->values[type->value_count].name = dup_string(name_part);
+        type->values[type->value_count].value = val;
+        type->value_count++;
+        p = comma ? comma + 1 : NULL;
+    }
+    free(values_copy);
+}
+
+int config_remove_type(ConfigTypes *types, const char *name)
+{
+    size_t i, j;
+
+    if (!types || !name) {
+        return 0;
+    }
+    for (i = 0; i < types->count; i++) {
+        if (strcmp(types->items[i].name, name) != 0) {
+            continue;
+        }
+        free(types->items[i].name);
+        for (j = 0; j < types->items[i].value_count; j++) {
+            free((char *)types->items[i].values[j].name);
+        }
+        free(types->items[i].values);
+        for (j = i + 1; j < types->count; j++) {
+            types->items[j - 1] = types->items[j];
+        }
+        types->count--;
+        return 1;
+    }
+    return 0;
+}
+
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options)
+                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types)
 {
     FILE *f;
     char line[1024];
@@ -880,6 +995,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_table_docs = 0;
     int in_symbols = 0;
     int in_data = 0;
+    int in_types = 0;
 
     if (!path) {
         return;
@@ -914,6 +1030,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_table_docs = strcmp(s + 1, "table_docs") == 0;
             in_symbols = strcmp(s + 1, "symbols") == 0;
             in_data = strcmp(s + 1, "data") == 0;
+            in_types = strcmp(s + 1, "types") == 0;
             continue;
         }
         eq = strchr(s, '=');
@@ -927,7 +1044,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *include_path = resolve_include_path(path, value);
 
             load_config(include_path, sigs, labels, entries, tables, schemas, routine_docs,
-                        table_docs, symbols, data_ranges, options);
+                        table_docs, symbols, data_ranges, options, types);
             free(value);
             free(include_path);
             continue;
@@ -946,12 +1063,10 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             free(value);
         } else if (in_inline) {
             uint32_t addr;
-            uint32_t length;
             uint8_t bank = 0;
             int has_bank = 0;
             char *key = s;
             char *value = dup_config_value(eq + 1);
-            char *param_name;
             TableSchema schema;
 
             if (parse_bank_label_ref(key, &bank, &addr)) {
@@ -960,59 +1075,11 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 die("invalid inline signature '%s = %s'", key, value);
             }
             memset(&schema, 0, sizeof(schema));
-            if (parse_mixed_inline_schema(value, &schema)) {
-                add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL, NULL, NULL);
+            if (parse_table_schema(value, &schema, types)) {
+                add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
                 free(schema.items);
-            } else if (parse_named_token(value, "byte", &param_name)) {
-                add_inline_signature_ex(sigs, has_bank, bank, addr, 1, TABLE_BYTE, NULL,
-                                        param_name, NULL);
-            } else if (parse_named_token(value, "far_code", &param_name)) {
-                add_inline_signature_ex(sigs, has_bank, bank, addr, 1, TABLE_FAR_CODE, NULL, NULL,
-                                        param_name);
             } else {
-                char *schema_value = dup_string(value);
-                char *alias = NULL;
-                TableField field;
-                char *field_name = NULL;
-
-                if (parse_table_schema(schema_value, &schema)) {
-                    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL, NULL,
-                                                NULL);
-                    free(schema.items);
-                } else if ((alias = strchr(value, ',')) != NULL) {
-                    *alias = '\0';
-                    alias = trim(alias + 1);
-                    value = trim(value);
-
-                    if (parse_table_field(value, &field)) {
-                        memset(&schema, 0, sizeof(schema));
-                        add_table_field(&schema, field.kind, field.count);
-                        add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, alias,
-                                                    NULL, NULL);
-                        free(schema.items);
-                    } else {
-                        die("invalid inline signature '%s = %s'", key, value);
-                    }
-                } else if ((field_name = strchr(value, ':')) != NULL) {
-                    *field_name = '\0';
-                    field_name = trim(field_name + 1);
-                    value = trim(value);
-                    if (!parse_table_field(value, &field) || *field_name == '\0') {
-                        die("invalid inline signature '%s = %s'", key, value);
-                    }
-                    memset(&schema, 0, sizeof(schema));
-                    add_table_field(&schema, field.kind, field.count);
-                    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL,
-                                                field.kind == TABLE_BYTE ? field_name : NULL,
-                                                field.kind == TABLE_BYTE ? NULL : field_name);
-                    free(schema.items);
-                } else if (parse_u32(value, &length) && length <= 255u) {
-                    add_inline_signature_ex(sigs, has_bank, bank, addr, (unsigned)length,
-                                            TABLE_BYTE, alias, NULL, NULL);
-                } else {
-                    die("invalid inline signature '%s = %s'", key, value);
-                }
-                free(schema_value);
+                die("invalid inline signature '%s = %s'", key, value);
             }
             free(value);
         } else if (in_labels) {
@@ -1051,7 +1118,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *key = s;
             char *value = dup_config_value(eq + 1);
 
-            if (!parse_table_schema(value, &schema)) {
+            if (!parse_table_schema(value, &schema, types)) {
                 die("invalid schema config '%s = %s'", key, value);
             }
             add_schema_def(schemas, key, schema);
@@ -1102,7 +1169,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
             } else if (strcmp(value, "far_string") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_FAR_STRING, 3);
-            } else if (strcmp(value, "far_data") == 0 || strcmp(value, "far_ptr") == 0) {
+            } else if (strcmp(value, "far_data") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_FAR_DATA, 3);
             } else if (strcmp(value, "far_table") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_FAR_TABLE, 3);
@@ -1129,24 +1196,22 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             if (!parse_bank_label_ref(key, &bank, &addr)) {
                 die("invalid table config key '%s'", key);
             }
-            if (strcmp(value, "counted_ptr16_string") == 0 ||
-                strcmp(value, "counted_ptr16le_string") == 0) {
+            if (strcmp(value, "counted_ptr16_string") == 0) {
                 free(schema.items);
                 memset(&schema, 0, sizeof(schema));
                 add_table_field(&schema, TABLE_PTR16_STRING, 1);
-            } else if (strcmp(value, "counted_ptr16_data") == 0 ||
-                       strcmp(value, "counted_ptr16le_data") == 0) {
+            } else if (strcmp(value, "counted_ptr16_data") == 0) {
                 free(schema.items);
                 memset(&schema, 0, sizeof(schema));
                 add_table_field(&schema, TABLE_PTR16_DATA, 1);
             } else if (parse_wrapped_table_format(value, "counted", &inner)) {
                 free(schema.items);
                 memset(&schema, 0, sizeof(schema));
-                if (!parse_table_schema(inner, &schema) &&
+                if (!parse_table_schema(inner, &schema, types) &&
                     !schema_def_named(schemas, inner, &schema)) {
                     die("invalid counted table row format '%s'", inner);
                 }
-            } else if (parse_rows_table_format(value, &rows, &schema, schemas)) {
+            } else if (parse_rows_table_format(value, &rows, &schema, schemas, types)) {
                 has_header = 0;
             } else if (parse_far_code_table_format(value, &rows)) {
                 free(schema.items);
@@ -1157,6 +1222,28 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 die("invalid table format '%s = %s'", key, value);
             }
             add_table_def(tables, bank, addr, schema, has_header, rows);
+            free(value);
+        } else if (in_types) {
+            char *key = s;
+            char *colon = strchr(key, ':');
+            char *type_name_str;
+            char *kind_str;
+            TableFieldKind kind;
+            char *value = dup_config_value(eq + 1);
+
+            if (!colon) {
+                die("invalid type '%s': expected name:byte or name:word", key);
+            }
+            *colon = '\0';
+            type_name_str = trim(key);
+            kind_str = trim(colon + 1);
+            if (!parse_table_kind(kind_str, &kind) || (kind != TABLE_BYTE && kind != TABLE_WORD)) {
+                die("invalid type kind '%s': must be byte or word", kind_str);
+            }
+            if (!valid_symbol_name(type_name_str)) {
+                die("invalid type name '%s'", type_name_str);
+            }
+            config_set_type(types, type_name_str, kind, value);
             free(value);
         }
     }
@@ -1178,76 +1265,24 @@ int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint3
 }
 
 int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                           const char *spec)
+                           const char *spec, const ConfigTypes *types)
 {
     char *value;
-    char *raw_value;
-    char *param_name;
-    char *schema_value;
-    char *alias = NULL;
-    char *field_name = NULL;
-    uint32_t length;
     TableSchema schema;
-    TableField field;
 
     if (!spec || !*spec) {
         return 1;
     }
-    raw_value = dup_string(spec);
-    value = raw_value;
+    value = dup_string(spec);
     memset(&schema, 0, sizeof(schema));
-    if (parse_mixed_inline_schema(value, &schema)) {
-        add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL, NULL, NULL);
-    } else if (parse_named_token(value, "byte", &param_name)) {
-        add_inline_signature_ex(sigs, has_bank, bank, addr, 1, TABLE_BYTE, NULL, param_name, NULL);
-    } else if (parse_named_token(value, "far_code", &param_name)) {
-        add_inline_signature_ex(sigs, has_bank, bank, addr, 1, TABLE_FAR_CODE, NULL, NULL,
-                                param_name);
-    } else {
-        schema_value = dup_string(value);
-        if (parse_table_schema(schema_value, &schema)) {
-            add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL, NULL, NULL);
-        } else if ((alias = strchr(value, ',')) != NULL) {
-            *alias = '\0';
-            alias = trim(alias + 1);
-            value = trim(value);
-            if (!parse_table_field(value, &field)) {
-                free(schema_value);
-                free(schema.items);
-                free(raw_value);
-                return 1;
-            }
-            memset(&schema, 0, sizeof(schema));
-            add_table_field(&schema, field.kind, field.count);
-            add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, alias, NULL, NULL);
-        } else if ((field_name = strchr(value, ':')) != NULL) {
-            *field_name = '\0';
-            field_name = trim(field_name + 1);
-            value = trim(value);
-            if (!parse_table_field(value, &field) || *field_name == '\0') {
-                free(schema_value);
-                free(schema.items);
-                free(raw_value);
-                return 1;
-            }
-            memset(&schema, 0, sizeof(schema));
-            add_table_field(&schema, field.kind, field.count);
-            add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, NULL,
-                                        field.kind == TABLE_BYTE ? field_name : NULL,
-                                        field.kind == TABLE_BYTE ? NULL : field_name);
-        } else if (parse_u32(value, &length) && length <= 255u) {
-            add_inline_signature_ex(sigs, has_bank, bank, addr, (unsigned)length, TABLE_BYTE,
-                                    NULL, NULL, NULL);
-        } else {
-            free(schema_value);
-            free(schema.items);
-            free(raw_value);
-            return 1;
-        }
-        free(schema_value);
+    if (!parse_table_schema(value, &schema, types)) {
+        free(schema.items);
+        free(value);
+        return 1;
     }
+    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
     free(schema.items);
-    free(raw_value);
+    free(value);
     return 0;
 }
 
@@ -1273,7 +1308,7 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
     } else if (strcmp(value, "far_string") == 0) {
         add_data_range(ranges, bank, addr, DATA_FAR_STRING, 3);
-    } else if (strcmp(value, "far_data") == 0 || strcmp(value, "far_ptr") == 0) {
+    } else if (strcmp(value, "far_data") == 0) {
         add_data_range(ranges, bank, addr, DATA_FAR_DATA, 3);
     } else if (strcmp(value, "far_table") == 0) {
         add_data_range(ranges, bank, addr, DATA_FAR_TABLE, 3);
@@ -1295,7 +1330,7 @@ int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr)
 }
 
 int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t bank, uint32_t addr,
-                          const char *spec)
+                          const char *spec, const ConfigTypes *types)
 {
     char *value;
     TableSchema schema;
@@ -1309,23 +1344,22 @@ int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t 
     value = dup_string(spec);
     memset(&schema, 0, sizeof(schema));
     add_table_field(&schema, TABLE_PTR16_DATA, 1);
-    if (strcmp(value, "counted_ptr16_string") == 0 || strcmp(value, "counted_ptr16le_string") == 0) {
+    if (strcmp(value, "counted_ptr16_string") == 0) {
         free(schema.items);
         memset(&schema, 0, sizeof(schema));
         add_table_field(&schema, TABLE_PTR16_STRING, 1);
-    } else if (strcmp(value, "counted_ptr16_data") == 0 ||
-               strcmp(value, "counted_ptr16le_data") == 0) {
+    } else if (strcmp(value, "counted_ptr16_data") == 0) {
         free(schema.items);
         memset(&schema, 0, sizeof(schema));
         add_table_field(&schema, TABLE_PTR16_DATA, 1);
     } else if (parse_wrapped_table_format(value, "counted", &inner)) {
         free(schema.items);
         memset(&schema, 0, sizeof(schema));
-        if (!parse_table_schema(inner, &schema) && !schema_def_named(schemas, inner, &schema)) {
+        if (!parse_table_schema(inner, &schema, types) && !schema_def_named(schemas, inner, &schema)) {
             free(value);
             return 1;
         }
-    } else if (parse_rows_table_format(value, &rows, &schema, schemas)) {
+    } else if (parse_rows_table_format(value, &rows, &schema, schemas, types)) {
         has_header = 0;
     } else if (parse_far_code_table_format(value, &rows)) {
         free(schema.items);

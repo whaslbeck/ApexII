@@ -135,7 +135,8 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
         if (i != 0) {
             fputs(", ", out);
         }
-        fputs(table_field_kind_name(schema->items[i].kind), out);
+        fputs(schema->items[i].type_name ? schema->items[i].type_name
+                                         : table_field_kind_name(schema->items[i].kind), out);
         if (schema->items[i].count != 1u) {
             fprintf(out, "[%lu]", (unsigned long)schema->items[i].count);
         }
@@ -144,19 +145,7 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
 
 static void write_inline_signature_value(FILE *out, const InlineSignature *sig)
 {
-    if (sig->schema.count == 1u && sig->schema.items[0].count == 1u && sig->raw_param &&
-        sig->schema.items[0].kind == TABLE_BYTE) {
-        fprintf(out, "byte:%s", sig->raw_param);
-        return;
-    }
-    if (sig->schema.count == 1u && sig->schema.items[0].count == 1u && sig->far_param) {
-        fprintf(out, "%s:%s", table_field_kind_name(sig->schema.items[0].kind), sig->far_param);
-        return;
-    }
     write_table_schema_text(out, &sig->schema);
-    if (sig->alias && *sig->alias) {
-        fprintf(out, ", %s", sig->alias);
-    }
 }
 
 static void write_data_range_value(FILE *out, const DataRange *range)
@@ -278,6 +267,28 @@ static void write_tables_section(FILE *out, const TableDefs *tables)
         write_config_address(out, 1, tables->items[i].bank, tables->items[i].addr);
         fputs(" = ", out);
         write_table_def_value(out, &tables->items[i]);
+        fputc('\n', out);
+    }
+}
+
+static void write_types_section(FILE *out, const ConfigTypes *types)
+{
+    size_t i, j;
+
+    if (types->count == 0) {
+        return;
+    }
+    fputs("\n[types]\n", out);
+    for (i = 0; i < types->count; i++) {
+        const ConfigType *t = &types->items[i];
+        fprintf(out, "%s:%s =", t->name,
+                t->kind == TABLE_BYTE ? "byte" : "word");
+        for (j = 0; j < t->value_count; j++) {
+            if (j > 0) {
+                fputc(',', out);
+            }
+            fprintf(out, " 0x%02x:%s", t->values[j].value, t->values[j].name);
+        }
         fputc('\n', out);
     }
 }
@@ -555,9 +566,6 @@ static void free_inline_signatures(InlineSignatures *sigs)
 
     for (i = 0; i < sigs->count; i++) {
         free_table_schema(&sigs->items[i].schema);
-        free((char *)sigs->items[i].alias);
-        free((char *)sigs->items[i].raw_param);
-        free((char *)sigs->items[i].far_param);
     }
     free(sigs->items);
     memset(sigs, 0, sizeof(*sigs));
@@ -842,7 +850,7 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
     load_config(project->config_path, &project->inline_sigs, &project->config_labels,
                 &project->config_entries, &project->tables, &project->schemas,
                 &project->routine_docs, &project->table_docs, &project->symbols,
-                &project->data_ranges, &project->options);
+                &project->data_ranges, &project->options, &project->config_types);
     validate_config_classification(&project->config_entries, &project->tables,
                                    &project->data_ranges);
 
@@ -881,6 +889,7 @@ void apex_project_free(ApexProject *project)
     free_label_set(&project->system_labels);
     free_reference_set(&project->refs);
     free_inline_signatures(&project->inline_sigs);
+    free_config_types(&project->config_types);
     free_config_labels(&project->config_labels);
     free_config_entries(&project->config_entries);
     free_table_defs(&project->tables);
@@ -1209,7 +1218,7 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
             effective_spec = "counted(ptr16_data)";
         }
         if (config_set_table_spec(&project->tables, &project->schemas, bank, addr,
-                                  effective_spec) != 0) {
+                                  effective_spec, &project->config_types) != 0) {
             return 1;
         }
         break;
@@ -1252,7 +1261,8 @@ int apex_project_set_inline(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project || !spec || !*spec) {
         return 1;
     }
-    if (config_set_inline_spec(&project->inline_sigs, has_bank, bank, addr, spec) != 0) {
+    if (config_set_inline_spec(&project->inline_sigs, has_bank, bank, addr, spec,
+                               &project->config_types) != 0) {
         return 1;
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
@@ -1290,7 +1300,8 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
     if (!project || !spec || !*spec) {
         return 1;
     }
-    if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, spec) != 0) {
+    if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, spec,
+                               &project->config_types) != 0) {
         return 1;
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
@@ -1364,6 +1375,7 @@ int apex_project_save_overlay(const ApexProject *project, const char *path, cons
     if (inc && *inc) {
         fprintf(out, "include = %s\n", basename_ptr(inc));
     }
+    write_types_section(out, &project->config_types);
     write_labels_section(out, &project->config_labels);
     write_entries_section(out, &project->config_entries);
     write_inline_section(out, &project->inline_sigs);
@@ -1375,4 +1387,24 @@ int apex_project_save_overlay(const ApexProject *project, const char *path, cons
         return 1;
     }
     return 0;
+}
+
+int apex_project_set_type(ApexProject *project, const char *name, int is_word,
+                          const char *values_str)
+{
+    if (!project || !name || !*name) {
+        return 1;
+    }
+    TableFieldKind kind = is_word ? TABLE_WORD : TABLE_BYTE;
+    config_set_type(&project->config_types, name, kind, values_str ? values_str : "");
+    apex_project_invalidate(project, APEX_DIRTY_RENDER);
+    return 0;
+}
+
+int apex_project_remove_type(ApexProject *project, const char *name)
+{
+    if (!project || !name) {
+        return 1;
+    }
+    return config_remove_type(&project->config_types, name) ? 0 : 1;
 }

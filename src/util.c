@@ -6,13 +6,21 @@
 #include <stdlib.h>
 #include <string.h>
 
+void (*apex_die_hook)(const char *msg) = NULL;
+
 void die(const char *fmt, ...)
 {
+    char msg[512];
     va_list ap;
 
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
+    if (apex_die_hook) {
+        apex_die_hook(msg);
+        exit(1); /* hook should longjmp; this is a safety fallback */
+    }
+    fputs(msg, stderr);
     fputc('\n', stderr);
     exit(1);
 }

@@ -136,6 +136,9 @@ int main(int argc, char **argv)
     state.show_call_graph    = false;
     state.show_hardware      = false;
     state.show_tables        = false;
+    state.show_inline_list   = false;
+    state.show_entries_list  = false;
+    state.show_types_editor  = false;
     state.show_bookmarks     = true;
     state.show_transitions   = false;
     state.request_layout_reset = true;
@@ -202,6 +205,9 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Call Graph",     NULL, &state.show_call_graph);
                 ImGui::MenuItem("Hardware",       NULL, &state.show_hardware);
                 ImGui::MenuItem("Tables",         NULL, &state.show_tables);
+                ImGui::MenuItem("Inline Sigs",    NULL, &state.show_inline_list);
+                ImGui::MenuItem("Code Entries",   NULL, &state.show_entries_list);
+                ImGui::MenuItem("Types",          NULL, &state.show_types_editor);
                 ImGui::MenuItem("Pattern Search", NULL, &state.show_pattern_search);
                 ImGui::MenuItem("RAM References", NULL, &state.show_ram_refs);
                 ImGui::Separator();
@@ -253,6 +259,9 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Hardware",       dock_bottom_id);
             ImGui::DockBuilderDockWindow("Tables",         dock_bottom_id);
             ImGui::DockBuilderDockWindow("Hex",            dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Inline Sigs",    dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Code Entries",   dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Types",          dock_bottom_id);
             ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
             ImGui::DockBuilderDockWindow("RAM References", dock_bottom_id);
 
@@ -479,6 +488,21 @@ int main(int argc, char **argv)
             render_hardware_window(project, document, &state);
             ImGui::End();
         }
+        if (state.show_types_editor) {
+            ImGui::Begin("Types", &state.show_types_editor);
+            render_types_editor(project, &state);
+            ImGui::End();
+        }
+        if (state.show_inline_list) {
+            ImGui::Begin("Inline Sigs", &state.show_inline_list);
+            render_inline_list(project, document, &state);
+            ImGui::End();
+        }
+        if (state.show_entries_list) {
+            ImGui::Begin("Code Entries", &state.show_entries_list);
+            render_entries_list(project, document, &state);
+            ImGui::End();
+        }
         if (state.show_pattern_search) {
             ImGui::Begin("Pattern Search", &state.show_pattern_search);
             render_pattern_search(project, &document, &state);
@@ -600,8 +624,10 @@ int main(int argc, char **argv)
                     uint8_t b;
                     uint32_t a;
                     if (selected_address(document, &state, &b, &a)) {
-                        apply_data_at_selection(project, &document, &state,
-                            state.edit_spec_input[0] ? state.edit_spec_input : "bytes[1]");
+                        char spec[32];
+                        snprintf(spec, sizeof(spec), "bytes[%d]",
+                                 state.edit_data_length > 0 ? state.edit_data_length : 1);
+                        apply_data_at_selection(project, &document, &state, spec);
                     }
                 }
             }
@@ -613,8 +639,19 @@ int main(int argc, char **argv)
                 }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_T)) {
-                apply_table_at_selection(project, &document, &state,
-                    state.edit_spec_input[0] ? state.edit_spec_input : "counted(ptr16_data)");
+                char spec[320] = "counted(ptr16_data)";
+                if (state.edit_schema_count > 0) {
+                    char schema[256];
+                    fields_to_spec(schema, sizeof(schema),
+                                   state.edit_schema_fields, state.edit_schema_count);
+                    if (state.edit_table_is_rows) {
+                        snprintf(spec, sizeof(spec), "rows[%d](%s)",
+                                 state.edit_table_rows, schema);
+                    } else {
+                        snprintf(spec, sizeof(spec), "counted(%s)", schema);
+                    }
+                }
+                apply_table_at_selection(project, &document, &state, spec);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Equal) ||
                 ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {

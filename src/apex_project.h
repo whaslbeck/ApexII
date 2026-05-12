@@ -41,6 +41,7 @@ typedef struct ApexProject {
     ConfigSymbols symbols;
     DataRanges data_ranges;
     ConfigOptions options;
+    ConfigTypes config_types;
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -79,5 +80,8 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
                            int emit_explain);
 int apex_project_save_overlay(const ApexProject *project, const char *path, const char *include_path);
+int apex_project_set_type(ApexProject *project, const char *name, int is_word,
+                          const char *values_str);
+int apex_project_remove_type(ApexProject *project, const char *name);
 
 #endif
