@@ -522,7 +522,7 @@ void render_global_search(const ApexRenderedDocument *d, UiState *s)
         s->search_results.clear();
         if (s->global_search_input[0]) {
             for (size_t i = 0; i < d->line_count; i++) {
-                if (strcasestr(d->lines[i].text, s->global_search_input)) {
+                if (line_matches_filter(&d->lines[i], s->global_search_input)) {
                     s->search_results.push_back(i);
                 }
             }
