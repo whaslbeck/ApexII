@@ -263,12 +263,13 @@ const InlineSignature *inline_signature_for(const InlineSignatures *sigs, uint8_
 {
     size_t i;
     const InlineSignature *unbanked = NULL;
+    uint8_t callee_bank = (addr >= APEX_SYSTEM_ORG) ? 0xffu : bank;
 
     for (i = 0; i < sigs->count; i++) {
         if (sigs->items[i].addr != addr) {
             continue;
         }
-        if (sigs->items[i].has_bank && sigs->items[i].bank == bank) {
+        if (sigs->items[i].has_bank && sigs->items[i].bank == callee_bank) {
             return &sigs->items[i];
         }
         if (!sigs->items[i].has_bank) {
