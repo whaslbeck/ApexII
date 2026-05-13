@@ -88,7 +88,11 @@ static const uint8_t *locate_asset(const Buffer *rom, uint8_t bank, uint32_t add
 
 static void ensure_dir(const char *path)
 {
+#ifdef _WIN32
+    if (mkdir(path) != 0 && errno != EEXIST) {
+#else
     if (mkdir(path, 0777) != 0 && errno != EEXIST) {
+#endif
         die("failed to create directory %s", path);
     }
 }
