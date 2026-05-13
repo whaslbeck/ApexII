@@ -15,6 +15,20 @@
 
 // --- UI Rendering Helpers (Internal) ---
 
+static bool str_icontains(const char *hay, const char *needle)
+{
+    if (!needle || !*needle) return true;
+    size_t nl = strlen(needle);
+    for (; *hay; hay++) {
+        size_t j;
+        for (j = 0; j < nl; j++) {
+            if (tolower((unsigned char)hay[j]) != tolower((unsigned char)needle[j])) break;
+        }
+        if (j == nl) return true;
+    }
+    return false;
+}
+
 static void render_text_chunk(const char *start, const char *end, const ImVec4 *color)
 {
     if (!start || !end || end <= start) {
@@ -1609,9 +1623,9 @@ void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *
                 snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
                 std::string spec = inline_sig_spec_string(sig);
                 std::string lbl  = label_at_address(d, s, bank, addr);
-                bool match = strcasestr(addrstr, filter) ||
-                             strcasestr(spec.c_str(), filter) ||
-                             (!lbl.empty() && strcasestr(lbl.c_str(), filter));
+                bool match = str_icontains(addrstr, filter) ||
+                             str_icontains(spec.c_str(), filter) ||
+                             (!lbl.empty() && str_icontains(lbl.c_str(), filter));
                 if (!match) continue;
             }
             rows.push_back(i);
@@ -1676,8 +1690,8 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
                 char addrstr[32];
                 snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
                 std::string lbl = label_at_address(d, s, bank, addr);
-                bool match = strcasestr(addrstr, filter) ||
-                             (!lbl.empty() && strcasestr(lbl.c_str(), filter));
+                bool match = str_icontains(addrstr, filter) ||
+                             (!lbl.empty() && str_icontains(lbl.c_str(), filter));
                 if (!match) continue;
             }
             rows.push_back(i);
