@@ -627,20 +627,19 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
         if (apex_render_find_line_by_address(d, r.source_bank, r.source_addr, &li)) {
             rs.push_back({li, r.source_bank, r.source_addr,
                           label_at_address(d, s, r.source_bank, r.source_addr),
-                          r.kind ? r.kind : ""});
+                          r.kind ? r.kind : "",
+                          r.row_index, r.row_cpu_addr});
         }
     }
     std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank) {
-            return a.bank < b.bank;
-        }
-        if (a.cpu_addr != b.cpu_addr) {
-            return a.cpu_addr < b.cpu_addr;
-        }
-        return a.kind < b.kind;
+        if (a.bank != b.bank) return a.bank < b.bank;
+        if (a.cpu_addr != b.cpu_addr) return a.cpu_addr < b.cpu_addr;
+        if (a.kind != b.kind) return a.kind < b.kind;
+        return a.row_index < b.row_index;
     });
     rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
+        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind &&
+               a.row_index == b.row_index;
     }), rs.end());
     return rs;
 }
@@ -658,16 +657,12 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
         if (apex_render_find_line_by_address(d, r.bank, r.addr, &li)) {
             rs.push_back({li, r.bank, r.addr,
                           label_at_address(d, s, r.bank, r.addr),
-                          r.kind ? r.kind : ""});
+                          r.kind ? r.kind : "", -1, 0u});
         }
     }
     std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank) {
-            return a.bank < b.bank;
-        }
-        if (a.cpu_addr != b.cpu_addr) {
-            return a.cpu_addr < b.cpu_addr;
-        }
+        if (a.bank != b.bank) return a.bank < b.bank;
+        if (a.cpu_addr != b.cpu_addr) return a.cpu_addr < b.cpu_addr;
         return a.kind < b.kind;
     });
     rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
@@ -1741,7 +1736,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigSymbols symbols = {};
     DataRanges data_ranges = {};
     ConfigOptions options = {};
-    options.labels_are_entries = 1;
+    options.labels_are_entries = 0;
     ConfigTypes types = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
                 &routine_docs, &table_docs, &symbols, &data_ranges, &options, &types);

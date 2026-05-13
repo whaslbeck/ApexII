@@ -606,15 +606,86 @@ int main(int argc, char **argv)
         }
 
         if (state.show_help) {
-            ImGui::Begin("Help", &state.show_help);
-            ImGui::BulletText("g/l: goto/label; /: filter; j/k: down/up; n/p: next/prev transition");
-            ImGui::BulletText("c/d/s/t: mark code/data/string/table; Del: clear; f/Enter: follow link");
-            ImGui::BulletText("X: XRefs; L/Shift+D: edit label/doc; B: bookmark; +/-: DMD Scrub; 0: reset; m: mark DMD");
-            ImGui::BulletText("Ctrl+S: save overlay; F5: re-analyze; Ctrl+F: global search; Ctrl+C: copy; Shift+Click: range");
-            ImGui::BulletText("Hex View: Click byte to inspect; highlights disassembly selection.");
-            ImGui::BulletText("Pattern Search: search ROM bytes, e.g. 'BD ?? 7E' (?? = wildcard).");
+            ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Keyboard Shortcuts", &state.show_help);
+
+            auto krow = [](const char *keys, const char *desc) {
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::TextDisabled("%s", keys);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(desc);
+            };
+            constexpr ImGuiTableFlags kTableFlags =
+                ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
+
+            ImGui::SeparatorText("Navigate");
+            if (ImGui::BeginTable("##nav", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("J / Down Arrow",     "Move selection down");
+                krow("K / Up Arrow",       "Move selection up");
+                krow("N / P",              "Next / prev code\xe2\x86\x94""data boundary");
+                krow("F / Enter",          "Follow link / jump to target");
+                krow("[ / ]",              "History back / forward");
+                krow("Alt+\xe2\x86\x90 / Alt+\xe2\x86\x92", "History back / forward (alt)");
+                krow("G",                  "Go to address");
+                krow("/",                  "Focus filter bar");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("Classify");
+            if (ImGui::BeginTable("##cls", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("C",    "Mark as code");
+                krow("D",    "Mark as data");
+                krow("S",    "Mark as string");
+                krow("T",    "Mark as table (uses current schema)");
+                krow("Del",  "Clear classification");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("Edit");
+            if (ImGui::BeginTable("##edt", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("L",         "Edit label");
+                krow("Shift+D",   "Edit comment / doc");
+                krow("B",         "Add bookmark");
+                krow("Shift+Click", "Extend selection range");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("View");
+            if (ImGui::BeginTable("##viw", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("X",        "Show incoming XRefs");
+                krow("H",        "Show / hide this window");
+                krow("Ctrl+F",   "Global search");
+                krow("Ctrl+C",   "Copy selection");
+                krow("Ctrl+S",   "Save config overlay");
+                krow("F5",       "Re-analyze");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("DMD Scrub");
+            if (ImGui::BeginTable("##dmd", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("+ / -",    "Advance / rewind 1 byte (Shift: 32)");
+                krow("0",        "Reset offset");
+                krow("M",        "Mark DMD fullframe at current offset");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("Tips");
+            ImGui::BulletText("Hex View: click byte to inspect; syncs with disassembly.");
+            ImGui::BulletText("Pattern Search: e.g.  BD ?? 7E  (?? = any byte).");
             ImGui::BulletText("RAM References: find all instructions accessing a RAM address.");
-            ImGui::BulletText("Alt+Left/Right: history");
+            ImGui::BulletText("Double-click a label token in a ; referenced_by line to navigate.");
+
             ImGui::End();
         }
 

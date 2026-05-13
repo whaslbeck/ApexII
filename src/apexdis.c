@@ -855,6 +855,22 @@ static void emit_db_line(FILE *out, uint32_t addr, const uint8_t *data, size_t c
 static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
                             size_t *pos, size_t count);
 
+/* Count disassembly lines emitted per row for this schema (after byte grouping). */
+static size_t schema_lines_per_row(const TableSchema *schema)
+{
+    size_t lines = 0;
+    size_t i;
+
+    for (i = 0; i < schema->count; i++) {
+        const TableField *f = &schema->items[i];
+        if (f->kind == TABLE_BYTE && !f->type_name)
+            lines += 1; /* grouped into one .DB line regardless of count */
+        else
+            lines += f->count;
+    }
+    return lines;
+}
+
 static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
                             size_t row_width, const Label *labels, size_t label_count,
@@ -863,14 +879,27 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             const ConfigTypes *types)
 {
     size_t row;
+    int multi_line = schema_lines_per_row(&table->schema) > 1;
 
     for (row = 0; row < rows && *pos + row_width <= len; row++) {
         size_t row_start = *pos;
         size_t i;
 
+        if (multi_line)
+            fprintf(out, "; [row %lu]\n", (unsigned long)row);
+
         for (i = 0; i < table->schema.count; i++) {
             size_t n;
             const TableField *field = &table->schema.items[i];
+
+            /* Untyped bytes: group all field->count bytes into one .DB line. */
+            if (field->kind == TABLE_BYTE && !field->type_name) {
+                if (*pos + field->count <= len) {
+                    emit_db_line(out, base_addr + (uint32_t)*pos, data + *pos, field->count);
+                    *pos += field->count;
+                }
+                continue;
+            }
 
             for (n = 0; n < field->count; n++) {
                 TableFieldKind kind = field->kind;
@@ -890,8 +919,6 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             fprintf(out, " %s=0x%02x", field->type_name, byte_val);
                         }
                         fputc('\n', out);
-                    } else {
-                        emit_db_line(out, base_addr + (uint32_t)*pos, data + *pos, 1);
                     }
                     (*pos)++;
                 } else if (kind == TABLE_WORD) {

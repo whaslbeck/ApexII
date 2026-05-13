@@ -79,10 +79,10 @@ static void render_line_text(const ApexRenderedDocument *document, UiState *stat
     }
 }
 
-static void render_dmd_preview(const DmdPreviewInfo &preview)
+static void render_dmd_preview(const DmdPreviewInfo &preview, float max_scale = 6.0f)
 {
     ImVec2 avail = ImGui::GetContentRegionAvail();
-    float scale = std::max(1.0f, std::min(6.0f, avail.x / (float)APEX_DMD_WIDTH));
+    float scale = std::max(1.0f, std::min(max_scale, avail.x / (float)APEX_DMD_WIDTH));
     ImGui::TextUnformatted(preview.title);
     ImGui::Text("Address: B%02x_A%04x  ROM: 0x%06lx",
                 preview.bank, (unsigned)preview.cpu_addr & 0xffffu,
@@ -110,6 +110,46 @@ static void render_dmd_preview(const DmdPreviewInfo &preview)
                                     lit ? IM_COL32(255, 160, 40, 255) : IM_COL32(28, 18, 6, 255));
             }
         }
+    }
+}
+
+/* Render a short disassembly preview of up to kPreviewLines instructions
+   starting at the given ROM offset / CPU address. Used in hover tooltips over
+   data and table blocks to help decide whether to reclassify as code. */
+static void render_disasm_preview(const ApexProject *p, size_t rom_off,
+                                   uint8_t bank, uint32_t cpu_addr)
+{
+    static const int kPreviewLines = 8;
+    if (rom_off >= p->rom.size) return;
+    char title[48];
+    snprintf(title, sizeof(title), "Code preview at B%02x_A%04x",
+             (unsigned)bank, (unsigned)cpu_addr & 0xffffu);
+    ImGui::SeparatorText(title);
+
+    const uint8_t *rom = p->rom.data;
+    size_t pos = rom_off;
+    uint32_t pc = cpu_addr;
+    uint32_t bank_end = (cpu_addr < 0x8000u) ? 0x8000u : 0x10000u;
+
+    for (int i = 0; i < kPreviewLines && pos < p->rom.size; i++) {
+        char mnem[64] = "?";
+        size_t avail = p->rom.size - pos;
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(
+            rom + pos, avail < 8u ? avail : 8u, pc, mnem, sizeof(mnem));
+        if (info.size == 0) break;
+
+        char hx[20] = "";
+        size_t nb = info.size <= 4u ? info.size : 4u;
+        for (size_t b = 0; b < nb; b++) {
+            snprintf(hx + b * 3, sizeof(hx) - b * 3, "%02X ", rom[pos + b]);
+        }
+        if (info.size > 4u) { hx[12] = '.'; hx[13] = '.'; hx[14] = ' '; hx[15] = '\0'; }
+
+        ImGui::Text("  %04X  %-15s %s", (unsigned)pc & 0xffffu, hx, mnem);
+
+        pos += info.size;
+        pc   = (uint32_t)((pc + info.size) & 0xffffu);
+        if ((info.flags & CPU6809_FLOW_STOP) || pc >= bank_end) break;
     }
 }
 
@@ -174,8 +214,9 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 // AllowWhenOverlappedByItem: needed because AllowOverlap+SpanAllColumns means
                 // the text items in columns 1/2 overlap the Selectable and claim HoveredId,
                 // which otherwise makes IsItemHovered() return false for the Selectable.
-                bool row_double_clicked = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && ImGui::IsMouseDoubleClicked(0);
-                bool row_right_clicked  = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && ImGui::IsMouseClicked(1);
+                bool row_hovered        = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem);
+                bool row_double_clicked = row_hovered && ImGui::IsMouseDoubleClicked(0);
+                bool row_right_clicked  = row_hovered && ImGui::IsMouseClicked(1);
                 if (row_right_clicked) {
                     if (!in_range) {
                         select_line(state, line_idx, 0);
@@ -199,6 +240,10 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 bool has_pointer = resolve_pointer_target(project, line, &t_bank, &t_addr, &t_far);
                 if (ImGui::IsItemHovered()) {
                     row_double_clicked |= ImGui::IsMouseDoubleClicked(0);
+                }
+                if (row_hovered &&
+                    (line->kind == APEX_RENDER_LINE_INSTRUCTION ||
+                     has_pointer || line->has_location)) {
                     ImGui::BeginTooltip();
                     if (line->kind == APEX_RENDER_LINE_INSTRUCTION) {
                         char mn[16];
@@ -253,6 +298,11 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             }
                         }
                     }
+                    if (line->has_location &&
+                        (line->block_kind == APEX_RENDER_BLOCK_DATA ||
+                         line->block_kind == APEX_RENDER_BLOCK_TABLE)) {
+                        render_disasm_preview(project, line->rom_addr, line->bank, line->cpu_addr);
+                    }
                     ImGui::EndTooltip();
                 }
                 if (ImGui::BeginPopup("row_context_menu")) {
@@ -299,7 +349,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         }
                         apply_table_at_selection(project, document_ptr, state, spec);
                     }
-                    if (ImGui::MenuItem("Clear Classification", "X")) {
+                    if (ImGui::MenuItem("Clear Classification", "Del")) {
                         clear_kind_at_selection(project, document_ptr, state);
                     }
                     ImGui::Separator();
@@ -478,7 +528,10 @@ void render_xref_popup(ApexProject *p, const ApexRenderedDocument *d, UiState *s
                     ImGui::CloseCurrentPopup();
                 }
                 ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(r.kind.c_str());
+                if (r.row_index >= 0)
+                    ImGui::Text("%s [%d]", r.kind.c_str(), r.row_index);
+                else
+                    ImGui::TextUnformatted(r.kind.c_str());
             }
             ImGui::EndTable();
         }
@@ -757,9 +810,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
 
                 if (ImGui::IsItemHovered()) {
                     ImGui::BeginTooltip();
-                    uint8_t bank;
-                    uint32_t cpu_addr;
-                    if (rom_offset_to_cpu_address(p, o, &bank, &cpu_addr)) {
+                    uint8_t bank = 0;
+                    uint32_t cpu_addr = 0;
+                    bool has_cpu = rom_offset_to_cpu_address(p, o, &bank, &cpu_addr) != 0;
+                    if (has_cpu) {
                         ImGui::Text("B%02x:A%04x  ROM:0x%06lx", bank, cpu_addr, (unsigned long)o);
                     } else {
                         ImGui::Text("ROM:0x%06lx", (unsigned long)o);
@@ -767,6 +821,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     ImGui::Text("$%02X  %u  '%c'", v, v, (v >= 32 && v <= 126) ? (char)v : '.');
                     if (o + 1 < p->rom.size) {
                         ImGui::Text("BE16:$%04X", ((uint16_t)v << 8) | p->rom.data[o + 1]);
+                    }
+                    if (has_cpu) {
+                        size_t li;
+                        bool is_data = !find_line_by_rom_offset(d, o, &li) ||
+                                       d->lines[li].block_kind == APEX_RENDER_BLOCK_DATA ||
+                                       d->lines[li].block_kind == APEX_RENDER_BLOCK_TABLE;
+                        if (is_data) render_disasm_preview(p, o, bank, cpu_addr);
                     }
                     ImGui::EndTooltip();
                 }

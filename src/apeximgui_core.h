@@ -85,6 +85,8 @@ struct RefEntry {
     uint32_t cpu_addr;
     std::string label;
     std::string kind;
+    int row_index;       /* >= 0 for table row refs */
+    uint32_t row_cpu_addr;
 };
 
 struct UiState {

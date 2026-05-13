@@ -845,7 +845,7 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
     memset(project, 0, sizeof(*project));
     project->rom_path = project_dup_string(rom_path);
     project->config_path = config_path ? project_dup_string(config_path) : NULL;
-    project->options.labels_are_entries = 1;
+    project->options.labels_are_entries = 0;
 
     load_config(project->config_path, &project->inline_sigs, &project->config_labels,
                 &project->config_entries, &project->tables, &project->schemas,
