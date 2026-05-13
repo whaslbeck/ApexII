@@ -157,8 +157,11 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         ImGuiSelectableFlags_AllowOverlap)) {
                     handle_line_selection(state, line_idx, ImGui::GetIO().KeyShift);
                 }
-                bool row_double_clicked = ImGui::IsItemHovered() && ImGui::IsMouseDoubleClicked(0);
-                bool row_right_clicked  = ImGui::IsItemHovered() && ImGui::IsMouseClicked(1);
+                // AllowWhenOverlappedByItem: needed because AllowOverlap+SpanAllColumns means
+                // the text items in columns 1/2 overlap the Selectable and claim HoveredId,
+                // which otherwise makes IsItemHovered() return false for the Selectable.
+                bool row_double_clicked = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && ImGui::IsMouseDoubleClicked(0);
+                bool row_right_clicked  = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && ImGui::IsMouseClicked(1);
                 if (row_right_clicked) {
                     if (!in_range) {
                         select_line(state, line_idx, 0);
@@ -795,12 +798,53 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         ImGui::OpenPopup("hex_ctx");
     }
     if (ImGui::BeginPopup("hex_ctx")) {
-        if (ImGui::MenuItem("Mark Code"))   { apply_code_at_selection(p, dp, s); }
-        if (ImGui::MenuItem("Mark Data"))   { apply_data_at_selection(p, dp, s, "bytes[1]"); }
-        if (ImGui::MenuItem("Mark String")) { apply_string_at_selection(p, dp, s); }
-        if (ImGui::MenuItem("Mark Table"))  { apply_table_at_selection(p, dp, s, "counted(ptr16_data)"); }
+        if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {
+            copy_selection_to_clipboard(*dp, s);
+            set_status(s, "copied");
+        }
+        if (ImGui::MenuItem("Mark as Code",   "C")) { apply_code_at_selection(p, dp, s); }
+        if (ImGui::MenuItem("Mark as Data",   "D")) {
+            char spec[32];
+            snprintf(spec, sizeof(spec), "bytes[%d]",
+                     s->edit_data_length > 0 ? s->edit_data_length : 1);
+            apply_data_at_selection(p, dp, s, spec);
+        }
+        if (ImGui::MenuItem("Mark as String", "S")) { apply_string_at_selection(p, dp, s); }
+        if (ImGui::MenuItem("Mark as Table",  "T")) {
+            char spec[320] = "counted(ptr16_data)";
+            if (s->edit_schema_count > 0) {
+                char schema[256];
+                fields_to_spec(schema, sizeof(schema),
+                               s->edit_schema_fields, s->edit_schema_count);
+                if (s->edit_table_is_rows) {
+                    snprintf(spec, sizeof(spec), "rows[%d](%s)", s->edit_table_rows, schema);
+                } else {
+                    snprintf(spec, sizeof(spec), "counted(%s)", schema);
+                }
+            }
+            apply_table_at_selection(p, dp, s, spec);
+        }
+        if (ImGui::MenuItem("Clear Classification", "Del")) { clear_kind_at_selection(p, dp, s); }
         ImGui::Separator();
-        if (ImGui::MenuItem("Clear Kind"))  { clear_kind_at_selection(p, dp, s); }
+        if (ImGui::MenuItem("Edit Label",   "L"))       { s->request_focus_label = 1; }
+        if (ImGui::MenuItem("Edit Comment", "Shift+D")) { s->request_focus_doc = 1; }
+        ImGui::Separator();
+        {
+            uint8_t b; uint32_t a;
+            bool has_addr = selected_address(*dp, s, &b, &a) != 0;
+            if (has_addr && ImGui::MenuItem("Show XRefs", "X")) {
+                s->request_xref_popup = true;
+                s->xref_popup_bank = b;
+                s->xref_popup_addr = a;
+            }
+            if (has_addr && ImGui::MenuItem("Add Bookmark", "B")) {
+                char n[64];
+                snprintf(n, 64, "Bookmark @ B%02x_%04x", b, a);
+                s->bookmarks.push_back({b, a, n});
+                s->request_focus_new_bookmark = 1;
+                set_status(s, "bookmark added");
+            }
+        }
         ImGui::EndPopup();
     }
 
