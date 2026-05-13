@@ -631,8 +631,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
     const int total_rows = (int)((p->rom.size + (size_t)(bytes_per_row - 1)) / (size_t)bytes_per_row);
     const float row_h   = ImGui::GetTextLineHeightWithSpacing();
     const float char_w  = ImGui::CalcTextSize("0").x;
-    /* Layout: "000000: " = 8 chars, then 16 × "xx " (3 chars each), 2-char gap, 16 ASCII chars */
-    const float hex_x0  = char_w * 8.5f;
+    /* Layout: "000000 Bff_Affff: " = 18 chars, then 16 × "xx " (3 chars each), 2-char gap, 16 ASCII chars */
+    const float hex_x0  = char_w * 18.5f;
     const float gap_w   = char_w * 2.0f;
     const float asc_x   = hex_x0 + (float)bytes_per_row * char_w * 3.0f + gap_w;
 
@@ -711,10 +711,24 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         for (int row_idx = clipper.DisplayStart; row_idx < clipper.DisplayEnd; row_idx++) {
             size_t row_start = (size_t)row_idx * (size_t)bytes_per_row;
 
-            /* Address label — buf needs 8 hex digits + ':' + '\0' = 10, use 24 for safety */
-            char addr_buf[24];
-            snprintf(addr_buf, sizeof(addr_buf), "%06lx:", (unsigned long)row_start);
-            ImGui::TextUnformatted(addr_buf);
+            /* Address label: ROM offset + virtual bank/CPU address */
+            {
+                uint8_t vbank; uint32_t vcpu;
+                char addr_buf[32];
+                if (rom_offset_to_cpu_address(p, row_start, &vbank, &vcpu)) {
+                    if (vbank == 0xffu) {
+                        snprintf(addr_buf, sizeof(addr_buf), "%06lx Bff_A%04x:",
+                                 (unsigned long)row_start, (unsigned)vcpu);
+                    } else {
+                        snprintf(addr_buf, sizeof(addr_buf), "%06lx B%02x_A%04x:",
+                                 (unsigned long)row_start, (unsigned)vbank, (unsigned)vcpu);
+                    }
+                } else {
+                    snprintf(addr_buf, sizeof(addr_buf), "%06lx            :",
+                             (unsigned long)row_start);
+                }
+                ImGui::TextDisabled("%s", addr_buf);
+            }
 
             /* Hex bytes */
             for (int col = 0; col < bytes_per_row; col++) {

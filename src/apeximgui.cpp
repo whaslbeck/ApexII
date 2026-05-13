@@ -186,6 +186,11 @@ int main(int argc, char **argv)
                 if (ImGui::MenuItem("Save Overlay", "Ctrl+S")) {
                     state.request_save_overlay = 1;
                 }
+                if (ImGui::MenuItem("Re-analyze", "F5")) {
+                    uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
+                    selected_address(document, &state, &cur_b, &cur_a);
+                    rerender_and_reselect(project, &document, &state, cur_b, cur_a);
+                }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Alt+F4")) {
                     if (state.overlay_dirty) { want_quit = true; } else { done = true; }
@@ -596,7 +601,7 @@ int main(int argc, char **argv)
             ImGui::BulletText("g/l: goto/label; /: filter; j/k: down/up; n/p: next/prev transition");
             ImGui::BulletText("c/d/s/t: mark code/data/string/table; Del: clear; f/Enter: follow link");
             ImGui::BulletText("X: XRefs; L/Shift+D: edit label/doc; B: bookmark; +/-: DMD Scrub; 0: reset; m: mark DMD");
-            ImGui::BulletText("Ctrl+S: save overlay; Ctrl+F: global search; Ctrl+C: copy; Shift+Click: range");
+            ImGui::BulletText("Ctrl+S: save overlay; F5: re-analyze; Ctrl+F: global search; Ctrl+C: copy; Shift+Click: range");
             ImGui::BulletText("Hex View: Click byte to inspect; highlights disassembly selection.");
             ImGui::BulletText("Pattern Search: search ROM bytes, e.g. 'BD ?? 7E' (?? = wildcard).");
             ImGui::BulletText("RAM References: find all instructions accessing a RAM address.");
@@ -726,6 +731,11 @@ int main(int argc, char **argv)
             }
             if (ImGui::IsKeyPressed(ImGuiKey_Delete)) {
                 clear_kind_at_selection(project, &document, &state);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+                uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
+                selected_address(document, &state, &cur_b, &cur_a);
+                rerender_and_reselect(project, &document, &state, cur_b, cur_a);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_F) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
                 if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F)) {

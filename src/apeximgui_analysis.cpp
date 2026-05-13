@@ -15,9 +15,17 @@ static std::string line_target_search_text(const ApexRenderedLine *line)
 {
     std::string text = line_to_string(line);
     size_t cp = text.find(';');
-    if (cp != std::string::npos) {
-        text.resize(cp);
+    if (cp == std::string::npos) {
+        return text;
     }
+    // Keep the full text for "; referenced_by ..." comment lines so that the
+    // label tokens inside (e.g. "code:B20_A4007") are reachable by double-click.
+    const char *after = text.c_str() + cp + 1;
+    while (*after == ' ' || *after == '\t') after++;
+    if (strncmp(after, "referenced_by", 13) == 0) {
+        return text;
+    }
+    text.resize(cp);
     return text;
 }
 
@@ -836,6 +844,7 @@ void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiSt
     if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
+        s->selection_end = li;
         s->request_scroll_to_selection = 1;
         s->editor_bound_line = (size_t)-1;
         s->suppress_history_push = 0;
