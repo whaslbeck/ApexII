@@ -518,6 +518,7 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
             p++;
         }
         size_t en = p;
+        bool matched = false;
         for (auto &e : s->cached_labels) {
             if (e.name.size() != en - st ||
                 strncasecmp(t.data() + st, e.name.data(), en - st) != 0) {
@@ -534,6 +535,29 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
             }
             if (!dupe) {
                 ts.push_back({e.line_index, e.bank, e.cpu_addr, e.name, st});
+                matched = true;
+            }
+        }
+        /* Fallback for Bxx_Ayyyy address tokens not in the label index (e.g. table
+           row addresses embedded in "; referenced_by ... line:N[Bxx_Ayyyy]"). */
+        if (!matched && en - st == 9) {
+            unsigned tok_bank = 0, tok_addr = 0;
+            char tok_buf[10];
+            memcpy(tok_buf, t.data() + st, 9);
+            tok_buf[9] = '\0';
+            if (sscanf(tok_buf, "B%2x_A%4x", &tok_bank, &tok_addr) == 2) {
+                size_t tli = 0;
+                if (apex_render_find_line_by_address(d, (uint8_t)tok_bank,
+                                                     (uint32_t)tok_addr, &tli)) {
+                    bool dupe = false;
+                    for (auto &ti : ts) {
+                        if (ti.line_index == tli) { dupe = true; break; }
+                    }
+                    if (!dupe) {
+                        ts.push_back({tli, (uint8_t)tok_bank, (uint32_t)tok_addr,
+                                      std::string(tok_buf), st});
+                    }
+                }
             }
         }
     }
@@ -2006,6 +2030,97 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     return 1;
 }
 
+int write_full_config(const ApexProject *p, const char *path, std::string *st)
+{
+    FILE *o = fopen(path, "w");
+    if (!o) {
+        *st = "open failed";
+        return -1;
+    }
+    fputs("; Apex ImGui config\n", o);
+    if (p->config_types.count > 0) {
+        fputs("\n[types]\n", o);
+        for (size_t i = 0; i < p->config_types.count; i++) {
+            const ConfigType *ct = &p->config_types.items[i];
+            fprintf(o, "%s:%s =", ct->name, (ct->kind == TABLE_WORD) ? "word" : "byte");
+            for (size_t j = 0; j < ct->value_count; j++) {
+                if (j > 0) fputc(',', o);
+                fprintf(o, " 0x%02x:%s", ct->values[j].value, ct->values[j].name);
+            }
+            fputc('\n', o);
+        }
+    }
+    if (p->config_labels.count > 0) {
+        fputs("\n[labels]\n", o);
+        for (size_t i = 0; i < p->config_labels.count; i++) {
+            write_config_address(o, p->config_labels.items[i].has_bank,
+                                 p->config_labels.items[i].bank,
+                                 p->config_labels.items[i].addr);
+            fputs(" = ", o);
+            write_escaped_value(o, p->config_labels.items[i].name);
+            fputc('\n', o);
+        }
+    }
+    if (p->config_entries.count > 0) {
+        fputs("\n[entries]\n", o);
+        for (size_t i = 0; i < p->config_entries.count; i++) {
+            write_config_address(o, p->config_entries.items[i].has_bank,
+                                 p->config_entries.items[i].bank,
+                                 p->config_entries.items[i].addr);
+            fputs(" = code\n", o);
+        }
+    }
+    if (p->inline_sigs.count > 0) {
+        fputs("\n[inline]\n", o);
+        for (size_t i = 0; i < p->inline_sigs.count; i++) {
+            write_config_address(o, p->inline_sigs.items[i].has_bank,
+                                 p->inline_sigs.items[i].bank,
+                                 p->inline_sigs.items[i].addr);
+            fprintf(o, " = %s\n", inline_sig_spec_string(&p->inline_sigs.items[i]).c_str());
+        }
+    }
+    if (p->data_ranges.count > 0) {
+        fputs("\n[data]\n", o);
+        for (size_t i = 0; i < p->data_ranges.count; i++) {
+            write_config_address(o, 1, p->data_ranges.items[i].bank,
+                                 p->data_ranges.items[i].addr);
+            fprintf(o, " = %s\n", data_range_spec_string(&p->data_ranges.items[i]).c_str());
+        }
+    }
+    if (p->tables.count > 0) {
+        fputs("\n[tables]\n", o);
+        for (size_t i = 0; i < p->tables.count; i++) {
+            write_config_address(o, 1, p->tables.items[i].bank, p->tables.items[i].addr);
+            fprintf(o, " = %s\n", table_def_spec_string(&p->tables.items[i]).c_str());
+        }
+    }
+    if (p->routine_docs.count > 0) {
+        fputs("\n[routine_docs]\n", o);
+        for (size_t i = 0; i < p->routine_docs.count; i++) {
+            write_config_address(o, p->routine_docs.items[i].has_bank,
+                                 p->routine_docs.items[i].bank,
+                                 p->routine_docs.items[i].addr);
+            fputs(" = ", o);
+            write_escaped_value(o, p->routine_docs.items[i].text);
+            fputc('\n', o);
+        }
+    }
+    if (p->table_docs.count > 0) {
+        fputs("\n[table_docs]\n", o);
+        for (size_t i = 0; i < p->table_docs.count; i++) {
+            write_config_address(o, p->table_docs.items[i].has_bank,
+                                 p->table_docs.items[i].bank,
+                                 p->table_docs.items[i].addr);
+            fputs(" = ", o);
+            write_escaped_value(o, p->table_docs.items[i].text);
+            fputc('\n', o);
+        }
+    }
+    fclose(o);
+    *st = "saved full config";
+    return 1;
+}
+
 std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input)
 {
     /* Parse space-separated hex tokens; '??' is a wildcard byte. */
@@ -2082,16 +2197,20 @@ std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const ch
     }
     addr_val &= 0xFFFF;
 
-    /* Build canonical search strings. The assembler emits uppercase $XXXX / $XX. */
-    char ext4[8];
-    snprintf(ext4, sizeof(ext4), "$%04X", addr_val);
+    /* Build canonical search strings matching the disassembler's output format.
+       cpu6809_disassemble_info_ex uses:
+         extended:   "0x%04x"   e.g. "0x037f"
+         direct:     "<0x%02x"  e.g. "<0x7f"   (always has < prefix) */
+    char ext4[10];
+    snprintf(ext4, sizeof(ext4), "0x%04x", addr_val);
     size_t ext_len = strlen(ext4);
 
-    char dir2[6];
+    /* For addr < 0x100 only: direct-page form <0xXX assumes DP=0x00. */
+    char dir2[9];
     size_t dir_len = 0;
     bool check_direct = (addr_val < 0x100);
     if (check_direct) {
-        snprintf(dir2, sizeof(dir2), "$%02X", addr_val);
+        snprintf(dir2, sizeof(dir2), "<0x%02x", addr_val);
         dir_len = strlen(dir2);
     }
 
@@ -2104,7 +2223,7 @@ std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const ch
         size_t len = line->length;
         bool found = false;
 
-        /* Search for 4-digit extended address ($XXXX), case-insensitive. */
+        /* Search for extended address (0xXXXX), case-insensitive. */
         for (size_t pos = 0; pos + ext_len <= len && !found; pos++) {
             if (strncasecmp(text + pos, ext4, ext_len) == 0) {
                 size_t end = pos + ext_len;
@@ -2115,7 +2234,7 @@ std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const ch
             }
         }
 
-        /* Search for 2-digit direct-page address ($XX), case-insensitive. */
+        /* Search for direct-page address (<0xXX), case-insensitive. */
         if (!found && check_direct) {
             for (size_t pos = 0; pos + dir_len <= len && !found; pos++) {
                 if (strncasecmp(text + pos, dir2, dir_len) == 0) {

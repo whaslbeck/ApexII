@@ -13,6 +13,7 @@ UNAME_S := $(shell uname -s 2>/dev/null)
 COMMON_OBJS := $(BUILD_DIR)/cpu6809.o $(BUILD_DIR)/util.o
 APEXDIS_CORE_OBJS := $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
 APEXDMD_OBJS := $(COMMON_OBJS) $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o
+APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
 
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 APEXIMGUI_SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
@@ -42,9 +43,9 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
 
-apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd
+apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -94,6 +95,9 @@ $(BUILD_DIR)/project_api_test: $(BUILD_DIR)/project_api_test.o $(APEXDIS_CORE_OB
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexdmd_test: $(BUILD_DIR)/apexdmd_test.o $(BUILD_DIR)/apexdmd.o $(COMMON_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/apexini: $(APEXINI_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(COMMON_OBJS)

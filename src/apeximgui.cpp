@@ -38,6 +38,7 @@ int main(int argc, char **argv)
     UiState state = {};
     bool done = false;
     bool want_quit = false;
+    bool want_consolidate = false;
     char rom_path[1024] = "";
     char config_path[1024] = "";
 
@@ -190,6 +191,14 @@ int main(int argc, char **argv)
                     uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
                     selected_address(document, &state, &cur_b, &cur_a);
                     rerender_and_reselect(project, &document, &state, cur_b, cur_a);
+                }
+                {
+                    bool has_base = state.base_config_path[0] != '\0';
+                    if (!has_base) ImGui::BeginDisabled();
+                    if (ImGui::MenuItem("Consolidate into Base INI")) {
+                        want_consolidate = true;
+                    }
+                    if (!has_base) ImGui::EndDisabled();
                 }
                 ImGui::Separator();
                 if (ImGui::MenuItem("Exit", "Alt+F4")) {
@@ -775,6 +784,43 @@ int main(int argc, char **argv)
             ImGui::SameLine();
             if (ImGui::Button("Exit Without Saving")) {
                 done = true;
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::SameLine();
+            if (ImGui::Button("Cancel")) {
+                ImGui::CloseCurrentPopup();
+            }
+            ImGui::EndPopup();
+        }
+
+        if (want_consolidate) {
+            ImGui::OpenPopup("Consolidate##consolidate");
+            want_consolidate = false;
+        }
+        if (ImGui::BeginPopupModal("Consolidate##consolidate", NULL,
+                                   ImGuiWindowFlags_AlwaysAutoResize)) {
+            ImGui::Text("Overwrite base INI with merged state:");
+            ImGui::TextDisabled("%s", state.base_config_path);
+            ImGui::TextUnformatted("The overlay will be reset to empty.");
+            ImGui::Separator();
+            if (ImGui::Button("Consolidate")) {
+                std::string st;
+                if (write_full_config(project, state.base_config_path, &st) > 0) {
+                    original_snapshot = build_original_snapshot(project);
+                    /* Reset overlay to an empty stub so it no longer diverges */
+                    FILE *ov = fopen(state.save_path_input, "w");
+                    if (ov) {
+                        const char *bp = strrchr(state.base_config_path, '/');
+                        if (!bp) bp = strrchr(state.base_config_path, '\\');
+                        const char *base_name = bp ? bp + 1 : state.base_config_path;
+                        fprintf(ov, "; Apex ImGui overlay\ninclude = %s\n", base_name);
+                        fclose(ov);
+                    }
+                    state.overlay_dirty = false;
+                    set_status(&state, "consolidated into base INI");
+                } else {
+                    set_status(&state, ("consolidate failed: " + st).c_str());
+                }
                 ImGui::CloseCurrentPopup();
             }
             ImGui::SameLine();

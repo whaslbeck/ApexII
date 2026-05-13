@@ -167,6 +167,46 @@ void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t sour
     refs->items[refs->count].source_addr = source_addr;
     refs->items[refs->count].kind = kind;
     refs->items[refs->count].source = source;
+    refs->items[refs->count].row_index = -1;
+    refs->items[refs->count].row_cpu_addr = 0;
+    refs->count++;
+}
+
+void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
+                              uint8_t source_bank, uint32_t source_addr, const char *source,
+                              int row_index, uint32_t row_cpu_addr)
+{
+    size_t i;
+
+    if (!refs || !source) {
+        return;
+    }
+    for (i = 0; i < refs->count; i++) {
+        if (refs->items[i].bank == bank && refs->items[i].addr == addr &&
+            refs->items[i].source_bank == source_bank &&
+            refs->items[i].source_addr == source_addr &&
+            refs->items[i].row_index == row_index) {
+            return;
+        }
+    }
+    if (refs->count == refs->cap) {
+        size_t new_cap = refs->cap == 0 ? 64 : refs->cap * 2;
+        Reference *new_items = realloc(refs->items, new_cap * sizeof(refs->items[0]));
+
+        if (!new_items) {
+            die("out of memory");
+        }
+        refs->items = new_items;
+        refs->cap = new_cap;
+    }
+    refs->items[refs->count].bank = bank;
+    refs->items[refs->count].addr = addr;
+    refs->items[refs->count].source_bank = source_bank;
+    refs->items[refs->count].source_addr = source_addr;
+    refs->items[refs->count].kind = "table";
+    refs->items[refs->count].source = source;
+    refs->items[refs->count].row_index = row_index;
+    refs->items[refs->count].row_cpu_addr = row_cpu_addr;
     refs->count++;
 }
 

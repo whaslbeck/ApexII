@@ -140,15 +140,26 @@ static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t 
             for (j = 0; j < i; j++) {
                 if (refs->items[j].bank == bank && refs->items[j].addr == addr &&
                     strcmp(refs->items[j].kind, refs->items[i].kind) == 0 &&
-                    strcmp(refs->items[j].source, refs->items[i].source) == 0) {
+                    strcmp(refs->items[j].source, refs->items[i].source) == 0 &&
+                    refs->items[j].row_index == refs->items[i].row_index) {
                     break;
                 }
             }
             if (j != i) {
                 continue;
             }
-            fprintf(out, "%s%s:%s", emitted ? ", " : "; referenced_by ", refs->items[i].kind,
-                    refs->items[i].source);
+            if (refs->items[i].row_index >= 0) {
+                /* table reference with row info: emit row index and row address */
+                uint32_t rc = refs->items[i].row_cpu_addr;
+                uint8_t rb = refs->items[i].source_bank;
+                fprintf(out, "%stable:%s line:%d[B%02x_A%04x]",
+                        emitted ? ", " : "; referenced_by ",
+                        refs->items[i].source, refs->items[i].row_index,
+                        (unsigned)rb, (unsigned)rc & 0xffffu);
+            } else {
+                fprintf(out, "%s%s:%s", emitted ? ", " : "; referenced_by ",
+                        refs->items[i].kind, refs->items[i].source);
+            }
             emitted = 1;
         }
     }
@@ -1673,7 +1684,7 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
                                      size_t *pos, uint8_t current_bank,
                                      const uint8_t *paged_rom, size_t banks, LabelSet *bank_labels,
                                      LabelSet *system_labels, const char *source,
-                                     ReferenceSet *refs)
+                                     ReferenceSet *refs, size_t row_index, uint32_t row_cpu_addr)
 {
     size_t row_start = *pos;
     size_t i;
@@ -1702,13 +1713,14 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
                 apply_table_far_label(kind, paged_rom, banks, bank_labels, system_labels, addr,
                                       bank);
                 if (bank == 0xffu && in_system_addr(addr)) {
-                    add_reference(refs, 0xff, addr, table->bank, table->addr, "table", source);
+                    add_table_row_reference(refs, 0xff, addr, table->bank, table->addr,
+                                            source, (int)row_index, row_cpu_addr);
                 } else {
                     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
                     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
                         target_bank = bank_id_for_index(paged_rom, bank_index);
-                        add_reference(refs, target_bank, addr, table->bank, table->addr, "table",
-                                      source);
+                        add_table_row_reference(refs, target_bank, addr, table->bank, table->addr,
+                                                source, (int)row_index, row_cpu_addr);
                     }
                 }
                 *pos += 3u;
@@ -1724,12 +1736,13 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
 
                     if (bank_index >= 0) {
                         apply_table_ptr16_label(kind, &bank_labels[bank_index], current_bank, ptr);
-                        add_reference(refs, current_bank, ptr, table->bank, table->addr, "table",
-                                      source);
+                        add_table_row_reference(refs, current_bank, ptr, table->bank, table->addr,
+                                                source, (int)row_index, row_cpu_addr);
                     }
                 } else if (in_system_addr(ptr)) {
                     apply_system_ptr16_label(kind, system_labels, ptr, "table");
-                    add_reference(refs, 0xff, ptr, table->bank, table->addr, "table", source);
+                    add_table_row_reference(refs, 0xff, ptr, table->bank, table->addr,
+                                            source, (int)row_index, row_cpu_addr);
                 }
                 *pos += 2u;
             }
@@ -1783,9 +1796,10 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
             }
             for (row = 0; row < count && pos + row_width <= used; row++) {
                 size_t row_pos = pos;
+                uint32_t row_cpu = (uint32_t)(APEX_SYSTEM_ORG + row_pos);
 
                 apply_table_field_labels(table, bank, used, &pos, table->bank, paged_rom, banks,
-                                         bank_labels, system_labels, source, refs);
+                                         bank_labels, system_labels, source, refs, row, row_cpu);
                 pos = row_pos + row_width;
             }
             continue;
@@ -1809,9 +1823,10 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
             row_width = (uint8_t)table_schema_width(&table->schema);
             for (row = 0; row < table->rows && pos + row_width <= used; row++) {
                 size_t row_pos = pos;
+                uint32_t row_cpu = (uint32_t)(APEX_PAGED_ORG + row_pos);
 
                 apply_table_field_labels(table, bank, used, &pos, table->bank, paged_rom, banks,
-                                         bank_labels, system_labels, source, refs);
+                                         bank_labels, system_labels, source, refs, row, row_cpu);
                 pos = row_pos + row_width;
             }
             continue;
@@ -1824,9 +1839,10 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
         pos += 3u;
         for (row = 0; row < count && pos + row_width <= used; row++) {
             size_t row_pos = pos;
+            uint32_t row_cpu = (uint32_t)(APEX_PAGED_ORG + row_pos);
 
             apply_table_field_labels(table, bank, used, &pos, table->bank, paged_rom, banks,
-                                     bank_labels, system_labels, source, refs);
+                                     bank_labels, system_labels, source, refs, row, row_cpu);
             pos = row_pos + row_width;
         }
     }

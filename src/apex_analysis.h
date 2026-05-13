@@ -47,6 +47,8 @@ typedef struct {
     uint32_t source_addr;
     const char *kind;
     const char *source;
+    int row_index;      /* >= 0 for table row refs, -1 otherwise */
+    uint32_t row_cpu_addr; /* CPU address of the row entry within the table */
 } Reference;
 
 typedef struct {
@@ -67,6 +69,9 @@ void explain_label_kind(Label *label, const char *source);
 void mark_label_data(Label *label);
 void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
                    uint32_t source_addr, const char *kind, const char *source);
+void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
+                              uint8_t source_bank, uint32_t source_addr, const char *source,
+                              int row_index, uint32_t row_cpu_addr);
 size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_bank,
                                            uint32_t source_start, uint32_t source_end);
 size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
