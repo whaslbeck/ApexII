@@ -132,8 +132,11 @@ struct UiState {
 
     size_t hex_selected_offset;
     bool hex_active;
+    bool hex_window_focused;
     int hex_request_follow;
     size_t hex_prev_selected_line;
+    char hex_search_input[64];
+    int request_focus_hex_search;
 
     bool show_navigator;
     bool show_labels;
@@ -174,9 +177,16 @@ struct UiState {
     std::vector<size_t> ram_ref_results;
     int request_focus_ram_refs;
 
+    bool show_ref_exclusions;
+    bool show_rom_map;
+
     bool refs_pinned;
     uint8_t refs_pinned_bank;
     uint32_t refs_pinned_addr;
+
+    bool graph_pinned;
+    uint8_t graph_pinned_bank;
+    uint32_t graph_pinned_addr;
 
     bool overlay_dirty;
 };
@@ -234,6 +244,7 @@ struct SnapshotType {
 struct OriginalSnapshot {
     std::vector<SnapshotLabel> labels;
     std::vector<SnapshotEntry> entries;
+    std::vector<SnapshotEntry> ref_exclusions;
     std::vector<SnapshotData> data;
     std::vector<SnapshotTable> tables;
     std::vector<SnapshotDoc> routine_docs;
@@ -386,5 +397,9 @@ std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *i
 std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const char *addr_input);
 void render_pattern_search(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+
+// Analysis: Ref Exclusions
+void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 #endif

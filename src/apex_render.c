@@ -63,6 +63,9 @@ static ApexRenderedBlockKind parse_block_name(const char *name, size_t length)
     if (length == 5 && memcmp(name, "table", 5) == 0) {
         return APEX_RENDER_BLOCK_TABLE;
     }
+    if (length == 12 && memcmp(name, "unclassified", 12) == 0) {
+        return APEX_RENDER_BLOCK_UNCLASSIFIED;
+    }
     return APEX_RENDER_BLOCK_UNKNOWN;
 }
 
@@ -83,7 +86,15 @@ static ApexRenderedBlockKind parse_transition_target_block(const char *text, siz
         }
     }
     if (i + 4 > length) {
-        return APEX_RENDER_BLOCK_UNKNOWN;
+        /* No "_to_" found — check if comment starts with a plain block name
+           (e.g. "; code bank=..." emitted for the first block in a bank). */
+        const char *kw = text + 2;
+        size_t rem    = length - 2;
+        size_t klen   = 0;
+        while (klen < rem && kw[klen] != ' ' && kw[klen] != '\t') {
+            klen++;
+        }
+        return parse_block_name(kw, klen);
     }
     while (start + name_len < length && text[start + name_len] != ' ' &&
            text[start + name_len] != '\t') {
@@ -116,6 +127,24 @@ static ApexRenderedTransitionKind parse_transition_kind(const char *text, size_t
     }
     if (length >= 13 && memcmp(text, "data_to_table", 13) == 0) {
         return APEX_RENDER_TRANSITION_DATA_TO_TABLE;
+    }
+    if (length >= 20 && memcmp(text, "code_to_unclassified", 20) == 0) {
+        return APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED;
+    }
+    if (length >= 20 && memcmp(text, "unclassified_to_code", 20) == 0) {
+        return APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_CODE;
+    }
+    if (length >= 21 && memcmp(text, "table_to_unclassified", 21) == 0) {
+        return APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED;
+    }
+    if (length >= 21 && memcmp(text, "unclassified_to_table", 21) == 0) {
+        return APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_TABLE;
+    }
+    if (length >= 20 && memcmp(text, "data_to_unclassified", 20) == 0) {
+        return APEX_RENDER_TRANSITION_DATA_TO_UNCLASSIFIED;
+    }
+    if (length >= 20 && memcmp(text, "unclassified_to_data", 20) == 0) {
+        return APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_DATA;
     }
     return APEX_RENDER_TRANSITION_NONE;
 }

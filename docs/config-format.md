@@ -46,9 +46,9 @@ labels_are_entries = false
 
 | Option | Default | Meaning |
 |---|---|---|
-| `labels_are_entries` | `true` | When `true`, every `[labels]` entry is also treated as a code entry point. Set to `false` for fine-grained control via `[entries]`. |
+| `labels_are_entries` | `false` | When `true`, every `[labels]` entry is also treated as a code entry point. Leave `false` for fine-grained control via `[entries]`. |
 
-Recommended: set `false` for new configs so that labels and classification are independent.
+Recommended: keep the default (`false`) so that labels and code classification are independent.
 
 ### `[labels]`
 
@@ -76,6 +76,21 @@ B38_A5100 = code
 ```
 
 The value must be `code` or may be left empty. When `labels_are_entries = false`, this is the only way to classify addresses as code other than following flow from reset vectors.
+
+### `[exclude_refs]`
+
+Suppresses speculative code references to the listed addresses. The analyser normally records a "code" cross-reference whenever it encounters an instruction whose immediate operand happens to be a valid in-ROM address (e.g. `LDD #$4000`). If that operand is not actually a pointer — just a register value or constant — the resulting reference is a false positive. Listing the target address here prevents it from being recorded.
+
+```ini
+[exclude_refs]
+B3d_A784b = 1
+Bff_A9000 = 1
+0x8990    = 1
+```
+
+The value on the right-hand side is ignored; `1` is conventional. Bank-qualified and bare-address forms are both accepted.
+
+This section has no effect on references that arise from actual branch or jump instructions — those are always recorded regardless.
 
 ### `[inline]`
 

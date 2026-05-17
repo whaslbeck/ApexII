@@ -328,7 +328,8 @@ void select_line(UiState *s, size_t i, int r)
     }
     s->selected_line = i;
     s->selection_end = i;
-    s->graph_needs_rebuild = true;
+    if (!s->graph_pinned)
+        s->graph_needs_rebuild = true;
 }
 
 void handle_line_selection(UiState *s, size_t i, bool sh)
@@ -361,7 +362,8 @@ void history_jump(UiState *s, int b)
     s->suppress_history_push = 1;
     s->selected_line = t;
     s->request_scroll_to_selection = 1;
-    s->graph_needs_rebuild = true;
+    if (!s->graph_pinned)
+        s->graph_needs_rebuild = true;
     s->suppress_history_push = 0;
 }
 
@@ -692,7 +694,10 @@ void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *
 {
     uint8_t b;
     uint32_t a;
-    if (!selected_address(d, s, &b, &a)) {
+    if (s->graph_pinned) {
+        b = s->graph_pinned_bank;
+        a = s->graph_pinned_addr;
+    } else if (!selected_address(d, s, &b, &a)) {
         return;
     }
     s->graph_nodes.clear();
@@ -776,7 +781,9 @@ void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
     if (f) {
         for (size_t i = s->selected_line + 1; i < d->line_count; i++) {
             if (d->lines[i].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA ||
-                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA) {
+                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA ||
+                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED ||
+                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED) {
                 select_line(s, i, 1);
                 return;
             }
@@ -784,7 +791,9 @@ void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
     } else {
         for (size_t i = s->selected_line + 1; i > 0; i--) {
             if (d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA ||
-                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA) {
+                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA ||
+                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED ||
+                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED) {
                 select_line(s, i - 1, 1);
                 return;
             }
@@ -1057,8 +1066,19 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
     for (auto &bm : s->bookmarks) {
         fprintf(f, "bookmark=0x%02x:%04x:%s\n", bm.bank, bm.addr, bm.name.c_str());
     }
-    fprintf(f, "show_types=%d\nshow_inline_list=%d\nshow_entries_list=%d\n",
-            s->show_types_editor, s->show_inline_list, s->show_entries_list);
+    fprintf(f,
+            "show_navigator=%d\nshow_disasm=%d\nshow_labels=%d\nshow_banks=%d\n"
+            "show_bookmarks=%d\nshow_transitions=%d\nshow_details=%d\nshow_refs=%d\n"
+            "show_dmd=%d\nshow_edit=%d\nshow_hex=%d\nshow_call_graph=%d\n"
+            "show_hardware=%d\nshow_tables=%d\nshow_types=%d\nshow_inline_list=%d\n"
+            "show_entries_list=%d\nshow_pattern_search=%d\nshow_ram_refs=%d\n"
+            "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n",
+            s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
+            s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
+            s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
+            s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
+            s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
+            s->show_ref_exclusions, s->show_search_window, s->show_rom_map);
     fclose(f);
 }
 
@@ -1147,12 +1167,50 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             if (sscanf(l + 9, "0x%x:%x:%255[^\r\n]", &b, &a, n) == 3) {
                 s->bookmarks.push_back({(uint8_t)b, (uint32_t)a, n});
             }
+        } else if (strncmp(l, "show_navigator=", 15) == 0) {
+            s->show_navigator = atoi(l + 15) != 0;
+        } else if (strncmp(l, "show_disasm=", 12) == 0) {
+            s->show_disasm = atoi(l + 12) != 0;
+        } else if (strncmp(l, "show_labels=", 12) == 0) {
+            s->show_labels = atoi(l + 12) != 0;
+        } else if (strncmp(l, "show_banks=", 11) == 0) {
+            s->show_banks = atoi(l + 11) != 0;
+        } else if (strncmp(l, "show_bookmarks=", 15) == 0) {
+            s->show_bookmarks = atoi(l + 15) != 0;
+        } else if (strncmp(l, "show_transitions=", 17) == 0) {
+            s->show_transitions = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_details=", 13) == 0) {
+            s->show_details = atoi(l + 13) != 0;
+        } else if (strncmp(l, "show_refs=", 10) == 0) {
+            s->show_refs = atoi(l + 10) != 0;
+        } else if (strncmp(l, "show_dmd=", 9) == 0) {
+            s->show_dmd = atoi(l + 9) != 0;
+        } else if (strncmp(l, "show_edit=", 10) == 0) {
+            s->show_edit = atoi(l + 10) != 0;
+        } else if (strncmp(l, "show_hex=", 9) == 0) {
+            s->show_hex = atoi(l + 9) != 0;
+        } else if (strncmp(l, "show_call_graph=", 16) == 0) {
+            s->show_call_graph = atoi(l + 16) != 0;
+        } else if (strncmp(l, "show_hardware=", 14) == 0) {
+            s->show_hardware = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_tables=", 12) == 0) {
+            s->show_tables = atoi(l + 12) != 0;
         } else if (strncmp(l, "show_types=", 11) == 0) {
             s->show_types_editor = atoi(l + 11) != 0;
         } else if (strncmp(l, "show_inline_list=", 17) == 0) {
             s->show_inline_list = atoi(l + 17) != 0;
         } else if (strncmp(l, "show_entries_list=", 18) == 0) {
             s->show_entries_list = atoi(l + 18) != 0;
+        } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
+            s->show_pattern_search = atoi(l + 20) != 0;
+        } else if (strncmp(l, "show_ram_refs=", 14) == 0) {
+            s->show_ram_refs = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_ref_exclusions=", 20) == 0) {
+            s->show_ref_exclusions = atoi(l + 20) != 0;
+        } else if (strncmp(l, "show_search_window=", 19) == 0) {
+            s->show_search_window = atoi(l + 19) != 0;
+        } else if (strncmp(l, "show_rom_map=", 13) == 0) {
+            s->show_rom_map = atoi(l + 13) != 0;
         }
     }
     fclose(f);
@@ -1529,23 +1587,30 @@ int line_matches_filter(const ApexRenderedLine *l, const char *f)
 const char *block_name(ApexRenderedBlockKind k)
 {
     switch (k) {
-    case APEX_RENDER_BLOCK_CODE:  return "code";
-    case APEX_RENDER_BLOCK_DATA:  return "data";
-    case APEX_RENDER_BLOCK_TABLE: return "table";
-    default:                      return "-";
+    case APEX_RENDER_BLOCK_CODE:         return "code";
+    case APEX_RENDER_BLOCK_DATA:         return "data";
+    case APEX_RENDER_BLOCK_TABLE:        return "table";
+    case APEX_RENDER_BLOCK_UNCLASSIFIED: return "?";
+    default:                             return "-";
     }
 }
 
 const char *transition_name(ApexRenderedTransitionKind k)
 {
     switch (k) {
-    case APEX_RENDER_TRANSITION_CODE_TO_DATA:  return "code_to_data";
-    case APEX_RENDER_TRANSITION_DATA_TO_CODE:  return "data_to_code";
-    case APEX_RENDER_TRANSITION_CODE_TO_TABLE: return "code_to_table";
-    case APEX_RENDER_TRANSITION_TABLE_TO_CODE: return "table_to_code";
-    case APEX_RENDER_TRANSITION_TABLE_TO_DATA: return "table_to_data";
-    case APEX_RENDER_TRANSITION_DATA_TO_TABLE: return "data_to_table";
-    default:                                   return "-";
+    case APEX_RENDER_TRANSITION_CODE_TO_DATA:           return "code_to_data";
+    case APEX_RENDER_TRANSITION_DATA_TO_CODE:           return "data_to_code";
+    case APEX_RENDER_TRANSITION_CODE_TO_TABLE:          return "code_to_table";
+    case APEX_RENDER_TRANSITION_TABLE_TO_CODE:          return "table_to_code";
+    case APEX_RENDER_TRANSITION_TABLE_TO_DATA:          return "table_to_data";
+    case APEX_RENDER_TRANSITION_DATA_TO_TABLE:          return "data_to_table";
+    case APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED:   return "code_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_CODE:   return "unclassified_to_code";
+    case APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED:  return "table_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_TABLE:  return "unclassified_to_table";
+    case APEX_RENDER_TRANSITION_DATA_TO_UNCLASSIFIED:   return "data_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_DATA:   return "unclassified_to_data";
+    default:                                            return "-";
     }
 }
 
@@ -1708,6 +1773,11 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                                  p->inline_sigs.items[i].addr,
                                  inline_sig_spec_string(&p->inline_sigs.items[i])});
     }
+    for (size_t i = 0; i < p->ref_exclusions.count; i++) {
+        s.ref_exclusions.push_back({p->ref_exclusions.items[i].has_bank,
+                                    p->ref_exclusions.items[i].bank,
+                                    p->ref_exclusions.items[i].addr});
+    }
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
         SnapshotType st;
@@ -1738,8 +1808,10 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigOptions options = {};
     options.labels_are_entries = 0;
     ConfigTypes types = {};
+    ConfigEntries ref_exclusions = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
-                &routine_docs, &table_docs, &symbols, &data_ranges, &options, &types);
+                &routine_docs, &table_docs, &symbols, &data_ranges, &options, &types,
+                &ref_exclusions);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
                             labels.items[i].bank,
@@ -1779,6 +1851,11 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
                                  sigs.items[i].addr,
                                  inline_sig_spec_string(&sigs.items[i])});
     }
+    for (size_t i = 0; i < ref_exclusions.count; i++) {
+        s.ref_exclusions.push_back({ref_exclusions.items[i].has_bank,
+                                    ref_exclusions.items[i].bank,
+                                    ref_exclusions.items[i].addr});
+    }
     for (size_t i = 0; i < types.count; i++) {
         const ConfigType *ct = &types.items[i];
         SnapshotType stype;
@@ -1789,6 +1866,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
         }
         s.types.push_back(std::move(stype));
     }
+    free(ref_exclusions.items);
     free_config_types(&types);
     return s;
 }
@@ -1798,6 +1876,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
 {
     std::vector<SnapshotLabel> cl;
     std::vector<SnapshotEntry> ce;
+    std::vector<SnapshotEntry> cexcl;
     std::vector<SnapshotData> cd;
     std::vector<SnapshotTable> ct;
     std::vector<SnapshotDoc> crd, ctd;
@@ -1899,6 +1978,39 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new ref exclusions; deletions require full snapshot */
+    for (auto &o : s->ref_exclusions) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->ref_exclusions.count; j++) {
+            if (p->ref_exclusions.items[j].has_bank == o.has_bank &&
+                p->ref_exclusions.items[j].bank == o.bank &&
+                p->ref_exclusions.items[j].addr == o.addr) {
+                still_there = true;
+                break;
+            }
+        }
+        if (!still_there) {
+            *st = "deletion needs full snapshot";
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < p->ref_exclusions.count; i++) {
+        bool found = false;
+        for (auto &o : s->ref_exclusions) {
+            if (o.has_bank == p->ref_exclusions.items[i].has_bank &&
+                o.bank == p->ref_exclusions.items[i].bank &&
+                o.addr == p->ref_exclusions.items[i].addr) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cexcl.push_back({p->ref_exclusions.items[i].has_bank,
+                             p->ref_exclusions.items[i].bank,
+                             p->ref_exclusions.items[i].addr});
+        }
+    }
+
     /* collect new or changed types */
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
@@ -1977,6 +2089,13 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             fputs(" = code\n", o);
         }
     }
+    if (!cexcl.empty()) {
+        fputs("\n[exclude_refs]\n", o);
+        for (auto &i : cexcl) {
+            write_config_address(o, i.has_bank, i.bank, i.addr);
+            fputs(" = 1\n", o);
+        }
+    }
     if (!ci.empty()) {
         fputs("\n[inline]\n", o);
         for (auto &i : ci) {
@@ -2033,6 +2152,8 @@ int write_full_config(const ApexProject *p, const char *path, std::string *st)
         return -1;
     }
     fputs("; Apex ImGui config\n", o);
+    if (p->options.labels_are_entries)
+        fputs("\n[options]\nlabels_are_entries = true\n", o);
     if (p->config_types.count > 0) {
         fputs("\n[types]\n", o);
         for (size_t i = 0; i < p->config_types.count; i++) {
@@ -2044,6 +2165,18 @@ int write_full_config(const ApexProject *p, const char *path, std::string *st)
             }
             fputc('\n', o);
         }
+    }
+    if (p->schemas.count > 0) {
+        fputs("\n[schemas]\n", o);
+        for (size_t i = 0; i < p->schemas.count; i++) {
+            fprintf(o, "%s = %s\n", p->schemas.items[i].name,
+                    table_schema_to_string(&p->schemas.items[i].schema).c_str());
+        }
+    }
+    if (p->symbols.count > 0) {
+        fputs("\n[symbols]\n", o);
+        for (size_t i = 0; i < p->symbols.count; i++)
+            fprintf(o, "%s = 0x%04x\n", p->symbols.items[i].name, p->symbols.items[i].value);
     }
     if (p->config_labels.count > 0) {
         fputs("\n[labels]\n", o);
@@ -2063,6 +2196,15 @@ int write_full_config(const ApexProject *p, const char *path, std::string *st)
                                  p->config_entries.items[i].bank,
                                  p->config_entries.items[i].addr);
             fputs(" = code\n", o);
+        }
+    }
+    if (p->ref_exclusions.count > 0) {
+        fputs("\n[exclude_refs]\n", o);
+        for (size_t i = 0; i < p->ref_exclusions.count; i++) {
+            write_config_address(o, p->ref_exclusions.items[i].has_bank,
+                                 p->ref_exclusions.items[i].bank,
+                                 p->ref_exclusions.items[i].addr);
+            fputs(" = 1\n", o);
         }
     }
     if (p->inline_sigs.count > 0) {
@@ -2333,10 +2475,11 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
             size_t tli;
             if (apex_render_find_line_by_address(*dp, tgt_bank, addr_val, &tli)) {
                 switch ((*dp)->lines[tli].block_kind) {
-                case APEX_RENDER_BLOCK_CODE:  prefix = "Sub_"; break;
-                case APEX_RENDER_BLOCK_DATA:  prefix = "Dat_"; break;
-                case APEX_RENDER_BLOCK_TABLE: prefix = "Tab_"; break;
-                default:                      prefix = "Loc_"; break;
+                case APEX_RENDER_BLOCK_CODE:         prefix = "Sub_"; break;
+                case APEX_RENDER_BLOCK_DATA:         prefix = "Dat_"; break;
+                case APEX_RENDER_BLOCK_TABLE:        prefix = "Tab_"; break;
+                case APEX_RENDER_BLOCK_UNCLASSIFIED: prefix = "Unc_"; break;
+                default:                             prefix = "Loc_"; break;
                 }
             }
         }

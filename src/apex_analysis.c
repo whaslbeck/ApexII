@@ -101,6 +101,8 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
     set->items[set->count].is_string = 0;
     set->items[set->count].is_conflict = 0;
     set->items[set->count].scanned = 0;
+    set->items[set->count].is_explicit_entry = 0;
+    set->items[set->count].reached_by_flow = 0;
     set->items[set->count].explain = NULL;
     set->items[set->count].kind_explain = NULL;
     set->count++;
@@ -826,11 +828,27 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
     }
 }
 
+static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t addr)
+{
+    size_t i;
+
+    if (!excl) {
+        return 0;
+    }
+    for (i = 0; i < excl->count; i++) {
+        if (excl->items[i].addr == addr &&
+            (!excl->items[i].has_bank || excl->items[i].bank == bank)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, LabelSet *labels,
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs)
+                          ReferenceSet *refs, const ConfigEntries *ref_exclusions)
 {
     size_t i = 0;
 
@@ -856,26 +874,53 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             (void)inst;
             if (pos > (size_t)(addr - base_addr) &&
                 data_range_at(current_bank, base_addr + (uint32_t)pos, data_ranges)) {
+                /* Code flow reaches a data-classified region. If there is a
+                   user-defined label at this address (not auto-generated), mark it
+                   as conflicted so the disassembler emits a WARNING. */
+                uint32_t cont_addr = base_addr + (uint32_t)pos;
+                size_t j;
+                for (j = 0; j < labels->count; j++) {
+                    if (labels->items[j].addr == cont_addr &&
+                        labels->items[j].name &&
+                        !generated_any_label_name(labels->items[j].name)) {
+                        labels->items[j].is_conflict = 1;
+                        explain_label_kind(&labels->items[j], "code_flow");
+                        break;
+                    }
+                }
                 break;
             }
             if (info.size == 0) {
                 break;
             }
             if (info.has_target) {
-                if (info.target >= base_addr && info.target < base_addr + used &&
-                    !label_name_at(info.target, labels->items, labels->count)) {
-                    if (base_addr == APEX_SYSTEM_ORG) {
-                        Label *target = add_label(labels, info.target,
-                                                  make_generated_label(info.target), 1);
-
+                if (info.target >= base_addr && info.target < base_addr + used) {
+                    if (!label_name_at(info.target, labels->items, labels->count)) {
+                        Label *target;
+                        if (base_addr == APEX_SYSTEM_ORG) {
+                            target = add_label(labels, info.target,
+                                               make_generated_label(info.target), 1);
+                        } else {
+                            target = add_label(labels, info.target,
+                                               make_bank_label(data[0], info.target), 1);
+                        }
                         explain_label(target, "code_flow");
                         explain_label_kind(target, "code_flow");
-                    } else {
-                        Label *target =
-                            add_label(labels, info.target, make_bank_label(data[0], info.target), 1);
-
-                        explain_label(target, "code_flow");
-                        explain_label_kind(target, "code_flow");
+                    } else if (!data_range_at(current_bank, info.target, data_ranges)) {
+                        /* A user-defined label exists at the branch target but may not
+                           be marked as code yet. Promote it so the convergence loop
+                           will scan it on the next pass. */
+                        {
+                            size_t j;
+                            for (j = 0; j < labels->count; j++) {
+                                if (labels->items[j].addr == info.target &&
+                                    labels->items[j].is_explicit_entry) {
+                                    labels->items[j].reached_by_flow = 1;
+                                    break;
+                                }
+                            }
+                        }
+                        add_label(labels, info.target, NULL, 1);
                     }
                 } else if (base_addr != APEX_SYSTEM_ORG && in_system_addr(info.target)) {
                     Label *target =
@@ -894,11 +939,15 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             if (info.has_addr_ref && !info.has_target) {
                 if (info.addr_ref >= base_addr && info.addr_ref < base_addr + used) {
-                    add_reference(refs, current_bank, info.addr_ref, current_bank, instr_addr,
-                                  "code", source);
+                    if (!addr_ref_excluded(ref_exclusions, current_bank, info.addr_ref)) {
+                        add_reference(refs, current_bank, info.addr_ref, current_bank, instr_addr,
+                                      "code", source);
+                    }
                 } else if (in_system_addr(info.addr_ref)) {
-                    add_reference(refs, 0xff, info.addr_ref, current_bank, instr_addr, "code",
-                                  source);
+                    if (!addr_ref_excluded(ref_exclusions, 0xff, info.addr_ref)) {
+                        add_reference(refs, 0xff, info.addr_ref, current_bank, instr_addr, "code",
+                                      source);
+                    }
                 }
             }
             {
@@ -918,6 +967,17 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             pos += info.size;
             pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used);
+            if (!(info.flags & CPU6809_FLOW_STOP) && pos < used) {
+                uint32_t next_addr = base_addr + (uint32_t)pos;
+                size_t j;
+                for (j = 0; j < labels->count; j++) {
+                    if (labels->items[j].addr == next_addr &&
+                        labels->items[j].is_explicit_entry) {
+                        labels->items[j].reached_by_flow = 1;
+                        break;
+                    }
+                }
+            }
             if (info.flags & CPU6809_FLOW_STOP) {
                 break;
             }

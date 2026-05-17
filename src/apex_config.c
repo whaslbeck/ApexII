@@ -445,8 +445,8 @@ static int remove_table_def(TableDefs *tables, uint8_t bank, uint32_t addr)
     return 0;
 }
 
-static void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind kind,
-                           size_t length)
+void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind kind,
+                    size_t length)
 {
     size_t i;
 
@@ -981,10 +981,11 @@ int config_remove_type(ConfigTypes *types, const char *name)
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types)
+                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
+                 ConfigEntries *ref_exclusions)
 {
     FILE *f;
-    char line[1024];
+    char line[8192];
     int in_options = 0;
     int in_inline = 0;
     int in_labels = 0;
@@ -996,6 +997,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_symbols = 0;
     int in_data = 0;
     int in_types = 0;
+    int in_exclude_refs = 0;
 
     if (!path) {
         return;
@@ -1031,6 +1033,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_symbols = strcmp(s + 1, "symbols") == 0;
             in_data = strcmp(s + 1, "data") == 0;
             in_types = strcmp(s + 1, "types") == 0;
+            in_exclude_refs = strcmp(s + 1, "exclude_refs") == 0;
             continue;
         }
         eq = strchr(s, '=');
@@ -1044,7 +1047,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *include_path = resolve_include_path(path, value);
 
             load_config(include_path, sigs, labels, entries, tables, schemas, routine_docs,
-                        table_docs, symbols, data_ranges, options, types);
+                        table_docs, symbols, data_ranges, options, types, ref_exclusions);
             free(value);
             free(include_path);
             continue;
@@ -1167,6 +1170,14 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_STRING, 0);
             } else if (strcmp(value, "dmd_fullframe") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
+            } else if (strcmp(value, "ptr16_string") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_PTR16_STRING, 2);
+            } else if (strcmp(value, "ptr16_data") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_PTR16_DATA, 2);
+            } else if (strcmp(value, "ptr16_code") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_PTR16_CODE, 2);
+            } else if (strcmp(value, "ptr16_table") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_PTR16_TABLE, 2);
             } else if (strcmp(value, "far_string") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_FAR_STRING, 3);
             } else if (strcmp(value, "far_data") == 0) {
@@ -1222,6 +1233,22 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 die("invalid table format '%s = %s'", key, value);
             }
             add_table_def(tables, bank, addr, schema, has_header, rows);
+            free(value);
+        } else if (in_exclude_refs) {
+            uint32_t addr;
+            uint8_t bank = 0;
+            int has_bank = 0;
+            char *key = s;
+            char *value = dup_config_value(eq + 1);
+
+            if (parse_bank_label_ref(key, &bank, &addr)) {
+                has_bank = 1;
+            } else if (!parse_u32(key, &addr)) {
+                die("invalid exclude_refs config '%s = %s'", key, value);
+            }
+            if (ref_exclusions) {
+                add_config_entry(ref_exclusions, has_bank, bank, addr);
+            }
             free(value);
         } else if (in_types) {
             char *key = s;
@@ -1306,6 +1333,14 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
         add_data_range(ranges, bank, addr, DATA_STRING, 0);
     } else if (strcmp(value, "dmd_fullframe") == 0) {
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
+    } else if (strcmp(value, "ptr16_string") == 0) {
+        add_data_range(ranges, bank, addr, DATA_PTR16_STRING, 2);
+    } else if (strcmp(value, "ptr16_data") == 0) {
+        add_data_range(ranges, bank, addr, DATA_PTR16_DATA, 2);
+    } else if (strcmp(value, "ptr16_code") == 0) {
+        add_data_range(ranges, bank, addr, DATA_PTR16_CODE, 2);
+    } else if (strcmp(value, "ptr16_table") == 0) {
+        add_data_range(ranges, bank, addr, DATA_PTR16_TABLE, 2);
     } else if (strcmp(value, "far_string") == 0) {
         add_data_range(ranges, bank, addr, DATA_FAR_STRING, 3);
     } else if (strcmp(value, "far_data") == 0) {

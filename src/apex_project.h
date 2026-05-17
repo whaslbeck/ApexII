@@ -42,6 +42,7 @@ typedef struct ApexProject {
     DataRanges data_ranges;
     ConfigOptions options;
     ConfigTypes config_types;
+    ConfigEntries ref_exclusions;
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -83,5 +84,9 @@ int apex_project_save_overlay(const ApexProject *project, const char *path, cons
 int apex_project_set_type(ApexProject *project, const char *name, int is_word,
                           const char *values_str);
 int apex_project_remove_type(ApexProject *project, const char *name);
+int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
+                                   uint32_t addr);
+int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
+                                      uint32_t addr);
 
 #endif

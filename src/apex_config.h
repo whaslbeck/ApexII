@@ -146,6 +146,10 @@ typedef enum {
     DATA_BYTES,
     DATA_STRING,
     DATA_DMD_FULLFRAME,
+    DATA_PTR16_STRING,
+    DATA_PTR16_DATA,
+    DATA_PTR16_CODE,
+    DATA_PTR16_TABLE,
     DATA_FAR_STRING,
     DATA_FAR_DATA,
     DATA_FAR_TABLE,
@@ -185,7 +189,8 @@ void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank,
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types);
+                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
+                 ConfigEntries *ref_exclusions);
 void free_config_types(ConfigTypes *types);
 const ConfigType *find_config_type(const ConfigTypes *types, const char *name);
 const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value);
@@ -197,6 +202,7 @@ int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint3
 int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
                            const char *spec, const ConfigTypes *types);
 int config_clear_inline(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr);
+void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind kind, size_t length);
 int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const char *spec);
 int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr);
 int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t bank, uint32_t addr,

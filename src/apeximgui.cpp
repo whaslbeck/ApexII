@@ -137,9 +137,11 @@ int main(int argc, char **argv)
     state.show_call_graph    = false;
     state.show_hardware      = false;
     state.show_tables        = false;
-    state.show_inline_list   = false;
-    state.show_entries_list  = false;
-    state.show_types_editor  = false;
+    state.show_inline_list      = false;
+    state.show_entries_list     = false;
+    state.show_types_editor     = false;
+    state.show_ref_exclusions   = false;
+    state.show_rom_map          = false;
     state.show_bookmarks     = true;
     state.show_transitions   = false;
     state.request_layout_reset = true;
@@ -207,9 +209,10 @@ int main(int argc, char **argv)
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Windows")) {
-                ImGui::MenuItem("Navigator",    "N", &state.show_navigator);
-                ImGui::MenuItem("Disassembly",  "D", &state.show_disasm);
-                ImGui::MenuItem("Hex Inspector","H", &state.show_hex);
+                ImGui::MenuItem("Navigator",    "N",      &state.show_navigator);
+                ImGui::MenuItem("Disassembly",  "D",      &state.show_disasm);
+                ImGui::MenuItem("Hex Inspector","H",      &state.show_hex);
+                ImGui::MenuItem("Global Search","Ctrl+F", &state.show_search_window);
                 ImGui::Separator();
                 ImGui::MenuItem("Banks",       NULL, &state.show_banks);
                 ImGui::MenuItem("Labels",      NULL, &state.show_labels);
@@ -224,6 +227,8 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Types",          NULL, &state.show_types_editor);
                 ImGui::MenuItem("Pattern Search", NULL, &state.show_pattern_search);
                 ImGui::MenuItem("RAM References", NULL, &state.show_ram_refs);
+                ImGui::MenuItem("Ref Exclusions", NULL, &state.show_ref_exclusions);
+                ImGui::MenuItem("ROM Map",        NULL, &state.show_rom_map);
                 ImGui::Separator();
                 ImGui::MenuItem("Details",     NULL, &state.show_details);
                 ImGui::MenuItem("References",  NULL, &state.show_refs);
@@ -278,6 +283,9 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Types",          dock_bottom_id);
             ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
             ImGui::DockBuilderDockWindow("RAM References", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Ref Exclusions", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Global Search",  dock_bottom_id);
+            ImGui::DockBuilderDockWindow("ROM Map",        dock_right_id);
 
             ImGui::DockBuilderFinish(dockspace_id);
             state.request_layout_reset = false;
@@ -527,10 +535,20 @@ int main(int argc, char **argv)
             render_ram_refs(project, document, &state);
             ImGui::End();
         }
+        if (state.show_ref_exclusions) {
+            ImGui::Begin("Ref Exclusions", &state.show_ref_exclusions);
+            render_ref_exclusions(project, &document, &state);
+            ImGui::End();
+        }
         render_xref_popup(project, document, &state);
         if (state.show_search_window) {
             ImGui::Begin("Global Search", &state.show_search_window);
             render_global_search(document, &state);
+            ImGui::End();
+        }
+        if (state.show_rom_map) {
+            ImGui::Begin("ROM Map", &state.show_rom_map);
+            render_rom_map(project, &document, &state);
             ImGui::End();
         }
         if (state.show_edit) {
@@ -780,11 +798,22 @@ int main(int argc, char **argv)
                     state.request_focus_new_bookmark = 1;
                 }
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_J) || ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
-                move_selection_relative(document, &state, 1);
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
-                move_selection_relative(document, &state, -1);
+            if (!state.hex_window_focused) {
+                if (ImGui::IsKeyPressed(ImGuiKey_J) || ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                    move_selection_relative(document, &state, 1);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                    move_selection_relative(document, &state, -1);
+                }
+                int page = (int)(ImGui::GetIO().DisplaySize.y /
+                                 ImGui::GetTextLineHeightWithSpacing()) - 4;
+                if (page < 5) page = 5;
+                if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+                    move_selection_relative(document, &state, page);
+                }
+                if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+                    move_selection_relative(document, &state, -page);
+                }
             }
             if (ImGui::IsKeyPressed(ImGuiKey_N)) {
                 jump_primary_transition(document, &state, 1);

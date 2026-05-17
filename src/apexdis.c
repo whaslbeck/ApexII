@@ -14,7 +14,8 @@ typedef enum {
     BLOCK_UNKNOWN,
     BLOCK_CODE,
     BLOCK_DATA,
-    BLOCK_TABLE
+    BLOCK_TABLE,
+    BLOCK_UNCLASSIFIED
 } BlockKind;
 
 static void emit_vector_equates(FILE *out, const VectorInfo *vectors, size_t count)
@@ -54,6 +55,9 @@ static const char *block_kind_name(BlockKind kind)
     if (kind == BLOCK_DATA) {
         return "data";
     }
+    if (kind == BLOCK_UNCLASSIFIED) {
+        return "unclassified";
+    }
     return "unknown";
 }
 
@@ -62,7 +66,11 @@ static void emit_transition_comment(FILE *out, BlockKind from, BlockKind to, uin
 {
     char kind[32];
 
-    if (from == BLOCK_UNKNOWN || to == BLOCK_UNKNOWN || from == to) {
+    if (to == BLOCK_UNKNOWN || from == to) {
+        return;
+    }
+    if (from == BLOCK_UNKNOWN) {
+        emit_location_comment(out, block_kind_name(to), bank, cpu_addr, rom_addr);
         return;
     }
     snprintf(kind, sizeof(kind), "%s_to_%s", block_kind_name(from), block_kind_name(to));
@@ -245,6 +253,18 @@ static const char *data_kind_name(DataKind kind)
     }
     if (kind == DATA_DMD_FULLFRAME) {
         return "dmd_fullframe";
+    }
+    if (kind == DATA_PTR16_STRING) {
+        return "ptr16_string";
+    }
+    if (kind == DATA_PTR16_DATA) {
+        return "ptr16_data";
+    }
+    if (kind == DATA_PTR16_CODE) {
+        return "ptr16_code";
+    }
+    if (kind == DATA_PTR16_TABLE) {
+        return "ptr16_table";
     }
     if (kind == DATA_FAR_STRING) {
         return "far_string";
@@ -855,21 +875,6 @@ static void emit_db_line(FILE *out, uint32_t addr, const uint8_t *data, size_t c
 static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
                             size_t *pos, size_t count);
 
-/* Count disassembly lines emitted per row for this schema (after byte grouping). */
-static size_t schema_lines_per_row(const TableSchema *schema)
-{
-    size_t lines = 0;
-    size_t i;
-
-    for (i = 0; i < schema->count; i++) {
-        const TableField *f = &schema->items[i];
-        if (f->kind == TABLE_BYTE && !f->type_name)
-            lines += 1; /* grouped into one .DB line regardless of count */
-        else
-            lines += f->count;
-    }
-    return lines;
-}
 
 static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
@@ -879,14 +884,12 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             const ConfigTypes *types)
 {
     size_t row;
-    int multi_line = schema_lines_per_row(&table->schema) > 1;
 
     for (row = 0; row < rows && *pos + row_width <= len; row++) {
         size_t row_start = *pos;
         size_t i;
 
-        if (multi_line)
-            fprintf(out, "; [row %lu]\n", (unsigned long)row);
+        fprintf(out, "; [row %lu]\n", (unsigned long)row);
 
         for (i = 0; i < table->schema.count; i++) {
             size_t n;
@@ -997,6 +1000,25 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         }
         emit_string(out, data + *pos, string_len);
         *pos += string_len;
+        return 1;
+    }
+    if (range->kind == DATA_PTR16_STRING || range->kind == DATA_PTR16_DATA ||
+        range->kind == DATA_PTR16_CODE  || range->kind == DATA_PTR16_TABLE) {
+        uint16_t ptr;
+        const char *lbl;
+
+        if (*pos + 2u > len) {
+            return 0;
+        }
+        ptr = read_be16(data + *pos);
+        lbl = table_ptr_label(ptr, range->bank, labels, label_count,
+                              extra_labels, extra_label_count);
+        if (lbl) {
+            fprintf(out, "    .DW %s\n", lbl);
+        } else {
+            fprintf(out, "    .DW 0x%04x\n", ptr);
+        }
+        *pos += 2u;
         return 1;
     }
     if (data_kind_is_far(range->kind)) {
@@ -1147,7 +1169,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         const DataRange *data_range = NULL;
         int has_string_label;
         int has_code_label;
-        BlockKind current_kind = BLOCK_DATA;
+        BlockKind current_kind = BLOCK_UNCLASSIFIED;
 
         if (tables) {
             table = table_def_at(current_bank, base_addr + (uint32_t)pos, tables);
@@ -1210,7 +1232,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             fprintf(out, "    .DW %s\n", entry_name);
             pos += 2;
             decoding_code = 0;
-            previous_kind = BLOCK_DATA;
+            previous_kind = current_kind == BLOCK_CODE ? BLOCK_UNCLASSIFIED : current_kind;
             continue;
         }
         if (decoding_code) {
@@ -1225,9 +1247,9 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                   base_addr + (uint32_t)(pos + info.size), labels,
                                   label_count)) {
                     decoding_code = 0;
-                    emit_transition_comment(out, BLOCK_CODE, BLOCK_DATA, current_bank,
+                    emit_transition_comment(out, BLOCK_CODE, BLOCK_UNCLASSIFIED, current_bank,
                                             base_addr + (uint32_t)pos, rom_base + pos);
-                    current_kind = BLOCK_DATA;
+                    current_kind = BLOCK_UNCLASSIFIED;
                 } else {
                     fprintf(out, "    %s\n", inst);
                     pos += info.size;
@@ -1253,9 +1275,9 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                     continue;
                 }
             }
-            emit_transition_comment(out, BLOCK_CODE, BLOCK_DATA, current_bank,
+            emit_transition_comment(out, BLOCK_CODE, BLOCK_UNCLASSIFIED, current_bank,
                                     base_addr + (uint32_t)pos, rom_base + pos);
-            current_kind = BLOCK_DATA;
+            current_kind = BLOCK_UNCLASSIFIED;
             decoding_code = 0;
         }
         {
@@ -1273,7 +1295,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         }
             emit_db_line(out, base_addr + (uint32_t)line_start, data + line_start, col);
         }
-        previous_kind = current_kind == BLOCK_CODE ? BLOCK_DATA : current_kind;
+        previous_kind = current_kind == BLOCK_CODE ? BLOCK_UNCLASSIFIED : current_kind;
     }
 }
 
@@ -1308,6 +1330,18 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
     }
 }
 
+static size_t total_code_bank_labels(const LabelSet *bank_labels, size_t banks)
+{
+    size_t total = 0, i, j;
+
+    for (i = 0; i < banks; i++) {
+        for (j = 0; j < bank_labels[i].count; j++) {
+            if (bank_labels[i].items[j].is_code) total++;
+        }
+    }
+    return total;
+}
+
 void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t vector_count,
                          InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                          size_t banks, LabelSet *bank_labels, LabelSet *labels,
@@ -1338,6 +1372,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
 
             explain_label(label, "config_label");
             if (options->labels_are_entries) {
+                label->is_explicit_entry = 1;
                 explain_label_kind(label, "config_label_entry");
             }
         }
@@ -1349,6 +1384,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
             Label *label = add_label(labels, config_entries->items[i].addr,
                                      make_generated_label(config_entries->items[i].addr), 1);
 
+            label->is_explicit_entry = 1;
             explain_label(label, "config_entry");
             explain_label_kind(label, "config_entry");
         }
@@ -1357,8 +1393,15 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
     if (inline_dispatcher != 0 && !inline_signature_for(inline_sigs, 0xffu, inline_dispatcher)) {
         add_inline_signature(inline_sigs, inline_dispatcher, 1, TABLE_BYTE);
     }
-    collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom, banks,
-                         bank_labels, labels, data_ranges, 0xff, refs);
+    {
+        size_t prev_count, prev_code;
+        do {
+            prev_count = labels->count;
+            prev_code  = total_code_bank_labels(labels, 1);
+            collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom,
+                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL);
+        } while (labels->count != prev_count || total_code_bank_labels(labels, 1) != prev_code);
+    }
 }
 
 static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo *vectors,
@@ -1453,13 +1496,15 @@ static size_t total_bank_labels(const LabelSet *bank_labels, size_t banks)
 void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                const InlineSignatures *inline_sigs,
                                LabelSet *bank_labels, LabelSet *system_labels,
-                               const DataRanges *data_ranges, ReferenceSet *refs)
+                               const DataRanges *data_ranges, ReferenceSet *refs,
+                               const ConfigEntries *ref_exclusions)
 {
-    size_t previous_total;
+    size_t prev_count, prev_code;
 
     do {
         size_t i;
-        previous_total = total_bank_labels(bank_labels, banks);
+        prev_count = total_bank_labels(bank_labels, banks);
+        prev_code  = total_code_bank_labels(bank_labels, banks);
         for (i = 0; i < banks; i++) {
             const uint8_t *bank = paged_rom + i * APEX_BANK_SIZE;
             size_t used = last_non_ff(bank, APEX_BANK_SIZE);
@@ -1467,10 +1512,11 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
             if (used > 1) {
                 collect_code_targets(bank, used, APEX_PAGED_ORG, &bank_labels[i], inline_sigs,
                                      paged_rom, banks, bank_labels, system_labels, data_ranges,
-                                     bank[0], refs);
+                                     bank[0], refs, ref_exclusions);
             }
         }
-    } while (total_bank_labels(bank_labels, banks) != previous_total);
+    } while (total_bank_labels(bank_labels, banks) != prev_count ||
+             total_code_bank_labels(bank_labels, banks) != prev_code);
 }
 
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
@@ -1493,6 +1539,7 @@ void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *
 
             explain_label(target, "config_label");
             if (options->labels_are_entries) {
+                target->is_explicit_entry = 1;
                 explain_label_kind(target, "config_label_entry");
             }
         }
@@ -1516,6 +1563,7 @@ void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_
             Label *label = add_label(&bank_labels[bank_index], entry->addr,
                                      make_bank_label(entry->bank, entry->addr), 1);
 
+            label->is_explicit_entry = 1;
             explain_label(label, "config_entry");
             explain_label_kind(label, "config_entry");
         }

@@ -56,7 +56,7 @@ static int cfg_load(Cfg *c, const char *path)
     if (!failed) {
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
                     &c->schemas, &c->rdocs, &c->tdocs, &c->syms, &c->data,
-                    &c->opts, &c->types);
+                    &c->opts, &c->types, NULL);
     }
     s_catching = 0;
     return failed;

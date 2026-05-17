@@ -15,6 +15,8 @@ typedef struct {
     int is_string;
     int is_conflict;
     int scanned;
+    int is_explicit_entry;  /* from [entries] config section */
+    int reached_by_flow;    /* flow from another entry reaches this address */
     const char *explain;
     const char *kind_explain;
 } Label;
@@ -119,7 +121,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs);
+                          ReferenceSet *refs, const ConfigEntries *ref_exclusions);
 const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count);
 size_t valid_string_len(const uint8_t *data, size_t len);
 

@@ -15,7 +15,8 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
 void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                const InlineSignatures *inline_sigs,
                                LabelSet *bank_labels, LabelSet *system_labels,
-                               const DataRanges *data_ranges, ReferenceSet *refs);
+                               const DataRanges *data_ranges, ReferenceSet *refs,
+                               const ConfigEntries *ref_exclusions);
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
                               size_t banks, LabelSet *bank_labels,
                               const ConfigOptions *options);
@@ -29,6 +30,91 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
                         LabelSet *bank_labels, LabelSet *system_labels,
                         const uint8_t *system_rom, ReferenceSet *refs);
 static void analyze_full_project(ApexProject *project);
+
+/* For every TABLE_FAR_DMD_FULLFRAME / TABLE_PTR16_DMD_FULLFRAME field in all
+   configured tables, add a DATA_DMD_FULLFRAME data-range entry for the target
+   if none exists yet.  Called after apply_table_labels so the far pointers can
+   be read from ROM. */
+static void inject_dmd_table_data_ranges(ApexProject *project)
+{
+    size_t i;
+
+    for (i = 0; i < project->tables.count; i++) {
+        const TableDef *table = &project->tables.items[i];
+        const uint8_t *bank_data;
+        size_t bank_data_len;
+        size_t pos;
+        uint16_t row_count;
+        uint8_t row_width;
+        size_t row;
+
+        if (table->bank == 0xffu) {
+            if (!in_system_addr(table->addr))
+                continue;
+            bank_data     = project->rom.data + project->paged_size;
+            bank_data_len = project->rom.size  - project->paged_size;
+            pos           = (size_t)(table->addr - APEX_SYSTEM_ORG);
+        } else {
+            int bidx = bank_index_for_id(project->rom.data, project->banks, table->bank);
+
+            if (bidx < 0 || table->addr < APEX_PAGED_ORG || table->addr >= 0x8000u)
+                continue;
+            bank_data     = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
+            bank_data_len = APEX_BANK_SIZE;
+            pos           = (size_t)(table->addr - APEX_PAGED_ORG);
+        }
+
+        if (table->has_header) {
+            if (pos + 3u > bank_data_len)
+                continue;
+            row_count = read_be16(bank_data + pos);
+            row_width = bank_data[pos + 2u];
+            pos += 3u;
+        } else {
+            row_count = (uint16_t)table->rows;
+            row_width = (uint8_t)table_schema_width(&table->schema);
+        }
+
+        for (row = 0; row < row_count && pos + row_width <= bank_data_len; row++) {
+            size_t fp = pos;
+            size_t fi;
+
+            for (fi = 0; fi < table->schema.count; fi++) {
+                size_t n;
+                TableFieldKind kind = table->schema.items[fi].kind;
+
+                for (n = 0; n < table->schema.items[fi].count; n++) {
+                    if (kind == TABLE_FAR_DMD_FULLFRAME && fp + 3u <= bank_data_len) {
+                        uint16_t addr    = read_be16(bank_data + fp);
+                        uint8_t tgt_bank = bank_data[fp + 2u];
+
+                        if (!data_range_at(tgt_bank, addr, &project->data_ranges))
+                            add_data_range(&project->data_ranges, tgt_bank, addr,
+                                           DATA_DMD_FULLFRAME, 0);
+                        fp += 3u;
+                    } else if (kind == TABLE_PTR16_DMD_FULLFRAME && fp + 2u <= bank_data_len) {
+                        uint16_t ptr     = read_be16(bank_data + fp);
+                        uint8_t tgt_bank = in_system_addr(ptr) ? 0xffu : table->bank;
+
+                        if (!data_range_at(tgt_bank, ptr, &project->data_ranges))
+                            add_data_range(&project->data_ranges, tgt_bank, ptr,
+                                           DATA_DMD_FULLFRAME, 0);
+                        fp += 2u;
+                    } else if (kind == TABLE_BYTE) {
+                        fp++;
+                    } else if (kind == TABLE_WORD) {
+                        fp += 2u;
+                    } else if (table_kind_is_far(kind)) {
+                        fp += 3u;
+                    } else {
+                        fp += 2u; /* ptr16 kinds */
+                    }
+                }
+            }
+            pos += row_width;
+        }
+    }
+}
 
 static const char *basename_ptr(const char *path)
 {
@@ -159,6 +245,18 @@ static void write_data_range_value(FILE *out, const DataRange *range)
         break;
     case DATA_DMD_FULLFRAME:
         fputs("dmd_fullframe", out);
+        break;
+    case DATA_PTR16_STRING:
+        fputs("ptr16_string", out);
+        break;
+    case DATA_PTR16_DATA:
+        fputs("ptr16_data", out);
+        break;
+    case DATA_PTR16_CODE:
+        fputs("ptr16_code", out);
+        break;
+    case DATA_PTR16_TABLE:
+        fputs("ptr16_table", out);
         break;
     case DATA_FAR_STRING:
         fputs("far_string", out);
@@ -850,7 +948,8 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
     load_config(project->config_path, &project->inline_sigs, &project->config_labels,
                 &project->config_entries, &project->tables, &project->schemas,
                 &project->routine_docs, &project->table_docs, &project->symbols,
-                &project->data_ranges, &project->options, &project->config_types);
+                &project->data_ranges, &project->options, &project->config_types,
+                &project->ref_exclusions);
     validate_config_classification(&project->config_entries, &project->tables,
                                    &project->data_ranges);
 
@@ -892,6 +991,7 @@ void apex_project_free(ApexProject *project)
     free_config_types(&project->config_types);
     free_config_labels(&project->config_labels);
     free_config_entries(&project->config_entries);
+    free_config_entries(&project->ref_exclusions);
     free_table_defs(&project->tables);
     free_schema_defs(&project->schemas);
     free_config_docs(&project->routine_docs);
@@ -944,7 +1044,8 @@ static void analyze_system_region(ApexProject *project)
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
-                         &project->system_labels, &project->data_ranges, 0xffu, &project->refs);
+                         &project->system_labels, &project->data_ranges, 0xffu, &project->refs,
+                         &project->ref_exclusions);
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);
@@ -1002,7 +1103,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
         collect_code_targets(bank, used, APEX_PAGED_ORG, &project->bank_labels[bank_index],
                              &project->inline_sigs, project->rom.data, project->banks,
                              project->bank_labels, &project->system_labels, &project->data_ranges,
-                             bank_id, &project->refs);
+                             bank_id, &project->refs, &project->ref_exclusions);
     }
     apply_string_content_labels(&project->bank_labels[bank_index], bank, used, APEX_PAGED_ORG);
     prune_unreferenced_generated_labels(&project->bank_labels[bank_index], bank_id, &project->refs);
@@ -1049,17 +1150,18 @@ static void analyze_full_project(ApexProject *project)
     apply_table_labels(&project->tables, project->rom.data, banks, project->bank_labels,
                        &project->system_labels, project->rom.data + project->paged_size,
                        &project->refs);
+    inject_dmd_table_data_ranges(project);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
-                         &project->data_ranges, 0xff, &project->refs);
+                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions);
     collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
                               project->bank_labels, &project->system_labels,
-                              &project->data_ranges, &project->refs);
+                              &project->data_ranges, &project->refs, &project->ref_exclusions);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
-                         &project->data_ranges, 0xff, &project->refs);
+                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions);
     for (i = 0; i < banks; i++) {
         const uint8_t *bank = project->rom.data + i * APEX_BANK_SIZE;
 
@@ -1407,4 +1509,30 @@ int apex_project_remove_type(ApexProject *project, const char *name)
         return 1;
     }
     return config_remove_type(&project->config_types, name) ? 0 : 1;
+}
+
+int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
+                                   uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    config_set_entry(&project->ref_exclusions, has_bank, bank, addr);
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
+                                      uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    if (config_clear_entry(&project->ref_exclusions, has_bank, bank, addr) != 0) {
+        return 1;
+    }
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
 }
