@@ -293,6 +293,9 @@ static std::string data_range_spec_string(const DataRange *r)
     case DATA_FAR_CODE:        return "far_code";
     case DATA_DMD_FULLFRAME:   return "dmd_fullframe";
     case DATA_FAR_DMD_FULLFRAME: return "far_dmd_fullframe";
+    case DATA_SPRITE:          return "sprite";
+    case DATA_PTR16_SPRITE:    return "ptr16_sprite";
+    case DATA_FAR_SPRITE:      return "far_sprite";
     default:                   return "bytes[1]";
     }
 }
@@ -780,20 +783,14 @@ void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
     }
     if (f) {
         for (size_t i = s->selected_line + 1; i < d->line_count; i++) {
-            if (d->lines[i].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA ||
-                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA ||
-                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED ||
-                d->lines[i].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED) {
+            if (d->lines[i].transition_kind != APEX_RENDER_TRANSITION_NONE) {
                 select_line(s, i, 1);
                 return;
             }
         }
     } else {
         for (size_t i = s->selected_line + 1; i > 0; i--) {
-            if (d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_DATA ||
-                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_DATA ||
-                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED ||
-                d->lines[i-1].transition_kind == APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED) {
+            if (d->lines[i-1].transition_kind != APEX_RENDER_TRANSITION_NONE) {
                 select_line(s, i - 1, 1);
                 return;
             }
@@ -1072,13 +1069,15 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_dmd=%d\nshow_edit=%d\nshow_hex=%d\nshow_call_graph=%d\n"
             "show_hardware=%d\nshow_tables=%d\nshow_types=%d\nshow_inline_list=%d\n"
             "show_entries_list=%d\nshow_pattern_search=%d\nshow_ram_refs=%d\n"
-            "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n",
+            "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
+            "show_dmd_list=%d\nshow_sprite_list=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
             s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
             s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
-            s->show_ref_exclusions, s->show_search_window, s->show_rom_map);
+            s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
+            s->show_dmd_list, s->show_sprite_list);
     fclose(f);
 }
 
@@ -1211,6 +1210,10 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_search_window = atoi(l + 19) != 0;
         } else if (strncmp(l, "show_rom_map=", 13) == 0) {
             s->show_rom_map = atoi(l + 13) != 0;
+        } else if (strncmp(l, "show_dmd_list=", 14) == 0) {
+            s->show_dmd_list = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_sprite_list=", 17) == 0) {
+            s->show_sprite_list = atoi(l + 17) != 0;
         }
     }
     fclose(f);
@@ -1542,6 +1545,109 @@ DmdPreviewInfo find_dmd_preview(const ApexProject *p, const ApexRenderedDocument
     return pr;
 }
 
+int address_is_sprite_start(const ApexProject *p, uint8_t b, uint32_t a)
+{
+    if (data_range_at(b, a, &p->data_ranges) &&
+        (data_range_at(b, a, &p->data_ranges)->kind == DATA_SPRITE ||
+         data_range_at(b, a, &p->data_ranges)->kind == DATA_FAR_SPRITE ||
+         data_range_at(b, a, &p->data_ranges)->kind == DATA_SPRITE_NOHEADER)) {
+        return 1;
+    }
+    const auto *ls = (b == 0xffu) ? &p->system_labels : NULL;
+    if (!ls) {
+        int bi = bank_index_for_far_ref(p->rom.data, p->banks, b);
+        if (bi >= 0) {
+            ls = &p->bank_labels[bi];
+        }
+    }
+    if (!ls) {
+        return 0;
+    }
+    for (size_t i = 0; i < ls->count; i++) {
+        if (ls->items[i].addr == a &&
+            ((ls->items[i].kind_explain && strstr(ls->items[i].kind_explain, "sprite")) ||
+             (ls->items[i].explain && strstr(ls->items[i].explain, "sprite")))) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, SpritePreviewInfo *pr)
+{
+    const uint8_t *src;
+    size_t len, ro;
+    uint8_t hdr = 0, vert = 0, horiz = 0, width = 0, height = 0, enc_type = 0;
+    size_t consumed = 0;
+
+    if (!project_locate_rom_bytes(p, b, a, &src, &len, &ro)) {
+        return 0;
+    }
+
+    /* Check if this is a classified no-header sprite */
+    const DataRange *dr = data_range_at(b, a, &p->data_ranges);
+    if (dr && dr->kind == DATA_SPRITE_NOHEADER && dr->length > 0) {
+        uint8_t nh_height = (uint8_t)dr->length;
+        if (!apexsprite_decode_noheader(src, len, pr->pixels, nh_height, &width, &consumed)) {
+            return 0;
+        }
+        pr->valid        = true;
+        pr->bank         = b;
+        pr->cpu_addr     = a;
+        pr->rom_offset   = ro;
+        pr->header_type  = 0;
+        pr->enc_type     = 0;
+        pr->consumed     = consumed;
+        pr->vert_offset  = 0;
+        pr->horiz_offset = 0;
+        pr->width        = width;
+        pr->height       = nh_height;
+        return 1;
+    }
+
+    if (!apexsprite_decode(src, len, pr->pixels, &hdr, &vert, &horiz, &width, &height, &enc_type, &consumed)) {
+        return 0;
+    }
+    pr->valid       = true;
+    pr->bank        = b;
+    pr->cpu_addr    = a;
+    pr->rom_offset  = ro;
+    pr->header_type = hdr;
+    pr->enc_type    = enc_type;
+    pr->consumed    = consumed;
+    pr->vert_offset  = vert;
+    pr->horiz_offset = horiz;
+    pr->width       = width;
+    pr->height      = height;
+    return 1;
+}
+
+SpritePreviewInfo find_sprite_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    SpritePreviewInfo pr = {};
+    uint8_t b;
+    uint32_t a;
+    if (!selected_address(d, s, &b, &a)) {
+        return pr;
+    }
+    if (decode_sprite_preview_at(p, b, a, &pr)) {
+        snprintf(pr.title, sizeof(pr.title), "Selected Sprite");
+        return pr;
+    }
+    if (s->selected_line < d->line_count) {
+        auto ts = find_line_targets(d, s, &d->lines[s->selected_line]);
+        for (auto &t : ts) {
+            if (address_is_sprite_start(p, t.bank, t.cpu_addr) &&
+                decode_sprite_preview_at(p, t.bank, t.cpu_addr, &pr)) {
+                pr.from_target = true;
+                snprintf(pr.title, sizeof(pr.title), "Target Sprite: %s", t.name.c_str());
+                return pr;
+            }
+        }
+    }
+    return pr;
+}
+
 int parse_target_address(const char *i, uint8_t *b, uint32_t *a)
 {
     unsigned pb, pa;
@@ -1589,8 +1695,10 @@ const char *block_name(ApexRenderedBlockKind k)
     switch (k) {
     case APEX_RENDER_BLOCK_CODE:         return "code";
     case APEX_RENDER_BLOCK_DATA:         return "data";
+    case APEX_RENDER_BLOCK_SPRITE:       return "sprite";
     case APEX_RENDER_BLOCK_TABLE:        return "table";
     case APEX_RENDER_BLOCK_UNCLASSIFIED: return "?";
+    case APEX_RENDER_BLOCK_FREE:         return "free";
     default:                             return "-";
     }
 }
@@ -1623,11 +1731,13 @@ static const struct { int kind; const char *name; } kKindNames[] = {
     { TABLE_PTR16_CODE,        "ptr16_code"   },
     { TABLE_PTR16_TABLE,       "ptr16_table"  },
     { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd_fullframe" },
+    { TABLE_PTR16_SPRITE,      "ptr16_sprite" },
     { TABLE_FAR_STRING,        "far_string"   },
     { TABLE_FAR_DATA,          "far_data"     },
     { TABLE_FAR_TABLE,         "far_table"    },
     { TABLE_FAR_CODE,          "far_code"     },
     { TABLE_FAR_DMD_FULLFRAME, "far_dmd_fullframe" },
+    { TABLE_FAR_SPRITE,        "far_sprite"   },
 };
 static const int kKindCount = (int)(sizeof(kKindNames) / sizeof(kKindNames[0]));
 
@@ -2477,6 +2587,7 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
                 switch ((*dp)->lines[tli].block_kind) {
                 case APEX_RENDER_BLOCK_CODE:         prefix = "Sub_"; break;
                 case APEX_RENDER_BLOCK_DATA:         prefix = "Dat_"; break;
+                case APEX_RENDER_BLOCK_SPRITE:       prefix = "Spr_"; break;
                 case APEX_RENDER_BLOCK_TABLE:        prefix = "Tab_"; break;
                 case APEX_RENDER_BLOCK_UNCLASSIFIED: prefix = "Unc_"; break;
                 default:                             prefix = "Loc_"; break;

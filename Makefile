@@ -11,9 +11,9 @@ SRC_DIR := src
 UNAME_S := $(shell uname -s 2>/dev/null)
 
 COMMON_OBJS := $(BUILD_DIR)/cpu6809.o $(BUILD_DIR)/util.o
-APEXDIS_CORE_OBJS := $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
+APEXDIS_CORE_OBJS := $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
 APEXDMD_OBJS := $(COMMON_OBJS) $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o
-APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
+APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
 
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 APEXIMGUI_SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)

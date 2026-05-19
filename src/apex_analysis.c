@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* forward declaration — defined later; also exposed in header for apexdis.c */
+
 size_t last_non_ff(const uint8_t *data, size_t len)
 {
     size_t n = len;
@@ -105,6 +107,7 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
     set->items[set->count].reached_by_flow = 0;
     set->items[set->count].explain = NULL;
     set->items[set->count].kind_explain = NULL;
+    set->sorted = 0;
     set->count++;
     return &set->items[set->count - 1];
 }
@@ -139,19 +142,8 @@ void mark_label_data(Label *label)
 void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
                    uint32_t source_addr, const char *kind, const char *source)
 {
-    size_t i;
-
     if (!refs || !source) {
         return;
-    }
-    for (i = 0; i < refs->count; i++) {
-        if (refs->items[i].bank == bank && refs->items[i].addr == addr &&
-            refs->items[i].source_bank == source_bank &&
-            refs->items[i].source_addr == source_addr &&
-            strcmp(refs->items[i].kind, kind) == 0 &&
-            strcmp(refs->items[i].source, source) == 0) {
-            return;
-        }
     }
     if (refs->count == refs->cap) {
         size_t new_cap = refs->cap == 0 ? 64 : refs->cap * 2;
@@ -171,6 +163,7 @@ void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t sour
     refs->items[refs->count].source = source;
     refs->items[refs->count].row_index = -1;
     refs->items[refs->count].row_cpu_addr = 0;
+    refs->sorted = 0;
     refs->count++;
 }
 
@@ -178,18 +171,8 @@ void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
                               uint8_t source_bank, uint32_t source_addr, const char *source,
                               int row_index, uint32_t row_cpu_addr)
 {
-    size_t i;
-
     if (!refs || !source) {
         return;
-    }
-    for (i = 0; i < refs->count; i++) {
-        if (refs->items[i].bank == bank && refs->items[i].addr == addr &&
-            refs->items[i].source_bank == source_bank &&
-            refs->items[i].source_addr == source_addr &&
-            refs->items[i].row_index == row_index) {
-            return;
-        }
     }
     if (refs->count == refs->cap) {
         size_t new_cap = refs->cap == 0 ? 64 : refs->cap * 2;
@@ -209,6 +192,7 @@ void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
     refs->items[refs->count].source = source;
     refs->items[refs->count].row_index = row_index;
     refs->items[refs->count].row_cpu_addr = row_cpu_addr;
+    refs->sorted = 0;
     refs->count++;
 }
 
@@ -311,20 +295,30 @@ const char *make_generated_label(uint32_t addr)
 const InlineSignature *inline_signature_for(const InlineSignatures *sigs, uint8_t bank,
                                             uint32_t addr)
 {
-    size_t i;
+    size_t lo = 0, hi = sigs->count;
     const InlineSignature *unbanked = NULL;
     uint8_t callee_bank = (addr >= APEX_SYSTEM_ORG) ? 0xffu : bank;
 
-    for (i = 0; i < sigs->count; i++) {
-        if (sigs->items[i].addr != addr) {
-            continue;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (sigs->items[mid].addr < addr) {
+            lo = mid + 1;
+        } else if (sigs->items[mid].addr > addr) {
+            hi = mid;
+        } else {
+            lo = mid;
+            break;
         }
-        if (sigs->items[i].has_bank && sigs->items[i].bank == callee_bank) {
-            return &sigs->items[i];
+    }
+    while (lo < sigs->count && sigs->items[lo].addr == addr) {
+        if (sigs->items[lo].has_bank && sigs->items[lo].bank == callee_bank) {
+            return &sigs->items[lo];
         }
-        if (!sigs->items[i].has_bank) {
-            unbanked = &sigs->items[i];
+        if (!sigs->items[lo].has_bank) {
+            unbanked = &sigs->items[lo];
         }
+        lo++;
     }
     return unbanked;
 }
@@ -445,11 +439,16 @@ void validate_config_classification(const ConfigEntries *entries, const TableDef
     }
 }
 
-size_t labels_at(uint32_t addr, const Label *labels, size_t label_count)
+size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
 {
     size_t count = 0;
     size_t i;
 
+    if (sorted) {
+        i = label_lower_bound(labels, label_count, addr);
+        while (i < label_count && labels[i].addr == addr) { count++; i++; }
+        return count;
+    }
     for (i = 0; i < label_count; i++) {
         if (labels[i].addr == addr) {
             count++;
@@ -458,10 +457,18 @@ size_t labels_at(uint32_t addr, const Label *labels, size_t label_count)
     return count;
 }
 
-int code_label_at(uint32_t addr, const Label *labels, size_t label_count)
+int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
 {
     size_t i;
 
+    if (sorted) {
+        i = label_lower_bound(labels, label_count, addr);
+        while (i < label_count && labels[i].addr == addr) {
+            if (labels[i].is_code) return 1;
+            i++;
+        }
+        return 0;
+    }
     for (i = 0; i < label_count; i++) {
         if (labels[i].addr == addr && labels[i].is_code) {
             return 1;
@@ -472,14 +479,23 @@ int code_label_at(uint32_t addr, const Label *labels, size_t label_count)
 
 const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ranges)
 {
-    size_t i;
+    size_t lo, hi;
 
     if (!ranges) {
         return NULL;
     }
-    for (i = 0; i < ranges->count; i++) {
-        if (ranges->items[i].bank == bank && ranges->items[i].addr == addr) {
-            return &ranges->items[i];
+    lo = 0;
+    hi = ranges->count;
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const DataRange *r = &ranges->items[mid];
+
+        if (r->bank < bank || (r->bank == bank && r->addr < addr)) {
+            lo = mid + 1;
+        } else if (r->bank > bank || (r->bank == bank && r->addr > addr)) {
+            hi = mid;
+        } else {
+            return r;
         }
     }
     return NULL;
@@ -508,10 +524,18 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
     return NULL;
 }
 
-int string_label_at(uint32_t addr, const Label *labels, size_t label_count)
+int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
 {
     size_t i;
 
+    if (sorted) {
+        i = label_lower_bound(labels, label_count, addr);
+        while (i < label_count && labels[i].addr == addr) {
+            if (labels[i].is_string) return 1;
+            i++;
+        }
+        return 0;
+    }
     for (i = 0; i < label_count; i++) {
         if (labels[i].addr == addr && labels[i].is_string) {
             return 1;
@@ -520,11 +544,20 @@ int string_label_at(uint32_t addr, const Label *labels, size_t label_count)
     return 0;
 }
 
-const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count)
+const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
 {
     size_t i;
     const char *generated = NULL;
 
+    if (sorted) {
+        i = label_lower_bound(labels, label_count, addr);
+        while (i < label_count && labels[i].addr == addr) {
+            if (!generated_label_name(labels[i].name)) return labels[i].name;
+            if (!generated) generated = labels[i].name;
+            i++;
+        }
+        return generated;
+    }
     for (i = 0; i < label_count; i++) {
         if (labels[i].addr == addr) {
             if (!generated_label_name(labels[i].name)) {
@@ -553,10 +586,15 @@ const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols)
     return NULL;
 }
 
-int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count)
+int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count,
+                  int sorted)
 {
     size_t i;
 
+    if (sorted) {
+        i = label_lower_bound(labels, label_count, start + 1);
+        return i < label_count && labels[i].addr < end;
+    }
     for (i = 0; i < label_count; i++) {
         if (labels[i].addr > start && labels[i].addr < end) {
             return 1;
@@ -574,20 +612,27 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
     if (name) {
         return name;
     }
-    name = label_name_at(addr, lookup->labels, lookup->label_count);
+    name = label_name_at(addr, lookup->labels, lookup->label_count, lookup->sorted);
     if (name) {
         return name;
     }
-    return label_name_at(addr, lookup->extra_labels, lookup->extra_label_count);
+    return label_name_at(addr, lookup->extra_labels, lookup->extra_label_count, lookup->sorted);
 }
 
 const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables)
 {
-    size_t i;
+    size_t lo = 0, hi = tables->count;
 
-    for (i = 0; i < tables->count; i++) {
-        if (tables->items[i].bank == bank && tables->items[i].addr == addr) {
-            return &tables->items[i];
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const TableDef *t = &tables->items[mid];
+
+        if (t->bank < bank || (t->bank == bank && t->addr < addr)) {
+            lo = mid + 1;
+        } else if (t->bank > bank || (t->bank == bank && t->addr > addr)) {
+            hi = mid;
+        } else {
+            return t;
         }
     }
     return NULL;
@@ -855,7 +900,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
     while (i < labels->count) {
         Label *label = &labels->items[i++];
         uint32_t addr = label->addr;
-        const char *source = label_name_at(addr, labels->items, labels->count);
+        const char *source = label_name_at(addr, labels->items, labels->count, 0);
         size_t pos;
 
         if (!label->is_code || label->scanned || addr < base_addr ||
@@ -895,7 +940,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             if (info.has_target) {
                 if (info.target >= base_addr && info.target < base_addr + used) {
-                    if (!label_name_at(info.target, labels->items, labels->count)) {
+                    if (!label_name_at(info.target, labels->items, labels->count, 0)) {
                         Label *target;
                         if (base_addr == APEX_SYSTEM_ORG) {
                             target = add_label(labels, info.target,
@@ -1010,4 +1055,147 @@ size_t valid_string_len(const uint8_t *data, size_t len)
         }
     }
     return 0;
+}
+
+/* --- sort + binary-search helpers --- */
+
+size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr)
+{
+    size_t lo = 0, hi = count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+
+        if (labels[mid].addr < addr) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr)
+{
+    size_t lo = 0, hi = refs->count;
+
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const Reference *r = &refs->items[mid];
+
+        if (r->bank < bank || (r->bank == bank && r->addr < addr)) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+static int label_addr_cmp(const void *a, const void *b)
+{
+    const Label *la = (const Label *)a;
+    const Label *lb = (const Label *)b;
+
+    if (la->addr < lb->addr) return -1;
+    if (la->addr > lb->addr) return 1;
+    return 0;
+}
+
+void sort_label_set(LabelSet *set)
+{
+    if (set->count > 1) {
+        qsort(set->items, set->count, sizeof(set->items[0]), label_addr_cmp);
+    }
+    set->sorted = 1;
+}
+
+static int data_range_cmp(const void *a, const void *b)
+{
+    const DataRange *ra = (const DataRange *)a;
+    const DataRange *rb = (const DataRange *)b;
+
+    if (ra->bank != rb->bank) return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
+    if (ra->addr < rb->addr) return -1;
+    if (ra->addr > rb->addr) return 1;
+    return 0;
+}
+
+void sort_data_ranges(DataRanges *ranges)
+{
+    if (ranges->count > 1) {
+        qsort(ranges->items, ranges->count, sizeof(ranges->items[0]), data_range_cmp);
+    }
+}
+
+static int table_def_cmp(const void *a, const void *b)
+{
+    const TableDef *ta = (const TableDef *)a;
+    const TableDef *tb = (const TableDef *)b;
+
+    if (ta->bank != tb->bank) return (int)(unsigned)ta->bank - (int)(unsigned)tb->bank;
+    if (ta->addr < tb->addr) return -1;
+    if (ta->addr > tb->addr) return 1;
+    return 0;
+}
+
+void sort_table_defs(TableDefs *tables)
+{
+    if (tables->count > 1) {
+        qsort(tables->items, tables->count, sizeof(tables->items[0]), table_def_cmp);
+    }
+}
+
+static int inline_sig_cmp(const void *a, const void *b)
+{
+    const InlineSignature *sa = (const InlineSignature *)a;
+    const InlineSignature *sb = (const InlineSignature *)b;
+
+    if (sa->addr < sb->addr) return -1;
+    if (sa->addr > sb->addr) return 1;
+    return 0;
+}
+
+void sort_inline_signatures(InlineSignatures *sigs)
+{
+    if (sigs->count > 1) {
+        qsort(sigs->items, sigs->count, sizeof(sigs->items[0]), inline_sig_cmp);
+    }
+}
+
+static int ref_cmp(const void *a, const void *b)
+{
+    const Reference *ra = (const Reference *)a;
+    const Reference *rb = (const Reference *)b;
+    int c;
+
+    if (ra->bank != rb->bank) return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
+    if (ra->addr < rb->addr) return -1;
+    if (ra->addr > rb->addr) return 1;
+    if (ra->source_bank != rb->source_bank)
+        return (int)(unsigned)ra->source_bank - (int)(unsigned)rb->source_bank;
+    if (ra->source_addr < rb->source_addr) return -1;
+    if (ra->source_addr > rb->source_addr) return 1;
+    if (ra->row_index != rb->row_index) return ra->row_index - rb->row_index;
+    c = strcmp(ra->kind, rb->kind);
+    if (c) return c;
+    return strcmp(ra->source, rb->source);
+}
+
+void sort_and_dedup_refs(ReferenceSet *refs)
+{
+    size_t read_idx, write_idx;
+
+    if (!refs || refs->count < 2) {
+        return;
+    }
+    qsort(refs->items, refs->count, sizeof(refs->items[0]), ref_cmp);
+    write_idx = 0;
+    for (read_idx = 1; read_idx < refs->count; read_idx++) {
+        if (ref_cmp(&refs->items[read_idx], &refs->items[write_idx]) != 0) {
+            refs->items[++write_idx] = refs->items[read_idx];
+        }
+    }
+    refs->count = write_idx + 1;
+    refs->sorted = 1;
 }

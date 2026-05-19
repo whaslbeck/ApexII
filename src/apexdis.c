@@ -2,6 +2,7 @@
 #include "apex_analysis.h"
 #include "apex_config.h"
 #include "apexdmd.h"
+#include "apexsprite.h"
 #include "apex_project.h"
 #include "cpu6809.h"
 #include "apexdis_api.h"
@@ -15,7 +16,8 @@ typedef enum {
     BLOCK_CODE,
     BLOCK_DATA,
     BLOCK_TABLE,
-    BLOCK_UNCLASSIFIED
+    BLOCK_UNCLASSIFIED,
+    BLOCK_SPRITE
 } BlockKind;
 
 static void emit_vector_equates(FILE *out, const VectorInfo *vectors, size_t count)
@@ -58,6 +60,9 @@ static const char *block_kind_name(BlockKind kind)
     if (kind == BLOCK_UNCLASSIFIED) {
         return "unclassified";
     }
+    if (kind == BLOCK_SPRITE) {
+        return "sprite";
+    }
     return "unknown";
 }
 
@@ -98,6 +103,7 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
                                  const InlineSignature *inline_sig)
 {
     int is_dmd = 0;
+    int is_sprite = 0;
 
     if (label && label->explain) {
         fprintf(out, "; explain label source=%s\n", label->explain);
@@ -105,6 +111,10 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
     if (label && ((label->kind_explain && strstr(label->kind_explain, "dmd_fullframe")) ||
                   (label->explain && strstr(label->explain, "dmd_fullframe")))) {
         is_dmd = 1;
+    }
+    if (label && ((label->kind_explain && strstr(label->kind_explain, "sprite")) ||
+                  (label->explain && strstr(label->explain, "sprite")))) {
+        is_sprite = 1;
     }
     if (kind != BLOCK_UNKNOWN) {
         const char *source = label && label->kind_explain ? label->kind_explain :
@@ -126,6 +136,9 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
         if (kind == BLOCK_DATA && is_dmd) {
             kind_name = "dmd_fullframe";
         }
+        if (kind == BLOCK_DATA && is_sprite) {
+            kind_name = "sprite";
+        }
         fprintf(out, "; explain kind=%s source=%s\n", kind_name, source);
     }
     if (inline_sig) {
@@ -137,39 +150,30 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
 static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t bank, uint32_t addr)
 {
     size_t i;
-    size_t j;
     int emitted = 0;
 
     if (!refs) {
         return;
     }
-    for (i = 0; i < refs->count; i++) {
-        if (refs->items[i].bank == bank && refs->items[i].addr == addr) {
-            for (j = 0; j < i; j++) {
-                if (refs->items[j].bank == bank && refs->items[j].addr == addr &&
-                    strcmp(refs->items[j].kind, refs->items[i].kind) == 0 &&
-                    strcmp(refs->items[j].source, refs->items[i].source) == 0 &&
-                    refs->items[j].row_index == refs->items[i].row_index) {
-                    break;
-                }
-            }
-            if (j != i) {
-                continue;
-            }
-            if (refs->items[i].row_index >= 0) {
-                /* table reference with row info: emit row index and row address */
-                uint32_t rc = refs->items[i].row_cpu_addr;
-                uint8_t rb = refs->items[i].source_bank;
-                fprintf(out, "%stable:%s line:%d[B%02x_A%04x]",
-                        emitted ? ", " : "; referenced_by ",
-                        refs->items[i].source, refs->items[i].row_index,
-                        (unsigned)rb, (unsigned)rc & 0xffffu);
-            } else {
-                fprintf(out, "%s%s:%s", emitted ? ", " : "; referenced_by ",
-                        refs->items[i].kind, refs->items[i].source);
-            }
-            emitted = 1;
+    /* refs are sorted+deduped by sort_and_dedup_refs; use binary search when sorted */
+    i = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
+    for (; i < refs->count; i++) {
+        if (refs->items[i].bank != bank || refs->items[i].addr != addr) {
+            if (refs->sorted) break;
+            continue;
         }
+        if (refs->items[i].row_index >= 0) {
+            uint32_t rc = refs->items[i].row_cpu_addr;
+            uint8_t rb = refs->items[i].source_bank;
+            fprintf(out, "%stable:%s line:%d[B%02x_A%04x]",
+                    emitted ? ", " : "; referenced_by ",
+                    refs->items[i].source, refs->items[i].row_index,
+                    (unsigned)rb, (unsigned)rc & 0xffffu);
+        } else {
+            fprintf(out, "%s%s:%s", emitted ? ", " : "; referenced_by ",
+                    refs->items[i].kind, refs->items[i].source);
+        }
+        emitted = 1;
     }
     if (emitted) {
         fputc('\n', out);
@@ -199,6 +203,9 @@ static const char *table_field_name(TableFieldKind kind)
     if (kind == TABLE_PTR16_DMD_FULLFRAME) {
         return "ptr16_dmd_fullframe";
     }
+    if (kind == TABLE_PTR16_SPRITE) {
+        return "ptr16_sprite";
+    }
     if (kind == TABLE_FAR_STRING) {
         return "far_string";
     }
@@ -210,6 +217,9 @@ static const char *table_field_name(TableFieldKind kind)
     }
     if (kind == TABLE_FAR_DMD_FULLFRAME) {
         return "far_dmd_fullframe";
+    }
+    if (kind == TABLE_FAR_SPRITE) {
+        return "far_sprite";
     }
     return "far_code";
 }
@@ -281,13 +291,40 @@ static const char *data_kind_name(DataKind kind)
     if (kind == DATA_FAR_DMD_FULLFRAME) {
         return "far_dmd_fullframe";
     }
+    if (kind == DATA_SPRITE) {
+        return "sprite";
+    }
+    if (kind == DATA_PTR16_SPRITE) {
+        return "ptr16_sprite";
+    }
+    if (kind == DATA_FAR_SPRITE) {
+        return "far_sprite";
+    }
+    if (kind == DATA_SPRITE_NOHEADER) {
+        return "sprite_noheader";
+    }
     return "bytes";
 }
 
 static int data_kind_is_far(DataKind kind)
 {
     return kind == DATA_FAR_STRING || kind == DATA_FAR_DATA || kind == DATA_FAR_TABLE ||
-           kind == DATA_FAR_CODE || kind == DATA_FAR_DMD_FULLFRAME;
+           kind == DATA_FAR_CODE || kind == DATA_FAR_DMD_FULLFRAME || kind == DATA_FAR_SPRITE;
+}
+
+static int data_kind_is_ptr16(DataKind kind)
+{
+    return kind == DATA_PTR16_STRING || kind == DATA_PTR16_DATA ||
+           kind == DATA_PTR16_CODE  || kind == DATA_PTR16_TABLE || kind == DATA_PTR16_SPRITE;
+}
+
+static TableFieldKind data_ptr16_to_table_kind(DataKind kind)
+{
+    if (kind == DATA_PTR16_CODE)   return TABLE_PTR16_CODE;
+    if (kind == DATA_PTR16_STRING) return TABLE_PTR16_STRING;
+    if (kind == DATA_PTR16_TABLE)  return TABLE_PTR16_TABLE;
+    if (kind == DATA_PTR16_SPRITE) return TABLE_PTR16_SPRITE;
+    return TABLE_PTR16_DATA;
 }
 
 static int locate_bank_bytes(const uint8_t *paged_rom, size_t banks, uint8_t bank, uint16_t addr,
@@ -362,6 +399,54 @@ static void emit_dmd_fullframe_target_comment(FILE *out, const uint8_t *paged_ro
     }
 }
 
+static void emit_sprite_comment(FILE *out, const uint8_t *src, size_t len)
+{
+    uint8_t hdr = 0, vert = 0, horiz = 0, width = 0, height = 0, enc_type = 0;
+    size_t consumed = 0;
+    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+
+    if (apexsprite_decode(src, len, tmp, &hdr, &vert, &horiz, &width, &height, &enc_type, &consumed)) {
+        fprintf(out, " ; sprite hdr=0x%02x vert=%u horiz=%u width=%u height=%u consumed=%lu",
+                (unsigned)hdr, (unsigned)vert, (unsigned)horiz,
+                (unsigned)width, (unsigned)height, (unsigned long)consumed);
+    } else {
+        fputs(" ; sprite invalid=1", out);
+    }
+}
+
+static void emit_sprite_noheader_comment(FILE *out, const uint8_t *src, size_t len,
+                                         uint8_t table_height)
+{
+    uint8_t width = 0;
+    size_t consumed = 0;
+    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+
+    if (apexsprite_decode_noheader(src, len, tmp, table_height, &width, &consumed)) {
+        fprintf(out, " ; sprite_noheader width=%u height=%u consumed=%lu",
+                (unsigned)width, (unsigned)table_height, (unsigned long)consumed);
+    } else {
+        fputs(" ; sprite_noheader invalid=1", out);
+    }
+}
+
+static void emit_sprite_target_comment(FILE *out, const uint8_t *paged_rom, size_t banks,
+                                       uint8_t bank, uint16_t addr)
+{
+    const uint8_t *src;
+    size_t len;
+
+    if (!locate_bank_bytes(paged_rom, banks, bank, addr, &src, &len)) {
+        fputs(" ; sprite unmapped=1", out);
+        return;
+    }
+    /* No-header VSI: byte 0 is width (1..128); header format uses 0x00/0xFD/0xFE/0xFF */
+    if (apexsprite_is_noheader(src, len)) {
+        fprintf(out, " ; sprite_noheader width=%u", (unsigned)src[0]);
+    } else {
+        emit_sprite_comment(out, src, len);
+    }
+}
+
 static void emit_routine_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
                                        size_t rom_base, const InlineSignature *inline_sig,
                                        const char *doc, const ReferenceSet *refs)
@@ -388,10 +473,17 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
     fputc('\n', out);
     emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
     emit_reference_comment(out, refs, bank, addr);
-    fprintf(out, "; kind data\n");
+    if (range->kind == DATA_SPRITE || range->kind == DATA_SPRITE_NOHEADER ||
+        range->kind == DATA_FAR_SPRITE) {
+        fprintf(out, "; kind sprite\n");
+    } else {
+        fprintf(out, "; kind data\n");
+    }
     if (range->kind == DATA_BYTES) {
         fprintf(out, "; data type=%s length=%lu\n", data_kind_name(range->kind),
                 (unsigned long)range->length);
+    } else if (range->kind == DATA_SPRITE_NOHEADER) {
+        fprintf(out, "; data type=sprite_noheader[%lu]\n", (unsigned long)range->length);
     } else {
         fprintf(out, "; data type=%s\n", data_kind_name(range->kind));
     }
@@ -404,6 +496,24 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
             fputc('\n', out);
         }
     }
+    if (range->kind == DATA_SPRITE) {
+        const uint8_t *src;
+        size_t len;
+
+        if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
+            emit_sprite_comment(out, src, len);
+            fputc('\n', out);
+        }
+    }
+    if (range->kind == DATA_SPRITE_NOHEADER) {
+        const uint8_t *src;
+        size_t len;
+
+        if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
+            emit_sprite_noheader_comment(out, src, len, (uint8_t)range->length);
+            fputc('\n', out);
+        }
+    }
 }
 
 static int label_is_dmd_fullframe(const Label *label)
@@ -413,6 +523,15 @@ static int label_is_dmd_fullframe(const Label *label)
     }
     return (label->kind_explain && strstr(label->kind_explain, "dmd_fullframe")) ||
            (label->explain && strstr(label->explain, "dmd_fullframe"));
+}
+
+static int label_is_sprite(const Label *label)
+{
+    if (!label) {
+        return 0;
+    }
+    return (label->kind_explain && strstr(label->kind_explain, "sprite")) ||
+           (label->explain && strstr(label->explain, "sprite"));
 }
 
 static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
@@ -460,6 +579,7 @@ static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, si
 }
 
 static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
+                           int labels_sorted,
                            uint8_t bank, uint32_t base_addr, size_t rom_base,
                            const InlineSignatures *inline_sigs, const TableDef *table,
                            const DataRange *data_range,
@@ -474,9 +594,13 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
     int emitted_conflict = 0;
     const InlineSignature *inline_sig = inline_signature_for(inline_sigs, bank, addr);
 
-    for (i = 0; i < label_count; i++) {
-        if (labels[i].addr == addr) {
-            if (!emitted_block && table) {
+    i = labels_sorted ? label_lower_bound(labels, label_count, addr) : 0;
+    for (; i < label_count; i++) {
+        if (labels[i].addr != addr) {
+            if (labels_sorted) break;
+            continue;
+        }
+        if (!emitted_block && table) {
                 emit_table_comment_block(out, bank, addr, base_addr, rom_base, table, data, len, pos,
                                          config_doc_at(table_docs, bank, addr), refs);
                 if (emit_explain) {
@@ -512,6 +636,17 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                         fputc('\n', out);
                     }
                 }
+                if (label_is_sprite(&labels[i])) {
+                    const uint8_t *src;
+                    size_t meta_len;
+
+                    fprintf(out, "; kind data\n");
+                    fprintf(out, "; data type=sprite\n");
+                    if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &meta_len)) {
+                        emit_sprite_comment(out, src, meta_len);
+                        fputc('\n', out);
+                    }
+                }
                 if (emit_explain) {
                     emit_explain_comment(out, labels[i].is_data || labels[i].is_string ? BLOCK_DATA :
                                                                               BLOCK_UNKNOWN,
@@ -527,11 +662,12 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
             }
             fprintf(out, "%s:\n", labels[i].name);
             emitted_label = 1;
-        }
     }
     if (!emitted_label && refs) {
-        for (i = 0; i < refs->count; i++) {
-            if (refs->items[i].bank == bank && refs->items[i].addr == addr) {
+        size_t ri = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
+
+        for (; ri < refs->count; ri++) {
+            if (refs->items[ri].bank == bank && refs->items[ri].addr == addr) {
                 if (!emitted_block) {
                     emit_location_comment(out, "label", bank, addr,
                                           rom_base + (size_t)(addr - base_addr));
@@ -540,6 +676,10 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                 fprintf(out, "%s:\n",
                         bank == 0xffu ? make_generated_label(addr) :
                                         make_bank_label(bank, (uint16_t)addr));
+                break;
+            }
+            if (refs->sorted && (refs->items[ri].bank > bank ||
+                                  (refs->items[ri].bank == bank && refs->items[ri].addr > addr))) {
                 break;
             }
         }
@@ -643,7 +783,7 @@ static void emit_string(FILE *out, const uint8_t *data, size_t len)
 static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t len,
                                             const Label *labels, size_t label_count)
 {
-    const char *start_name = label_name_at(start, labels, label_count);
+    const char *start_name = label_name_at(start, labels, label_count, 0);
     size_t i;
 
     if (!start_name) {
@@ -662,10 +802,10 @@ static const char *table_ptr_label(uint16_t ptr, uint8_t bank,
                                    size_t label_count, const Label *extra_labels,
                                    size_t extra_label_count)
 {
-    const char *label = label_name_at(ptr, labels, label_count);
+    const char *label = label_name_at(ptr, labels, label_count, 0);
 
     if (!label) {
-        label = label_name_at(ptr, extra_labels, extra_label_count);
+        label = label_name_at(ptr, extra_labels, extra_label_count, 0);
     }
     if (!label && ptr >= APEX_PAGED_ORG && ptr < 0x8000u) {
         label = make_bank_label(bank, ptr);
@@ -689,16 +829,21 @@ static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
     }
     ptr = read_be16(data + *pos);
     label = table_ptr_label(ptr, bank, labels, label_count, extra_labels, extra_label_count);
-    if (label) {
-        fprintf(out, "    %s %s",
-                kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME" : "TABLE_PTR",
-                label);
-    } else {
-        fprintf(out, "    %s 0x%04x",
-                kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME" : "TABLE_PTR", ptr);
+    {
+        const char *pseudo = kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME" :
+                             kind == TABLE_PTR16_SPRITE         ? "TABLE_PTR_SPRITE"         :
+                                                                  "TABLE_PTR";
+        if (label) {
+            fprintf(out, "    %s %s", pseudo, label);
+        } else {
+            fprintf(out, "    %s 0x%04x", pseudo, ptr);
+        }
     }
     if (kind == TABLE_PTR16_DMD_FULLFRAME) {
         emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, ptr);
+    }
+    if (kind == TABLE_PTR16_SPRITE) {
+        emit_sprite_target_comment(out, paged_rom, banks, bank, ptr);
     }
     fputc('\n', out);
     *pos += 2u;
@@ -746,9 +891,9 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
     uint8_t label_bank = bank;
 
     if (bank == 0xffu && in_system_addr(addr)) {
-        label = label_name_at(addr, labels, label_count);
+        label = label_name_at(addr, labels, label_count, 0);
         if (!label) {
-            label = label_name_at(addr, extra_labels, extra_label_count);
+            label = label_name_at(addr, extra_labels, extra_label_count, 0);
         }
         if (!label) {
             label = make_generated_label(addr);
@@ -759,7 +904,7 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
 
         if (bank_index >= 0) {
             label_bank = bank_id_for_index(paged_rom, bank_index);
-            label = label_name_at(addr, bank_labels[bank_index].items, bank_labels[bank_index].count);
+            label = label_name_at(addr, bank_labels[bank_index].items, bank_labels[bank_index].count, 0);
         }
         if (!label) {
             label = make_bank_label(label_bank, addr);
@@ -791,6 +936,9 @@ static const char *table_far_pseudo(TableFieldKind kind)
     if (kind == TABLE_FAR_DMD_FULLFRAME) {
         return "TABLE_FAR_DMD_FULLFRAME";
     }
+    if (kind == TABLE_FAR_SPRITE) {
+        return "TABLE_FAR_SPRITE";
+    }
     return "TABLE_FAR_PTR";
 }
 
@@ -807,6 +955,9 @@ static const char *inline_far_pseudo(TableFieldKind kind)
     }
     if (kind == TABLE_FAR_DMD_FULLFRAME) {
         return "INLINE_FAR_DMD_FULLFRAME";
+    }
+    if (kind == TABLE_FAR_SPRITE) {
+        return "INLINE_FAR_SPRITE";
     }
     return "INLINE_FAR_PTR";
 }
@@ -825,6 +976,9 @@ static const char *inline_ptr_pseudo(TableFieldKind kind)
     if (kind == TABLE_PTR16_DMD_FULLFRAME) {
         return "INLINE_PTR_DMD_FULLFRAME";
     }
+    if (kind == TABLE_PTR16_SPRITE) {
+        return "INLINE_PTR_SPRITE";
+    }
     return "INLINE_PTR";
 }
 
@@ -841,6 +995,9 @@ static const char *data_far_pseudo(DataKind kind)
     }
     if (kind == DATA_FAR_DMD_FULLFRAME) {
         return "FAR_DMD_FULLFRAME";
+    }
+    if (kind == DATA_FAR_SPRITE) {
+        return "FAR_SPRITE";
     }
     return "FAR_PTR";
 }
@@ -951,6 +1108,9 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                     if (kind == TABLE_FAR_DMD_FULLFRAME) {
                         emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, addr);
                     }
+                    if (kind == TABLE_FAR_SPRITE) {
+                        emit_sprite_target_comment(out, paged_rom, banks, bank, addr);
+                    }
                     fputc('\n', out);
                     *pos += 3u;
                 } else {
@@ -1032,6 +1192,10 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             emit_dmd_fullframe_target_comment(out, paged_rom, banks, data[*pos + 2u],
                                               read_be16(data + *pos));
         }
+        if (range->kind == DATA_FAR_SPRITE) {
+            emit_sprite_target_comment(out, paged_rom, banks, data[*pos + 2u],
+                                       read_be16(data + *pos));
+        }
         fputc('\n', out);
         *pos += 3u;
         return 1;
@@ -1041,6 +1205,30 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         uint8_t type = 0;
 
         if (!decode_dmd_fullframe_metadata(data + *pos, len - *pos, &type, &consumed) ||
+            consumed == 0u) {
+            consumed = 1u;
+        }
+        emit_data_bytes(out, data, len, base_addr, pos, consumed);
+        return 1;
+    }
+    if (range->kind == DATA_SPRITE) {
+        uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+        size_t consumed = 0;
+
+        if (!apexsprite_decode(data + *pos, len - *pos, tmp,
+                               NULL, NULL, NULL, NULL, NULL, NULL, &consumed) ||
+            consumed == 0u) {
+            consumed = 1u;
+        }
+        emit_data_bytes(out, data, len, base_addr, pos, consumed);
+        return 1;
+    }
+    if (range->kind == DATA_SPRITE_NOHEADER) {
+        uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+        size_t consumed = 0;
+
+        if (!apexsprite_decode_noheader(data + *pos, len - *pos, tmp,
+                                        (uint8_t)range->length, NULL, &consumed) ||
             consumed == 0u) {
             consumed = 1u;
         }
@@ -1114,6 +1302,9 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 if (kind == TABLE_FAR_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, target);
                 }
+                if (kind == TABLE_FAR_SPRITE) {
+                    emit_sprite_target_comment(out, paged_rom, banks, bank, target);
+                }
                 fputc('\n', out);
                 *pos += 3u;
             } else {
@@ -1129,6 +1320,9 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 if (kind == TABLE_PTR16_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, current_bank, ptr);
                 }
+                if (kind == TABLE_PTR16_SPRITE) {
+                    emit_sprite_target_comment(out, paged_rom, banks, current_bank, ptr);
+                }
                 fputc('\n', out);
                 *pos += 2u;
             }
@@ -1140,7 +1334,7 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
 }
 
 static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
-                                const Label *labels, size_t label_count,
+                                const Label *labels, size_t label_count, int sorted,
                                 const Label *extra_labels, size_t extra_label_count,
                                 const VectorInfo *vectors, size_t vector_count,
                                 const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
@@ -1161,6 +1355,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
     lookup.extra_labels = extra_labels;
     lookup.extra_label_count = extra_label_count;
     lookup.symbols = symbols;
+    lookup.sorted = sorted;
 
     while (pos < len) {
         size_t col = 0;
@@ -1175,25 +1370,33 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             table = table_def_at(current_bank, base_addr + (uint32_t)pos, tables);
         }
         data_range = data_range_at(current_bank, base_addr + (uint32_t)pos, data_ranges);
-        has_string_label = string_label_at(base_addr + (uint32_t)pos, labels, label_count);
-        has_code_label = code_label_at(base_addr + (uint32_t)pos, labels, label_count);
+        has_string_label = string_label_at(base_addr + (uint32_t)pos, labels, label_count, sorted);
+        has_code_label = code_label_at(base_addr + (uint32_t)pos, labels, label_count, sorted);
         if (table) {
             current_kind = BLOCK_TABLE;
-        } else if (data_range || has_string_label) {
+        } else if (data_range) {
+            if (data_range->kind == DATA_SPRITE || data_range->kind == DATA_SPRITE_NOHEADER ||
+                data_range->kind == DATA_FAR_SPRITE) {
+                current_kind = BLOCK_SPRITE;
+            } else {
+                current_kind = BLOCK_DATA;
+            }
+        } else if (has_string_label) {
             current_kind = BLOCK_DATA;
         } else if (has_code_label || decoding_code) {
             current_kind = BLOCK_CODE;
         }
         emit_transition_comment(out, previous_kind, current_kind, current_bank,
                                 base_addr + (uint32_t)pos, rom_base + pos);
-        emit_labels_at(out, base_addr + (uint32_t)pos, labels, label_count, current_bank, base_addr,
-                       rom_base, inline_sigs, table, data_range, data, len, pos, routine_docs,
-                       table_docs, refs, emit_explain, paged_rom, banks);
+        emit_labels_at(out, base_addr + (uint32_t)pos, labels, label_count, sorted,
+                       current_bank, base_addr, rom_base, inline_sigs, table, data_range,
+                       data, len, pos, routine_docs, table_docs, refs, emit_explain,
+                       paged_rom, banks);
         if (data_range && emit_data_range(out, data_range, data, len, base_addr, &pos, labels, label_count,
                                           extra_labels, extra_label_count, paged_rom, banks,
                                           bank_labels)) {
             decoding_code = 0;
-            previous_kind = BLOCK_DATA;
+            previous_kind = (current_kind == BLOCK_SPRITE) ? BLOCK_SPRITE : BLOCK_DATA;
             continue;
         }
         if (has_string_label) {
@@ -1245,7 +1448,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
 
                 if (label_between(base_addr + (uint32_t)pos,
                                   base_addr + (uint32_t)(pos + info.size), labels,
-                                  label_count)) {
+                                  label_count, sorted)) {
                     decoding_code = 0;
                     emit_transition_comment(out, BLOCK_CODE, BLOCK_UNCLASSIFIED, current_bank,
                                             base_addr + (uint32_t)pos, rom_base + pos);
@@ -1284,7 +1487,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             size_t line_start = pos;
 
         while (pos < len && col < 16) {
-            if (col > 0 && labels_at(base_addr + (uint32_t)pos, labels, label_count)) {
+            if (col > 0 && labels_at(base_addr + (uint32_t)pos, labels, label_count, sorted)) {
                 break;
             }
             if (col > 0 && vector_entry_at(base_addr + (uint32_t)pos, vectors, vector_count)) {
@@ -1311,7 +1514,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
     uint8_t bank_id = data[0];
 
     emit_location_comment(out, "bank_start", bank_id, APEX_PAGED_ORG, rom_bank_base);
-    if (!labels_at(APEX_PAGED_ORG, labels->items, labels->count)) {
+    if (!labels_at(APEX_PAGED_ORG, labels->items, labels->count, labels->sorted)) {
         fprintf(out, "B%02x_A%04x:\n", bank_id, (unsigned)APEX_PAGED_ORG);
     }
 
@@ -1320,12 +1523,15 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
     }
     fprintf(out, "    BANK_ID 0x%02x\n", bank_id);    if (used > 1) {
         emit_db_with_labels(out, data + 1, used - 1, APEX_PAGED_ORG + 1, labels->items,
-                            labels->count, system_labels->items, system_labels->count, NULL, 0,
-                            inline_sigs, paged_rom, banks, bank_labels, tables, routine_docs,
-                            table_docs, symbols, data_ranges, refs, bank_id, rom_bank_base + 1u,
-                            emit_explain, types);
+                            labels->count, labels->sorted, system_labels->items,
+                            system_labels->count, NULL, 0, inline_sigs, paged_rom, banks,
+                            bank_labels, tables, routine_docs, table_docs, symbols, data_ranges,
+                            refs, bank_id, rom_bank_base + 1u, emit_explain, types);
     }
     if (used < APEX_BANK_SIZE) {
+        emit_location_comment(out, "free", bank_id,
+                              (uint32_t)(APEX_PAGED_ORG + used),
+                              rom_bank_base + used);
         fprintf(out, "    FILL_TO_BANK_END\n");
     }
 }
@@ -1416,16 +1622,21 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
     size_t used = last_non_ff(data, APEX_SYSTEM_SIZE);
 
     emit_location_comment(out, "bank_start", 0xffu, APEX_SYSTEM_ORG, rom_system_base);
-    if (!labels_at(APEX_SYSTEM_ORG, labels->items, labels->count)) {
+    if (!labels_at(APEX_SYSTEM_ORG, labels->items, labels->count, labels->sorted)) {
         fprintf(out, "Bff_A%04x:\n", (unsigned)APEX_SYSTEM_ORG);
     }
 
-    if (used > 0) {        emit_db_with_labels(out, data, used, APEX_SYSTEM_ORG, labels->items, labels->count, NULL,
-                            0, vectors, vector_count, inline_sigs, paged_rom, banks, bank_labels,
-                            tables, routine_docs, table_docs, symbols, data_ranges, refs, 0xff,
-                            rom_system_base, emit_explain, types);
+    if (used > 0) {
+        emit_db_with_labels(out, data, used, APEX_SYSTEM_ORG, labels->items, labels->count,
+                            labels->sorted, NULL, 0, vectors, vector_count, inline_sigs,
+                            paged_rom, banks, bank_labels, tables, routine_docs, table_docs,
+                            symbols, data_ranges, refs, 0xff, rom_system_base, emit_explain,
+                            types);
     }
     if (used < APEX_SYSTEM_SIZE) {
+        emit_location_comment(out, "free", 0xffu,
+                              (uint32_t)(APEX_SYSTEM_ORG + used),
+                              rom_system_base + used);
         fprintf(out, "    FILL_TO_BANK_END\n");
     }
 }
@@ -1573,6 +1784,8 @@ void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_
 static void apply_data_far_label(DataKind kind, const uint8_t *paged_rom, size_t banks,
                                  LabelSet *bank_labels, LabelSet *system_labels, uint16_t addr,
                                  uint8_t bank);
+static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank,
+                                    uint16_t ptr);
 
 static const char *table_far_ref_source(TableFieldKind kind)
 {
@@ -1584,6 +1797,9 @@ static const char *table_far_ref_source(TableFieldKind kind)
     }
     if (kind == TABLE_FAR_DMD_FULLFRAME) {
         return "table_far_dmd_fullframe_ref";
+    }
+    if (kind == TABLE_FAR_SPRITE) {
+        return "table_far_sprite_ref";
     }
     return "table_far_data_ref";
 }
@@ -1599,6 +1815,9 @@ static const char *table_ptr_ref_source(TableFieldKind kind)
     if (kind == TABLE_PTR16_DMD_FULLFRAME) {
         return "table_ptr16_dmd_fullframe_ref";
     }
+    if (kind == TABLE_PTR16_SPRITE) {
+        return "table_ptr16_sprite_ref";
+    }
     return "table_ptr16_data_ref";
 }
 
@@ -1606,6 +1825,9 @@ static const char *config_data_source(DataKind kind)
 {
     if (kind == DATA_DMD_FULLFRAME) {
         return "config_dmd_fullframe";
+    }
+    if (kind == DATA_SPRITE) {
+        return "config_sprite";
     }
     return "config_data";
 }
@@ -1651,7 +1873,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                     continue;
                 }
                 data = system_rom + (size_t)(range->addr - APEX_SYSTEM_ORG);
-                source = label_name_at(range->addr, system_labels->items, system_labels->count);
+                source = label_name_at(range->addr, system_labels->items, system_labels->count, 0);
             } else {
                 int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
 
@@ -1662,7 +1884,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                 data = paged_rom + (size_t)bank_index * APEX_BANK_SIZE +
                        (size_t)(range->addr - APEX_PAGED_ORG);
                 source = label_name_at(range->addr, bank_labels[bank_index].items,
-                                       bank_labels[bank_index].count);
+                                       bank_labels[bank_index].count, 0);
             }
             target = read_be16(data);
             bank = data[2];
@@ -1676,6 +1898,48 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                 if (bank_index >= 0 && target >= APEX_PAGED_ORG && target < 0x8000u) {
                     add_reference(refs, bank_id_for_index(paged_rom, bank_index), target,
                                   range->bank, range->addr, "data", source);
+                }
+            }
+        } else if (data_kind_is_ptr16(range->kind)) {
+            /* Follow each 2-byte pointer in the range to discover code/data targets. */
+            TableFieldKind tkind = data_ptr16_to_table_kind(range->kind);
+            const uint8_t *data = NULL;
+            const char *source = NULL;
+            size_t j;
+
+            if (range->bank == 0xffu) {
+                if (!in_system_addr(range->addr)) {
+                    continue;
+                }
+                data = system_rom + (size_t)(range->addr - APEX_SYSTEM_ORG);
+                source = label_name_at(range->addr, system_labels->items, system_labels->count, 0);
+            } else {
+                int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
+
+                if (bank_index < 0 || range->addr < APEX_PAGED_ORG ||
+                    range->addr >= 0x8000u) {
+                    continue;
+                }
+                data = paged_rom + (size_t)bank_index * APEX_BANK_SIZE +
+                       (size_t)(range->addr - APEX_PAGED_ORG);
+                source = label_name_at(range->addr, bank_labels[bank_index].items,
+                                       bank_labels[bank_index].count, 0);
+            }
+            for (j = 0; j + 2u <= range->length; j += 2u) {
+                uint16_t ptr = read_be16(data + j);
+
+                if (ptr >= APEX_PAGED_ORG && ptr < 0x8000u) {
+                    int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
+
+                    if (bank_index >= 0) {
+                        apply_table_ptr16_label(tkind, &bank_labels[bank_index], range->bank, ptr);
+                        add_reference(refs, range->bank, ptr, range->bank,
+                                      range->addr + (uint32_t)j, "data", source);
+                    }
+                } else if (in_system_addr(ptr)) {
+                    apply_system_ptr16_label(tkind, system_labels, ptr, "data");
+                    add_reference(refs, 0xff, ptr, range->bank,
+                                  range->addr + (uint32_t)j, "data", source);
                 }
             }
         }
@@ -1733,6 +1997,8 @@ static void apply_data_far_label(DataKind kind, const uint8_t *paged_rom, size_t
         table_kind = TABLE_FAR_CODE;
     } else if (kind == DATA_FAR_DMD_FULLFRAME) {
         table_kind = TABLE_FAR_DMD_FULLFRAME;
+    } else if (kind == DATA_FAR_SPRITE) {
+        table_kind = TABLE_FAR_SPRITE;
     }
     apply_table_far_label(table_kind, paged_rom, banks, bank_labels, system_labels, addr, bank);
 }
@@ -1860,7 +2126,7 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
                 explain_label_kind(table_label, "config_table");
                 mark_label_data(table_label);
             }
-            source = label_name_at(table->addr, system_labels->items, system_labels->count);
+            source = label_name_at(table->addr, system_labels->items, system_labels->count, 0);
             if (table->has_header && pos + 3u <= used) {
                 count = read_be16(bank + pos);
                 row_width = bank[pos + 2u];
@@ -1893,7 +2159,7 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
             explain_label_kind(table_label, "config_table");
             mark_label_data(table_label);
         }
-        source = label_name_at(table->addr, bank_labels[bank_index].items, bank_labels[bank_index].count);
+        source = label_name_at(table->addr, bank_labels[bank_index].items, bank_labels[bank_index].count, 0);
         if (!table->has_header) {
             row_width = (uint8_t)table_schema_width(&table->schema);
             for (row = 0; row < table->rows && pos + row_width <= used; row++) {

@@ -142,6 +142,9 @@ int main(int argc, char **argv)
     state.show_types_editor     = false;
     state.show_ref_exclusions   = false;
     state.show_rom_map          = false;
+    state.show_dmd_list         = false;
+    state.show_sprite_list      = false;
+    state.sprite_scan_done      = false;
     state.show_bookmarks     = true;
     state.show_transitions   = false;
     state.request_layout_reset = true;
@@ -194,6 +197,12 @@ int main(int argc, char **argv)
                     selected_address(document, &state, &cur_b, &cur_a);
                     rerender_and_reselect(project, &document, &state, cur_b, cur_a);
                 }
+                if (ImGui::MenuItem("Force Full Re-analyze", "Shift+F5")) {
+                    uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
+                    selected_address(document, &state, &cur_b, &cur_a);
+                    apex_project_invalidate(project, APEX_DIRTY_ANALYSIS);
+                    rerender_and_reselect(project, &document, &state, cur_b, cur_a);
+                }
                 {
                     bool has_base = state.base_config_path[0] != '\0';
                     if (!has_base) ImGui::BeginDisabled();
@@ -229,6 +238,8 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("RAM References", NULL, &state.show_ram_refs);
                 ImGui::MenuItem("Ref Exclusions", NULL, &state.show_ref_exclusions);
                 ImGui::MenuItem("ROM Map",        NULL, &state.show_rom_map);
+                ImGui::MenuItem("DMD Frames",     NULL, &state.show_dmd_list);
+                ImGui::MenuItem("Sprites",        NULL, &state.show_sprite_list);
                 ImGui::Separator();
                 ImGui::MenuItem("Details",     NULL, &state.show_details);
                 ImGui::MenuItem("References",  NULL, &state.show_refs);
@@ -321,19 +332,12 @@ int main(int argc, char **argv)
                 state.request_focus_filter = 0;
             }
             ImGui::InputText("Filter", state.filter_input, 128);
-            if (ImGui::Button("Next code_to_data")) {
-                jump_to_transition(document, &state, APEX_RENDER_TRANSITION_CODE_TO_DATA, 1);
+            if (ImGui::Button("Next boundary")) {
+                jump_primary_transition(document, &state, 1);
             }
             ImGui::SameLine();
-            if (ImGui::Button("Prev code_to_data")) {
-                jump_to_transition(document, &state, APEX_RENDER_TRANSITION_CODE_TO_DATA, 0);
-            }
-            if (ImGui::Button("Next table_to_data")) {
-                jump_to_transition(document, &state, APEX_RENDER_TRANSITION_TABLE_TO_DATA, 1);
-            }
-            ImGui::SameLine();
-            if (ImGui::Button("Prev table_to_data")) {
-                jump_to_transition(document, &state, APEX_RENDER_TRANSITION_TABLE_TO_DATA, 0);
+            if (ImGui::Button("Prev boundary")) {
+                jump_primary_transition(document, &state, 0);
             }
             ImGui::Separator();
             ImGui::TextUnformatted("Recent");
@@ -551,6 +555,16 @@ int main(int argc, char **argv)
             render_rom_map(project, &document, &state);
             ImGui::End();
         }
+        if (state.show_dmd_list) {
+            ImGui::Begin("DMD Frames", &state.show_dmd_list);
+            render_dmd_list_window(project, document, &state);
+            ImGui::End();
+        }
+        if (state.show_sprite_list) {
+            ImGui::Begin("Sprites", &state.show_sprite_list);
+            render_sprite_list_window(project, &document, &state);
+            ImGui::End();
+        }
         if (state.show_edit) {
             ImGui::Begin("Edit", &state.show_edit);
             render_editor(project, &document, &original_snapshot, &state);
@@ -643,7 +657,7 @@ int main(int argc, char **argv)
                 ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
                 krow("J / Down Arrow",     "Move selection down");
                 krow("K / Up Arrow",       "Move selection up");
-                krow("N / P",              "Next / prev code\xe2\x86\x94""data boundary");
+                krow("N / P",              "Next / prev block boundary");
                 krow("F / Enter",          "Follow link / jump to target");
                 krow("[ / ]",              "History back / forward");
                 krow("Alt+\xe2\x86\x90 / Alt+\xe2\x86\x92", "History back / forward (alt)");
@@ -685,6 +699,7 @@ int main(int argc, char **argv)
                 krow("Ctrl+C",   "Copy selection");
                 krow("Ctrl+S",   "Save config overlay");
                 krow("F5",       "Re-analyze");
+                krow("Shift+F5", "Force full re-analyze");
                 ImGui::EndTable();
             }
 
@@ -844,6 +859,8 @@ int main(int argc, char **argv)
             if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
                 uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
                 selected_address(document, &state, &cur_b, &cur_a);
+                if (io.KeyShift)
+                    apex_project_invalidate(project, APEX_DIRTY_ANALYSIS);
                 rerender_and_reselect(project, &document, &state, cur_b, cur_a);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_F) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {

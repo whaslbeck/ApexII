@@ -152,6 +152,53 @@ static bool is_dmd_fullframe_addr(const ApexProject *p, uint8_t bank, uint32_t a
     return false;
 }
 
+static bool is_sprite_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
+{
+    size_t i;
+    for (i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *dr = &p->data_ranges.items[i];
+        if (dr->kind == DATA_SPRITE && dr->bank == bank && addr == dr->addr)
+            return true;
+    }
+    return false;
+}
+
+static void render_sprite_preview(const SpritePreviewInfo &pr, float max_scale = 6.0f)
+{
+    ImVec2 avail = ImGui::GetContentRegionAvail();
+    float scale_x = pr.width  > 0 ? avail.x / (float)pr.width  : 1.0f;
+    float scale_y = pr.height > 0 ? avail.x / (float)pr.height : 1.0f;
+    float scale = std::max(1.0f, std::min(max_scale, std::min(scale_x, scale_y)));
+    ImGui::TextUnformatted(pr.title);
+    ImGui::Text("Address: B%02x_A%04x  ROM: 0x%06lx",
+                pr.bank, (unsigned)pr.cpu_addr & 0xffffu, (unsigned long)pr.rom_offset);
+    ImGui::Text("Hdr: 0x%02x  Enc: 0x%02x  Size: %ux%u  Consumed: %lu",
+                (unsigned)pr.header_type, (unsigned)pr.enc_type,
+                (unsigned)pr.width, (unsigned)pr.height, (unsigned long)pr.consumed);
+    ImGui::Separator();
+    uint8_t row_bytes = (uint8_t)((pr.width + 7u) / 8u);
+    ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
+    ImGui::InvisibleButton("spr_canvas", ImVec2(pr.width * scale, pr.height * scale));
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(canvas_pos,
+                        ImVec2(canvas_pos.x + pr.width * scale, canvas_pos.y + pr.height * scale),
+                        IM_COL32(8, 8, 8, 255));
+    for (uint8_t row = 0; row < pr.height; row++) {
+        for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
+            uint8_t bits = pr.pixels[row * row_bytes + col_byte];
+            for (size_t bit = 0; bit < 8u; bit++) {
+                int px = (int)(col_byte * 8u + bit);
+                if (px >= (int)pr.width) break;
+                bool lit = ((bits >> bit) & 1u) != 0u; /* LSB = leftmost pixel, same as DMD renderer */
+                ImVec2 p0(canvas_pos.x + px * scale, canvas_pos.y + row * scale);
+                draw->AddRectFilled(p0,
+                                    ImVec2(p0.x + scale - 1.0f, p0.y + scale - 1.0f),
+                                    lit ? IM_COL32(120, 220, 255, 255) : IM_COL32(6, 18, 28, 255));
+            }
+        }
+    }
+}
+
 /* Render a short disassembly preview of up to kPreviewLines display lines
    starting at the given ROM offset / CPU address. Handles inline-byte payloads:
    after a JSR/LBSR with a known inline signature the payload bytes are shown as
@@ -383,12 +430,16 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     } else if (line->block_kind == APEX_RENDER_BLOCK_DATA &&
                                is_dmd_fullframe_addr(project, line->bank, line->cpu_addr)) {
                         ImGui::TextColored(ImVec4(1.00f, 0.30f, 0.70f, 1.0f), "dmd_fullframe");
+                    } else if (line->block_kind == APEX_RENDER_BLOCK_SPRITE) {
+                        ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f), "sprite");
                     } else {
                         ImGui::TextUnformatted(block_name(line->block_kind));
                     }
                 } else if (line->has_location && line->block_kind == APEX_RENDER_BLOCK_DATA &&
                            is_dmd_fullframe_addr(project, line->bank, line->cpu_addr)) {
                     ImGui::TextColored(ImVec4(1.00f, 0.30f, 0.70f, 1.0f), "dmd_fullframe");
+                } else if (line->has_location && line->block_kind == APEX_RENDER_BLOCK_SPRITE) {
+                    ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f), "sprite");
                 } else {
                     ImGui::TextUnformatted(block_name(line->block_kind));
                 }
@@ -571,9 +622,77 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     }
                     if (line->has_location &&
                         (line->block_kind == APEX_RENDER_BLOCK_DATA ||
+                         line->block_kind == APEX_RENDER_BLOCK_SPRITE ||
                          line->block_kind == APEX_RENDER_BLOCK_TABLE ||
                          line->block_kind == APEX_RENDER_BLOCK_UNCLASSIFIED)) {
                         render_disasm_preview(project, line->rom_addr, line->bank, line->cpu_addr);
+                    }
+                    if (line->has_location) {
+                        DmdPreviewInfo dmd_pr = {};
+                        bool found_dmd = false;
+                        if (is_dmd_fullframe_addr(project, line->bank, line->cpu_addr) &&
+                            decode_dmd_preview_at(project, line->bank, line->cpu_addr, &dmd_pr)) {
+                            snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Preview");
+                            found_dmd = true;
+                        }
+                        if (!found_dmd) {
+                            auto ts = find_line_targets(document, state, line);
+                            for (auto &t : ts) {
+                                if (address_is_dmd_fullframe_start(project, t.bank, t.cpu_addr) &&
+                                    decode_dmd_preview_at(project, t.bank, t.cpu_addr, &dmd_pr)) {
+                                    snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Target");
+                                    found_dmd = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (found_dmd) {
+                            ImGui::Separator();
+                            render_dmd_preview(dmd_pr, 4.0f);
+                        }
+                        if (!found_dmd) {
+                            SpritePreviewInfo spr_pr = {};
+                            bool found_spr = false;
+                            if (is_sprite_addr(project, line->bank, line->cpu_addr) &&
+                                decode_sprite_preview_at(project, line->bank, line->cpu_addr, &spr_pr)) {
+                                snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Preview");
+                                found_spr = true;
+                            }
+                            if (!found_spr) {
+                                auto ts = find_line_targets(document, state, line);
+                                for (auto &t : ts) {
+                                    if (address_is_sprite_start(project, t.bank, t.cpu_addr) &&
+                                        decode_sprite_preview_at(project, t.bank, t.cpu_addr, &spr_pr)) {
+                                        snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
+                                        found_spr = true;
+                                        break;
+                                    }
+                                }
+                            }
+                            /* Fallback: for ptr16_sprite FDB rows whose target isn't labeled
+                               yet (unclassified), read the 2-byte pointer from ROM directly. */
+                            if (!found_spr &&
+                                line->has_location &&
+                                line->block_kind == APEX_RENDER_BLOCK_TABLE &&
+                                line->kind == APEX_RENDER_LINE_DIRECTIVE) {
+                                const uint8_t *fdb_src; size_t fdb_rem;
+                                if (project_locate_rom_bytes(project, line->bank,
+                                                             line->cpu_addr, &fdb_src,
+                                                             &fdb_rem, NULL) && fdb_rem >= 2u) {
+                                    uint32_t tgt_addr = ((uint32_t)fdb_src[0] << 8) | fdb_src[1];
+                                    uint8_t tgt_bank = (tgt_addr >= 0x8000u) ? 0xFFu : line->bank;
+                                    if (decode_sprite_preview_at(project, tgt_bank,
+                                                                 tgt_addr, &spr_pr)) {
+                                        snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
+                                        found_spr = true;
+                                    }
+                                }
+                            }
+                            if (found_spr) {
+                                ImGui::Separator();
+                                render_sprite_preview(spr_pr, 4.0f);
+                            }
+                        }
                     }
                     ImGui::EndTooltip();
                 }
@@ -1076,15 +1195,17 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
     }
 
     static const ImVec4 kind_colors[] = {
-        ImVec4(0.50f, 0.50f, 0.50f, 1.0f), /* UNKNOWN       — gray    */
-        ImVec4(0.40f, 0.90f, 0.40f, 1.0f), /* CODE          — green   */
-        ImVec4(0.45f, 0.70f, 1.00f, 1.0f), /* DATA (.DB)    — blue    */
-        ImVec4(0.95f, 0.65f, 0.20f, 1.0f), /* TABLE         — orange  */
-        ImVec4(0.65f, 0.65f, 0.65f, 1.0f), /* UNCLASSIFIED  — light gray */
-        ImVec4(0.90f, 0.55f, 0.90f, 1.0f), /* STRING        — purple  */
-        ImVec4(0.30f, 0.90f, 0.90f, 1.0f), /* .DW           — cyan    */
-        ImVec4(1.00f, 0.40f, 0.35f, 1.0f), /* FAR pointer   — red     */
-        ImVec4(1.00f, 0.30f, 0.70f, 1.0f), /* DMD fullframe — magenta */
+        ImVec4(0.50f, 0.50f, 0.50f, 1.0f), /* [0] UNKNOWN       — gray       */
+        ImVec4(0.40f, 0.90f, 0.40f, 1.0f), /* [1] CODE          — green      */
+        ImVec4(0.45f, 0.70f, 1.00f, 1.0f), /* [2] DATA (.DB)    — blue       */
+        ImVec4(0.95f, 0.65f, 0.20f, 1.0f), /* [3] TABLE         — orange     */
+        ImVec4(0.65f, 0.65f, 0.65f, 1.0f), /* [4] UNCLASSIFIED  — light gray */
+        ImVec4(0.55f, 0.35f, 0.10f, 1.0f), /* [5] FREE (0xFF)   — dark amber */
+        ImVec4(0.47f, 0.86f, 1.00f, 1.0f), /* [6] SPRITE        — sky blue   */
+        ImVec4(0.90f, 0.55f, 0.90f, 1.0f), /* [7] STRING        — purple     */
+        ImVec4(0.30f, 0.90f, 0.90f, 1.0f), /* [8] .DW           — cyan       */
+        ImVec4(1.00f, 0.40f, 0.35f, 1.0f), /* [9] FAR pointer   — red        */
+        ImVec4(1.00f, 0.30f, 0.70f, 1.0f), /* [10] DMD fullframe — magenta   */
     };
     static const size_t kind_colors_count = sizeof(kind_colors) / sizeof(kind_colors[0]);
 
@@ -1213,7 +1334,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             for (size_t li = 0; li < d->line_count && fill < vis_end; li++) {
                 const ApexRenderedLine *l = &d->lines[li];
                 if (!l->has_location) continue;
-                /* Resolve extended kind: DATA lines with distinct pseudo-ops get own colors. */
+                /* Resolve extended kind: DATA lines with distinct pseudo-ops get own colors.
+                   SPRITE block kind (=6) maps directly; DATA sub-types use indices 7-10. */
                 uint8_t lk = (uint8_t)l->block_kind;
                 if (l->block_kind == APEX_RENDER_BLOCK_DATA && l->text && l->length >= 3) {
                     const char *p2 = l->text;
@@ -1221,15 +1343,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     while (rem > 0 && (*p2 == ' ' || *p2 == '\t')) { p2++; rem--; }
                     if (rem >= 6 && memcmp(p2, "STRING", 6) == 0 &&
                         (rem == 6 || p2[6] == ' ' || p2[6] == '\t'))
-                        lk = 5; /* STRING — purple */
+                        lk = 7; /* STRING — purple */
                     else if (rem >= 3 && memcmp(p2, ".DW", 3) == 0 &&
                              (rem == 3 || p2[3] == ' ' || p2[3] == '\t'))
-                        lk = 6; /* .DW — cyan */
+                        lk = 8; /* .DW — cyan */
                     else if (rem >= 4 && memcmp(p2, "FAR_", 4) == 0)
-                        lk = 7; /* FAR pointer — red */
+                        lk = 9; /* FAR pointer — red */
                     else {
-                        /* DMD fullframe: check whether this CPU address falls
-                           within a DATA_DMD_FULLFRAME data range. */
                         size_t ri;
                         for (ri = 0; ri < p->data_ranges.count; ri++) {
                             const DataRange *dr = &p->data_ranges.items[ri];
@@ -1237,7 +1357,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                                 dr->bank == l->bank &&
                                 l->cpu_addr >= dr->addr &&
                                 l->cpu_addr < dr->addr + APEX_DMD_PAGE_BYTES) {
-                                lk = 8; /* DMD fullframe — magenta */
+                                lk = 10; /* DMD fullframe — magenta */
                                 break;
                             }
                         }
@@ -1605,6 +1725,7 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
         { TABLE_PTR16_DATA,         "ptr16_data"  },
         { TABLE_PTR16_CODE,         "ptr16_code"  },
         { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd"   },
+        { TABLE_PTR16_SPRITE,      "ptr16_spr"   },
     };
     /* Row 2: far pointer kinds */
     static const struct { int kind; const char *label; } kRow2[] = {
@@ -1613,6 +1734,7 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
         { TABLE_FAR_TABLE,         "far_table"   },
         { TABLE_FAR_CODE,          "far_code"    },
         { TABLE_FAR_DMD_FULLFRAME, "far_dmd"     },
+        { TABLE_FAR_SPRITE,        "far_spr"     },
     };
 
     bool changed = false;
@@ -1679,11 +1801,13 @@ static void render_field_chips(ApexEditField *fields, int *count)
                 { TABLE_PTR16_CODE,        "ptr16_code"    },
                 { TABLE_PTR16_TABLE,       "ptr16_table"   },
                 { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd"    },
+                { TABLE_PTR16_SPRITE,      "ptr16_spr"    },
                 { TABLE_FAR_STRING,        "far_string"    },
                 { TABLE_FAR_DATA,          "far_data"      },
                 { TABLE_FAR_TABLE,         "far_table"     },
                 { TABLE_FAR_CODE,          "far_code"      },
                 { TABLE_FAR_DMD_FULLFRAME, "far_dmd"       },
+                { TABLE_FAR_SPRITE,        "far_spr"       },
             };
             kname = "?";
             for (int k = 0; k < (int)(sizeof(kN)/sizeof(kN[0])); k++) {
@@ -1779,6 +1903,20 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         snprintf(spec, sizeof(spec), "bytes[%d]", s->edit_data_length);
         apply_data_at_selection(p, dp, s, spec);
     }
+    ImGui::SameLine();
+    if (ImGui::Button("sprite##raw")) { apply_data_at_selection(p, dp, s, "sprite"); }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(42.0f);
+    ImGui::InputInt("##snhh", &s->sprite_nh_height, 0, 0);
+    if (s->sprite_nh_height < 1)  s->sprite_nh_height = 1;
+    if (s->sprite_nh_height > 128) s->sprite_nh_height = 128;
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("height for sprite_noheader");
+    ImGui::SameLine();
+    if (ImGui::Button("spr_nh##raw")) {
+        char spec[32];
+        snprintf(spec, sizeof(spec), "sprite_noheader[%d]", s->sprite_nh_height);
+        apply_data_at_selection(p, dp, s, spec);
+    }
     /* row: 16-bit pointer types */
     ImGui::TextDisabled("ptr16:");
     ImGui::SameLine();
@@ -1789,18 +1927,22 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::Button("string##p16")) { apply_data_at_selection(p, dp, s, "ptr16_string"); }
     ImGui::SameLine();
     if (ImGui::Button("table##p16"))  { apply_data_at_selection(p, dp, s, "ptr16_table");  }
+    ImGui::SameLine();
+    if (ImGui::Button("spr##p16"))    { apply_data_at_selection(p, dp, s, "ptr16_sprite"); }
     /* row: far pointer types */
     ImGui::TextDisabled("far:  ");
     ImGui::SameLine();
-    if (ImGui::Button("code##far"))   { apply_data_at_selection(p, dp, s, "far_code");     }
+    if (ImGui::Button("code##far"))    { apply_data_at_selection(p, dp, s, "far_code");    }
     ImGui::SameLine();
-    if (ImGui::Button("data##far"))   { apply_data_at_selection(p, dp, s, "far_data");     }
+    if (ImGui::Button("data##far"))    { apply_data_at_selection(p, dp, s, "far_data");    }
     ImGui::SameLine();
-    if (ImGui::Button("string##far")) { apply_data_at_selection(p, dp, s, "far_string");   }
+    if (ImGui::Button("string##far"))  { apply_data_at_selection(p, dp, s, "far_string");  }
     ImGui::SameLine();
-    if (ImGui::Button("table##far"))  { apply_data_at_selection(p, dp, s, "far_table");    }
+    if (ImGui::Button("table##far"))   { apply_data_at_selection(p, dp, s, "far_table");   }
     ImGui::SameLine();
-    if (ImGui::Button("dmd##far"))    { apply_data_at_selection(p, dp, s, "dmd_fullframe"); }
+    if (ImGui::Button("dmd##far"))     { apply_data_at_selection(p, dp, s, "dmd_fullframe"); }
+    ImGui::SameLine();
+    if (ImGui::Button("far_spr##far")) { apply_data_at_selection(p, dp, s, "far_sprite");  }
 
     /* ── Inline ─────────────────────────────────────────────────── */
     ImGui::SeparatorText("Inline Signature");
@@ -1882,7 +2024,8 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         s->request_focus_doc = 0;
     }
     ImGui::InputTextMultiline("##doc", s->edit_doc_input, 1024,
-                              ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5));
+                              ImVec2(-FLT_MIN, ImGui::GetTextLineHeight() * 5),
+                              ImGuiInputTextFlags_WordWrap);
     if (ImGui::Button("Apply##doc")) {
         if (s->edit_doc_input[0]) {
             if (apex_project_set_doc(p, s->edit_doc_mode == EDIT_DOC_TABLE, 1, b, a,
@@ -2606,15 +2749,17 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
     }
 
     static const ImVec4 kind_colors[] = {
-        ImVec4(0.50f, 0.50f, 0.50f, 1.0f), /* UNKNOWN       — gray       */
-        ImVec4(0.40f, 0.90f, 0.40f, 1.0f), /* CODE          — green      */
-        ImVec4(0.45f, 0.70f, 1.00f, 1.0f), /* DATA (.DB)    — blue       */
-        ImVec4(0.95f, 0.65f, 0.20f, 1.0f), /* TABLE         — orange     */
-        ImVec4(0.65f, 0.65f, 0.65f, 1.0f), /* UNCLASSIFIED  — light gray */
-        ImVec4(0.90f, 0.55f, 0.90f, 1.0f), /* STRING        — purple     */
-        ImVec4(0.30f, 0.90f, 0.90f, 1.0f), /* .DW           — cyan       */
-        ImVec4(1.00f, 0.40f, 0.35f, 1.0f), /* FAR pointer   — red        */
-        ImVec4(1.00f, 0.30f, 0.70f, 1.0f), /* DMD fullframe — magenta    */
+        ImVec4(0.50f, 0.50f, 0.50f, 1.0f), /* [0]  UNKNOWN       — gray       */
+        ImVec4(0.40f, 0.90f, 0.40f, 1.0f), /* [1]  CODE          — green      */
+        ImVec4(0.45f, 0.70f, 1.00f, 1.0f), /* [2]  DATA (.DB)    — blue       */
+        ImVec4(0.95f, 0.65f, 0.20f, 1.0f), /* [3]  TABLE         — orange     */
+        ImVec4(0.65f, 0.65f, 0.65f, 1.0f), /* [4]  UNCLASSIFIED  — light gray */
+        ImVec4(0.55f, 0.35f, 0.10f, 1.0f), /* [5]  FREE (0xFF)   — dark amber */
+        ImVec4(0.47f, 0.86f, 1.00f, 1.0f), /* [6]  SPRITE        — sky blue   */
+        ImVec4(0.90f, 0.55f, 0.90f, 1.0f), /* [7]  STRING        — purple     */
+        ImVec4(0.30f, 0.90f, 0.90f, 1.0f), /* [8]  .DW           — cyan       */
+        ImVec4(1.00f, 0.40f, 0.35f, 1.0f), /* [9]  FAR pointer   — red        */
+        ImVec4(1.00f, 0.30f, 0.70f, 1.0f), /* [10] DMD fullframe — magenta    */
     };
     static const int kind_colors_count = (int)(sizeof(kind_colors) / sizeof(kind_colors[0]));
 
@@ -2647,12 +2792,12 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
                     while (rem > 0 && (*tp == ' ' || *tp == '\t')) { tp++; rem--; }
                     if (rem >= 6 && memcmp(tp, "STRING", 6) == 0 &&
                         (rem == 6 || tp[6] == ' ' || tp[6] == '\t'))
-                        lk = 5;
+                        lk = 7;
                     else if (rem >= 3 && memcmp(tp, ".DW", 3) == 0 &&
                              (rem == 3 || tp[3] == ' ' || tp[3] == '\t'))
-                        lk = 6;
+                        lk = 8;
                     else if (rem >= 4 && memcmp(tp, "FAR_", 4) == 0)
-                        lk = 7;
+                        lk = 9;
                     else {
                         for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
                             const DataRange *dr = &p->data_ranges.items[ri];
@@ -2660,7 +2805,7 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
                                 dr->bank == l->bank &&
                                 l->cpu_addr >= dr->addr &&
                                 l->cpu_addr < dr->addr + APEX_DMD_PAGE_BYTES) {
-                                lk = 8;
+                                lk = 10;
                                 break;
                             }
                         }
@@ -2820,5 +2965,665 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
             }
             ImGui::SetTooltip("%s", tip);
         }
+    }
+}
+
+void render_dmd_list_window(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    size_t dmd_count = 0;
+    for (size_t i = 0; i < p->data_ranges.count; i++)
+        if (p->data_ranges.items[i].kind == DATA_DMD_FULLFRAME)
+            dmd_count++;
+    ImGui::TextDisabled("(%zu frames)", dmd_count);
+
+    if (ImGui::BeginTable("dmd_list", 2,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,  110.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        int row_id = 0;
+        for (size_t i = 0; i < p->data_ranges.count; i++) {
+            const DataRange *dr = &p->data_ranges.items[i];
+            if (dr->kind != DATA_DMD_FULLFRAME) continue;
+
+            char addrstr[32];
+            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
+                     (unsigned)dr->bank, (unsigned)dr->addr & 0xffffu);
+            std::string lbl = label_at_address(d, s, dr->bank, dr->addr);
+            size_t li = 0;
+            bool found = apex_render_find_line_by_address(d, dr->bank, dr->addr, &li) != NULL;
+            bool sel = found && s->selected_line == li;
+
+            ImGui::PushID(row_id++);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::Selectable(addrstr, sel,
+                    ImGuiSelectableFlags_SpanAllColumns |
+                    ImGuiSelectableFlags_AllowOverlap)) {
+                if (found) select_line(s, li, 1);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
+                DmdPreviewInfo pr = {};
+                if (decode_dmd_preview_at(p, dr->bank, dr->addr, &pr)) {
+                    ImGui::BeginTooltip();
+                    render_dmd_preview(pr, 4.0f);
+                    ImGui::EndTooltip();
+                }
+            }
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(lbl.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* Resolve a WPC far pointer {cpu, bank} to a ROM offset.
+   Returns true on success.  bank == 0xFF means the system bank. */
+static bool vsi_resolve_far(const ApexProject *p,
+                             uint32_t cpu, uint8_t bank, size_t *out)
+{
+    if (bank == 0xFFu) {
+        if (cpu < 0x8000u || cpu >= 0x10000u) return false;
+        size_t o = p->paged_size + (cpu - 0x8000u);
+        if (o >= p->rom.size) return false;
+        *out = o;
+        return true;
+    }
+    if (cpu < 0x4000u || cpu >= 0x8000u) return false;
+    int bi = bank_index_for_far_ref(p->rom.data, p->banks, bank);
+    if (bi < 0) return false;
+    size_t o = (size_t)bi * 0x4000u + (cpu - 0x4000u);
+    if (o >= p->rom.size) return false;
+    *out = o;
+    return true;
+}
+
+/* Resolve a 16-bit near pointer from a ptr16_sprite table entry.
+   If cpu >= 0x8000 the target is in the system bank regardless of tbl_bank. */
+static bool ptr16_sprite_resolve(const ApexProject *p, uint32_t cpu, uint8_t tbl_bank,
+                                  size_t *out, uint8_t *out_bank)
+{
+    uint8_t effective_bank = (cpu >= 0x8000u) ? 0xFFu : tbl_bank;
+    if (!vsi_resolve_far(p, cpu, effective_bank, out)) return false;
+    *out_bank = effective_bank;
+    return true;
+}
+
+/* Scan the ROM for the WPC font-table code signature, walk the master VSI
+   table, and populate s->vsi_table_entries with every discoverable image. */
+static void scan_vsi_table_candidates(const ApexProject *p, UiState *s)
+{
+    s->vsi_table_entries.clear();
+    s->vsi_sub_tables.clear();
+    s->vsi_table_scan_done = true; /* set early so early-returns leave it true */
+
+    if (!p->rom.data || p->rom.size == 0 || p->paged_size >= p->rom.size)
+        return;
+
+    /* --- Step 1: find the LDX / ABX / ASLB code signature in system bank ---
+       Pattern (from WPCEdit initTableAddrs):
+         BE xx xx 3A 58 3A D6 ?? 34 04 (F6|BD) ?? ?? (BD|F6) ??
+       where xx xx is the system-bank CPU address of the 3-byte far pointer
+       that points to the font master table. */
+    const uint8_t *sys = p->rom.data + p->paged_size;
+    size_t sys_len = p->rom.size - p->paged_size;
+    size_t sig = SIZE_MAX;
+    for (size_t i = 0; i + 16u <= sys_len; i++) {
+        if (sys[i]    == 0xBEu &&
+            sys[i+3]  == 0x3Au && sys[i+4] == 0x58u &&
+            sys[i+5]  == 0x3Au && sys[i+6] == 0xD6u &&
+            sys[i+8]  == 0x34u && sys[i+9] == 0x04u &&
+            (sys[i+10] == 0xF6u || sys[i+10] == 0xBDu) &&
+            (sys[i+13] == 0xBDu || sys[i+13] == 0xF6u)) {
+            sig = i;
+            break;
+        }
+    }
+    if (sig == SIZE_MAX) return;
+
+    /* --- Step 2: extract the CPU address of the far-pointer cell ---
+       The LDX operand (bytes 1-2 of the pattern) is a system-bank address
+       that holds the 3-byte far pointer to the master table. */
+    uint32_t ptr_cpu = ((uint32_t)sys[sig+1] << 8) | sys[sig+2];
+    if (ptr_cpu < 0x8000u) return;
+    size_t ptr_off = p->paged_size + (ptr_cpu - 0x8000u);
+    if (ptr_off + 3u > p->rom.size) return;
+
+    /* --- Step 3: read the 3-byte far pointer → master table address ---
+       Force bank to 0xFF when cpu address is in system range (WPCEdit does
+       the same when the page byte is not a valid paged bank indicator). */
+    uint32_t master_cpu  = ((uint32_t)p->rom.data[ptr_off] << 8)
+                           | p->rom.data[ptr_off+1];
+    uint8_t  master_bank = p->rom.data[ptr_off+2];
+    if (master_cpu >= 0x8000u) master_bank = 0xFFu;
+
+    size_t master_off;
+    if (!vsi_resolve_far(p, master_cpu, master_bank, &master_off)) return;
+
+    /* --- Step 4: walk master table (array of 3-byte far pointers) ---
+       Stop at the first entry that cannot be parsed as a valid VSI sub-table
+       (matches WPCEdit's preAnalyzeVariableSizedImageTable behaviour). */
+    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+
+    for (int tidx = 0; tidx < 512; tidx++) {
+        size_t eoff = master_off + (size_t)tidx * 3u;
+        if (eoff + 3u > p->rom.size) break;
+
+        uint32_t e_cpu  = ((uint32_t)p->rom.data[eoff] << 8) | p->rom.data[eoff+1];
+        uint8_t  e_bank = p->rom.data[eoff+2];
+        if (e_cpu >= 0x8000u) e_bank = 0xFFu;
+
+        /* First hop: resolve the far pointer from the master table entry. */
+        size_t inter_off;
+        if (!vsi_resolve_far(p, e_cpu, e_bank, &inter_off)) break;
+
+        /* Near-pointer fixup (some ROMs store a 2-byte near pointer at the
+           first hop instead of the sub-table directly).  If the 2-byte word
+           at the first hop is itself in the paged range, follow it (keeping
+           the same bank byte). */
+        if (inter_off + 2u <= p->rom.size) {
+            uint32_t tmp_cpu = ((uint32_t)p->rom.data[inter_off] << 8)
+                               | p->rom.data[inter_off+1];
+            if (tmp_cpu >= 0x4000u && tmp_cpu < 0x8000u)
+                e_cpu = tmp_cpu;
+        }
+
+        size_t sub_off;
+        if (!vsi_resolve_far(p, e_cpu, e_bank, &sub_off)) break;
+        if (sub_off + 4u > p->rom.size) break;
+
+        /* --- Step 5: parse the sub-table header ---
+           Layout: [ImgIndexMin][ImgIndexMax]... 0x00 [TableHeight] [TableSpacing]
+                   followed by total_images × 2-byte BE near pointers. */
+        const uint8_t *sub  = p->rom.data + sub_off;
+        size_t         slen = p->rom.size - sub_off;
+
+        size_t pos = 0;
+        int total_imgs = 0;
+        bool valid = true;
+        while (pos + 1u < slen && sub[pos] != 0x00u) {
+            uint8_t imin = sub[pos], imax = sub[pos+1];
+            if (imin > imax || total_imgs + (imax - imin + 1) > 512) {
+                valid = false; break;
+            }
+            total_imgs += (int)(imax - imin + 1);
+            pos += 2;
+        }
+        if (!valid || total_imgs == 0) break;
+        if (pos >= slen || sub[pos] != 0x00u) break;
+        pos++; /* skip terminator */
+
+        if (pos + 2u > slen) break;
+        uint8_t tbl_h = sub[pos++];
+        pos++; /* spacing byte */
+        if (tbl_h == 0 || tbl_h > 32) break;
+        if (pos + (size_t)total_imgs * 2u > slen) break;
+
+        /* Record sub-table metadata (pos = header length: pairs + terminator + H + spacing) */
+        {
+            uint8_t sb; uint32_t sa;
+            if (rom_offset_to_cpu_address(p, sub_off, &sb, &sa)) {
+                UiState::VsiSubTableInfo st;
+                st.table_idx   = tidx;
+                st.bank        = sb;
+                st.cpu_addr    = sa;
+                st.header_len  = pos;
+                st.num_images  = total_imgs;
+                st.table_height= tbl_h;
+                s->vsi_sub_tables.push_back(st);
+            }
+        }
+
+        /* --- Step 6: enumerate images in this sub-table --- */
+        for (int iidx = 0; iidx < total_imgs; iidx++) {
+            size_t ppos = pos + (size_t)iidx * 2u;
+            uint32_t img_cpu = ((uint32_t)sub[ppos] << 8) | sub[ppos+1];
+
+            size_t img_off;
+            uint8_t img_effective_bank;
+            if (!ptr16_sprite_resolve(p, img_cpu, e_bank, &img_off, &img_effective_bank)) continue;
+
+            const uint8_t *img = p->rom.data + img_off;
+            size_t img_len = p->rom.size - img_off;
+
+            uint8_t img_bank_out;
+            uint32_t img_cpu_out;
+            if (!rom_offset_to_cpu_address(p, img_off, &img_bank_out, &img_cpu_out))
+                continue;
+
+            uint8_t b0 = img_len > 0 ? img[0] : 0;
+            bool is_nh = false;
+            uint8_t w = 0, h = 0;
+            bool decoded = false;
+
+            if (b0 == 0x00u || b0 == 0xFDu || b0 == 0xFEu || b0 == 0xFFu) {
+                uint8_t ht, vb, hb, enc; size_t con;
+                if (apexsprite_decode(img, img_len, tmp,
+                                      &ht, &vb, &hb, &w, &h, &enc, &con))
+                    decoded = true;
+            } else if (b0 >= 1u && b0 <= 128u) {
+                uint8_t pw; size_t con;
+                if (apexsprite_decode_noheader(img, img_len, tmp,
+                                               tbl_h, &pw, &con)) {
+                    w = pw; h = tbl_h; is_nh = true; decoded = true;
+                }
+            }
+            if (!decoded) continue;
+
+            bool classified = false;
+            for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
+                const DataRange *dr = &p->data_ranges.items[ri];
+                if ((dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER) &&
+                    dr->bank == img_bank_out && dr->addr == img_cpu_out) {
+                    classified = true; break;
+                }
+            }
+
+            UiState::VsiTableEntry e;
+            e.table_idx   = tidx;
+            e.image_idx   = iidx;
+            e.table_height= tbl_h;
+            e.bank        = img_bank_out;
+            e.cpu_addr    = img_cpu_out;
+            e.rom_offset  = img_off;
+            e.is_noheader = is_nh;
+            e.width       = w;
+            e.height      = h;
+            e.classified  = classified;
+            s->vsi_table_entries.push_back(e);
+        }
+    }
+}
+
+/* Bulk-classify a complete VSI sub-table: header bytes + pointer-array table + all images. */
+static void classify_vsi_table(ApexProject *p, const ApexRenderedDocument **dp,
+                               UiState *s, int table_idx)
+{
+    const UiState::VsiSubTableInfo *st = nullptr;
+    for (auto &t : s->vsi_sub_tables) {
+        if (t.table_idx == table_idx) { st = &t; break; }
+    }
+    if (!st) return;
+
+    /* Sub-table header bytes (min/max pairs + 0x00 + height + spacing) */
+    if (st->header_len > 0) {
+        char spec[32];
+        snprintf(spec, sizeof(spec), "bytes[%zu]", st->header_len);
+        apex_project_set_kind(p, 1, st->bank, st->cpu_addr, APEX_KIND_DATA, spec);
+    }
+
+    /* Pointer array: rows[N](ptr16_sprite), starting right after the header */
+    if (st->num_images > 0) {
+        uint32_t ptr_addr = st->cpu_addr + (uint32_t)st->header_len;
+        char spec[64];
+        snprintf(spec, sizeof(spec), "rows[%d](ptr16_sprite)", st->num_images);
+        apex_project_set_kind(p, 1, st->bank, ptr_addr, APEX_KIND_TABLE, spec);
+    }
+
+    /* Individual images: walk the raw pointer array so we classify ALL entries,
+       including those the scan skipped (null check handles 0x0000 / unmapped). */
+    {
+        size_t sub_off;
+        if (vsi_resolve_far(p, st->cpu_addr, st->bank, &sub_off)) {
+            size_t ptr_off = sub_off + st->header_len;
+            uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+            for (int iidx = 0; iidx < st->num_images; iidx++) {
+                size_t ppos = ptr_off + (size_t)iidx * 2u;
+                if (ppos + 2u > p->rom.size) break;
+                uint32_t img_cpu = ((uint32_t)p->rom.data[ppos] << 8) | p->rom.data[ppos+1];
+                size_t img_off;
+                uint8_t img_effective_bank;
+                if (!ptr16_sprite_resolve(p, img_cpu, st->bank, &img_off, &img_effective_bank)) continue;
+                uint8_t img_bank; uint32_t img_cpu_out;
+                if (!rom_offset_to_cpu_address(p, img_off, &img_bank, &img_cpu_out)) continue;
+
+                const uint8_t *img = p->rom.data + img_off;
+                size_t img_len = p->rom.size - img_off;
+                uint8_t b0 = img_len > 0 ? img[0] : 0;
+                char spec[32];
+                if (b0 >= 1u && b0 <= 128u) {
+                    snprintf(spec, sizeof(spec), "sprite_noheader[%d]", (int)st->table_height);
+                } else if (apexsprite_decode(img, img_len, tmp,
+                                             nullptr, nullptr, nullptr, nullptr,
+                                             nullptr, nullptr, nullptr)) {
+                    strcpy(spec, "sprite");
+                } else {
+                    /* Undecipherable format — classify as raw bytes so it gets a label */
+                    strcpy(spec, "sprite");
+                }
+                apex_project_set_kind(p, 1, img_bank, img_cpu_out, APEX_KIND_DATA, spec);
+            }
+        }
+    }
+
+    /* Re-analyze, re-render, scroll to sub-table, then refresh the VSI scan. */
+    rerender_and_reselect(p, dp, s, st->bank, st->cpu_addr);
+    scan_vsi_table_candidates(p, s);
+}
+
+static void scan_sprite_candidates(const ApexProject *p, UiState *s)
+{
+    s->sprite_candidates.clear();
+    if (!p->rom.data || p->rom.size == 0) {
+        s->sprite_scan_done = true;
+        return;
+    }
+    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
+    for (size_t off = 0; off < p->rom.size; off++) {
+        uint8_t b0 = p->rom.data[off];
+        if (b0 != 0x00u && b0 != 0xFDu && b0 != 0xFEu && b0 != 0xFFu)
+            continue;
+        const uint8_t *src = p->rom.data + off;
+        size_t src_size = p->rom.size - off;
+        uint8_t htype, voff_b, hoff_b, width, height, enc_type;
+        size_t consumed;
+        if (!apexsprite_decode(src, src_size, tmp, &htype, &voff_b, &hoff_b,
+                               &width, &height, &enc_type, &consumed))
+            continue;
+        uint8_t bank;
+        uint32_t cpu_addr;
+        if (!rom_offset_to_cpu_address(p, off, &bank, &cpu_addr))
+            continue;
+        bool classified = false;
+        for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
+            const DataRange *dr = &p->data_ranges.items[ri];
+            if (dr->kind == DATA_SPRITE && dr->bank == bank && dr->addr == cpu_addr) {
+                classified = true;
+                break;
+            }
+        }
+        UiState::SpriteScanEntry e;
+        e.bank        = bank;
+        e.cpu_addr    = cpu_addr;
+        e.rom_offset  = off;
+        e.header_type = htype;
+        e.enc_type    = enc_type;
+        e.width       = width;
+        e.height      = height;
+        e.consumed    = consumed;
+        e.classified  = classified;
+        s->sprite_candidates.push_back(e);
+    }
+    s->sprite_scan_done = true;
+}
+
+void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    const ApexRenderedDocument *d = *dp;
+    size_t classified_count = 0;
+    for (size_t i = 0; i < p->data_ranges.count; i++) {
+        DataKind k = p->data_ranges.items[i].kind;
+        if (k == DATA_SPRITE || k == DATA_SPRITE_NOHEADER)
+            classified_count++;
+    }
+
+    if (ImGui::Button("Scan VSI Tables")) {
+        scan_vsi_table_candidates(p, s);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Scan ROM")) {
+        scan_sprite_candidates(p, s);
+    }
+    ImGui::SameLine();
+    {
+        size_t vsi_count  = s->vsi_table_scan_done ? s->vsi_table_entries.size() : 0;
+        size_t cand_count = 0;
+        if (s->sprite_scan_done) {
+            for (auto &e : s->sprite_candidates)
+                if (!e.classified &&
+                    e.width  >= s->sprite_filter_min_w && e.width  <= s->sprite_filter_max_w &&
+                    e.height >= s->sprite_filter_min_h && e.height <= s->sprite_filter_max_h)
+                    cand_count++;
+        }
+        ImGui::TextDisabled("(%zu classified, %zu vsi, %zu scan)",
+                            classified_count, vsi_count, cand_count);
+    }
+
+    /* Filter controls */
+    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("W min", &s->sprite_filter_min_w);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("W max", &s->sprite_filter_max_w);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("H min", &s->sprite_filter_min_h);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("H max", &s->sprite_filter_max_h);
+    s->sprite_filter_min_w = std::max(1, std::min(s->sprite_filter_min_w, 128));
+    s->sprite_filter_max_w = std::max(s->sprite_filter_min_w, std::min(s->sprite_filter_max_w, 128));
+    s->sprite_filter_min_h = std::max(1, std::min(s->sprite_filter_min_h, 32));
+    s->sprite_filter_max_h = std::max(s->sprite_filter_min_h, std::min(s->sprite_filter_max_h, 32));
+
+    /* --- VSI Sub-Table overview (shown when scan produced results) --- */
+    if (s->vsi_table_scan_done && !s->vsi_sub_tables.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("VSI sub-tables — click Classify to apply all entries to config");
+
+        if (ImGui::BeginTable("vsi_subtables", 6,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
+                ImGuiTableFlags_SizingFixedFit)) {
+            ImGui::TableSetupColumn("Tbl",   0, 30.0f);
+            ImGui::TableSetupColumn("Address", 0, 110.0f);
+            ImGui::TableSetupColumn("H",     0, 25.0f);
+            ImGui::TableSetupColumn("Imgs",  0, 35.0f);
+            ImGui::TableSetupColumn("Hdr",   0, 35.0f);
+            ImGui::TableSetupColumn("",      0, 90.0f); /* Classify button */
+            ImGui::TableHeadersRow();
+
+            bool vsi_reclassified = false;
+            for (auto &st : s->vsi_sub_tables) {
+                int pass = 0, done = 0;
+                for (auto &e : s->vsi_table_entries) {
+                    if (e.table_idx != st.table_idx) continue;
+                    if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+                    if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+                    pass++;
+                    if (e.classified) done++;
+                }
+
+                ImGui::PushID(st.table_idx);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("T%d", st.table_idx);
+                ImGui::TableSetColumnIndex(1);
+                {
+                    char addrstr[32];
+                    snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
+                             (unsigned)st.bank, (unsigned)st.cpu_addr & 0xffffu);
+                    size_t li = 0;
+                    bool found = apex_render_find_line_by_address(d, st.bank, st.cpu_addr, &li) != NULL;
+                    if (ImGui::SmallButton(addrstr) && found)
+                        select_line(s, li, 1);
+                }
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%u", (unsigned)st.table_height);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("%d", st.num_images);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%zu", st.header_len);
+                ImGui::TableSetColumnIndex(5);
+                bool all_done = (done == pass && pass == st.num_images);
+                if (all_done) {
+                    ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.0f, 1.0f), "classified");
+                } else {
+                    char btn[24];
+                    snprintf(btn, sizeof(btn), "Classify##t%d", st.table_idx);
+                    if (ImGui::SmallButton(btn)) {
+                        int tidx = st.table_idx; /* copy before vsi_sub_tables is invalidated */
+                        classify_vsi_table(p, dp, s, tidx);
+                        d = *dp;
+                        vsi_reclassified = true;
+                    }
+                    if (!vsi_reclassified && done > 0) {
+                        ImGui::SameLine();
+                        ImGui::TextDisabled("%d/%d", done, st.num_images);
+                    }
+                }
+                ImGui::PopID();
+                if (vsi_reclassified) break; /* vsi_sub_tables was rebuilt — must not iterate further */
+            }
+            ImGui::EndTable();
+        }
+        ImGui::Separator();
+    } else if (s->vsi_table_scan_done && s->vsi_sub_tables.empty()) {
+        ImGui::TextDisabled("VSI table signature not found in this ROM.");
+        ImGui::Separator();
+    }
+
+    if (ImGui::BeginTable("sprite_list", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,   110.0f);
+        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,    60.0f);
+        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,    90.0f);
+        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed,    60.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        int row_id = 0;
+
+        /* --- VSI table entries (from "Scan VSI Tables") --- */
+        if (s->vsi_table_scan_done) {
+            for (auto &e : s->vsi_table_entries) {
+                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
+                         (unsigned)e.bank, (unsigned)e.cpu_addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, e.bank, e.cpu_addr);
+                size_t li = 0;
+                bool found = apex_render_find_line_by_address(d, e.bank, e.cpu_addr, &li) != NULL;
+                bool sel = found && s->selected_line == li;
+
+                ImGui::PushID(row_id++);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (ImGui::Selectable(addrstr, sel,
+                        ImGuiSelectableFlags_SpanAllColumns |
+                        ImGuiSelectableFlags_AllowOverlap)) {
+                    if (found) select_line(s, li, 1);
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
+                    SpritePreviewInfo pr = {};
+                    if (decode_sprite_preview_at(p, e.bank, e.cpu_addr, &pr)) {
+                        ImGui::BeginTooltip();
+                        render_sprite_preview(pr, 6.0f);
+                        char info[64];
+                        snprintf(info, sizeof(info),
+                                 "T%d I%d  %ux%u  tbl_h=%u  %s",
+                                 e.table_idx, e.image_idx,
+                                 (unsigned)e.width, (unsigned)e.height,
+                                 (unsigned)e.table_height,
+                                 e.is_noheader ? "no-hdr" : "hdr");
+                        ImGui::TextUnformatted(info);
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%ux%u", (unsigned)e.width, (unsigned)e.height);
+                ImGui::TableSetColumnIndex(2);
+                if (e.classified)
+                    ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
+                                       e.is_noheader ? "vsi_nh*" : "vsi*");
+                else
+                    ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f),
+                                       e.is_noheader ? "vsi_nh" : "vsi");
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("T%d I%d", e.table_idx, e.image_idx);
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(lbl.c_str());
+                ImGui::PopID();
+            }
+        } else if (s->vsi_table_entries.empty()) {
+            /* no scan yet — show hint */
+        }
+
+        /* --- Classified sprites from data_ranges --- */
+        for (size_t i = 0; i < p->data_ranges.count; i++) {
+            const DataRange *dr = &p->data_ranges.items[i];
+            if (dr->kind != DATA_SPRITE && dr->kind != DATA_SPRITE_NOHEADER) continue;
+
+            char addrstr[32];
+            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
+                     (unsigned)dr->bank, (unsigned)dr->addr & 0xffffu);
+            std::string lbl = label_at_address(d, s, dr->bank, dr->addr);
+            size_t li = 0;
+            bool found = apex_render_find_line_by_address(d, dr->bank, dr->addr, &li) != NULL;
+            bool sel = found && s->selected_line == li;
+
+            SpritePreviewInfo pr = {};
+            bool have_pr = decode_sprite_preview_at(p, dr->bank, dr->addr, &pr) != 0;
+
+            ImGui::PushID(row_id++);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::Selectable(addrstr, sel,
+                    ImGuiSelectableFlags_SpanAllColumns |
+                    ImGuiSelectableFlags_AllowOverlap)) {
+                if (found) select_line(s, li, 1);
+            }
+            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && have_pr) {
+                ImGui::BeginTooltip();
+                render_sprite_preview(pr, 6.0f);
+                ImGui::EndTooltip();
+            }
+            ImGui::TableSetColumnIndex(1);
+            if (have_pr)
+                ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
+            else
+                ImGui::TextDisabled("?");
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
+                               dr->kind == DATA_SPRITE_NOHEADER ? "spr_nh" : "sprite");
+            ImGui::TableSetColumnIndex(3); /* Tbl/Img — not applicable */
+            ImGui::TableSetColumnIndex(4);
+            ImGui::TextUnformatted(lbl.c_str());
+            ImGui::PopID();
+        }
+
+        /* --- ROM scan candidates (unclassified, dimension-filtered) --- */
+        if (s->sprite_scan_done) {
+            for (auto &e : s->sprite_candidates) {
+                if (e.classified) continue;
+                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
+                         (unsigned)e.bank, (unsigned)e.cpu_addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, e.bank, e.cpu_addr);
+                size_t li = 0;
+                bool found = apex_render_find_line_by_address(d, e.bank, e.cpu_addr, &li) != NULL;
+                bool sel = found && s->selected_line == li;
+
+                ImGui::PushID(row_id++);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (ImGui::Selectable(addrstr, sel,
+                        ImGuiSelectableFlags_SpanAllColumns |
+                        ImGuiSelectableFlags_AllowOverlap)) {
+                    if (found) select_line(s, li, 1);
+                }
+                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
+                    SpritePreviewInfo pr = {};
+                    if (decode_sprite_preview_at(p, e.bank, e.cpu_addr, &pr)) {
+                        ImGui::BeginTooltip();
+                        render_sprite_preview(pr, 6.0f);
+                        ImGui::EndTooltip();
+                    }
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%ux%u", (unsigned)e.width, (unsigned)e.height);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextDisabled("scan");
+                ImGui::TableSetColumnIndex(3); /* Tbl/Img — not applicable */
+                ImGui::TableSetColumnIndex(4);
+                ImGui::TextUnformatted(lbl.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
     }
 }

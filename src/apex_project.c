@@ -195,6 +195,8 @@ static const char *table_field_kind_name(TableFieldKind kind)
         return "ptr16_table";
     case TABLE_PTR16_DMD_FULLFRAME:
         return "ptr16_dmd_fullframe";
+    case TABLE_PTR16_SPRITE:
+        return "ptr16_sprite";
     case TABLE_FAR_STRING:
         return "far_string";
     case TABLE_FAR_DATA:
@@ -205,6 +207,8 @@ static const char *table_field_kind_name(TableFieldKind kind)
         return "far_code";
     case TABLE_FAR_DMD_FULLFRAME:
         return "far_dmd_fullframe";
+    case TABLE_FAR_SPRITE:
+        return "far_sprite";
     case TABLE_BYTE:
         return "byte";
     case TABLE_WORD:
@@ -272,6 +276,18 @@ static void write_data_range_value(FILE *out, const DataRange *range)
         break;
     case DATA_FAR_DMD_FULLFRAME:
         fputs("far_dmd_fullframe", out);
+        break;
+    case DATA_SPRITE:
+        fputs("sprite", out);
+        break;
+    case DATA_SPRITE_NOHEADER:
+        fprintf(out, "sprite_noheader[%lu]", (unsigned long)range->length);
+        break;
+    case DATA_PTR16_SPRITE:
+        fputs("ptr16_sprite", out);
+        break;
+    case DATA_FAR_SPRITE:
+        fputs("far_sprite", out);
         break;
     }
 }
@@ -1035,6 +1051,9 @@ static void analyze_system_region(ApexProject *project)
                         project->bank_labels, &project->system_labels, &system_config_labels,
                         &system_config_entries, &system_data_ranges, &project->options,
                         &project->refs);
+    sort_table_defs(&project->tables);
+    sort_inline_signatures(&project->inline_sigs);
+    sort_data_ranges(&project->data_ranges);
     apply_data_range_labels(&system_data_ranges, project->rom.data, project->banks,
                             project->rom.data + project->paged_size, project->bank_labels,
                             &project->system_labels, &project->refs);
@@ -1049,6 +1068,8 @@ static void analyze_system_region(ApexProject *project)
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);
+    sort_label_set(&project->system_labels);
+    sort_and_dedup_refs(&project->refs);
     prune_unreferenced_generated_labels(&project->system_labels, 0xffu, &project->refs);
     {
         size_t i;
@@ -1086,6 +1107,9 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     free_label_set(&project->bank_labels[bank_index]);
     remove_references_from_source_range(&project->refs, bank_id, APEX_PAGED_ORG, 0x7fffu);
 
+    sort_table_defs(&project->tables);
+    sort_inline_signatures(&project->inline_sigs);
+    sort_data_ranges(&project->data_ranges);
     apply_config_bank_labels(&bank_config_labels, project->rom.data, project->banks,
                              project->bank_labels, &project->options);
     apply_config_bank_entries(&bank_config_entries, project->rom.data, project->banks,
@@ -1106,6 +1130,8 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
                              bank_id, &project->refs, &project->ref_exclusions);
     }
     apply_string_content_labels(&project->bank_labels[bank_index], bank, used, APEX_PAGED_ORG);
+    sort_label_set(&project->bank_labels[bank_index]);
+    sort_and_dedup_refs(&project->refs);
     prune_unreferenced_generated_labels(&project->bank_labels[bank_index], bank_id, &project->refs);
     prune_unreferenced_generated_labels(&project->system_labels, 0xffu, &project->refs);
     {
@@ -1130,6 +1156,9 @@ static void analyze_full_project(ApexProject *project)
     size_t i;
     size_t banks = project->banks;
 
+    sort_table_defs(&project->tables);
+    sort_inline_signatures(&project->inline_sigs);
+
     free_label_set(&project->system_labels);
     free_reference_set(&project->refs);
     for (i = 0; i < banks; i++) {
@@ -1151,6 +1180,7 @@ static void analyze_full_project(ApexProject *project)
                        &project->system_labels, project->rom.data + project->paged_size,
                        &project->refs);
     inject_dmd_table_data_ranges(project);
+    sort_data_ranges(&project->data_ranges);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
@@ -1158,10 +1188,29 @@ static void analyze_full_project(ApexProject *project)
     collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
                               project->bank_labels, &project->system_labels,
                               &project->data_ranges, &project->refs, &project->ref_exclusions);
-    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
-                         APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
-                         project->rom.data, banks, project->bank_labels, &project->system_labels,
-                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions);
+    {
+        size_t prev_count, prev_code;
+        do {
+            size_t j;
+            prev_count = project->system_labels.count;
+            prev_code = 0;
+            for (j = 0; j < project->system_labels.count; j++) {
+                if (project->system_labels.items[j].is_code) prev_code++;
+            }
+            collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
+                                 APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
+                                 project->rom.data, banks, project->bank_labels,
+                                 &project->system_labels, &project->data_ranges, 0xff,
+                                 &project->refs, &project->ref_exclusions);
+            {
+                size_t j2, curr_code = 0;
+                for (j2 = 0; j2 < project->system_labels.count; j2++) {
+                    if (project->system_labels.items[j2].is_code) curr_code++;
+                }
+                if (curr_code == prev_code && project->system_labels.count == prev_count) break;
+            }
+        } while (1);
+    }
     for (i = 0; i < banks; i++) {
         const uint8_t *bank = project->rom.data + i * APEX_BANK_SIZE;
 
@@ -1171,6 +1220,11 @@ static void analyze_full_project(ApexProject *project)
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);
+    for (i = 0; i < banks; i++) {
+        sort_label_set(&project->bank_labels[i]);
+    }
+    sort_label_set(&project->system_labels);
+    sort_and_dedup_refs(&project->refs);
 }
 
 int apex_project_analyze(ApexProject *project)
@@ -1223,7 +1277,7 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
     }
     if (!updated) {
         Label *label = add_label(labels, addr, config_label->name,
-                                 code_label_at(addr, labels->items, labels->count));
+                                 code_label_at(addr, labels->items, labels->count, 0));
 
         label->name = config_label->name;
     }

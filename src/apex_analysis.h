@@ -25,6 +25,7 @@ typedef struct {
     Label *items;
     size_t count;
     size_t cap;
+    int sorted;
 } LabelSet;
 
 typedef struct {
@@ -40,6 +41,7 @@ typedef struct {
     const Label *extra_labels;
     size_t extra_label_count;
     const ConfigSymbols *symbols;
+    int sorted;
 } LabelLookup;
 
 typedef struct {
@@ -57,6 +59,7 @@ typedef struct {
     Reference *items;
     size_t count;
     size_t cap;
+    int sorted;
 } ReferenceSet;
 
 size_t last_non_ff(const uint8_t *data, size_t len);
@@ -74,6 +77,10 @@ void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t sour
 void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
                               uint8_t source_bank, uint32_t source_addr, const char *source,
                               int row_index, uint32_t row_cpu_addr);
+void sort_data_ranges(DataRanges *ranges);
+void sort_table_defs(TableDefs *tables);
+void sort_inline_signatures(InlineSignatures *sigs);
+void sort_and_dedup_refs(ReferenceSet *refs);
 size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_bank,
                                            uint32_t source_start, uint32_t source_end);
 size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
@@ -90,14 +97,18 @@ int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank)
 uint8_t bank_id_for_index(const uint8_t *paged_rom, int bank_index);
 void validate_config_classification(const ConfigEntries *entries, const TableDefs *tables,
                                     const DataRanges *data_ranges);
-size_t labels_at(uint32_t addr, const Label *labels, size_t label_count);
-int code_label_at(uint32_t addr, const Label *labels, size_t label_count);
+size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
+int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
 const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ranges);
 const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr);
-int string_label_at(uint32_t addr, const Label *labels, size_t label_count);
-const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count);
+int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
+const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
 const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols);
-int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count);
+int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count,
+                  int sorted);
+void sort_label_set(LabelSet *set);
+size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr);
+size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr);
 const char *lookup_label_for_cpu(void *ctx, uint32_t addr);
 const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables);
 int in_system_addr(uint32_t addr);

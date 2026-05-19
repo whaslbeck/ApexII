@@ -80,11 +80,24 @@ puls_asm="$OUT/puls_pc_flow.disasm"
 "$ROOT/build/apexasm" "$puls_rom" "$ROOT/tests/puls_pc_flow.asm"
 "$ROOT/build/apexdis" "$puls_rom" "$puls_asm"
 if grep -q 'PULS PC' "$puls_asm" &&
-    grep -q '^; code_to_data bank=0xff cpu=0x8002 rom=0x078002' "$puls_asm" &&
+    grep -q '^; code_to_unclassified bank=0xff cpu=0x8002 rom=0x078002' "$puls_asm" &&
     grep -q '^    .DB 0x86, 0x00' "$puls_asm"; then
     printf 'PASS puls_pc_flow.asm\n'
 else
     printf 'FAIL puls_pc_flow.asm\n' >&2
+    exit 1
+fi
+
+label_flow_rom="$OUT/label_code_flow.rom"
+label_flow_asm="$OUT/label_code_flow.disasm"
+"$ROOT/build/apexasm" "$label_flow_rom" "$ROOT/tests/label_code_flow.asm"
+"$ROOT/build/apexdis" "$label_flow_rom" "$label_flow_asm" "$ROOT/tests/label_code_flow.ini"
+if grep -q '^Target:' "$label_flow_asm" &&
+    grep -q '^    RTS' "$label_flow_asm" &&
+    ! grep -q '\.DB.*0x39' "$label_flow_asm"; then
+    printf 'PASS label_code_flow.asm\n'
+else
+    printf 'FAIL label_code_flow.asm\n' >&2
     exit 1
 fi
 
@@ -168,7 +181,7 @@ banked_inline_rebuilt="$OUT/banked_inline.rebuilt"
 if cmp -s "$banked_inline_rom" "$banked_inline_rebuilt" &&
     grep -q '^Entry:' "$banked_inline_asm" &&
     grep -q '^    JSR BankInline' "$banked_inline_asm" &&
-    grep -q '^        INLINE_BYTE 0x42 ; for JSR BankInline mode=0x42' "$banked_inline_asm" &&
+    grep -q '^        INLINE_BYTE 0x42 ; for JSR BankInline$' "$banked_inline_asm" &&
     grep -q '^; inline params=byte' "$banked_inline_asm" &&
     grep -q '^; explain label source=config_label' "$banked_inline_explain" &&
     grep -q '^; explain kind=code source=config_entry' "$banked_inline_explain" &&
@@ -193,7 +206,7 @@ if cmp -s "$system_banked_inline_rom" "$system_banked_inline_rebuilt" &&
     grep -q '^Entry:$' "$system_banked_inline_asm" &&
     grep -q '^Helper:$' "$system_banked_inline_asm" &&
     grep -q '^    JSR Helper$' "$system_banked_inline_asm" &&
-    grep -q '^        INLINE_BYTE 0x42 ; for JSR Helper mode=0x42$' "$system_banked_inline_asm" &&
+    grep -q '^        INLINE_BYTE 0x42 ; for JSR Helper$' "$system_banked_inline_asm" &&
     grep -q '^; inline params=byte$' "$system_banked_inline_asm"; then
     printf 'PASS system_banked_inline.asm\n'
 else
@@ -220,6 +233,23 @@ else
     exit 1
 fi
 
+types_asm="$OUT/types.disasm"
+types_rebuilt="$OUT/types.rebuilt"
+"$ROOT/build/apexdis" "$system_banked_inline_rom" "$types_asm" "$ROOT/tests/types.ini"
+"$ROOT/build/apexasm" "$types_rebuilt" "$types_asm"
+if cmp -s "$system_banked_inline_rom" "$types_rebuilt" &&
+    grep -q '^MODE_PARAM_TEST_MODE = 0x42$' "$types_asm" &&
+    grep -q '^MODE_PARAM_NO_MODE = 0xff$' "$types_asm" &&
+    grep -q '^        INLINE_BYTE 0x42 ; for JSR Helper mode_param=test_mode$' "$types_asm"; then
+    printf 'PASS types.ini\n'
+else
+    printf 'FAIL types.ini\n' >&2
+    if ! cmp -s "$system_banked_inline_rom" "$types_rebuilt"; then
+        report_mismatch "$system_banked_inline_rom" "$types_rebuilt"
+    fi
+    exit 1
+fi
+
 cross_bank_inline_rom="$OUT/cross_bank_inline.rom"
 cross_bank_inline_asm="$OUT/cross_bank_inline.disasm"
 cross_bank_inline_rebuilt="$OUT/cross_bank_inline.rebuilt"
@@ -229,8 +259,8 @@ cross_bank_inline_rebuilt="$OUT/cross_bank_inline.rebuilt"
 "$ROOT/build/apexasm" "$cross_bank_inline_rebuilt" "$cross_bank_inline_asm"
 if cmp -s "$cross_bank_inline_rom" "$cross_bank_inline_rebuilt" &&
     grep -q '^    JSR SysHelper$' "$cross_bank_inline_asm" &&
-    grep -q '^        INLINE_BYTE 0x37 ; for JSR SysHelper mode=0x37$' "$cross_bank_inline_asm" &&
-    grep -q '^        INLINE_BYTE 0x99 ; for JSR SysHelper mode=0x99$' "$cross_bank_inline_asm"; then
+    grep -q '^        INLINE_BYTE 0x37 ; for JSR SysHelper$' "$cross_bank_inline_asm" &&
+    grep -q '^        INLINE_BYTE 0x99 ; for JSR SysHelper$' "$cross_bank_inline_asm"; then
     printf 'PASS cross_bank_inline.asm\n'
 else
     printf 'FAIL cross_bank_inline.asm\n' >&2
@@ -276,14 +306,14 @@ if cmp -s "$far_tables_rom" "$far_tables_rebuilt" &&
     grep -q '^Bff_A8012:' "$far_tables_asm" &&
     grep -q '^    .DB 0x41, 0x00 ; 0x8012 |A.|' "$far_tables_asm" &&
     grep -q '^; table_to_data bank=0x20 cpu=0x400d rom=0x00000d' "$far_tables_asm" &&
-    grep -q '^; data_to_code bank=0x21 cpu=0x4006 rom=0x004006' "$far_tables_asm" &&
+    grep -q '^; unclassified_to_code bank=0x21 cpu=0x4006 rom=0x004006' "$far_tables_asm" &&
     grep -q '^ENTRY_SWI2:' "$far_tables_asm" &&
-    grep -q '^; referenced_by table:B20_A4007, code:B21_A4006' "$far_tables_asm" &&
+    grep -q '^; referenced_by table:B20_A4007 line:0\[B20_A4007\], code:B21_A4006' "$far_tables_asm" &&
     grep -q '^; referenced_by data:B20_A400d' "$far_tables_asm" &&
     grep -q '^    LDX \[B21_A4004\]' "$far_tables_asm" &&
     grep -q '^    JSR Bff_A800b' "$far_tables_asm" &&
     grep -q '^    JSR InlineParam' "$far_tables_asm" &&
-    grep -q '^        INLINE_BYTE 0x7a ; for JSR InlineParam mode=0x7a' "$far_tables_asm" &&
+    grep -q '^        INLINE_BYTE 0x7a ; for JSR InlineParam$' "$far_tables_asm" &&
     grep -q '^; doc Inline param doc with ; semicolon, # hash, and \\ slash' "$far_tables_asm" &&
     grep -q '^    JSR InlineComplex' "$far_tables_asm" &&
     grep -q '^        INLINE_PTR B21_A4004 ; for JSR InlineComplex' "$far_tables_asm" &&
@@ -390,12 +420,12 @@ if cmp -s "$ROOT/roms/addam_h4.rom" "$config_rebuilt" &&
     grep -q '^DMD_FRAMEBUFFER_3800 = 0x3800' "$config_asm" &&
     grep -q 'CMPA <_ROM_BANK_SHADOW' "$config_asm" &&
     grep -q 'STA _ASIC_ROM_PAGE' "$config_asm" &&
-    grep -q 'LDU #DMD_FRAMEBUFFER_3800' "$config_asm" &&
+    grep -q 'LDX #DMD_FRAMEBUFFER_3800' "$config_asm" &&
     grep -q 'JSR \[__SPRINGBOARD\]' "$config_asm" &&
     grep -q '^; kind table' "$config_asm" &&
     grep -q '^; table rows=116 row_width=3 row_format=far_code' "$config_asm" &&
     grep -q '^; doc Headerless dispatcher table containing far-code routine entry pointers\.' "$config_asm" &&
-    grep -q '^; code_to_data bank=' "$config_asm" &&
+    grep -q '^; code_to_unclassified bank=' "$config_asm" &&
     grep -q '^    TABLE_FAR_CODE Bff_Aedbe' "$config_asm" &&
     grep -q '^    TABLE_FAR_CODE B3d_A7be5' "$config_asm" &&
     grep -q '^Bff_Aedbe:' "$config_asm" &&
@@ -410,7 +440,7 @@ if cmp -s "$ROOT/roms/addam_h4.rom" "$config_rebuilt" &&
     awk '
         /^Bff_Aedc7:/ { in_block = 1 }
         /^Bff_Aedf7:/ { in_block = 0 }
-        in_block && /^; code_to_data/ { found = 1 }
+        in_block && /^; code_to_unclassified/ { found = 1 }
         END { exit found ? 1 : 0 }
     ' "$config_asm" &&
     grep -q 'TABLE_PTR B3b_A415c_STRING_INSTALLED' "$config_asm" &&

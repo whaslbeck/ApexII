@@ -109,7 +109,7 @@ int main(int argc, char **argv)
         return 1;
     }
     line = apex_render_find_next_transition(doc1, entry_line_index,
-                                            APEX_RENDER_TRANSITION_CODE_TO_DATA,
+                                            APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED,
                                             &transition_line_index);
     if (!line || !line->has_location || line->cpu_addr != 0x8004u) {
         fprintf(stderr, "next transition lookup failed\n");
@@ -117,7 +117,7 @@ int main(int argc, char **argv)
         return 1;
     }
     line = apex_render_find_prev_transition(doc1, transition_line_index,
-                                            APEX_RENDER_TRANSITION_CODE_TO_DATA, NULL);
+                                            APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED, NULL);
     if (!line || !line->has_location || line->cpu_addr != 0x8004u) {
         fprintf(stderr, "prev transition lookup failed\n");
         apex_project_free(project);
@@ -207,7 +207,7 @@ int main(int argc, char **argv)
     }
 
     if (apex_project_set_label(project, 0, 0xffu, 0x8005u, "HelperInline") != 0 ||
-        apex_project_set_inline(project, 0, 0xffu, 0x8005u, "byte:newmode") != 0) {
+        apex_project_set_inline(project, 0, 0xffu, 0x8005u, "byte") != 0) {
         fprintf(stderr, "set_inline failed\n");
         apex_project_free(project);
         return 1;
@@ -220,7 +220,7 @@ int main(int argc, char **argv)
     doc4 = apex_project_render(project, 0, 0);
     if (!doc4 || !contains(doc4->text, "HelperInline:") ||
         !contains(doc4->text, "JSR HelperInline") ||
-        !contains(doc4->text, "newmode=0x42")) {
+        !contains(doc4->text, "INLINE_BYTE 0x42")) {
         fprintf(stderr, "inline update not reflected in render\n");
         apex_project_free(project);
         return 1;
@@ -254,7 +254,7 @@ int main(int argc, char **argv)
             apex_project_free(project);
             return 1;
         }
-        if (apex_project_set_inline(project, 1, 0x20u, 0x4006u, "byte:newmode") != 0) {
+        if (apex_project_set_inline(project, 1, 0x20u, 0x4006u, "byte") != 0) {
             fprintf(stderr, "bank set_inline failed\n");
             apex_project_free(project);
             return 1;
@@ -266,7 +266,7 @@ int main(int argc, char **argv)
             return 1;
         }
         doc1 = apex_project_render(project, 0, 0);
-        if (!doc1 || !contains(doc1->text, "newmode=0x42")) {
+        if (!doc1 || !contains(doc1->text, "INLINE_BYTE 0x42")) {
             fprintf(stderr, "bank inline update not reflected in render\n");
             apex_project_free(project);
             return 1;
@@ -287,7 +287,7 @@ int main(int argc, char **argv)
             apex_project_free(project);
             return 1;
         }
-        if (apex_project_set_inline(project, 1, 0x20u, 0x4008u, "byte:newmode") != 0) {
+        if (apex_project_set_inline(project, 1, 0x20u, 0x4008u, "byte") != 0) {
             fprintf(stderr, "prune set_inline failed\n");
             apex_project_free(project);
             return 1;

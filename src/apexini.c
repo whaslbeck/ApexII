@@ -1,12 +1,17 @@
 /* apexini — INI config utilities for ApexII projects.
  *
  * Subcommands:
- *   check   <file.ini> ...        syntax-check one or more config files
- *   overlaps <file.ini>           report address conflicts and range overlaps
- *   merge   <out.ini> <file.ini>... merge multiple configs into one sorted file
+ *   check          <file.ini> ...        syntax-check one or more config files
+ *   overlaps       <file.ini>            report address conflicts and range overlaps
+ *   merge          <out.ini> <file.ini>... merge multiple configs into one sorted file
+ *   normalize      <file.ini> [<out.ini>] rewrite with Bxx_Ayyyy address format
+ *   find-redundant <rom> <file.ini>      list [entries] reachable without explicit entry
+ *   strip-redundant <rom> <file.ini>     remove redundant [entries] in-place
  */
 #include "apex.h"
 #include "apex_config.h"
+#include "apex_project.h"
+#include "apex_render.h"
 
 #include <ctype.h>
 #include <setjmp.h>
@@ -45,6 +50,7 @@ typedef struct {
     DataRanges       data;
     ConfigOptions    opts;
     ConfigTypes      types;
+    ConfigEntries    ref_exclusions;
 } Cfg;
 
 static int cfg_load(Cfg *c, const char *path)
@@ -56,7 +62,7 @@ static int cfg_load(Cfg *c, const char *path)
     if (!failed) {
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
                     &c->schemas, &c->rdocs, &c->tdocs, &c->syms, &c->data,
-                    &c->opts, &c->types, NULL);
+                    &c->opts, &c->types, &c->ref_exclusions);
     }
     s_catching = 0;
     return failed;
@@ -99,6 +105,7 @@ static void cfg_free(Cfg *c)
     free(c->syms.items);
 
     free(c->data.items);
+    free(c->ref_exclusions.items);
     free_config_types(&c->types);
     memset(c, 0, sizeof(*c));
 }
@@ -126,6 +133,12 @@ static void w_addr(FILE *f, int has_bank, uint8_t bank, uint32_t addr)
         fprintf(f, "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
     else
         fprintf(f, "0x%04x", (unsigned)addr & 0xffffu);
+}
+
+static void w_addr_norm(FILE *f, int has_bank, uint8_t bank, uint32_t addr)
+{
+    uint8_t b = has_bank ? bank : 0xffu;
+    fprintf(f, "B%02x_A%04x", b, (unsigned)addr & 0xffffu);
 }
 
 static void w_escaped(FILE *f, const char *v)
@@ -163,11 +176,13 @@ static const char *kind_name(TableFieldKind k)
     case TABLE_PTR16_CODE:          return "ptr16_code";
     case TABLE_PTR16_TABLE:         return "ptr16_table";
     case TABLE_PTR16_DMD_FULLFRAME: return "ptr16_dmd_fullframe";
+    case TABLE_PTR16_SPRITE:        return "ptr16_sprite";
     case TABLE_FAR_STRING:          return "far_string";
     case TABLE_FAR_DATA:            return "far_data";
     case TABLE_FAR_TABLE:           return "far_table";
     case TABLE_FAR_CODE:            return "far_code";
     case TABLE_FAR_DMD_FULLFRAME:   return "far_dmd_fullframe";
+    case TABLE_FAR_SPRITE:          return "far_sprite";
     case TABLE_BYTE:                return "byte";
     case TABLE_WORD:                return "word";
     }
@@ -190,14 +205,23 @@ static void w_schema(FILE *f, const TableSchema *s)
 static void w_data_val(FILE *f, const DataRange *r)
 {
     switch (r->kind) {
-    case DATA_BYTES:           fprintf(f, "bytes[%lu]", (unsigned long)r->length); break;
-    case DATA_STRING:          fputs("string",           f); break;
-    case DATA_DMD_FULLFRAME:   fputs("dmd_fullframe",    f); break;
-    case DATA_FAR_STRING:      fputs("far_string",       f); break;
-    case DATA_FAR_DATA:        fputs("far_data",         f); break;
-    case DATA_FAR_TABLE:       fputs("far_table",        f); break;
-    case DATA_FAR_CODE:        fputs("far_code",         f); break;
-    case DATA_FAR_DMD_FULLFRAME: fputs("far_dmd_fullframe", f); break;
+    case DATA_BYTES:             fprintf(f, "bytes[%lu]", (unsigned long)r->length); break;
+    case DATA_STRING:            fputs("string",              f); break;
+    case DATA_DMD_FULLFRAME:     fputs("dmd_fullframe",       f); break;
+    case DATA_PTR16_STRING:      fputs("ptr16_string",        f); break;
+    case DATA_PTR16_DATA:        fputs("ptr16_data",          f); break;
+    case DATA_PTR16_CODE:        fputs("ptr16_code",          f); break;
+    case DATA_PTR16_TABLE:       fputs("ptr16_table",         f); break;
+    case DATA_FAR_STRING:        fputs("far_string",          f); break;
+    case DATA_FAR_DATA:          fputs("far_data",            f); break;
+    case DATA_FAR_TABLE:         fputs("far_table",           f); break;
+    case DATA_FAR_CODE:          fputs("far_code",            f); break;
+    case DATA_FAR_DMD_FULLFRAME: fputs("far_dmd_fullframe",   f); break;
+    case DATA_SPRITE:            fputs("sprite",              f); break;
+    case DATA_PTR16_SPRITE:      fputs("ptr16_sprite",        f); break;
+    case DATA_FAR_SPRITE:        fputs("far_sprite",          f); break;
+    case DATA_SPRITE_NOHEADER:
+        fprintf(f, "sprite_noheader[%lu]", (unsigned long)r->length); break;
     }
 }
 
@@ -282,7 +306,10 @@ static int cmp_doc(const void *a, const void *b)
 
 /* ── write a complete config ────────────────────────────────────────────── */
 
-static void write_cfg(FILE *f, Cfg *c)
+/* addr_fn: either w_addr (preserve format) or w_addr_norm (always Bxx_Ayyyy) */
+typedef void (*AddrFn)(FILE *, int, uint8_t, uint32_t);
+
+static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
 {
     size_t i, j;
 
@@ -296,6 +323,9 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->tables.count)  qsort(c->tables.items,   c->tables.count,  sizeof(c->tables.items[0]),  cmp_table);
     if (c->rdocs.count)   qsort(c->rdocs.items,    c->rdocs.count,   sizeof(c->rdocs.items[0]),   cmp_doc);
     if (c->tdocs.count)   qsort(c->tdocs.items,    c->tdocs.count,   sizeof(c->tdocs.items[0]),   cmp_doc);
+    if (c->ref_exclusions.count)
+        qsort(c->ref_exclusions.items, c->ref_exclusions.count,
+              sizeof(c->ref_exclusions.items[0]), cmp_entry);
 
     if (c->opts.labels_are_entries)
         fputs("[options]\nlabels_are_entries = true\n", f);
@@ -332,8 +362,8 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->labels.count) {
         fputs("\n[labels]\n", f);
         for (i = 0; i < c->labels.count; i++) {
-            w_addr(f, c->labels.items[i].has_bank, c->labels.items[i].bank,
-                   c->labels.items[i].addr);
+            addr_fn(f, c->labels.items[i].has_bank, c->labels.items[i].bank,
+                    c->labels.items[i].addr);
             fputs(" = ", f);
             w_escaped(f, c->labels.items[i].name);
             fputc('\n', f);
@@ -343,8 +373,8 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->entries.count) {
         fputs("\n[entries]\n", f);
         for (i = 0; i < c->entries.count; i++) {
-            w_addr(f, c->entries.items[i].has_bank, c->entries.items[i].bank,
-                   c->entries.items[i].addr);
+            addr_fn(f, c->entries.items[i].has_bank, c->entries.items[i].bank,
+                    c->entries.items[i].addr);
             fputs(" = code\n", f);
         }
     }
@@ -352,8 +382,8 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->sigs.count) {
         fputs("\n[inline]\n", f);
         for (i = 0; i < c->sigs.count; i++) {
-            w_addr(f, c->sigs.items[i].has_bank, c->sigs.items[i].bank,
-                   c->sigs.items[i].addr);
+            addr_fn(f, c->sigs.items[i].has_bank, c->sigs.items[i].bank,
+                    c->sigs.items[i].addr);
             fputs(" = ", f);
             w_schema(f, &c->sigs.items[i].schema);
             fputc('\n', f);
@@ -383,8 +413,8 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->rdocs.count) {
         fputs("\n[routine_docs]\n", f);
         for (i = 0; i < c->rdocs.count; i++) {
-            w_addr(f, c->rdocs.items[i].has_bank, c->rdocs.items[i].bank,
-                   c->rdocs.items[i].addr);
+            addr_fn(f, c->rdocs.items[i].has_bank, c->rdocs.items[i].bank,
+                    c->rdocs.items[i].addr);
             fputs(" = ", f);
             w_escaped(f, c->rdocs.items[i].text);
             fputc('\n', f);
@@ -394,13 +424,28 @@ static void write_cfg(FILE *f, Cfg *c)
     if (c->tdocs.count) {
         fputs("\n[table_docs]\n", f);
         for (i = 0; i < c->tdocs.count; i++) {
-            w_addr(f, c->tdocs.items[i].has_bank, c->tdocs.items[i].bank,
-                   c->tdocs.items[i].addr);
+            addr_fn(f, c->tdocs.items[i].has_bank, c->tdocs.items[i].bank,
+                    c->tdocs.items[i].addr);
             fputs(" = ", f);
             w_escaped(f, c->tdocs.items[i].text);
             fputc('\n', f);
         }
     }
+
+    if (c->ref_exclusions.count) {
+        fputs("\n[exclude_refs]\n", f);
+        for (i = 0; i < c->ref_exclusions.count; i++) {
+            addr_fn(f, c->ref_exclusions.items[i].has_bank,
+                    c->ref_exclusions.items[i].bank,
+                    c->ref_exclusions.items[i].addr);
+            fputs(" = exclude\n", f);
+        }
+    }
+}
+
+static void write_cfg(FILE *f, Cfg *c)
+{
+    write_cfg_ex(f, c, w_addr);
 }
 
 /* ── check command ──────────────────────────────────────────────────────── */
@@ -421,9 +466,9 @@ static int cmd_check(int argc, char **argv)
             fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
             any_err = 1;
         } else {
-            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu\n",
+            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu\n",
                    argv[i], c.labels.count, c.entries.count, c.sigs.count,
-                   c.data.count, c.tables.count, c.types.count);
+                   c.data.count, c.tables.count, c.types.count, c.ref_exclusions.count);
         }
         cfg_free(&c);
     }
@@ -458,12 +503,19 @@ static uint32_t data_end(const DataRange *r)
     switch (r->kind) {
     case DATA_BYTES:           len = r->length; break;
     case DATA_DMD_FULLFRAME:   len = 512u;      break;
+    case DATA_PTR16_STRING:
+    case DATA_PTR16_DATA:
+    case DATA_PTR16_CODE:
+    case DATA_PTR16_TABLE:     len = 2u;        break;
     case DATA_FAR_STRING:
     case DATA_FAR_DATA:
     case DATA_FAR_TABLE:
     case DATA_FAR_CODE:
-    case DATA_FAR_DMD_FULLFRAME: len = 3u;      break;
-    default:                   len = 0u;         break;
+    case DATA_FAR_DMD_FULLFRAME:
+    case DATA_FAR_SPRITE:        len = 3u;           break;
+    case DATA_PTR16_SPRITE:      len = 2u;           break;
+    case DATA_SPRITE_NOHEADER:   len = 0u; break; /* width is in ROM, end not statically known */
+    default:                   len = 0u;              break;
     }
     return len ? r->addr + (uint32_t)len : 0u;
 }
@@ -533,18 +585,28 @@ static int cmd_overlaps(int argc, char **argv)
         e->addr     = c.data.items[i].addr;
         e->end      = data_end(&c.data.items[i]);
         strcpy(e->section, "data");
-        /* reuse w_data_val via snprintf/FILE is awkward; inline it */
         switch (c.data.items[i].kind) {
         case DATA_BYTES:
             snprintf(e->spec, sizeof(e->spec), "bytes[%lu]",
                      (unsigned long)c.data.items[i].length); break;
-        case DATA_STRING:          strcpy(e->spec, "string");           break;
-        case DATA_DMD_FULLFRAME:   strcpy(e->spec, "dmd_fullframe");    break;
-        case DATA_FAR_STRING:      strcpy(e->spec, "far_string");       break;
-        case DATA_FAR_DATA:        strcpy(e->spec, "far_data");         break;
-        case DATA_FAR_TABLE:       strcpy(e->spec, "far_table");        break;
-        case DATA_FAR_CODE:        strcpy(e->spec, "far_code");         break;
-        case DATA_FAR_DMD_FULLFRAME: strcpy(e->spec, "far_dmd_fullframe"); break;
+        case DATA_STRING:            strcpy(e->spec, "string");              break;
+        case DATA_DMD_FULLFRAME:     strcpy(e->spec, "dmd_fullframe");       break;
+        case DATA_PTR16_STRING:      strcpy(e->spec, "ptr16_string");        break;
+        case DATA_PTR16_DATA:        strcpy(e->spec, "ptr16_data");          break;
+        case DATA_PTR16_CODE:        strcpy(e->spec, "ptr16_code");          break;
+        case DATA_PTR16_TABLE:       strcpy(e->spec, "ptr16_table");         break;
+        case DATA_FAR_STRING:        strcpy(e->spec, "far_string");          break;
+        case DATA_FAR_DATA:          strcpy(e->spec, "far_data");            break;
+        case DATA_FAR_TABLE:         strcpy(e->spec, "far_table");           break;
+        case DATA_FAR_CODE:          strcpy(e->spec, "far_code");            break;
+        case DATA_FAR_DMD_FULLFRAME: strcpy(e->spec, "far_dmd_fullframe");   break;
+        case DATA_SPRITE:            strcpy(e->spec, "sprite");              break;
+        case DATA_PTR16_SPRITE:      strcpy(e->spec, "ptr16_sprite");        break;
+        case DATA_FAR_SPRITE:        strcpy(e->spec, "far_sprite");          break;
+        case DATA_SPRITE_NOHEADER:
+            snprintf(e->spec, sizeof(e->spec), "sprite_noheader[%lu]",
+                     (unsigned long)c.data.items[i].length);
+            break;
         }
     }
     for (i = 0; i < c.tables.count; i++) {
@@ -583,14 +645,12 @@ static int cmd_overlaps(int argc, char **argv)
 
     /* pass 1: same-address conflicts (different sections at same addr) */
     for (i = 0; i < count; ) {
-        /* find all entries at this address */
         j = i + 1;
         while (j < count &&
                addr_cmp(ovl[i].has_bank, ovl[i].bank, ovl[i].addr,
                         ovl[j].has_bank, ovl[j].bank, ovl[j].addr) == 0)
             j++;
         if (j > i + 1) {
-            /* Multiple entries at same address - check for different sections */
             size_t k, l;
             char key[16];
             fmt_addr(key, sizeof(key), ovl[i].has_bank, ovl[i].bank, ovl[i].addr);
@@ -608,19 +668,19 @@ static int cmd_overlaps(int argc, char **argv)
         i = j;
     }
 
-    /* pass 2: range overlaps (entry A's range extends into entry B's start) */
+    /* pass 2: range overlaps */
     for (i = 0; i < count; i++) {
         uint8_t ba;
 
-        if (ovl[i].end == 0) continue; /* unknown length */
+        if (ovl[i].end == 0) continue;
         ba = ovl[i].has_bank ? ovl[i].bank : 0xffu;
 
         for (j = i + 1; j < count; j++) {
             uint8_t bb = ovl[j].has_bank ? ovl[j].bank : 0xffu;
 
-            if (bb != ba) break;          /* different bank (sorted) */
-            if (ovl[j].addr >= ovl[i].end) break; /* no more overlaps */
-            if (ovl[j].addr == ovl[i].addr) continue; /* same-addr, already reported */
+            if (bb != ba) break;
+            if (ovl[j].addr >= ovl[i].end) break;
+            if (ovl[j].addr == ovl[i].addr) continue;
 
             {
                 char ka[16], kb[16];
@@ -656,10 +716,6 @@ static int cmd_merge(int argc, char **argv)
         return 2;
     }
 
-    /* Load all input files sequentially into one config.
-     * load_config's add_* helpers handle deduplication (same address = update).
-     * Conflicts (e.g. same label name at different addresses) cause die(),
-     * which we catch and report. */
     for (i = 1; i < argc; i++) {
         if (cfg_load(&c, argv[i])) {
             fprintf(stderr, "%s: merge conflict: %s\n", argv[i], s_err);
@@ -682,6 +738,590 @@ static int cmd_merge(int argc, char **argv)
     return 0;
 }
 
+/* ── normalize command ──────────────────────────────────────────────────── */
+
+static int cmd_normalize(int argc, char **argv)
+{
+    Cfg c;
+    FILE *out;
+    const char *outpath;
+    size_t i;
+
+    memset(&c, 0, sizeof(c));
+    if (argc < 1) {
+        fputs("usage: apexini normalize <file.ini> [<out.ini>]\n", stderr);
+        return 2;
+    }
+    if (cfg_load(&c, argv[0])) {
+        fprintf(stderr, "%s: error: %s\n", argv[0], s_err);
+        return 1;
+    }
+
+    /* Upgrade has_bank=0 addresses (system bank) to explicit Bff form. */
+    for (i = 0; i < c.labels.count; i++)
+        if (!c.labels.items[i].has_bank) { c.labels.items[i].has_bank = 1; c.labels.items[i].bank = 0xff; }
+    for (i = 0; i < c.entries.count; i++)
+        if (!c.entries.items[i].has_bank) { c.entries.items[i].has_bank = 1; c.entries.items[i].bank = 0xff; }
+    for (i = 0; i < c.sigs.count; i++)
+        if (!c.sigs.items[i].has_bank) { c.sigs.items[i].has_bank = 1; c.sigs.items[i].bank = 0xff; }
+    for (i = 0; i < c.rdocs.count; i++)
+        if (!c.rdocs.items[i].has_bank) { c.rdocs.items[i].has_bank = 1; c.rdocs.items[i].bank = 0xff; }
+    for (i = 0; i < c.tdocs.count; i++)
+        if (!c.tdocs.items[i].has_bank) { c.tdocs.items[i].has_bank = 1; c.tdocs.items[i].bank = 0xff; }
+    for (i = 0; i < c.ref_exclusions.count; i++)
+        if (!c.ref_exclusions.items[i].has_bank) { c.ref_exclusions.items[i].has_bank = 1; c.ref_exclusions.items[i].bank = 0xff; }
+
+    outpath = (argc >= 2) ? argv[1] : argv[0];
+    out = fopen(outpath, "w");
+    if (!out) {
+        perror(outpath);
+        cfg_free(&c);
+        return 1;
+    }
+    write_cfg_ex(out, &c, w_addr_norm);
+    fclose(out);
+
+    printf("normalized → %s\n", outpath);
+    cfg_free(&c);
+    return 0;
+}
+
+/* ── redundant-entry helpers ────────────────────────────────────────────── */
+
+/*
+ * An entry at (bank, addr) is redundant when code already flows naturally into
+ * that address from preceding instructions, making the explicit [entries] line
+ * unnecessary.  We detect this by scanning backward in the rendered document
+ * from the entry's address:
+ *
+ *   - If the first substantial line is a CODE instruction → code flows in
+ *     → redundant.
+ *   - If the first substantial line is a transition comment → block boundary
+ *     → the entry is genuinely needed.
+ *   - If we reach the start of the document → needed.
+ */
+/* RTS, RTI, JMP, BRA, LBRA, SWI*, CWAI, SYNC do not fall through. */
+static int is_terminal_instruction(const ApexRenderedLine *l)
+{
+    static const struct { const char *s; size_t n; } terms[] = {
+        {"LBRA", 4}, {"CWAI", 4}, {"SYNC", 4},
+        {"SWI2", 4}, {"SWI3", 4},
+        {"RTS",  3}, {"RTI",  3}, {"JMP",  3}, {"BRA",  3}, {"SWI",  3},
+    };
+    const char *t = l->text;
+    size_t len = l->length;
+    size_t i;
+    while (len > 0 && (*t == ' ' || *t == '\t')) { t++; len--; }
+    for (i = 0; i < sizeof(terms)/sizeof(terms[0]); i++) {
+        size_t n = terms[i].n;
+        if (len >= n && strncmp(t, terms[i].s, n) == 0 &&
+            (len == n || t[n] == ' ' || t[n] == '\t'))
+            return 1;
+    }
+    return 0;
+}
+
+static int is_entry_redundant(const ApexRenderedDocument *doc,
+                              uint8_t bank, uint32_t addr)
+{
+    size_t li, i;
+
+    if (!apex_render_find_line_by_address(doc, bank, addr, &li))
+        return 0; /* not in document at all → not redundant */
+
+    i = li;
+    while (i > 0) {
+        const ApexRenderedLine *l;
+        i--;
+        l = &doc->lines[i];
+
+        if (l->kind == APEX_RENDER_LINE_BLANK)
+            continue;
+
+        /* Skip label lines stacked at the same address */
+        if (l->kind == APEX_RENDER_LINE_LABEL &&
+            l->has_location && l->bank == bank && l->cpu_addr == addr)
+            continue;
+
+        /* Skip plain (non-transition) comment lines */
+        if (l->kind == APEX_RENDER_LINE_COMMENT &&
+            l->transition_kind == APEX_RENDER_TRANSITION_NONE)
+            continue;
+
+        /* Any block-boundary transition → entry is needed */
+        if (l->transition_kind != APEX_RENDER_TRANSITION_NONE)
+            return 0;
+
+        /* A non-terminal instruction flows through → entry is redundant.
+           Terminal instructions (RTS, JMP, BRA, etc.) end the block without
+           falling through, so an adjacent code entry is genuinely needed. */
+        if (l->kind == APEX_RENDER_LINE_INSTRUCTION)
+            return !is_terminal_instruction(l);
+
+        /* Location header or other structural line → be conservative */
+        return 0;
+    }
+    return 0; /* start of document → needed */
+}
+
+/* Open a project (ROM + config), analyze, render.  Returns NULL on failure. */
+static const ApexRenderedDocument *open_and_render(const char *rom, const char *cfg_path,
+                                                   ApexProject **out_proj)
+{
+    ApexProject *p = apex_project_open(rom, cfg_path);
+    if (!p) {
+        fprintf(stderr, "error: cannot open ROM '%s' with config '%s'\n", rom, cfg_path);
+        return NULL;
+    }
+    if (apex_project_analyze(p) != 0) {
+        fprintf(stderr, "error: analysis failed\n");
+        apex_project_free(p);
+        return NULL;
+    }
+    const ApexRenderedDocument *doc = apex_project_render(p, 0, 0);
+    if (!doc) {
+        fprintf(stderr, "error: render failed\n");
+        apex_project_free(p);
+        return NULL;
+    }
+    *out_proj = p;
+    return doc;
+}
+
+/* ── find-redundant command ─────────────────────────────────────────────── */
+
+static int cmd_find_redundant(int argc, char **argv)
+{
+    ApexProject *p;
+    const ApexRenderedDocument *doc;
+    size_t i, found = 0;
+
+    if (argc < 2) {
+        fputs("usage: apexini find-redundant <rom> <file.ini>\n", stderr);
+        return 2;
+    }
+
+    doc = open_and_render(argv[0], argv[1], &p);
+    if (!doc) return 1;
+
+    for (i = 0; i < p->config_entries.count; i++) {
+        const ConfigEntry *e = &p->config_entries.items[i];
+        uint8_t bank = e->has_bank ? e->bank : 0xffu;
+        if (is_entry_redundant(doc, bank, e->addr)) {
+            char buf[20];
+            fmt_addr(buf, sizeof(buf), e->has_bank, e->bank, e->addr);
+            printf("redundant: %s\n", buf);
+            found++;
+        }
+    }
+
+    if (found == 0)
+        printf("%s: no redundant entries found\n", argv[1]);
+    else
+        printf("%zu redundant entry/entries found\n", found);
+
+    apex_project_free(p);
+    return found > 0 ? 1 : 0;
+}
+
+/* ── strip-redundant command ────────────────────────────────────────────── */
+
+static int cmd_strip_redundant(int argc, char **argv)
+{
+    ApexProject *p;
+    const ApexRenderedDocument *doc;
+    size_t i, removed = 0;
+    Cfg c;
+    FILE *out;
+
+    if (argc < 2) {
+        fputs("usage: apexini strip-redundant <rom> <file.ini>\n", stderr);
+        return 2;
+    }
+
+    doc = open_and_render(argv[0], argv[1], &p);
+    if (!doc) return 1;
+
+    /* Collect redundant (has_bank, bank, addr) tuples from the project.
+       Then load the config into a Cfg, filter, and write back. */
+    memset(&c, 0, sizeof(c));
+    if (cfg_load(&c, argv[1])) {
+        fprintf(stderr, "%s: error: %s\n", argv[1], s_err);
+        apex_project_free(p);
+        return 1;
+    }
+
+    {
+        size_t new_count = 0;
+        for (i = 0; i < c.entries.count; i++) {
+            const ConfigEntry *e = &c.entries.items[i];
+            uint8_t bank = e->has_bank ? e->bank : 0xffu;
+            /* Check against the rendered document from the project */
+            if (is_entry_redundant(doc, bank, e->addr)) {
+                char buf[20];
+                fmt_addr(buf, sizeof(buf), e->has_bank, e->bank, e->addr);
+                printf("removing: %s\n", buf);
+                removed++;
+            } else {
+                c.entries.items[new_count++] = *e;
+            }
+        }
+        c.entries.count = new_count;
+    }
+
+    apex_project_free(p);
+
+    if (removed == 0) {
+        printf("%s: no redundant entries found, file unchanged\n", argv[1]);
+        cfg_free(&c);
+        return 0;
+    }
+
+    out = fopen(argv[1], "w");
+    if (!out) {
+        perror(argv[1]);
+        cfg_free(&c);
+        return 1;
+    }
+    write_cfg(out, &c);
+    fclose(out);
+
+    printf("removed %zu redundant entry/entries from %s\n", removed, argv[1]);
+    cfg_free(&c);
+    return 0;
+}
+
+/* ── coverage command ───────────────────────────────────────────────────── */
+
+static int cmd_coverage(int argc, char **argv)
+{
+    ApexProject *p;
+    const ApexRenderedDocument *doc;
+    uint8_t *kinds;
+    size_t rom_size, i;
+    /* per-kind totals */
+    size_t tot[6] = {0, 0, 0, 0, 0, 0}; /* UNKNOWN, CODE, DATA, TABLE, UNCL, FREE */
+
+    if (argc < 2) {
+        fputs("usage: apexini coverage <rom> <file.ini>\n", stderr);
+        return 2;
+    }
+
+    doc = open_and_render(argv[0], argv[1], &p);
+    if (!doc) return 1;
+
+    rom_size = p->rom.size;
+    kinds = (uint8_t *)calloc(rom_size, 1);
+    if (!kinds) {
+        fputs("out of memory\n", stderr);
+        apex_project_free(p);
+        return 1;
+    }
+
+    /* Forward pass: assign block_kind to every ROM byte */
+    {
+        uint8_t cur = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
+        size_t fill = 0;
+        for (i = 0; i < doc->line_count && fill < rom_size; i++) {
+            const ApexRenderedLine *l = &doc->lines[i];
+            if (!l->has_location) continue;
+            if (l->rom_addr <= fill) {
+                cur = (uint8_t)l->block_kind;
+            } else {
+                size_t end = l->rom_addr < rom_size ? l->rom_addr : rom_size;
+                while (fill < end) kinds[fill++] = cur;
+                cur = (uint8_t)l->block_kind;
+            }
+        }
+        while (fill < rom_size) kinds[fill++] = cur;
+    }
+
+    printf("%-6s  %6s  %12s  %12s  %12s  %14s  %10s  %10s\n",
+           "bank", "bytes", "code", "data", "table", "unclassified", "free", "unknown");
+
+    /* Paged banks */
+    for (i = 0; i < p->banks; i++) {
+        size_t base = i * APEX_BANK_SIZE;
+        size_t end  = base + APEX_BANK_SIZE;
+        uint8_t bank_id = p->rom.data[base];
+        size_t cnt[6] = {0, 0, 0, 0, 0, 0};
+        size_t j;
+
+        for (j = base; j < end && j < rom_size; j++) {
+            int k = kinds[j];
+            if (k >= 0 && k < 6) cnt[k]++;
+        }
+
+        size_t total = end <= rom_size ? APEX_BANK_SIZE : rom_size - base;
+        printf("0x%02x    %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
+               bank_id, total,
+               cnt[1], total ? cnt[1]*100.0/total : 0.0,
+               cnt[2], total ? cnt[2]*100.0/total : 0.0,
+               cnt[3], total ? cnt[3]*100.0/total : 0.0,
+               cnt[4], total ? cnt[4]*100.0/total : 0.0,
+               cnt[5], total ? cnt[5]*100.0/total : 0.0,
+               cnt[0], total ? cnt[0]*100.0/total : 0.0);
+
+        for (j = 0; j < 6; j++) tot[j] += cnt[j];
+    }
+
+    /* System bank */
+    {
+        size_t sys_start = rom_size > APEX_SYSTEM_SIZE ? rom_size - APEX_SYSTEM_SIZE : 0;
+        size_t cnt[6] = {0, 0, 0, 0, 0, 0};
+        size_t j;
+
+        for (j = sys_start; j < rom_size; j++) {
+            int k = kinds[j];
+            if (k >= 0 && k < 6) cnt[k]++;
+        }
+
+        size_t total = rom_size - sys_start;
+        printf("0xff    %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
+               total,
+               cnt[1], total ? cnt[1]*100.0/total : 0.0,
+               cnt[2], total ? cnt[2]*100.0/total : 0.0,
+               cnt[3], total ? cnt[3]*100.0/total : 0.0,
+               cnt[4], total ? cnt[4]*100.0/total : 0.0,
+               cnt[5], total ? cnt[5]*100.0/total : 0.0,
+               cnt[0], total ? cnt[0]*100.0/total : 0.0);
+
+        for (j = 0; j < 6; j++) tot[j] += cnt[j];
+    }
+
+    /* Total */
+    printf("%-6s  %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
+           "total", rom_size,
+           tot[1], rom_size ? tot[1]*100.0/rom_size : 0.0,
+           tot[2], rom_size ? tot[2]*100.0/rom_size : 0.0,
+           tot[3], rom_size ? tot[3]*100.0/rom_size : 0.0,
+           tot[4], rom_size ? tot[4]*100.0/rom_size : 0.0,
+           tot[5], rom_size ? tot[5]*100.0/rom_size : 0.0,
+           tot[0], rom_size ? tot[0]*100.0/rom_size : 0.0);
+
+    free(kinds);
+    apex_project_free(p);
+    return 0;
+}
+
+/* ── orphan-labels command ──────────────────────────────────────────────── */
+
+static int cmd_orphan_labels(int argc, char **argv)
+{
+    ApexProject *p;
+    size_t i, j, found = 0;
+
+    if (argc < 2) {
+        fputs("usage: apexini orphan-labels <rom> <file.ini>\n", stderr);
+        return 2;
+    }
+
+    p = apex_project_open(argv[0], argv[1]);
+    if (!p) {
+        fprintf(stderr, "error: cannot open ROM '%s' with config '%s'\n", argv[0], argv[1]);
+        return 1;
+    }
+    if (apex_project_analyze(p) != 0) {
+        fprintf(stderr, "error: analysis failed\n");
+        apex_project_free(p);
+        return 1;
+    }
+
+    for (i = 0; i < p->config_labels.count; i++) {
+        const ConfigLabel *lbl = &p->config_labels.items[i];
+        uint8_t bank = lbl->has_bank ? lbl->bank : 0xffu;
+        int has_ref = 0;
+        int is_entry = 0;
+
+        /* Skip if also an explicit [entries] point — those are reachable by design */
+        for (j = 0; j < p->config_entries.count; j++) {
+            uint8_t eb = p->config_entries.items[j].has_bank
+                         ? p->config_entries.items[j].bank : 0xffu;
+            if (eb == bank && p->config_entries.items[j].addr == lbl->addr) {
+                is_entry = 1;
+                break;
+            }
+        }
+        if (is_entry) continue;
+
+        /* Check for any inbound ROM reference */
+        for (j = 0; j < p->refs.count; j++) {
+            if (p->refs.items[j].bank == bank && p->refs.items[j].addr == lbl->addr) {
+                has_ref = 1;
+                break;
+            }
+        }
+
+        if (!has_ref) {
+            char buf[20];
+            fmt_addr(buf, sizeof(buf), lbl->has_bank, lbl->bank, lbl->addr);
+            printf("orphan: %-20s  %s\n", buf, lbl->name ? lbl->name : "");
+            found++;
+        }
+    }
+
+    if (found == 0)
+        printf("%s: no orphan labels found\n", argv[1]);
+    else
+        printf("%zu orphan label(s) found\n", found);
+
+    apex_project_free(p);
+    return found > 0 ? 1 : 0;
+}
+
+/* ── check-bounds command ───────────────────────────────────────────────── */
+
+/* Returns 1 if (has_bank, bank, addr) is a valid ROM address, 0 and prints error if not. */
+static int check_one_addr(const ApexProject *p, int has_bank, uint8_t bank, uint32_t addr,
+                          const char *section, int *issues)
+{
+    char addrstr[20];
+    fmt_addr(addrstr, sizeof(addrstr), has_bank, bank, addr);
+
+    if (!has_bank) {
+        /* No bank specifier: valid in paged range 0x4000-0x7fff (all banks) or
+           system range 0x8000-0xffff.  RAM addresses (< 0x4000) are suspicious. */
+        if (addr < APEX_PAGED_ORG || addr > 0xffffu) {
+            printf("invalid: [%s] %s  address without bank out of CPU range (expected 0x4000-0xffff)\n",
+                   section, addrstr);
+            (*issues)++;
+            return 0;
+        }
+    } else if (bank == 0xffu) {
+        /* Explicit system bank: CPU 0x8000-0xffff */
+        if (addr < APEX_SYSTEM_ORG || addr > 0xffffu) {
+            printf("invalid: [%s] %s  system bank address out of range (expected 0x8000-0xffff)\n",
+                   section, addrstr);
+            (*issues)++;
+            return 0;
+        }
+        if (p->rom.size < APEX_SYSTEM_SIZE) {
+            printf("invalid: [%s] %s  ROM too small for a system bank\n", section, addrstr);
+            (*issues)++;
+            return 0;
+        }
+    } else {
+        /* Paged bank: CPU 0x4000-0x7fff */
+        if (addr < APEX_PAGED_ORG || addr >= APEX_PAGED_ORG + APEX_BANK_SIZE) {
+            printf("invalid: [%s] %s  paged bank address out of range (expected 0x4000-0x7fff)\n",
+                   section, addrstr);
+            (*issues)++;
+            return 0;
+        }
+        if (bank_index_for_id(p->rom.data, p->banks, bank) < 0) {
+            printf("invalid: [%s] %s  bank 0x%02x not found in ROM\n",
+                   section, addrstr, bank);
+            (*issues)++;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+/* Check that addr+length-1 stays within the same bank page. */
+static void check_range_end(int has_bank, uint8_t bank, uint32_t addr,
+                            size_t length, const char *section, int *issues)
+{
+    if (length == 0) return;
+    uint32_t last = addr + (uint32_t)length - 1u;
+    uint32_t page_end = (!has_bank || bank == 0xffu) ? 0xffffu
+                        : (uint32_t)(APEX_PAGED_ORG + APEX_BANK_SIZE - 1u);
+    if (last > page_end) {
+        char addrstr[20];
+        fmt_addr(addrstr, sizeof(addrstr), has_bank, bank, addr);
+        printf("invalid: [%s] %s  range of %zu bytes overflows bank (ends at 0x%04x)\n",
+               section, addrstr, length, (unsigned)last);
+        (*issues)++;
+    }
+}
+
+static int cmd_check_bounds(int argc, char **argv)
+{
+    ApexProject *p;
+    int issues = 0;
+    size_t i;
+
+    if (argc < 2) {
+        fputs("usage: apexini check-bounds <rom> <file.ini>\n", stderr);
+        return 2;
+    }
+
+    p = apex_project_open(argv[0], argv[1]);
+    if (!p) {
+        fprintf(stderr, "error: cannot open ROM '%s' with config '%s'\n", argv[0], argv[1]);
+        return 1;
+    }
+
+    /* Labels */
+    for (i = 0; i < p->config_labels.count; i++) {
+        const ConfigLabel *e = &p->config_labels.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "labels", &issues);
+    }
+
+    /* Entries */
+    for (i = 0; i < p->config_entries.count; i++) {
+        const ConfigEntry *e = &p->config_entries.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "entries", &issues);
+    }
+
+    /* Inline signatures */
+    for (i = 0; i < p->inline_sigs.count; i++) {
+        const InlineSignature *s = &p->inline_sigs.items[i];
+        if (check_one_addr(p, s->has_bank, s->bank, s->addr, "inline", &issues))
+            check_range_end(s->has_bank, s->bank, s->addr, s->length, "inline", &issues);
+    }
+
+    /* Data ranges */
+    for (i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *d = &p->data_ranges.items[i];
+        if (check_one_addr(p, 1, d->bank, d->addr, "data", &issues)) {
+            size_t len = 0;
+            switch (d->kind) {
+            case DATA_BYTES:             len = d->length; break;
+            case DATA_DMD_FULLFRAME:     len = 512u;      break;
+            case DATA_PTR16_STRING:
+            case DATA_PTR16_DATA:
+            case DATA_PTR16_CODE:
+            case DATA_PTR16_TABLE:
+            case DATA_PTR16_SPRITE:      len = 2u;        break;
+            case DATA_FAR_STRING:
+            case DATA_FAR_DATA:
+            case DATA_FAR_TABLE:
+            case DATA_FAR_CODE:
+            case DATA_FAR_DMD_FULLFRAME:
+            case DATA_FAR_SPRITE:        len = 3u;        break;
+            default:                     len = 0u;        break;
+            }
+            if (len) check_range_end(1, d->bank, d->addr, len, "data", &issues);
+        }
+    }
+
+    /* Tables */
+    for (i = 0; i < p->tables.count; i++) {
+        const TableDef *t = &p->tables.items[i];
+        if (check_one_addr(p, 1, t->bank, t->addr, "tables", &issues)) {
+            if (!t->has_header && t->rows > 0) {
+                size_t w = table_schema_width(&t->schema);
+                if (w) check_range_end(1, t->bank, t->addr, t->rows * w, "tables", &issues);
+            }
+        }
+    }
+
+    /* Ref exclusions */
+    for (i = 0; i < p->ref_exclusions.count; i++) {
+        const ConfigEntry *e = &p->ref_exclusions.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "exclude_refs", &issues);
+    }
+
+    if (issues == 0)
+        printf("%s + %s: all addresses valid\n", argv[0], argv[1]);
+    else
+        printf("%d invalid address(es) found\n", issues);
+
+    apex_project_free(p);
+    return issues > 0 ? 1 : 0;
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -689,7 +1329,7 @@ int main(int argc, char **argv)
     apex_die_hook = catch_die;
 
     if (argc < 2) {
-        fputs("usage: apexini <check|overlaps|merge> ...\n", stderr);
+        fputs("usage: apexini <check|overlaps|merge|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
         return 2;
     }
     if (strcmp(argv[1], "check") == 0)
@@ -698,8 +1338,20 @@ int main(int argc, char **argv)
         return cmd_overlaps(argc - 2, argv + 2);
     if (strcmp(argv[1], "merge") == 0)
         return cmd_merge(argc - 2, argv + 2);
+    if (strcmp(argv[1], "normalize") == 0)
+        return cmd_normalize(argc - 2, argv + 2);
+    if (strcmp(argv[1], "find-redundant") == 0)
+        return cmd_find_redundant(argc - 2, argv + 2);
+    if (strcmp(argv[1], "strip-redundant") == 0)
+        return cmd_strip_redundant(argc - 2, argv + 2);
+    if (strcmp(argv[1], "coverage") == 0)
+        return cmd_coverage(argc - 2, argv + 2);
+    if (strcmp(argv[1], "orphan-labels") == 0)
+        return cmd_orphan_labels(argc - 2, argv + 2);
+    if (strcmp(argv[1], "check-bounds") == 0)
+        return cmd_check_bounds(argc - 2, argv + 2);
 
     fprintf(stderr, "apexini: unknown command '%s'\n", argv[1]);
-    fputs("usage: apexini <check|overlaps|merge> ...\n", stderr);
+    fputs("usage: apexini <check|overlaps|merge|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
     return 2;
 }

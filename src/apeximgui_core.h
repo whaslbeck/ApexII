@@ -10,6 +10,7 @@
 
 extern "C" {
 #include "apexdmd.h"
+#include "apexsprite.h"
 #include "apex_project.h"
 #include "apex_render.h"
 #include "apex_analysis.h"
@@ -179,6 +180,8 @@ struct UiState {
 
     bool show_ref_exclusions;
     bool show_rom_map;
+    bool show_dmd_list;
+    bool show_sprite_list;
 
     bool refs_pinned;
     uint8_t refs_pinned_bank;
@@ -189,6 +192,44 @@ struct UiState {
     uint32_t graph_pinned_addr;
 
     bool overlay_dirty;
+
+    struct SpriteScanEntry {
+        uint8_t bank;
+        uint32_t cpu_addr;
+        size_t rom_offset;
+        uint8_t header_type, enc_type;
+        uint8_t width, height;
+        size_t consumed;
+        bool classified;
+    };
+    std::vector<SpriteScanEntry> sprite_candidates;
+    bool sprite_scan_done;
+    int sprite_filter_min_w = 1, sprite_filter_max_w = 128;
+    int sprite_filter_min_h = 1, sprite_filter_max_h = 32;
+    int sprite_nh_height = 12; /* height for sprite_noheader classify button */
+
+    struct VsiTableEntry {
+        int table_idx;      /* index in master table */
+        int image_idx;      /* image number within sub-table */
+        uint8_t table_height; /* height from sub-table descriptor */
+        uint8_t bank;
+        uint32_t cpu_addr;
+        size_t rom_offset;
+        bool is_noheader;   /* true = no-header VSI (byte 0 = width) */
+        uint8_t width, height;
+        bool classified;    /* already in data_ranges as DATA_SPRITE / DATA_SPRITE_NOHEADER */
+    };
+    struct VsiSubTableInfo {
+        int table_idx;
+        uint8_t bank;
+        uint32_t cpu_addr;   /* sub-table start address */
+        size_t header_len;   /* bytes before pointer array (min/max pairs + terminator + H + spacing) */
+        int num_images;
+        uint8_t table_height;
+    };
+    std::vector<VsiTableEntry> vsi_table_entries;
+    std::vector<VsiSubTableInfo> vsi_sub_tables;
+    bool vsi_table_scan_done = false;
 };
 
 struct SnapshotLabel {
@@ -271,6 +312,23 @@ struct DmdPreviewInfo {
     uint8_t plane[APEX_DMD_PAGE_BYTES];
 };
 
+struct SpritePreviewInfo {
+    bool valid;
+    bool from_target;
+    uint8_t bank;
+    uint32_t cpu_addr;
+    size_t rom_offset;
+    uint8_t header_type;
+    uint8_t enc_type;
+    size_t consumed;
+    uint8_t vert_offset;
+    uint8_t horiz_offset;
+    uint8_t width;
+    uint8_t height;
+    char title[128];
+    uint8_t pixels[APEX_SPRITE_MAX_BYTES];
+};
+
 // --- Shared Helper Function Declarations ---
 
 // Core State & Navigation
@@ -286,6 +344,11 @@ int project_locate_rom_bytes(const ApexProject *project, uint8_t bank, uint32_t 
 int address_is_dmd_fullframe_start(const ApexProject *project, uint8_t bank, uint32_t addr);
 int decode_dmd_preview_at(const ApexProject *project, uint8_t bank, uint32_t addr, DmdPreviewInfo *preview);
 DmdPreviewInfo find_dmd_preview(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+
+// Sprite logic
+int address_is_sprite_start(const ApexProject *project, uint8_t bank, uint32_t addr);
+int decode_sprite_preview_at(const ApexProject *project, uint8_t bank, uint32_t addr, SpritePreviewInfo *preview);
+SpritePreviewInfo find_sprite_preview(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 // Inline spec string
 std::string inline_sig_spec_string(const InlineSignature *s);
@@ -401,5 +464,9 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
 // Analysis: Ref Exclusions
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+
+// DMD and Sprite list windows
+void render_dmd_list_window(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+void render_sprite_list_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 #endif

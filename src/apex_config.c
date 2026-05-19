@@ -599,6 +599,8 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
         *kind = TABLE_PTR16_TABLE;
     } else if (strcmp(value, "ptr16_dmd_fullframe") == 0) {
         *kind = TABLE_PTR16_DMD_FULLFRAME;
+    } else if (strcmp(value, "ptr16_sprite") == 0) {
+        *kind = TABLE_PTR16_SPRITE;
     } else if (strcmp(value, "far_string") == 0) {
         *kind = TABLE_FAR_STRING;
     } else if (strcmp(value, "far_data") == 0) {
@@ -609,6 +611,8 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
         *kind = TABLE_FAR_CODE;
     } else if (strcmp(value, "far_dmd_fullframe") == 0) {
         *kind = TABLE_FAR_DMD_FULLFRAME;
+    } else if (strcmp(value, "far_sprite") == 0) {
+        *kind = TABLE_FAR_SPRITE;
     } else {
         return 0;
     }
@@ -801,7 +805,7 @@ static char *resolve_include_path(const char *from_path, const char *include_pat
 int table_kind_is_far(TableFieldKind kind)
 {
     return kind == TABLE_FAR_STRING || kind == TABLE_FAR_DATA || kind == TABLE_FAR_TABLE ||
-           kind == TABLE_FAR_CODE || kind == TABLE_FAR_DMD_FULLFRAME;
+           kind == TABLE_FAR_CODE || kind == TABLE_FAR_DMD_FULLFRAME || kind == TABLE_FAR_SPRITE;
 }
 
 static size_t table_field_width(TableFieldKind kind)
@@ -1188,6 +1192,14 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_FAR_CODE, 3);
             } else if (strcmp(value, "far_dmd_fullframe") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_FAR_DMD_FULLFRAME, 3);
+            } else if (strcmp(value, "sprite") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_SPRITE, 0);
+            } else if (parse_count_format(value, "sprite_noheader", &length)) {
+                add_data_range(data_ranges, bank, addr, DATA_SPRITE_NOHEADER, length);
+            } else if (strcmp(value, "ptr16_sprite") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_PTR16_SPRITE, 2);
+            } else if (strcmp(value, "far_sprite") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_FAR_SPRITE, 3);
             } else {
                 die("invalid data format '%s = %s'", key, value);
             }
@@ -1351,6 +1363,14 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
         add_data_range(ranges, bank, addr, DATA_FAR_CODE, 3);
     } else if (strcmp(value, "far_dmd_fullframe") == 0) {
         add_data_range(ranges, bank, addr, DATA_FAR_DMD_FULLFRAME, 3);
+    } else if (strcmp(value, "sprite") == 0) {
+        add_data_range(ranges, bank, addr, DATA_SPRITE, 0);
+    } else if (parse_count_format(value, "sprite_noheader", &length)) {
+        add_data_range(ranges, bank, addr, DATA_SPRITE_NOHEADER, length);
+    } else if (strcmp(value, "ptr16_sprite") == 0) {
+        add_data_range(ranges, bank, addr, DATA_PTR16_SPRITE, 2);
+    } else if (strcmp(value, "far_sprite") == 0) {
+        add_data_range(ranges, bank, addr, DATA_FAR_SPRITE, 3);
     } else {
         free(value);
         return 1;

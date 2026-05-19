@@ -148,9 +148,11 @@ static int reserved_label_name(const char *s)
         "INLINE_STRING_PTR", "INLINE_CODE_PTR", "INLINE_TABLE_PTR", "INLINE_FAR_CODE",
         "INLINE_FAR_STRING", "INLINE_FAR_PTR", "INLINE_FAR_TABLE",
         "INLINE_PTR_DMD_FULLFRAME", "INLINE_FAR_DMD_FULLFRAME",
+        "INLINE_PTR_SPRITE", "INLINE_FAR_SPRITE",
         "TABLE_PTR", "TABLE_FAR_CODE", "TABLE_FAR_STRING", "TABLE_FAR_PTR",
         "TABLE_FAR_TABLE", "TABLE_PTR_DMD_FULLFRAME", "TABLE_FAR_DMD_FULLFRAME",
-        "FAR_CODE", "FAR_STRING", "FAR_PTR", "FAR_TABLE", "FAR_DMD_FULLFRAME",
+        "TABLE_PTR_SPRITE", "TABLE_FAR_SPRITE",
+        "FAR_CODE", "FAR_STRING", "FAR_PTR", "FAR_TABLE", "FAR_DMD_FULLFRAME", "FAR_SPRITE",
         "STRING", "LDA", "LDB", "LDD", "LDX", "LDY", "LDU", "LDS", "STA", "STB",
         "STD", "STX", "STY", "STU", "STS", "JSR", "JMP", "RTS", "RTI", "BRA",
         "BSR", "PULS", "PULU", "PSHS", "PSHU", NULL
@@ -673,6 +675,8 @@ static void parse_line(AsmState *st, char *line)
         parse_table_ptr(st, trim(s + strlen("INLINE_TABLE_PTR")));
     } else if (starts_with_word(s, "INLINE_PTR_DMD_FULLFRAME")) {
         parse_table_ptr(st, trim(s + strlen("INLINE_PTR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "INLINE_PTR_SPRITE")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_PTR_SPRITE")));
     } else if (starts_with_word(s, "INLINE_PTR")) {
         parse_table_ptr(st, trim(s + strlen("INLINE_PTR")));
     } else if (starts_with_word(s, "INLINE_FAR_CODE")) {
@@ -683,6 +687,8 @@ static void parse_line(AsmState *st, char *line)
         parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_TABLE")));
     } else if (starts_with_word(s, "INLINE_FAR_DMD_FULLFRAME")) {
         parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "INLINE_FAR_SPRITE")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_SPRITE")));
     } else if (starts_with_word(s, "INLINE_FAR_PTR")) {
         parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_PTR")));
     } else if (starts_with_word(s, "FAR_STRING")) {
@@ -695,6 +701,10 @@ static void parse_line(AsmState *st, char *line)
         parse_inline_far_code(st, trim(s + strlen("FAR_CODE")));
     } else if (starts_with_word(s, "FAR_DMD_FULLFRAME")) {
         parse_inline_far_code(st, trim(s + strlen("FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "FAR_SPRITE")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_SPRITE")));
+    } else if (starts_with_word(s, "TABLE_PTR_SPRITE")) {
+        parse_table_ptr(st, trim(s + strlen("TABLE_PTR_SPRITE")));
     } else if (starts_with_word(s, "TABLE_PTR")) {
         parse_table_ptr(st, trim(s + strlen("TABLE_PTR")));
     } else if (starts_with_word(s, "TABLE_PTR_DMD_FULLFRAME")) {
@@ -705,6 +715,8 @@ static void parse_line(AsmState *st, char *line)
         parse_table_far_code(st, trim(s + strlen("TABLE_FAR_TABLE")));
     } else if (starts_with_word(s, "TABLE_FAR_DMD_FULLFRAME")) {
         parse_table_far_code(st, trim(s + strlen("TABLE_FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "TABLE_FAR_SPRITE")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_SPRITE")));
     } else if (starts_with_word(s, "TABLE_FAR_PTR")) {
         parse_table_far_code(st, trim(s + strlen("TABLE_FAR_PTR")));
     } else if (starts_with_word(s, "TABLE_FAR_CODE")) {

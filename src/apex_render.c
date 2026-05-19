@@ -60,11 +60,17 @@ static ApexRenderedBlockKind parse_block_name(const char *name, size_t length)
     if (length == 4 && memcmp(name, "data", 4) == 0) {
         return APEX_RENDER_BLOCK_DATA;
     }
+    if (length == 6 && memcmp(name, "sprite", 6) == 0) {
+        return APEX_RENDER_BLOCK_SPRITE;
+    }
     if (length == 5 && memcmp(name, "table", 5) == 0) {
         return APEX_RENDER_BLOCK_TABLE;
     }
     if (length == 12 && memcmp(name, "unclassified", 12) == 0) {
         return APEX_RENDER_BLOCK_UNCLASSIFIED;
+    }
+    if (length == 4 && memcmp(name, "free", 4) == 0) {
+        return APEX_RENDER_BLOCK_FREE;
     }
     return APEX_RENDER_BLOCK_UNKNOWN;
 }

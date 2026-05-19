@@ -10,11 +10,13 @@ typedef enum {
     TABLE_PTR16_CODE,
     TABLE_PTR16_TABLE,
     TABLE_PTR16_DMD_FULLFRAME,
+    TABLE_PTR16_SPRITE,
     TABLE_FAR_STRING,
     TABLE_FAR_DATA,
     TABLE_FAR_TABLE,
     TABLE_FAR_CODE,
     TABLE_FAR_DMD_FULLFRAME,
+    TABLE_FAR_SPRITE,
     TABLE_BYTE,
     TABLE_WORD
 } TableFieldKind;
@@ -154,7 +156,11 @@ typedef enum {
     DATA_FAR_DATA,
     DATA_FAR_TABLE,
     DATA_FAR_CODE,
-    DATA_FAR_DMD_FULLFRAME
+    DATA_FAR_DMD_FULLFRAME,
+    DATA_SPRITE,
+    DATA_PTR16_SPRITE,
+    DATA_FAR_SPRITE,
+    DATA_SPRITE_NOHEADER   /* no-header VSI: byte 0 = width px, height in DataRange.length */
 } DataKind;
 
 typedef struct {
