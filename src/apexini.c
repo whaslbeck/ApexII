@@ -207,6 +207,8 @@ static void w_data_val(FILE *f, const DataRange *r)
     switch (r->kind) {
     case DATA_BYTES:             fprintf(f, "bytes[%lu]", (unsigned long)r->length); break;
     case DATA_STRING:            fputs("string",              f); break;
+    case DATA_STRING_LP:         fputs("string_lp",           f); break;
+    case DATA_STRING_FIXED:      fprintf(f, "string[%lu]", (unsigned long)r->length); break;
     case DATA_DMD_FULLFRAME:     fputs("dmd_fullframe",       f); break;
     case DATA_PTR16_STRING:      fputs("ptr16_string",        f); break;
     case DATA_PTR16_DATA:        fputs("ptr16_data",          f); break;
@@ -334,12 +336,10 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
         fputs("\n[types]\n", f);
         for (i = 0; i < c->types.count; i++) {
             const ConfigType *t = &c->types.items[i];
-            fprintf(f, "%s:%s =", t->name, t->kind == TABLE_BYTE ? "byte" : "word");
+            fprintf(f, "%s:%s =\n", t->name, t->kind == TABLE_BYTE ? "byte" : "word");
             for (j = 0; j < t->value_count; j++) {
-                if (j) fputc(',', f);
-                fprintf(f, " 0x%02x:%s", t->values[j].value, t->values[j].name);
+                fprintf(f, "\t0x%02x:%s\n", t->values[j].value, t->values[j].name);
             }
-            fputc('\n', f);
         }
     }
 
@@ -590,6 +590,11 @@ static int cmd_overlaps(int argc, char **argv)
             snprintf(e->spec, sizeof(e->spec), "bytes[%lu]",
                      (unsigned long)c.data.items[i].length); break;
         case DATA_STRING:            strcpy(e->spec, "string");              break;
+        case DATA_STRING_LP:         strcpy(e->spec, "string_lp");           break;
+        case DATA_STRING_FIXED:
+            snprintf(e->spec, sizeof(e->spec), "string[%lu]",
+                     (unsigned long)c.data.items[i].length);
+            break;
         case DATA_DMD_FULLFRAME:     strcpy(e->spec, "dmd_fullframe");       break;
         case DATA_PTR16_STRING:      strcpy(e->spec, "ptr16_string");        break;
         case DATA_PTR16_DATA:        strcpy(e->spec, "ptr16_data");          break;

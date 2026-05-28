@@ -211,7 +211,11 @@ static void write_config_address(FILE *o, int hb, uint8_t b, uint32_t a)
 {
     if (hb) {
         fprintf(o, "B%02x_A%04x", b, (unsigned)a & 0xffff);
+    } else if ((a & 0xffff) >= 0x8000u) {
+        /* System bank: deterministically bank 0xFF even without explicit has_bank. */
+        fprintf(o, "Bff_A%04x", (unsigned)a & 0xffff);
     } else {
+        /* RAM (<0x4000) or ambiguous paged address — keep legacy format. */
         fprintf(o, "0x%04x", (unsigned)a & 0xffff);
     }
 }
@@ -287,6 +291,8 @@ static std::string data_range_spec_string(const DataRange *r)
     }
     switch (r->kind) {
     case DATA_STRING:          return "string";
+    case DATA_STRING_LP:       return "string_lp";
+    case DATA_STRING_FIXED:    return "string[" + std::to_string(r->length) + "]";
     case DATA_FAR_STRING:      return "far_string";
     case DATA_FAR_DATA:        return "far_data";
     case DATA_FAR_TABLE:       return "far_table";
@@ -916,7 +922,10 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     uint8_t b;
     uint32_t a;
     if (s->hex_active) {
-        if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
+        size_t base = s->hex_has_range
+            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
+            : s->hex_selected_offset;
+        if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
         }
     } else {
@@ -936,7 +945,10 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
     uint8_t b;
     uint32_t a;
     if (s->hex_active) {
-        if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
+        size_t base = s->hex_has_range
+            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
+            : s->hex_selected_offset;
+        if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
         }
     } else {
@@ -945,6 +957,27 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
         }
     }
     if (apex_project_set_kind(p, 1, b, a, APEX_KIND_STRING, "string") == 0) {
+        rerender_and_reselect(p, dp, s, b, a);
+    }
+}
+
+void apply_string_lp_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    uint8_t b;
+    uint32_t a;
+    if (s->hex_active) {
+        size_t base = s->hex_has_range
+            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
+            : s->hex_selected_offset;
+        if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
+            return;
+        }
+    } else {
+        if (!selected_address(*dp, s, &b, &a)) {
+            return;
+        }
+    }
+    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_DATA, "string_lp") == 0) {
         rerender_and_reselect(p, dp, s, b, a);
     }
 }

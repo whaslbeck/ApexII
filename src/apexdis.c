@@ -261,6 +261,12 @@ static const char *data_kind_name(DataKind kind)
     if (kind == DATA_STRING) {
         return "string";
     }
+    if (kind == DATA_STRING_LP) {
+        return "string_lp";
+    }
+    if (kind == DATA_STRING_FIXED) {
+        return "string_fixed";
+    }
     if (kind == DATA_DMD_FULLFRAME) {
         return "dmd_fullframe";
     }
@@ -780,6 +786,43 @@ static void emit_string(FILE *out, const uint8_t *data, size_t len)
     fprintf(out, "\"\n");
 }
 
+/* Returns 1 + N (length byte + N chars) if data[0..N] is a valid LP string, else 0. */
+static size_t valid_string_lp_len(const uint8_t *data, size_t len)
+{
+    size_t n, i;
+    if (len == 0) return 0;
+    n = data[0];
+    if (n == 0 || 1u + n > len) return 0;
+    for (i = 1u; i <= n; i++) {
+        if (data[i] < 0x20u || data[i] > 0x7fu) return 0;
+    }
+    return 1u + n;
+}
+
+/* Emits STRING_LP "…" (data[0] is the length byte, data[1..len-1] are the chars). */
+static void emit_string_lp(FILE *out, const uint8_t *data, size_t len)
+{
+    size_t i;
+    fprintf(out, "    STRING_LP \"");
+    for (i = 1u; i < len; i++) {
+        if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
+        fputc(data[i], out);
+    }
+    fprintf(out, "\"\n");
+}
+
+/* Emits STRING_FIXED "…" (data[0..len-1] are the chars, no extra byte). */
+static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
+{
+    size_t i;
+    fprintf(out, "    STRING_FIXED \"");
+    for (i = 0; i < len; i++) {
+        if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
+        fputc(data[i], out);
+    }
+    fprintf(out, "\"\n");
+}
+
 static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t len,
                                             const Label *labels, size_t label_count)
 {
@@ -1160,6 +1203,32 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         }
         emit_string(out, data + *pos, string_len);
         *pos += string_len;
+        return 1;
+    }
+    if (range->kind == DATA_STRING_LP) {
+        size_t string_len = valid_string_lp_len(data + *pos, len - *pos);
+
+        if (string_len == 0) {
+            return 0;
+        }
+        emit_string_lp(out, data + *pos, string_len);
+        *pos += string_len;
+        return 1;
+    }
+    if (range->kind == DATA_STRING_FIXED) {
+        size_t n = range->length;
+        size_t i;
+
+        if (n == 0 || *pos + n > len) {
+            return 0;
+        }
+        for (i = 0; i < n; i++) {
+            if (data[*pos + i] < 0x20u || data[*pos + i] > 0x7fu) {
+                return 0;
+            }
+        }
+        emit_string_fixed(out, data + *pos, n);
+        *pos += n;
         return 1;
     }
     if (range->kind == DATA_PTR16_STRING || range->kind == DATA_PTR16_DATA ||
@@ -1860,7 +1929,8 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
         explain_label(label, config_data_source(range->kind));
         explain_label_kind(label, config_data_source(range->kind));
         mark_label_data(label);
-        if (range->kind == DATA_STRING) {
+        if (range->kind == DATA_STRING || range->kind == DATA_STRING_LP ||
+            range->kind == DATA_STRING_FIXED) {
             label->is_string = 1;
         } else if (data_kind_is_far(range->kind) && range->addr + 2u <= 0xffffu) {
             const uint8_t *data;

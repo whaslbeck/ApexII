@@ -1138,8 +1138,14 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, ui
             }
             {
                 char value[64];
+                uint16_t imm = be16(data + op_len);
 
-                format_addr(value, sizeof(value), label, label_ctx, be16(data + op_len));
+                /* Track as address reference so that labels at this address
+                   accumulate incoming refs (e.g. LDX #TABLE_ADDR). The range
+                   checks in collect_code_targets filter out non-ROM values. */
+                info.has_addr_ref = 1;
+                info.addr_ref     = imm;
+                format_addr(value, sizeof(value), label, label_ctx, imm);
                 snprintf(out, out_size, "%s #%s", op->mnemonic, value);
             }
             info.size = op_len + 2u;

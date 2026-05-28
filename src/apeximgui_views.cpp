@@ -157,7 +157,9 @@ static bool is_sprite_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
     size_t i;
     for (i = 0; i < p->data_ranges.count; i++) {
         const DataRange *dr = &p->data_ranges.items[i];
-        if (dr->kind == DATA_SPRITE && dr->bank == bank && addr == dr->addr)
+        if ((dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER ||
+             dr->kind == DATA_FAR_SPRITE) &&
+            dr->bank == bank && addr == dr->addr)
             return true;
     }
     return false;
@@ -355,14 +357,28 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
             visible.push_back(i);
         }
     }
-    if (ImGui::BeginTable("disasm", 3,
+    /* Flow-arrow gutter constants */
+    static constexpr int   FA_MAX_LANES  = 5;
+    static constexpr float FA_LANE_PITCH = 8.0f;
+    static constexpr float FA_MARGIN     = 4.0f;
+    static constexpr float FA_GUTTER_W   = FA_MARGIN + FA_MAX_LANES * FA_LANE_PITCH + FA_MARGIN;
+
+    if (ImGui::BeginTable("disasm", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupScrollFreeze(2, 1);
+        ImGui::TableSetupScrollFreeze(3, 1);
+        ImGui::TableSetupColumn("##gutter", ImGuiTableColumnFlags_WidthFixed |
+                                            ImGuiTableColumnFlags_NoHeaderLabel, FA_GUTTER_W);
         ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,   120.0f);
         ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,    60.0f);
         ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
+        /* Flow-arrow data collected during clipper loop, drawn after EndTable */
+        struct FlowArrow { int src_row, dst_row; bool backward; int lane; ImU32 color; };
+        std::vector<float>     fa_row_y(visible.size(), -1.0f);
+        std::vector<FlowArrow> fa_arrows;
+        float fa_win_x = ImGui::GetWindowPos().x;   /* absolute X of frozen gutter */
+
         ImGuiListClipper clipper;
         clipper.Begin((int)visible.size());
         if (state->request_scroll_to_selection && selected_visible_row >= 0) {
@@ -394,22 +410,15 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
                 }
+                /* Column 0: gutter (invisible Selectable + flow-arrow overlay) */
                 ImGui::TableSetColumnIndex(0);
-                char addr_buf[32];
-                const char *addr_text = "##line";
-                if (line->has_location) {
-                    snprintf(addr_buf, 32, "B%02x_A%04x", line->bank,
-                             (unsigned)line->cpu_addr & 0xffffu);
-                    addr_text = addr_buf;
-                }
-                if (ImGui::Selectable(addr_text, in_range,
+                if (ImGui::Selectable("##rowsel", in_range,
                         ImGuiSelectableFlags_SpanAllColumns |
                         ImGuiSelectableFlags_AllowOverlap)) {
                     handle_line_selection(state, line_idx, ImGui::GetIO().KeyShift);
                 }
                 // AllowWhenOverlappedByItem: needed because AllowOverlap+SpanAllColumns means
-                // the text items in columns 1/2 overlap the Selectable and claim HoveredId,
-                // which otherwise makes IsItemHovered() return false for the Selectable.
+                // the text items in other columns overlap the Selectable and claim HoveredId.
                 bool row_hovered        = ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem);
                 bool row_double_clicked = row_hovered && ImGui::IsMouseDoubleClicked(0);
                 bool row_right_clicked  = row_hovered && ImGui::IsMouseClicked(1);
@@ -419,7 +428,58 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     }
                     ImGui::OpenPopup("row_context_menu");
                 }
+                /* Record row vertical centre for flow arrows */
+                {
+                    ImVec2 rmin = ImGui::GetItemRectMin();
+                    ImVec2 rmax = ImGui::GetItemRectMax();
+                    fa_row_y[(size_t)row] = (rmin.y + rmax.y) * 0.5f;
+                }
+                /* Collect branch target for flow arrows */
+                if (state->show_flow_arrows &&
+                    line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location &&
+                    line->rom_addr < project->rom.size) {
+                    const uint8_t *rb = project->rom.data + line->rom_addr;
+                    size_t         rl = project->rom.size  - line->rom_addr;
+                    char dummy[1];
+                    Cpu6809InstrInfo finfo = cpu6809_disassemble_info(rb, rl,
+                                                line->cpu_addr, dummy, sizeof(dummy));
+                    if (finfo.has_target && (finfo.flags & CPU6809_TARGET_CODE)) {
+                        /* Exclude JSR/LBSR (subroutine calls) */
+                        const char *mt = line->text;
+                        while (*mt == ' ') mt++;
+                        bool is_call = (strncmp(mt,"JSR", 3)==0 && (mt[3]==' '||!mt[3])) ||
+                                       (strncmp(mt,"LBSR",4)==0 && (mt[4]==' '||!mt[4]));
+                        if (!is_call) {
+                            size_t tgt_doc_line;
+                            if (apex_render_find_line_by_address(document, line->bank,
+                                                                  finfo.target, &tgt_doc_line)) {
+                                /* find visible-row index of target */
+                                auto it = std::lower_bound(visible.begin(), visible.end(),
+                                                           tgt_doc_line);
+                                if (it != visible.end() && *it == tgt_doc_line) {
+                                    int tgt_row = (int)(it - visible.begin());
+                                    bool bwd = tgt_row < row;
+                                    ImU32 col = bwd
+                                        ? IM_COL32(80,  200, 120, 200)
+                                        : IM_COL32(120, 150, 220, 180);
+                                    fa_arrows.push_back({row, tgt_row, bwd, -1, col});
+                                }
+                            }
+                        }
+                    }
+                }
+
+                /* Column 1: address */
                 ImGui::TableSetColumnIndex(1);
+                char addr_buf[32];
+                if (line->has_location)
+                    snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x", line->bank,
+                             (unsigned)line->cpu_addr & 0xffffu);
+                else
+                    addr_buf[0] = '\0';
+                ImGui::TextUnformatted(addr_buf);
+
+                ImGui::TableSetColumnIndex(2);
                 if (line->kind == APEX_RENDER_LINE_LABEL && line->has_location) {
                     const Label *el = find_explicit_entry_label(project, line->bank, line->cpu_addr);
                     if (el) {
@@ -443,7 +503,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 } else {
                     ImGui::TextUnformatted(block_name(line->block_kind));
                 }
-                ImGui::TableSetColumnIndex(2);
+                ImGui::TableSetColumnIndex(3);
                 if (line->transition_kind != APEX_RENDER_TRANSITION_NONE) {
                     ImGui::TextDisabled("%s", transition_name(line->transition_kind));
                     ImGui::SameLine();
@@ -458,6 +518,45 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                  excl_bank, (unsigned)excl_addr & 0xffff);
                         ImGui::SameLine(0, 0);
                         ImGui::TextColored(ImVec4(0.85f, 0.55f, 0.20f, 1.0f), "%s", excl_buf);
+                    }
+                }
+                /* Inline xref annotations for label lines */
+                if (line->kind == APEX_RENDER_LINE_LABEL && line->has_location) {
+                    auto in_refs = find_incoming_refs(project, document, state,
+                                                     line->bank, line->cpu_addr);
+                    static const int kMaxInline = 8;
+                    int shown = 0;
+                    for (auto &r : in_refs) {
+                        if (shown >= kMaxInline) break;
+                        char rbuf[128];
+                        if (!r.label.empty())
+                            snprintf(rbuf, sizeof(rbuf), "<- %s  %s",
+                                     r.kind.c_str(), r.label.c_str());
+                        else
+                            snprintf(rbuf, sizeof(rbuf), "<- %s  B%02x_A%04x",
+                                     r.kind.c_str(), r.bank,
+                                     (unsigned)r.cpu_addr & 0xffff);
+                        ImGui::PushID((int)(0xc0de0000u ^ line_idx ^ (size_t)shown));
+                        ImGui::PushStyleColor(ImGuiCol_Text,
+                            ImVec4(0.55f, 0.75f, 0.55f, 1.0f));
+                        if (ImGui::SmallButton(rbuf)) {
+                            select_line(state, r.line_index, 1);
+                        }
+                        ImGui::PopStyleColor();
+                        ImGui::PopID();
+                        shown++;
+                    }
+                    if ((int)in_refs.size() > kMaxInline) {
+                        ImGui::PushID((int)(0xc0de0000u ^ line_idx ^ 0xff));
+                        char more[32];
+                        snprintf(more, sizeof(more), "<- +%d more...",
+                                 (int)in_refs.size() - kMaxInline);
+                        if (ImGui::SmallButton(more)) {
+                            state->request_xref_popup = true;
+                            state->xref_popup_bank    = line->bank;
+                            state->xref_popup_addr    = line->cpu_addr;
+                        }
+                        ImGui::PopID();
                     }
                 }
                 ImGui::EndGroup();
@@ -725,6 +824,9 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     if (ImGui::MenuItem("Mark as String", "S")) {
                         apply_string_at_selection(project, document_ptr, state);
                     }
+                    if (ImGui::MenuItem("Mark as String LP")) {
+                        apply_string_lp_at_selection(project, document_ptr, state);
+                    }
                     if (ImGui::MenuItem("Mark as Table", "T")) {
                         char spec[320] = "counted(ptr16_data)";
                         if (state->edit_schema_count > 0) {
@@ -838,6 +940,70 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
             if (rerendered_in_loop) break;
         }
         ImGui::EndTable();
+
+        /* --- Flow arrows --- */
+        if (state->show_flow_arrows && !fa_arrows.empty()) {
+            /* Lane assignment: sort by span length (shortest → innermost lane) */
+            std::sort(fa_arrows.begin(), fa_arrows.end(), [](const FlowArrow &a, const FlowArrow &b) {
+                return std::abs(a.dst_row - a.src_row) < std::abs(b.dst_row - b.src_row);
+            });
+            /* lane_end[lane] = the max row already used on that lane */
+            std::vector<int> lane_max_row(FA_MAX_LANES, -1);
+            for (auto &a : fa_arrows) {
+                int lo = std::min(a.src_row, a.dst_row);
+                int hi = std::max(a.src_row, a.dst_row);
+                for (int lane = 0; lane < FA_MAX_LANES; lane++) {
+                    if (lane_max_row[lane] < lo) {
+                        a.lane = lane;
+                        lane_max_row[lane] = hi;
+                        break;
+                    }
+                }
+            }
+
+            /* Highlight arrows connected to the selected line */
+            for (auto &a : fa_arrows) {
+                bool sel = ((size_t)a.src_row < visible.size() &&
+                            visible[(size_t)a.src_row] == state->selected_line) ||
+                           ((size_t)a.dst_row < visible.size() &&
+                            visible[(size_t)a.dst_row] == state->selected_line);
+                if (sel) {
+                    /* Brighten: set alpha to 255 */
+                    a.color = (a.color & 0x00ffffffu) | 0xff000000u;
+                }
+            }
+
+            ImDrawList *dl   = ImGui::GetWindowDrawList();
+            float win_scroll = ImGui::GetScrollX();
+            float gx         = fa_win_x - win_scroll; /* left edge of gutter (frozen = no scroll) */
+            float gx_edge    = gx + FA_GUTTER_W;       /* right edge of gutter */
+
+            /* clip to gutter column only */
+            float wy_min = ImGui::GetWindowPos().y;
+            float wy_max = wy_min + ImGui::GetWindowSize().y;
+            dl->PushClipRect({gx, wy_min}, {gx_edge, wy_max}, true);
+
+            for (auto &a : fa_arrows) {
+                if (a.lane < 0) continue;               /* no lane assigned */
+                float y_src = fa_row_y[(size_t)a.src_row];
+                float y_dst = (a.dst_row >= 0 && (size_t)a.dst_row < fa_row_y.size())
+                              ? fa_row_y[(size_t)a.dst_row] : -1.0f;
+                if (y_src < 0.0f || y_dst < 0.0f) continue;
+
+                float x_lane = gx + FA_MARGIN + (float)(a.lane + 1) * FA_LANE_PITCH;
+                float thick  = ((a.color >> 24) == 255) ? 2.0f : 1.5f;
+
+                dl->AddLine({gx_edge, y_src}, {x_lane, y_src}, a.color, thick);
+                dl->AddLine({x_lane,  y_src}, {x_lane, y_dst}, a.color, thick);
+                dl->AddLine({x_lane,  y_dst}, {gx_edge, y_dst}, a.color, thick);
+                /* arrowhead at destination */
+                float aw = 4.0f;
+                dl->AddTriangleFilled({gx_edge, y_dst},
+                                      {gx_edge - aw, y_dst - aw},
+                                      {gx_edge - aw, y_dst + aw}, a.color);
+            }
+            dl->PopClipRect();
+        }
     }
 }
 
@@ -1280,7 +1446,9 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             int64_t next = (int64_t)s->hex_selected_offset + delta;
             if (next < 0) next = 0;
             if (next >= (int64_t)p->rom.size) next = (int64_t)p->rom.size - 1;
+            s->hex_anchor_offset   = (size_t)next;
             s->hex_selected_offset = (size_t)next;
+            s->hex_has_range       = false;
             s->hex_request_follow  = 1;
             size_t li;
             if (find_line_by_rom_offset(*dp, (size_t)next, &li)) {
@@ -1341,9 +1509,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     const char *p2 = l->text;
                     size_t rem = l->length;
                     while (rem > 0 && (*p2 == ' ' || *p2 == '\t')) { p2++; rem--; }
-                    if (rem >= 6 && memcmp(p2, "STRING", 6) == 0 &&
-                        (rem == 6 || p2[6] == ' ' || p2[6] == '\t'))
-                        lk = 7; /* STRING — purple */
+                    if ((rem >= 12 && memcmp(p2, "STRING_FIXED", 12) == 0 &&
+                         (rem == 12 || p2[12] == ' ' || p2[12] == '\t')) ||
+                        (rem >= 9 && memcmp(p2, "STRING_LP", 9) == 0 &&
+                         (rem == 9 || p2[9] == ' ' || p2[9] == '\t')) ||
+                        (rem >= 6 && memcmp(p2, "STRING", 6) == 0 &&
+                         (rem == 6 || p2[6] == ' ' || p2[6] == '\t')))
+                        lk = 7; /* STRING / STRING_LP / STRING_FIXED — purple */
                     else if (rem >= 3 && memcmp(p2, ".DW", 3) == 0 &&
                              (rem == 3 || p2[3] == ' ' || p2[3] == '\t'))
                         lk = 8; /* .DW — cyan */
@@ -1399,13 +1571,19 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             }
 
             /* Hex bytes */
+            size_t rng_lo = s->hex_has_range
+                ? std::min(s->hex_anchor_offset, s->hex_selected_offset) : 0;
+            size_t rng_hi = s->hex_has_range
+                ? std::max(s->hex_anchor_offset, s->hex_selected_offset) : 0;
             for (int col = 0; col < bytes_per_row; col++) {
                 size_t o = row_start + (size_t)col;
                 if (o >= p->rom.size) {
                     break;
                 }
-                uint8_t v   = p->rom.data[o];
-                bool is_cur = s->hex_active && o == s->hex_selected_offset;
+                uint8_t v        = p->rom.data[o];
+                bool is_cur      = s->hex_active && o == s->hex_selected_offset;
+                bool is_in_range = s->hex_active && s->hex_has_range
+                                   && o >= rng_lo && o <= rng_hi;
                 uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
@@ -1416,6 +1594,12 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         ImVec2(pos.x + char_w * 2.2f, pos.y + ImGui::GetTextLineHeight()),
                         IM_COL32(255, 220, 0, 255));
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.05f, 0.05f, 0.05f, 1.0f));
+                } else if (is_in_range) {
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(pos,
+                        ImVec2(pos.x + char_w * 2.2f, pos.y + ImGui::GetTextLineHeight()),
+                        IM_COL32(60, 140, 220, 130));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Text, tc);
                 }
@@ -1459,7 +1643,15 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     ImGui::EndTooltip();
                 }
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                    s->hex_selected_offset = o;
+                    bool shift = ImGui::GetIO().KeyShift;
+                    if (shift && s->hex_active) {
+                        s->hex_selected_offset = o;
+                        s->hex_has_range = (s->hex_anchor_offset != o);
+                    } else {
+                        s->hex_anchor_offset   = o;
+                        s->hex_selected_offset = o;
+                        s->hex_has_range       = false;
+                    }
                     s->hex_active = true;
                     size_t li;
                     if (find_line_by_rom_offset(d, o, &li)) {
@@ -1485,8 +1677,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (o >= p->rom.size) {
                     break;
                 }
-                uint8_t v   = p->rom.data[o];
-                bool is_cur = s->hex_active && o == s->hex_selected_offset;
+                uint8_t v        = p->rom.data[o];
+                bool is_cur      = s->hex_active && o == s->hex_selected_offset;
+                bool is_in_range = s->hex_active && s->hex_has_range
+                                   && o >= rng_lo && o <= rng_hi;
                 uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
@@ -1497,6 +1691,12 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         ImVec2(pos.x + char_w, pos.y + ImGui::GetTextLineHeight()),
                         IM_COL32(255, 220, 0, 255));
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.05f, 0.05f, 0.05f, 1.0f));
+                } else if (is_in_range) {
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(pos,
+                        ImVec2(pos.x + char_w, pos.y + ImGui::GetTextLineHeight()),
+                        IM_COL32(60, 140, 220, 130));
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
                 } else {
                     ImGui::PushStyleColor(ImGuiCol_Text, tc);
                 }
@@ -1505,7 +1705,15 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 ImGui::PopStyleColor();
 
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
-                    s->hex_selected_offset = o;
+                    bool shift = ImGui::GetIO().KeyShift;
+                    if (shift && s->hex_active) {
+                        s->hex_selected_offset = o;
+                        s->hex_has_range = (s->hex_anchor_offset != o);
+                    } else {
+                        s->hex_anchor_offset   = o;
+                        s->hex_selected_offset = o;
+                        s->hex_has_range       = false;
+                    }
                     s->hex_active = true;
                     size_t li;
                     if (find_line_by_rom_offset(d, o, &li)) {
@@ -1529,13 +1737,33 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             set_status(s, "copied");
         }
         if (ImGui::MenuItem("Mark as Code",   "C")) { apply_code_at_selection(p, dp, s); }
-        if (ImGui::MenuItem("Mark as Data",   "D")) {
-            char spec[32];
-            snprintf(spec, sizeof(spec), "bytes[%d]",
-                     s->edit_data_length > 0 ? s->edit_data_length : 1);
-            apply_data_at_selection(p, dp, s, spec);
+        if (s->hex_has_range) {
+            size_t rlo = std::min(s->hex_anchor_offset, s->hex_selected_offset);
+            size_t rhi = std::max(s->hex_anchor_offset, s->hex_selected_offset);
+            size_t rn  = rhi - rlo + 1;
+            char blabel[48], slabel[48];
+            snprintf(blabel, sizeof(blabel), "Assign bytes[%zu]", rn);
+            snprintf(slabel, sizeof(slabel), "Assign string[%zu]", rn);
+            if (ImGui::MenuItem(blabel)) {
+                char spec[32];
+                snprintf(spec, sizeof(spec), "bytes[%zu]", rn);
+                apply_data_at_selection(p, dp, s, spec);
+            }
+            if (ImGui::MenuItem(slabel)) {
+                char spec[32];
+                snprintf(spec, sizeof(spec), "string[%zu]", rn);
+                apply_data_at_selection(p, dp, s, spec);
+            }
+        } else {
+            if (ImGui::MenuItem("Mark as Data", "D")) {
+                char spec[32];
+                snprintf(spec, sizeof(spec), "bytes[%d]",
+                         s->edit_data_length > 0 ? s->edit_data_length : 1);
+                apply_data_at_selection(p, dp, s, spec);
+            }
         }
         if (ImGui::MenuItem("Mark as String", "S")) { apply_string_at_selection(p, dp, s); }
+        if (ImGui::MenuItem("Mark as String LP"))   { apply_string_lp_at_selection(p, dp, s); }
         if (ImGui::MenuItem("Mark as Table",  "T")) {
             char spec[320] = "counted(ptr16_data)";
             if (s->edit_schema_count > 0) {
@@ -1701,13 +1929,16 @@ void render_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s
         dl->AddText(ImVec2(n.pos.x - std::min(tsz.x, n.size.x - 10) * 0.5f,
                            n.pos.y - tsz.y * 0.5f),
                     IM_COL32(255, 255, 255, 255), n.name.c_str());
-        if (hov && ImGui::IsMouseDoubleClicked(0)) {
+        if (hov && ImGui::IsMouseClicked(0)) {
             size_t li;
             if (apex_render_find_line_by_address(d, n.bank, n.addr, &li)) {
                 select_line(s, li, 1);
                 s->graph_needs_rebuild = true;
             }
         }
+        if (hov)
+            ImGui::SetTooltip("B%02x_A%04x\nClick to navigate",
+                              n.bank, (unsigned)n.addr & 0xffff);
     }
 }
 
@@ -1758,28 +1989,47 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
         if (i > 0) ImGui::SameLine();
         push_kind(kRow2[i].kind, kRow2[i].label);
     }
-    /* named types from config, appended to row 2 */
-    if (p) {
-        for (size_t ti = 0; ti < p->config_types.count; ti++) {
-            ImGui::SameLine();
-            const ConfigType *ct = &p->config_types.items[ti];
-            if (ImGui::SmallButton(ct->name)) {
-                if (*count < APEX_MAX_EDIT_FIELDS) {
-                    ApexEditField f = {};
-                    f.kind  = -1;
-                    f.count = add_count > 0 ? add_count : 1;
-                    snprintf(f.type_name, sizeof(f.type_name), "%s", ct->name);
-                    fields[(*count)++] = f;
-                    changed = true;
+    /* named types from config — combo with search filter */
+    if (p && p->config_types.count > 0) {
+        static char cust_filter[64] = {};
+        ImGui::SetNextItemWidth(160.0f);
+        if (ImGui::BeginCombo("##cust_type", "Custom type...",
+                              ImGuiComboFlags_HeightLarge)) {
+            ImGui::SetNextItemWidth(-1.0f);
+            if (ImGui::IsWindowAppearing()) {
+                ImGui::SetKeyboardFocusHere();
+                cust_filter[0] = '\0';
+            }
+            ImGui::InputTextWithHint("##cust_filter", "search...",
+                                     cust_filter, sizeof(cust_filter));
+            ImGui::Separator();
+            for (size_t ti = 0; ti < p->config_types.count; ti++) {
+                const ConfigType *ct = &p->config_types.items[ti];
+                if (cust_filter[0] &&
+                    !strstr(ct->name, cust_filter)) {
+                    continue;
+                }
+                if (ImGui::Selectable(ct->name)) {
+                    if (*count < APEX_MAX_EDIT_FIELDS) {
+                        ApexEditField f = {};
+                        f.kind  = -1;
+                        f.count = add_count > 0 ? add_count : 1;
+                        snprintf(f.type_name, sizeof(f.type_name), "%s", ct->name);
+                        fields[(*count)++] = f;
+                        changed = true;
+                    }
+                    cust_filter[0] = '\0';
+                    ImGui::CloseCurrentPopup();
+                }
+                if (ImGui::IsItemHovered() && ct->value_count > 0) {
+                    ImGui::BeginTooltip();
+                    for (size_t vi = 0; vi < ct->value_count; vi++) {
+                        ImGui::Text("0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
+                    }
+                    ImGui::EndTooltip();
                 }
             }
-            if (ImGui::IsItemHovered() && ct->value_count > 0) {
-                ImGui::BeginTooltip();
-                for (size_t vi = 0; vi < ct->value_count; vi++) {
-                    ImGui::Text("0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
-                }
-                ImGui::EndTooltip();
-            }
+            ImGui::EndCombo();
         }
     }
     return changed;
@@ -1882,9 +2132,11 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     /* row: special kinds */
     if (ImGui::Button("Code##cls"))   { apply_code_at_selection(p, dp, s); }
     ImGui::SameLine();
-    if (ImGui::Button("String##cls")) { apply_string_at_selection(p, dp, s); }
+    if (ImGui::Button("String##cls"))   { apply_string_at_selection(p, dp, s); }
     ImGui::SameLine();
-    if (ImGui::Button("Clear##cls"))  { clear_kind_at_selection(p, dp, s); }
+    if (ImGui::Button("String LP##cls")) { apply_string_lp_at_selection(p, dp, s); }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear##cls"))    { clear_kind_at_selection(p, dp, s); }
     /* row: raw byte/word + bytes[N] */
     ImGui::TextDisabled("raw:");
     ImGui::SameLine();
@@ -2227,8 +2479,10 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
 
             ImGui::TableSetColumnIndex(3);
             if (ImGui::SmallButton("Del")) {
-                apex_project_clear_kind(p, 1, t->bank, t->addr);
-                rerender_and_reselect(p, dp, s, t->bank, t->addr);
+                uint8_t  del_bank = t->bank;
+                uint32_t del_addr = t->addr;
+                apex_project_clear_kind(p, 1, del_bank, del_addr);
+                rerender_and_reselect(p, dp, s, del_bank, del_addr);
             }
             ImGui::PopID();
         }
@@ -2790,8 +3044,12 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
                     const char *tp = l->text;
                     size_t rem = l->length;
                     while (rem > 0 && (*tp == ' ' || *tp == '\t')) { tp++; rem--; }
-                    if (rem >= 6 && memcmp(tp, "STRING", 6) == 0 &&
-                        (rem == 6 || tp[6] == ' ' || tp[6] == '\t'))
+                    if ((rem >= 12 && memcmp(tp, "STRING_FIXED", 12) == 0 &&
+                         (rem == 12 || tp[12] == ' ' || tp[12] == '\t')) ||
+                        (rem >= 9 && memcmp(tp, "STRING_LP", 9) == 0 &&
+                         (rem == 9 || tp[9] == ' ' || tp[9] == '\t')) ||
+                        (rem >= 6 && memcmp(tp, "STRING", 6) == 0 &&
+                         (rem == 6 || tp[6] == ' ' || tp[6] == '\t')))
                         lk = 7;
                     else if (rem >= 3 && memcmp(tp, ".DW", 3) == 0 &&
                              (rem == 3 || tp[3] == ' ' || tp[3] == '\t'))

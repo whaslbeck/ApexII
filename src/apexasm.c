@@ -501,6 +501,85 @@ static void parse_string(AsmState *st, char *args)
     die("unterminated STRING");
 }
 
+static void parse_string_fixed(AsmState *st, char *args)
+{
+    char *p = trim(args);
+
+    if (*p != '"') {
+        die("invalid STRING_FIXED '%s'", args);
+    }
+    p++;
+    while (*p) {
+        unsigned char ch = 0;
+
+        if (*p == '"') {
+            p++;
+            if (*trim(p) != '\0') {
+                die("unexpected trailing text after STRING_FIXED");
+            }
+            return;
+        }
+        if (*p == '\\') {
+            p++;
+            if (*p == '"' || *p == '\\') {
+                ch = (unsigned char)*p++;
+            } else {
+                die("invalid STRING_FIXED escape");
+            }
+        } else {
+            ch = (unsigned char)*p++;
+        }
+        if (ch < 0x20u || ch > 0x7fu) {
+            die("STRING_FIXED byte out of supported ASCII range");
+        }
+        emit_byte(st, ch);
+    }
+    die("unterminated STRING_FIXED");
+}
+
+static void parse_string_lp(AsmState *st, char *args)
+{
+    char *p = trim(args);
+    uint8_t buf[256];
+    size_t len = 0;
+
+    if (*p != '"') {
+        die("invalid STRING_LP '%s'", args);
+    }
+    p++;
+    while (*p) {
+        unsigned char ch = 0;
+
+        if (*p == '"') {
+            p++;
+            if (*trim(p) != '\0') {
+                die("unexpected trailing text after STRING_LP");
+            }
+            emit_byte(st, (uint8_t)len);
+            { size_t i; for (i = 0; i < len; i++) emit_byte(st, buf[i]); }
+            return;
+        }
+        if (*p == '\\') {
+            p++;
+            if (*p == '"' || *p == '\\') {
+                ch = (unsigned char)*p++;
+            } else {
+                die("invalid STRING_LP escape");
+            }
+        } else {
+            ch = (unsigned char)*p++;
+        }
+        if (ch < 0x20u || ch > 0x7fu) {
+            die("STRING_LP byte out of supported ASCII range");
+        }
+        if (len >= 255u) {
+            die("STRING_LP too long (max 255 bytes)");
+        }
+        buf[len++] = ch;
+    }
+    die("unterminated STRING_LP");
+}
+
 static void parse_inline_far_code(AsmState *st, char *args)
 {
     char *first;
@@ -721,6 +800,10 @@ static void parse_line(AsmState *st, char *line)
         parse_table_far_code(st, trim(s + strlen("TABLE_FAR_PTR")));
     } else if (starts_with_word(s, "TABLE_FAR_CODE")) {
         parse_table_far_code(st, trim(s + strlen("TABLE_FAR_CODE")));
+    } else if (starts_with_word(s, "STRING_FIXED")) {
+        parse_string_fixed(st, trim(s + strlen("STRING_FIXED")));
+    } else if (starts_with_word(s, "STRING_LP")) {
+        parse_string_lp(st, trim(s + strlen("STRING_LP")));
     } else if (starts_with_word(s, "STRING")) {
         parse_string(st, trim(s + strlen("STRING")));
     } else if (starts_with_word(s, ".DB")) {

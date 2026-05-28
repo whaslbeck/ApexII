@@ -889,6 +889,11 @@ static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t a
     return 0;
 }
 
+/* Work-list convergence loop: scans from every code label until flow stops (JMP/BRA/RTS/RTI),
+   adding new branch/call targets to the label set for the next pass.  Continues until no
+   unscanned code labels remain.  Known limitation: indirect jumps (JMP ,X / JMP [addr]) have
+   no static target and are not resolved; code reachable only via computed dispatch must be
+   declared as an explicit entry point in the config. */
 void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, LabelSet *labels,
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,

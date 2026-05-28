@@ -147,6 +147,8 @@ typedef struct {
 typedef enum {
     DATA_BYTES,
     DATA_STRING,
+    DATA_STRING_LP,     /* length-prefixed: byte 0 = N, followed by N bytes, no null */
+    DATA_STRING_FIXED,  /* fixed-length string: N bytes of ASCII, length in DataRange.length */
     DATA_DMD_FULLFRAME,
     DATA_PTR16_STRING,
     DATA_PTR16_DATA,

@@ -116,6 +116,30 @@ else
     exit 1
 fi
 
+string_fixed_rom="$OUT/string_fixed.rom"
+string_fixed_asm="$OUT/string_fixed.disasm"
+"$ROOT/build/apexasm" "$string_fixed_rom" "$ROOT/tests/string_fixed.asm"
+"$ROOT/build/apexdis" "$string_fixed_rom" "$string_fixed_asm" "$ROOT/tests/string_fixed.ini"
+if grep -q '^; data type=string_fixed' "$string_fixed_asm" &&
+    grep -q '^    STRING_FIXED "WORLD"' "$string_fixed_asm"; then
+    printf 'PASS string_fixed.asm\n'
+else
+    printf 'FAIL string_fixed.asm\n' >&2
+    exit 1
+fi
+
+string_lp_rom="$OUT/string_lp.rom"
+string_lp_asm="$OUT/string_lp.disasm"
+"$ROOT/build/apexasm" "$string_lp_rom" "$ROOT/tests/string_lp.asm"
+"$ROOT/build/apexdis" "$string_lp_rom" "$string_lp_asm" "$ROOT/tests/string_lp.ini"
+if grep -q '^; data type=string_lp' "$string_lp_asm" &&
+    grep -q '^    STRING_LP "HELLO"' "$string_lp_asm"; then
+    printf 'PASS string_lp.asm\n'
+else
+    printf 'FAIL string_lp.asm\n' >&2
+    exit 1
+fi
+
 if "$ROOT/build/apexdis" "$data_range_rom" "$OUT/config_duplicate_label.disasm" \
     "$ROOT/tests/config_duplicate_label.ini" 2>"$OUT/config_duplicate_label.stderr"; then
     printf 'FAIL config_duplicate_label.ini\n' >&2

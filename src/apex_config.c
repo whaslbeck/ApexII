@@ -1002,6 +1002,13 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_data = 0;
     int in_types = 0;
     int in_exclude_refs = 0;
+    /* pending multi-line [types] entry */
+    char pt_name[256];
+    TableFieldKind pt_kind;
+    char pt_vals[8192];
+    pt_name[0] = '\0';
+    pt_kind = TABLE_BYTE;
+    pt_vals[0] = '\0';
 
     if (!path) {
         return;
@@ -1015,6 +1022,17 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
         char *eq;
 
         strip_config_comment(line);
+        /* continuation line: leading whitespace in [types] appends to pending entry */
+        if (in_types && pt_name[0] &&
+            ((unsigned char)line[0] == '\t' || (unsigned char)line[0] == ' ')) {
+            char *cv = trim(line);
+            if (*cv) {
+                size_t vl = strlen(pt_vals);
+                if (vl) { strncat(pt_vals, ", ", sizeof(pt_vals) - vl - 1); vl += 2; }
+                strncat(pt_vals, cv, sizeof(pt_vals) - strlen(pt_vals) - 1);
+            }
+            continue;
+        }
         s = trim(line);
         if (*s == '\0') {
             continue;
@@ -1024,6 +1042,11 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
 
             if (!end) {
                 die("invalid config section '%s'", s);
+            }
+            /* flush any pending multi-line type before leaving [types] */
+            if (pt_name[0]) {
+                config_set_type(types, pt_name, pt_kind, pt_vals);
+                pt_name[0] = '\0'; pt_vals[0] = '\0';
             }
             *end = '\0';
             in_options = strcmp(s + 1, "options") == 0;
@@ -1172,6 +1195,10 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_BYTES, length);
             } else if (strcmp(value, "string") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_STRING, 0);
+            } else if (strcmp(value, "string_lp") == 0) {
+                add_data_range(data_ranges, bank, addr, DATA_STRING_LP, 0);
+            } else if (parse_count_format(value, "string", &length)) {
+                add_data_range(data_ranges, bank, addr, DATA_STRING_FIXED, length);
             } else if (strcmp(value, "dmd_fullframe") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
             } else if (strcmp(value, "ptr16_string") == 0) {
@@ -1269,7 +1296,13 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *kind_str;
             TableFieldKind kind;
             char *value = dup_config_value(eq + 1);
+            char *trimmed_value;
 
+            /* flush previous pending multi-line type */
+            if (pt_name[0]) {
+                config_set_type(types, pt_name, pt_kind, pt_vals);
+                pt_name[0] = '\0'; pt_vals[0] = '\0';
+            }
             if (!colon) {
                 die("invalid type '%s': expected name:byte or name:word", key);
             }
@@ -1282,9 +1315,21 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             if (!valid_symbol_name(type_name_str)) {
                 die("invalid type name '%s'", type_name_str);
             }
-            config_set_type(types, type_name_str, kind, value);
+            trimmed_value = trim(value);
+            if (*trimmed_value == '\0') {
+                /* empty value: accumulate continuation lines */
+                snprintf(pt_name, sizeof(pt_name), "%s", type_name_str);
+                pt_kind = kind;
+                pt_vals[0] = '\0';
+            } else {
+                config_set_type(types, type_name_str, kind, trimmed_value);
+            }
             free(value);
         }
+    }
+    /* flush any pending multi-line type at end of file */
+    if (pt_name[0]) {
+        config_set_type(types, pt_name, pt_kind, pt_vals);
     }
     if (ferror(f)) {
         die("failed to read config %s", path);
@@ -1341,8 +1386,12 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
     value = dup_string(spec);
     if (parse_count_format(value, "bytes", &length)) {
         add_data_range(ranges, bank, addr, DATA_BYTES, length);
+    } else if (parse_count_format(value, "string", &length)) {
+        add_data_range(ranges, bank, addr, DATA_STRING_FIXED, length);
     } else if (strcmp(value, "string") == 0) {
         add_data_range(ranges, bank, addr, DATA_STRING, 0);
+    } else if (strcmp(value, "string_lp") == 0) {
+        add_data_range(ranges, bank, addr, DATA_STRING_LP, 0);
     } else if (strcmp(value, "dmd_fullframe") == 0) {
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
     } else if (strcmp(value, "ptr16_string") == 0) {

@@ -78,6 +78,7 @@ int apexsprite_decode_noheader(const uint8_t *src, size_t src_size,
     size_t page_bytes;
 
     if (!src || !dest || src_size < 1u || table_height == 0) return 0;
+    if (table_height > APEX_SPRITE_MAX_HEIGHT) return 0;
 
     width = src[0];
     if (width == 0 || width > APEX_SPRITE_MAX_WIDTH) return 0;

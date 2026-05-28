@@ -226,7 +226,8 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Banks",       NULL, &state.show_banks);
                 ImGui::MenuItem("Labels",      NULL, &state.show_labels);
                 ImGui::MenuItem("Bookmarks",   NULL, &state.show_bookmarks);
-                ImGui::MenuItem("Transitions", NULL, &state.show_transitions);
+                ImGui::MenuItem("Transitions",  NULL, &state.show_transitions);
+                ImGui::MenuItem("Flow Arrows",  NULL, &state.show_flow_arrows);
                 ImGui::Separator();
                 ImGui::MenuItem("Call Graph",     NULL, &state.show_call_graph);
                 ImGui::MenuItem("Hardware",       NULL, &state.show_hardware);
@@ -343,7 +344,7 @@ int main(int argc, char **argv)
             ImGui::TextUnformatted("Recent");
             {
                 size_t hcount = state.history_back.size();
-                size_t hshow  = hcount > 15 ? 15 : hcount;
+                size_t hshow  = hcount > 25 ? 25 : hcount;
                 for (size_t hi = 0; hi < hshow; hi++) {
                     size_t hli = state.history_back[hcount - 1 - hi];
                     if (hli >= (size_t)document->line_count) {
@@ -357,10 +358,20 @@ int main(int argc, char **argv)
                     } else {
                         snprintf(hbuf, sizeof(hbuf), "line %lu", (unsigned long)hli);
                     }
+                    bool is_bm = false;
+                    if (hl->has_location) {
+                        for (const auto &bk : state.bookmarks)
+                            if (bk.bank == hl->bank && bk.addr == hl->cpu_addr)
+                                { is_bm = true; break; }
+                    }
                     ImGui::PushID((int)(2000 + hi));
+                    if (is_bm)
+                        ImGui::PushStyleColor(ImGuiCol_Button,
+                            ImVec4(0.60f, 0.30f, 0.85f, 0.40f));
                     if (ImGui::SmallButton(hbuf)) {
                         select_line(&state, hli, 1);
                     }
+                    if (is_bm) ImGui::PopStyleColor();
                     if (hl->has_location) {
                         std::string lbl = label_at_address(document, &state,
                                                            hl->bank, hl->cpu_addr);

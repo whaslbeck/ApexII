@@ -131,7 +131,11 @@ static void write_config_address(FILE *out, int has_bank, uint8_t bank, uint32_t
 {
     if (has_bank) {
         fprintf(out, "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+    } else if ((addr & 0xffffu) >= 0x8000u) {
+        /* System bank: deterministically bank 0xFF even without explicit has_bank. */
+        fprintf(out, "Bff_A%04x", (unsigned)addr & 0xffffu);
     } else {
+        /* RAM (<0x4000) or ambiguous paged address — keep legacy format. */
         fprintf(out, "0x%04x", (unsigned)addr & 0xffffu);
     }
 }
@@ -246,6 +250,12 @@ static void write_data_range_value(FILE *out, const DataRange *range)
         break;
     case DATA_STRING:
         fputs("string", out);
+        break;
+    case DATA_STRING_LP:
+        fputs("string_lp", out);
+        break;
+    case DATA_STRING_FIXED:
+        fprintf(out, "string[%lu]", (unsigned long)range->length);
         break;
     case DATA_DMD_FULLFRAME:
         fputs("dmd_fullframe", out);

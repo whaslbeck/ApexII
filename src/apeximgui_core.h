@@ -132,6 +132,8 @@ struct UiState {
     int dmd_scrub_offset;
 
     size_t hex_selected_offset;
+    size_t hex_anchor_offset;   /* range start — set on plain left-click */
+    bool hex_has_range;         /* true when a multi-byte range is selected */
     bool hex_active;
     bool hex_window_focused;
     int hex_request_follow;
@@ -139,6 +141,7 @@ struct UiState {
     char hex_search_input[64];
     int request_focus_hex_search;
 
+    bool show_flow_arrows = true;
     bool show_navigator;
     bool show_labels;
     bool show_banks;
@@ -395,6 +398,7 @@ void rerender_and_reselect(ApexProject *project, const ApexRenderedDocument **do
 void apply_code_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_data_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void apply_string_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void apply_string_lp_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_table_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void clear_kind_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *document, uint8_t bank, size_t *line_index);
