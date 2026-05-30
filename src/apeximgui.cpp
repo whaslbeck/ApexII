@@ -140,8 +140,16 @@ int main(int argc, char **argv)
     state.show_inline_list      = false;
     state.show_entries_list     = false;
     state.show_types_editor     = false;
-    state.show_ref_exclusions   = false;
-    state.show_rom_map          = false;
+    state.show_symbols_editor   = false;
+    state.sym_selected          = -1;
+    state.show_ref_exclusions    = false;
+    state.show_code_candidates    = false;
+    state.code_candidates         = {};
+    state.code_candidates_stale   = false;
+    state.show_inline_candidates  = false;
+    state.inline_candidates       = {};
+    state.inline_candidates_stale = false;
+    state.show_rom_map           = false;
     state.show_dmd_list         = false;
     state.show_sprite_list      = false;
     state.sprite_scan_done      = false;
@@ -155,6 +163,30 @@ int main(int argc, char **argv)
                  (int)(sizeof(state.save_path_input) - 15), config_path);
         strncpy(state.base_config_path, config_path, 1023);
         state.base_config_path[1023] = '\0';
+    } else if (rom_path[0]) {
+        /* No config supplied: derive default from ROM filename.
+           Strip .rom/.bin extension (any case) and append .ini. */
+        size_t len = strlen(rom_path);
+        /* Find start of last path component. */
+        size_t last_sep = 0;
+        for (size_t i = 0; i < len; i++)
+            if (rom_path[i] == '/' || rom_path[i] == '\\') last_sep = i + 1u;
+        /* Find last dot in that component (use len = no dot if none found). */
+        size_t dot = len;
+        for (size_t i = last_sep; i < len; i++)
+            if (rom_path[i] == '.') dot = i;
+        /* Only strip if the extension is .rom or .bin (case-insensitive). */
+        if (dot < len) {
+            const char *e = rom_path + dot;
+            char el[8] = {'\0'};
+            for (int j = 0; j < 7 && e[j]; j++)
+                el[j] = (e[j] >= 'A' && e[j] <= 'Z') ? (char)(e[j] + 32) : e[j];
+            if (strcmp(el, ".rom") != 0 && strcmp(el, ".bin") != 0)
+                dot = len;
+        }
+        snprintf(state.save_path_input, sizeof(state.save_path_input),
+                 "%.*s.ini", (int)dot, rom_path);
+        state.base_config_path[0] = '\0';
     } else {
         strcpy(state.save_path_input, "apeximgui.ini");
         state.base_config_path[0] = '\0';
@@ -234,10 +266,13 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Tables",         NULL, &state.show_tables);
                 ImGui::MenuItem("Inline Sigs",    NULL, &state.show_inline_list);
                 ImGui::MenuItem("Code Entries",   NULL, &state.show_entries_list);
+                ImGui::MenuItem("Symbols",        NULL, &state.show_symbols_editor);
                 ImGui::MenuItem("Types",          NULL, &state.show_types_editor);
                 ImGui::MenuItem("Pattern Search", NULL, &state.show_pattern_search);
                 ImGui::MenuItem("RAM References", NULL, &state.show_ram_refs);
-                ImGui::MenuItem("Ref Exclusions", NULL, &state.show_ref_exclusions);
+                ImGui::MenuItem("Ref Exclusions",    NULL, &state.show_ref_exclusions);
+                ImGui::MenuItem("Code Candidates",    NULL, &state.show_code_candidates);
+                ImGui::MenuItem("Inline Candidates", NULL, &state.show_inline_candidates);
                 ImGui::MenuItem("ROM Map",        NULL, &state.show_rom_map);
                 ImGui::MenuItem("DMD Frames",     NULL, &state.show_dmd_list);
                 ImGui::MenuItem("Sprites",        NULL, &state.show_sprite_list);
@@ -292,11 +327,14 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Hex",            dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Sigs",    dock_bottom_id);
             ImGui::DockBuilderDockWindow("Code Entries",   dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Symbols",        dock_bottom_id);
             ImGui::DockBuilderDockWindow("Types",          dock_bottom_id);
             ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
             ImGui::DockBuilderDockWindow("RAM References", dock_bottom_id);
-            ImGui::DockBuilderDockWindow("Ref Exclusions", dock_bottom_id);
-            ImGui::DockBuilderDockWindow("Global Search",  dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Ref Exclusions",  dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Code Candidates",   dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Inline Candidates", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Global Search",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("ROM Map",        dock_right_id);
 
             ImGui::DockBuilderFinish(dockspace_id);
@@ -525,6 +563,11 @@ int main(int argc, char **argv)
             render_hardware_window(project, document, &state);
             ImGui::End();
         }
+        if (state.show_symbols_editor) {
+            ImGui::Begin("Symbols", &state.show_symbols_editor);
+            render_symbols_editor(project, document, &state);
+            ImGui::End();
+        }
         if (state.show_types_editor) {
             ImGui::Begin("Types", &state.show_types_editor);
             render_types_editor(project, &state);
@@ -553,6 +596,16 @@ int main(int argc, char **argv)
         if (state.show_ref_exclusions) {
             ImGui::Begin("Ref Exclusions", &state.show_ref_exclusions);
             render_ref_exclusions(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_code_candidates) {
+            ImGui::Begin("Code Candidates", &state.show_code_candidates);
+            render_code_candidates(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_inline_candidates) {
+            ImGui::Begin("Inline Candidates", &state.show_inline_candidates);
+            render_inline_candidates(project, &document, &state);
             ImGui::End();
         }
         render_xref_popup(project, document, &state);
@@ -973,6 +1026,8 @@ int main(int argc, char **argv)
     SDL_GL_DeleteContext(gl_context);
     SDL_DestroyWindow(window);
     SDL_Quit();
+    apex_free_code_candidates(&state.code_candidates);
+    apex_free_inline_candidates(&state.inline_candidates);
     apex_project_free(project);
     return 0;
 }

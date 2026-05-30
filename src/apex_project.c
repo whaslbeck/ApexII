@@ -1600,3 +1600,665 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
 }
+
+int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value)
+{
+    if (!project) return 1;
+    if (config_set_symbol(&project->symbols, name, value) != 0) return 1;
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_clear_symbol(ApexProject *project, const char *name)
+{
+    if (!project) return 1;
+    if (config_clear_symbol(&project->symbols, name) != 0) return 1;
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Code candidate scanner
+ * ------------------------------------------------------------------------- */
+
+static void candidate_push(ApexCodeCandidates *out, uint8_t bank, uint32_t addr,
+                            int score, int tier, int instr_count, const char *preview)
+{
+    size_t i;
+    /* deduplicate: if same address already present, keep higher score */
+    for (i = 0; i < out->count; i++) {
+        if (out->items[i].bank == bank && out->items[i].addr == addr) {
+            if (score > out->items[i].score) {
+                out->items[i].score       = score;
+                out->items[i].tier        = tier;
+                out->items[i].instr_count = instr_count;
+                if (preview && preview[0])
+                    strncpy(out->items[i].preview, preview,
+                            APEX_CANDIDATE_PREVIEW - 1);
+            }
+            return;
+        }
+    }
+    if (out->count == out->cap) {
+        size_t new_cap = out->cap == 0 ? 64 : out->cap * 2;
+        ApexCodeCandidate *ni = (ApexCodeCandidate *)realloc(
+            out->items, new_cap * sizeof(out->items[0]));
+        if (!ni) return;
+        out->items = ni;
+        out->cap   = new_cap;
+    }
+    out->items[out->count].bank        = bank;
+    out->items[out->count].addr        = addr;
+    out->items[out->count].score       = score;
+    out->items[out->count].tier        = tier;
+    out->items[out->count].instr_count = instr_count;
+    out->items[out->count].preview[0]  = '\0';
+    if (preview && preview[0])
+        strncpy(out->items[out->count].preview, preview,
+                APEX_CANDIDATE_PREVIEW - 1);
+    out->count++;
+}
+
+/* Probe up to MAX_PROBE bytes of ROM starting at base_addr.
+   Returns score 0-100; 0 means "not code".
+   Sets *instr_count_out and writes first instruction text to preview. */
+#define SCAN_MAX_PROBE_BYTES 160
+#define SCAN_MAX_INSTRS      24
+#define SCAN_MIN_INSTRS_TERM  3   /* min instrs required if terminator found   */
+#define SCAN_MIN_INSTRS_NOTERM 10 /* min instrs required without terminator    */
+
+/* PSHS (0x34) and PSHU (0x36) are classic 6809 function prologues —
+   strong evidence of a real subroutine start. */
+#define OPCODE_PSHS 0x34u
+#define OPCODE_PSHU 0x36u
+
+static int probe_code(const uint8_t *data, size_t len, uint32_t base_addr,
+                       int *instr_count_out, char *preview, size_t preview_size)
+{
+    int    instr_count   = 0;
+    size_t pos           = 0;
+    int    unique[256]   = {0};
+    int    unique_count  = 0;
+    int    prologue_bonus = 0;
+    char   buf[80];
+
+    /* Check for PSHS/PSHU at the very first byte — subroutine prologue */
+    if (len >= 2 &&
+        (data[0] == OPCODE_PSHS || data[0] == OPCODE_PSHU))
+        prologue_bonus = 15;
+
+    while (pos < SCAN_MAX_PROBE_BYTES && pos < len && instr_count < SCAN_MAX_INSTRS) {
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(
+            data + pos, len - pos, base_addr + (uint32_t)pos, buf, sizeof(buf));
+
+        if (info.size == 0) return 0;   /* invalid opcode → disqualify */
+
+        if (instr_count == 0 && preview && preview_size > 0)
+            strncpy(preview, buf, preview_size - 1);
+
+        if (!unique[(unsigned char)data[pos]]) {
+            unique[(unsigned char)data[pos]] = 1;
+            unique_count++;
+        }
+        instr_count++;
+        pos += info.size;
+
+        if (info.flags & CPU6809_FLOW_STOP) {
+            if (instr_count < SCAN_MIN_INSTRS_TERM) return 0;
+            int score = 50 + instr_count * 3 + unique_count * 2 + prologue_bonus;
+            if (score > 100) score = 100;
+            if (instr_count_out) *instr_count_out = instr_count;
+            return score;
+        }
+    }
+
+    if (instr_count < SCAN_MIN_INSTRS_NOTERM) return 0;
+    /* Long clean stream without explicit terminator: lower ceiling */
+    int score = 20 + instr_count * 2 + unique_count * 3 + prologue_bonus;
+    if (score > 80) score = 80;
+    if (instr_count_out) *instr_count_out = instr_count;
+    return score;
+}
+
+static int addr_is_classified(const ApexProject *p, uint8_t bank, uint32_t addr,
+                               const LabelSet *labels)
+{
+    if (code_label_at(addr, labels->items, labels->count, labels->sorted))
+        return 1;
+    if (data_range_at(bank, addr, &p->data_ranges))
+        return 1;
+    if (table_def_at(bank, addr, &p->tables))
+        return 1;
+    return 0;
+}
+
+/* Scan one bank for candidates.
+   src_bank_id = the bank byte (0xff for system).
+   data / size / base_addr describe the bank's ROM slice.
+   valid_bank[256] = precomputed "this bank byte exists in ROM" table. */
+static void scan_bank(const ApexProject  *p,
+                       uint8_t             src_bank_id,
+                       const uint8_t      *data,
+                       size_t              size,
+                       uint32_t            base_addr,
+                       const LabelSet     *labels,
+                       const uint8_t       valid_bank[256],
+                       ApexCodeCandidates *out)
+{
+    size_t  i;
+    int     prev_classified = 1; /* treat bank start as "came from classified" */
+
+    for (i = 0; i + 2 < size; i++) {
+        uint32_t addr = base_addr + (uint32_t)i;
+        int curr_classified = addr_is_classified(p, src_bank_id, addr, labels);
+
+        /* ---- Tier 1: far-pointer scan ----------------------------------- */
+        /* A far pointer is addr_hi, addr_lo, bank_byte.
+           We only scan this in paged banks (not inside the system bank itself)
+           to avoid blowing up the candidate count. */
+        if (i + 2 < size) {
+            uint16_t tgt_addr = ((uint16_t)data[i] << 8) | data[i + 1];
+            uint8_t  tgt_bank = data[i + 2];
+
+            /* target must be a valid far-code address */
+            if (valid_bank[tgt_bank] &&
+                ((tgt_bank == 0xffu && tgt_addr >= 0x8000u) ||
+                 (tgt_bank != 0xffu && tgt_addr >= APEX_PAGED_ORG &&
+                  tgt_addr < 0x8000u))) {
+
+                /* resolve target */
+                const uint8_t  *tgt_data  = NULL;
+                size_t          tgt_size  = 0;
+                uint32_t        tgt_base  = 0;
+                const LabelSet *tgt_lbls  = NULL;
+
+                if (tgt_bank == 0xffu) {
+                    tgt_data = p->rom.data + p->paged_size;
+                    tgt_size = p->rom.size - p->paged_size;
+                    tgt_base = APEX_SYSTEM_ORG;
+                    tgt_lbls = &p->system_labels;
+                } else {
+                    int bi = bank_index_for_id(p->rom.data, p->banks, tgt_bank);
+                    if (bi >= 0) {
+                        tgt_data = p->rom.data + (size_t)bi * APEX_BANK_SIZE;
+                        tgt_size = APEX_BANK_SIZE;
+                        tgt_base = APEX_PAGED_ORG;
+                        tgt_lbls = &p->bank_labels[(size_t)bi];
+                    }
+                }
+
+                if (tgt_data && !addr_is_classified(p, tgt_bank, tgt_addr, tgt_lbls)) {
+                    size_t tgt_off = tgt_addr - tgt_base;
+                    if (tgt_off < tgt_size) {
+                        char preview[APEX_CANDIDATE_PREVIEW] = "";
+                        int  ic  = 0;
+                        int  sc  = probe_code(tgt_data + tgt_off, tgt_size - tgt_off,
+                                              tgt_addr, &ic, preview, sizeof(preview));
+                        if (sc >= 30) {
+                            int boosted = sc + 20;
+                            if (boosted > 100) boosted = 100;
+                            candidate_push(out, tgt_bank, tgt_addr,
+                                           boosted, 1, ic, preview);
+                        }
+                    }
+                }
+            }
+        }
+
+        /* ---- Tier 2: probe at unclassified region starts ---------------- */
+        /* Only probe at the first byte of each unclassified run to limit
+           the total number of probes and avoid mid-code probes. */
+        if (!curr_classified && prev_classified) {
+            char preview[APEX_CANDIDATE_PREVIEW] = "";
+            int  ic = 0;
+            int  sc = probe_code(data + i, size - i, addr, &ic, preview, sizeof(preview));
+            if (sc >= 50) {
+                candidate_push(out, src_bank_id, addr, sc, 2, ic, preview);
+            }
+        }
+
+        prev_classified = curr_classified;
+    }
+}
+
+static int cand_cmp_score(const void *a, const void *b)
+{
+    const ApexCodeCandidate *ca = (const ApexCodeCandidate *)a;
+    const ApexCodeCandidate *cb = (const ApexCodeCandidate *)b;
+    return cb->score - ca->score;   /* descending */
+}
+
+void apex_scan_code_candidates(const ApexProject *p, ApexCodeCandidates *out)
+{
+    size_t  i;
+    uint8_t valid_bank[256];
+
+    if (!p || !out) return;
+    out->items = NULL;
+    out->count = 0;
+    out->cap   = 0;
+
+    /* precompute valid bank IDs */
+    for (i = 0; i < 256; i++) valid_bank[i] = 0;
+    valid_bank[0xffu] = 1;
+    for (i = 0; i < p->banks; i++)
+        valid_bank[p->rom.data[i * APEX_BANK_SIZE]] = 1;
+
+    /* scan paged banks */
+    for (i = 0; i < p->banks; i++) {
+        uint8_t  bid  = p->rom.data[i * APEX_BANK_SIZE];
+        scan_bank(p, bid,
+                  p->rom.data + i * APEX_BANK_SIZE,
+                  APEX_BANK_SIZE,
+                  APEX_PAGED_ORG,
+                  &p->bank_labels[i],
+                  valid_bank, out);
+    }
+
+    /* scan system bank */
+    if (p->rom.size > p->paged_size) {
+        scan_bank(p, 0xffu,
+                  p->rom.data + p->paged_size,
+                  p->rom.size  - p->paged_size,
+                  APEX_SYSTEM_ORG,
+                  &p->system_labels,
+                  valid_bank, out);
+    }
+
+    /* sort by score descending */
+    if (out->count > 0)
+        qsort(out->items, out->count, sizeof(out->items[0]), cand_cmp_score);
+}
+
+void apex_free_code_candidates(ApexCodeCandidates *candidates)
+{
+    if (!candidates) return;
+    free(candidates->items);
+    candidates->items = NULL;
+    candidates->count = 0;
+    candidates->cap   = 0;
+}
+
+/* -------------------------------------------------------------------------
+ * Inline-dispatcher candidate scanner
+ *
+ * Looks for functions matching the WPC 6809 inline-data convention:
+ *   PULS X           ; pull return-addr into X (points at inline bytes)
+ *   LDB  ,X+  ...    ; read inline fields with post-increment
+ *   JMP  ,X          ; jump past inline data
+ * or the PSHS X / RTS variant.
+ * ------------------------------------------------------------------------- */
+
+/* 6809 opcodes used by the scanner */
+#define OPC_PULS  0x35u   /* PULS  rlist  (S-stack) */
+#define OPC_PULU  0x37u   /* PULU  rlist  (U-stack) */
+#define OPC_PSHS  0x34u   /* PSHS  rlist */
+#define OPC_PSHU  0x36u   /* PSHU  rlist */
+#define MASK_X    0x10u   /* X bit in PULS/PSHS register mask */
+#define OPC_LDA_IDX 0xA6u
+#define OPC_LDB_IDX 0xE6u
+#define OPC_LDD_IDX 0xECu
+#define OPC_LDX_IDX 0xAEu
+#define OPC_LDU_IDX 0xEEu
+#define OPC_LDY_IDX 0xAEu  /* prefix 0x10 + 0xAE */
+#define OPC_STD_IDX 0xEDu
+#define OPC_STX_IDX 0xAFu
+#define OPC_JMP_IDX 0x6Eu
+#define OPC_RTS     0x39u
+#define OPC_PREFIX  0x10u
+
+#define POSTBYTE_X_PLUS1 0x80u  /* ,X+  */
+#define POSTBYTE_X_PLUS2 0x81u  /* ,X++ */
+#define POSTBYTE_X_NONE  0x84u  /* ,X   (no offset) */
+
+/* Field kinds used to build spec strings */
+#define FKIND_BYTE  0
+#define FKIND_WORD  1
+#define FKIND_FAR   2   /* merged byte+word → far_code */
+#define MAX_FIELDS  8
+
+/* Build spec string from field array; returns 0 on success */
+static int build_spec(const int *fields, int nfields, char *out, size_t outsz)
+{
+    int pos = 0;
+    for (int i = 0; i < nfields && pos < (int)outsz - 1; i++) {
+        if (i > 0) {
+            int r = snprintf(out + pos, outsz - (size_t)pos, ", ");
+            if (r < 0) return 1;
+            pos += r;
+        }
+        const char *name = fields[i] == FKIND_BYTE ? "byte" :
+                           fields[i] == FKIND_WORD ? "word" : "far_code";
+        int r = snprintf(out + pos, outsz - (size_t)pos, "%s", name);
+        if (r < 0) return 1;
+        pos += r;
+    }
+    out[pos] = '\0';
+    return pos == 0 ? 1 : 0;
+}
+
+/* Analyse up to ~25 instructions of the function at (data, len, base_addr).
+   Returns 1 if this looks like an inline dispatcher; fills fields/nfields. */
+static int scan_detect_inline_dispatcher(const uint8_t *data, size_t len,
+                                     uint32_t base_addr,
+                                     int *fields, int *nfields)
+{
+    (void)base_addr;
+    size_t pos       = 0;
+    int found_puls_x = 0;     /* seen PULS/PULU with X bit */
+    int found_term   = 0;     /* seen JMP ,X or PSHS X;RTS */
+    int instr_cnt    = 0;
+    *nfields         = 0;
+
+    while (pos < len && instr_cnt < 25) {
+        uint8_t op = data[pos];
+        instr_cnt++;
+
+        /* PULS / PULU with X bit in mask */
+        if ((op == OPC_PULS || op == OPC_PULU) && pos + 1 < len) {
+            if (data[pos + 1] & MASK_X) found_puls_x = 1;
+            pos += 2;
+            continue;
+        }
+
+        /* Prefixed 2-byte opcode (0x10 prefix) */
+        if (op == OPC_PREFIX && pos + 2 < len) {
+            uint8_t op2  = data[pos + 1];
+            uint8_t pb   = data[pos + 2];
+            /* LDY ,X++ = 0x10 0xAE 0x81 */
+            if (op2 == 0xAEu && pb == POSTBYTE_X_PLUS2 && *nfields < MAX_FIELDS) {
+                fields[(*nfields)++] = FKIND_WORD;
+                pos += 3;
+                continue;
+            }
+            /* LDS ,X++ = 0x10 0xEE 0x81 */
+            if (op2 == 0xEEu && pb == POSTBYTE_X_PLUS2 && *nfields < MAX_FIELDS) {
+                fields[(*nfields)++] = FKIND_WORD;
+                pos += 3;
+                continue;
+            }
+            /* otherwise: advance past prefixed instruction (2+operand bytes) */
+            Cpu6809InstrInfo info = cpu6809_disassemble_info(
+                data + pos, len - pos, 0, NULL, 0);
+            pos += info.size > 0 ? info.size : 1;
+            continue;
+        }
+
+        /* Post-increment byte load: LDA/LDB ,X+ */
+        if ((op == OPC_LDA_IDX || op == OPC_LDB_IDX) &&
+            pos + 1 < len && data[pos + 1] == POSTBYTE_X_PLUS1) {
+            if (*nfields < MAX_FIELDS) fields[(*nfields)++] = FKIND_BYTE;
+            pos += 2;
+            continue;
+        }
+
+        /* Post-increment word load: LDD/LDX/LDU ,X++ */
+        if ((op == OPC_LDD_IDX || op == OPC_LDX_IDX || op == OPC_LDU_IDX) &&
+            pos + 1 < len && data[pos + 1] == POSTBYTE_X_PLUS2) {
+            if (*nfields < MAX_FIELDS) fields[(*nfields)++] = FKIND_WORD;
+            pos += 2;
+            continue;
+        }
+
+        /* JMP ,X — clean terminator */
+        if (op == OPC_JMP_IDX && pos + 1 < len &&
+            data[pos + 1] == POSTBYTE_X_NONE) {
+            found_term = 1;
+            break;
+        }
+
+        /* RTS — check if preceded by PSHS with X bit (other variant) */
+        if (op == OPC_RTS) {
+            found_term = (found_puls_x && *nfields > 0); /* lenient: accept if we saw fields */
+            break;
+        }
+
+        /* PSHS with X bit: sets up new return address past inline data */
+        if ((op == OPC_PSHS || op == OPC_PSHU) && pos + 1 < len &&
+            (data[pos + 1] & MASK_X)) {
+            pos += 2;
+            continue;   /* expect RTS to follow */
+        }
+
+        /* Any other instruction: advance generically */
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(
+            data + pos, len - pos, 0, NULL, 0);
+        if (info.size == 0) return 0;   /* invalid opcode → not code */
+        pos += info.size;
+    }
+
+    if (!found_puls_x || *nfields == 0 || !found_term) return 0;
+
+    /* Merge consecutive (BYTE, WORD) pairs → FAR field */
+    int merged[MAX_FIELDS];
+    int nm = 0;
+    for (int i = 0; i < *nfields; ) {
+        if (i + 1 < *nfields &&
+            fields[i] == FKIND_BYTE && fields[i + 1] == FKIND_WORD) {
+            merged[nm++] = FKIND_FAR;
+            i += 2;
+        } else {
+            merged[nm++] = fields[i++];
+        }
+    }
+    for (int i = 0; i < nm; i++) fields[i] = merged[i];
+    *nfields = nm;
+
+    return 1;
+}
+
+/* Validate a single callsite: are the bytes after the JSR consistent
+   with the spec?  Returns 1 = valid, 0 = invalid / can't tell. */
+static int validate_callsite_bytes(const uint8_t *after, size_t avail,
+                                    const int *fields, int nfields,
+                                    const uint8_t valid_bank[256])
+{
+    size_t need = 0;
+    for (int i = 0; i < nfields; i++)
+        need += (fields[i] == FKIND_BYTE) ? 1 : (fields[i] == FKIND_WORD) ? 2 : 3;
+    if (avail < need) return 0;
+
+    size_t off = 0;
+    for (int i = 0; i < nfields; i++) {
+        if (fields[i] == FKIND_BYTE) {
+            off++;   /* any byte is valid */
+        } else if (fields[i] == FKIND_WORD) {
+            uint16_t v = ((uint16_t)after[off] << 8) | after[off + 1];
+            /* word must be a plausible ROM address */
+            if (v < APEX_PAGED_ORG) return 0;
+            off += 2;
+        } else { /* FKIND_FAR */
+            uint16_t addr = ((uint16_t)after[off] << 8) | after[off + 1];
+            uint8_t  bank = after[off + 2];
+            if (!valid_bank[bank]) return 0;
+            if (bank == 0xFFu) {
+                if (addr < APEX_SYSTEM_ORG) return 0;
+            } else {
+                if (addr < APEX_PAGED_ORG || addr >= 0x8000u) return 0;
+            }
+            off += 3;
+        }
+    }
+    return 1;
+}
+
+/* Count JSR-extended (0xBD hi lo) callsites for a system-bank function
+   (cpu_addr in 0x8000-0xFFFF); fills callsite_count and callsite_valid. */
+static void count_callsites(const ApexProject *p, uint32_t func_addr,
+                              const int *fields, int nfields,
+                              const uint8_t valid_bank[256],
+                              int *cnt, int *valid)
+{
+    *cnt   = 0;
+    *valid = 0;
+    if (p->rom.size < 3) return;
+
+    uint8_t hi = (uint8_t)((func_addr >> 8) & 0xFFu);
+    uint8_t lo = (uint8_t)( func_addr        & 0xFFu);
+
+    for (size_t i = 0; i + 2 < p->rom.size; i++) {
+        if (p->rom.data[i] == 0xBDu &&
+            p->rom.data[i + 1] == hi &&
+            p->rom.data[i + 2] == lo) {
+            (*cnt)++;
+            size_t after_off = i + 3;
+            size_t avail     = p->rom.size - after_off;
+            if (validate_callsite_bytes(p->rom.data + after_off, avail,
+                                         fields, nfields, valid_bank))
+                (*valid)++;
+        }
+    }
+}
+
+static int has_inline_sig(const InlineSignatures *sigs, int has_bank,
+                           uint8_t bank, uint32_t addr)
+{
+    size_t i;
+    for (i = 0; i < sigs->count; i++) {
+        if (sigs->items[i].addr == addr &&
+            (!has_bank || sigs->items[i].bank == bank)) return 1;
+    }
+    return 0;
+}
+
+static void inline_push(ApexInlineCandidates *out,
+                          uint8_t bank, uint32_t addr,
+                          const char *spec, int score,
+                          int callsite_count, int callsite_valid)
+{
+    /* deduplicate */
+    for (size_t i = 0; i < out->count; i++) {
+        if (out->items[i].bank == bank && out->items[i].addr == addr) {
+            if (score > out->items[i].score) {
+                out->items[i].score          = score;
+                out->items[i].callsite_count = callsite_count;
+                out->items[i].callsite_valid = callsite_valid;
+                strncpy(out->items[i].spec, spec, APEX_INLINE_SPEC_MAX - 1);
+            }
+            return;
+        }
+    }
+    if (out->count == out->cap) {
+        size_t nc = out->cap == 0 ? 32 : out->cap * 2;
+        ApexInlineCandidate *ni = (ApexInlineCandidate *)realloc(
+            out->items, nc * sizeof(out->items[0]));
+        if (!ni) return;
+        out->items = ni;
+        out->cap   = nc;
+    }
+    ApexInlineCandidate *c = &out->items[out->count++];
+    c->bank           = bank;
+    c->addr           = addr;
+    c->score          = score;
+    c->callsite_count = callsite_count;
+    c->callsite_valid = callsite_valid;
+    strncpy(c->spec, spec, APEX_INLINE_SPEC_MAX - 1);
+    c->spec[APEX_INLINE_SPEC_MAX - 1] = '\0';
+}
+
+static int inline_cmp(const void *a, const void *b)
+{
+    return ((const ApexInlineCandidate *)b)->score -
+           ((const ApexInlineCandidate *)a)->score;
+}
+
+void apex_scan_inline_candidates(const ApexProject *p, ApexInlineCandidates *out)
+{
+    size_t  i, j;
+    uint8_t valid_bank[256];
+
+    if (!p || !out) return;
+    out->items = NULL;
+    out->count = 0;
+    out->cap   = 0;
+
+    for (i = 0; i < 256; i++) valid_bank[i] = 0;
+    valid_bank[0xFFu] = 1;
+    for (i = 0; i < p->banks; i++)
+        valid_bank[p->rom.data[i * APEX_BANK_SIZE]] = 1;
+
+    /* Scan every known code label in every bank */
+    /* Helper: process one LabelSet */
+    for (int pass = 0; pass < 2; pass++) {
+        size_t lset_count = (pass == 0) ? p->banks : 1;
+
+        for (i = 0; i < lset_count; i++) {
+            const LabelSet *ls;
+            uint8_t  bank_id;
+            uint32_t base_addr;
+            const uint8_t *bdata;
+            size_t   bsize;
+
+            if (pass == 0) {
+                ls        = &p->bank_labels[i];
+                bank_id   = p->rom.data[i * APEX_BANK_SIZE];
+                base_addr = APEX_PAGED_ORG;
+                bdata     = p->rom.data + i * APEX_BANK_SIZE;
+                bsize     = APEX_BANK_SIZE;
+            } else {
+                ls        = &p->system_labels;
+                bank_id   = 0xFFu;
+                base_addr = APEX_SYSTEM_ORG;
+                bdata     = p->rom.data + p->paged_size;
+                bsize     = p->rom.size - p->paged_size;
+            }
+
+            for (j = 0; j < ls->count; j++) {
+                const Label *lbl = &ls->items[j];
+                if (!lbl->is_code) continue;
+                if (lbl->addr < base_addr) continue;
+                size_t off = lbl->addr - base_addr;
+                if (off >= bsize) continue;
+
+                /* Skip if already has an inline sig defined */
+                if (has_inline_sig(&p->inline_sigs, 1, bank_id, lbl->addr))
+                    continue;
+
+                int fields[MAX_FIELDS];
+                int nfields = 0;
+                if (!scan_detect_inline_dispatcher(bdata + off, bsize - off,
+                                               lbl->addr, fields, &nfields))
+                    continue;
+
+                char spec[APEX_INLINE_SPEC_MAX] = "";
+                if (build_spec(fields, nfields, spec, sizeof(spec)) != 0)
+                    continue;
+
+                /* Score: base 40, +10 if >1 field, callsite factor */
+                int score = 40 + (nfields > 1 ? 10 : 0);
+
+                int cnt = 0, valid_cs = 0;
+                /* Callsite search only reliable for system-bank functions */
+                if (bank_id == 0xFFu)
+                    count_callsites(p, lbl->addr, fields, nfields,
+                                    valid_bank, &cnt, &valid_cs);
+
+                if (cnt > 0) {
+                    score += (cnt >= 3 ? 20 : 10);
+                    if (valid_cs == cnt)          score += 25;
+                    else if (valid_cs * 2 >= cnt) score += 12;
+                }
+                if (score > 100) score = 100;
+
+                /* Require at least some confidence */
+                if (cnt == 0 && score < 50) score = 45; /* show but mark uncertain */
+
+                inline_push(out, bank_id, lbl->addr, spec, score, cnt, valid_cs);
+            }
+        }
+    }
+
+    if (out->count > 0)
+        qsort(out->items, out->count, sizeof(out->items[0]), inline_cmp);
+}
+
+void apex_free_inline_candidates(ApexInlineCandidates *candidates)
+{
+    if (!candidates) return;
+    free(candidates->items);
+    candidates->items = NULL;
+    candidates->count = 0;
+    candidates->cap   = 0;
+}

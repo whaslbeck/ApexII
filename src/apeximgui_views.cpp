@@ -795,6 +795,18 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     }
                     ImGui::EndTooltip();
                 }
+                /* Capture line fields before the popup: any classify/clear action inside the
+                   popup calls rerender_and_reselect which frees document->lines, making the
+                   `line` pointer dangle.  Menu items that run AFTER the triggering item must
+                   not dereference `line`. */
+                const bool     pop_has_loc  = line->has_location;
+                const uint8_t  pop_bank     = line->bank;
+                const uint32_t pop_cpu_addr = line->cpu_addr;
+                uint8_t  pop_excl_bank = 0;
+                uint32_t pop_excl_addr = 0;
+                const bool pop_has_excl =
+                    pop_has_loc && line_excluded_ref(project, line, &pop_excl_bank, &pop_excl_addr);
+
                 if (ImGui::BeginPopup("row_context_menu")) {
                     if (has_pointer && ImGui::MenuItem("Jump to target", "F / Enter")) {
                         size_t tl;
@@ -802,10 +814,10 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             select_line(state, tl, 1);
                         }
                     }
-                    if (line->has_location && ImGui::MenuItem("Show incoming references", "X")) {
+                    if (pop_has_loc && ImGui::MenuItem("Show incoming references", "X")) {
                         state->request_xref_popup = true;
-                        state->xref_popup_bank = line->bank;
-                        state->xref_popup_addr = line->cpu_addr;
+                        state->xref_popup_bank = pop_bank;
+                        state->xref_popup_addr = pop_cpu_addr;
                     }
                     ImGui::Separator();
                     if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {
@@ -853,18 +865,19 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         state->request_focus_doc = 1;
                     }
                     ImGui::Separator();
-                    if (line->has_location && ImGui::MenuItem("Add Bookmark", "B")) {
+                    if (pop_has_loc && ImGui::MenuItem("Add Bookmark", "B")) {
                         char n[64];
-                        snprintf(n, 64, "Bookmark @ B%02x_%04x", line->bank, line->cpu_addr);
-                        state->bookmarks.push_back({line->bank, line->cpu_addr, n});
+                        snprintf(n, 64, "Bookmark @ B%02x_%04x", pop_bank, pop_cpu_addr);
+                        state->bookmarks.push_back({pop_bank, pop_cpu_addr, n});
                         state->request_focus_new_bookmark = 1;
                         set_status(state, "bookmark added");
                     }
-                    if (line->has_location) {
+                    if (pop_has_loc) {
                         auto out_refs = find_outgoing_refs(project, document, state,
-                                                          line->bank, line->cpu_addr);
-                        uint8_t excl_bank = 0; uint32_t excl_addr = 0;
-                        bool has_excl = line_excluded_ref(project, line, &excl_bank, &excl_addr);
+                                                          pop_bank, pop_cpu_addr);
+                        const bool has_excl = pop_has_excl;
+                        const uint8_t  excl_bank = pop_excl_bank;
+                        const uint32_t excl_addr = pop_excl_addr;
                         bool any_code_ref = has_excl;
                         for (auto &ref : out_refs) {
                             if (ref.kind == "code" && ref.row_index < 0) {
@@ -2521,6 +2534,153 @@ static bool valid_identifier(const char *s)
     return true;
 }
 
+/* Find lines in the rendered document whose text contains the given word (symbol name).
+   Returns a list of line indices. */
+static std::vector<size_t> find_symbol_usages(const ApexRenderedDocument *d, const char *name)
+{
+    std::vector<size_t> out;
+    if (!d || !name || !*name) return out;
+    size_t nlen = strlen(name);
+    for (size_t i = 0; i < d->line_count; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        if (!l->has_location || l->kind == APEX_RENDER_LINE_COMMENT) continue;
+        /* search for name as a word (bounded by non-identifier chars) */
+        const char *p2 = l->text;
+        size_t rem = (size_t)l->length;
+        while (rem >= nlen) {
+            const char *hit = (const char *)memchr(p2, (unsigned char)name[0], rem - nlen + 1);
+            if (!hit) break;
+            size_t off = (size_t)(hit - l->text);
+            if (memcmp(hit, name, nlen) == 0) {
+                /* check word boundaries */
+                bool lb = (off == 0 || (!isalnum((unsigned char)hit[-1]) && hit[-1] != '_'));
+                bool rb = (off + nlen >= (size_t)l->length ||
+                           (!isalnum((unsigned char)hit[nlen]) && hit[nlen] != '_'));
+                if (lb && rb) { out.push_back(i); break; }
+            }
+            size_t skip = (size_t)(hit - p2) + 1;
+            p2  += skip;
+            rem -= skip;
+        }
+    }
+    return out;
+}
+
+void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document, UiState *s)
+{
+    /* ---- Add / Edit form ---- */
+    bool name_ok = config_valid_symbol_name(s->sym_edit_name) != 0;
+    unsigned long parsed_val = 0;
+    bool val_ok = false;
+    {
+        char *ep = NULL;
+        if (s->sym_edit_value[0]) {
+            parsed_val = strtoul(s->sym_edit_value, &ep, 0);
+            val_ok = (ep && *ep == '\0' && parsed_val <= 0xffffu);
+        }
+    }
+
+    ImGui::SetNextItemWidth(160.0f);
+    ImGui::InputTextWithHint("##sym_name", "NAME", s->sym_edit_name, sizeof(s->sym_edit_name));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90.0f);
+    ImGui::InputTextWithHint("##sym_val", "0x0000", s->sym_edit_value, sizeof(s->sym_edit_value));
+    ImGui::SameLine();
+
+    bool can_submit = name_ok && val_ok;
+    if (!can_submit) ImGui::BeginDisabled();
+    bool is_update = false;
+    for (size_t i = 0; i < p->symbols.count; i++) {
+        if (strcmp(p->symbols.items[i].name, s->sym_edit_name) == 0) { is_update = true; break; }
+    }
+    if (ImGui::Button(is_update ? "Update##sym" : "Add##sym")) {
+        if (apex_project_set_symbol(p, s->sym_edit_name, (uint32_t)parsed_val) == 0) {
+            s->overlay_dirty = true;
+            s->labels_valid  = false;
+        }
+    }
+    if (!can_submit) ImGui::EndDisabled();
+
+    if (!name_ok && s->sym_edit_name[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "invalid name");
+    else if (!val_ok && s->sym_edit_value[0])
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "value must be 0x0000..0xffff");
+
+    ImGui::Separator();
+
+    /* ---- Symbol list ---- */
+    if (ImGui::BeginTable("sym_list", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, p->symbols.count > 0 ? 200.0f : 60.0f))) {
+        ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableHeadersRow();
+
+        bool deleted = false;
+        for (size_t i = 0; i < p->symbols.count && !deleted; i++) {
+            ImGui::TableNextRow();
+            ImGui::PushID((int)i);
+            bool selected = (s->sym_selected == (int)i);
+
+            ImGui::TableSetColumnIndex(0);
+            if (ImGui::Selectable(p->symbols.items[i].name, selected,
+                    ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                s->sym_selected = (int)i;
+                snprintf(s->sym_edit_name, sizeof(s->sym_edit_name), "%s",
+                         p->symbols.items[i].name);
+                snprintf(s->sym_edit_value, sizeof(s->sym_edit_value), "0x%04x",
+                         p->symbols.items[i].value);
+            }
+
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("0x%04x", p->symbols.items[i].value);
+
+            ImGui::TableSetColumnIndex(2);
+            ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));
+            if (ImGui::SmallButton("Del")) {
+                char del_name[64];
+                snprintf(del_name, sizeof(del_name), "%s", p->symbols.items[i].name);
+                if (s->sym_selected == (int)i) s->sym_selected = -1;
+                apex_project_clear_symbol(p, del_name);
+                s->overlay_dirty = true;
+                s->labels_valid  = false;
+                deleted = true;
+            }
+            ImGui::PopStyleColor();
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    /* ---- Usages of selected symbol ---- */
+    if (s->sym_selected >= 0 && (size_t)s->sym_selected < p->symbols.count && document) {
+        const char *selname = p->symbols.items[s->sym_selected].name;
+        ImGui::SeparatorText("Usages in disassembly");
+        auto usages = find_symbol_usages(document, selname);
+        if (usages.empty()) {
+            ImGui::TextDisabled("none found");
+        } else {
+            float list_h = std::min((float)usages.size() * ImGui::GetFrameHeightWithSpacing() + 4.0f,
+                                    120.0f);
+            ImGui::BeginChild("sym_usages", ImVec2(0, list_h), false);
+            for (size_t i = 0; i < usages.size(); i++) {
+                const ApexRenderedLine *l = &document->lines[usages[i]];
+                char lbuf[160];
+                snprintf(lbuf, sizeof(lbuf), "B%02x_A%04x  %.*s",
+                         l->bank, (unsigned)l->cpu_addr & 0xffff,
+                         std::min((int)l->length, 100), l->text);
+                ImGui::PushID((int)(0xf0000000u ^ (unsigned)i));
+                if (ImGui::SmallButton(lbuf))
+                    select_line(s, usages[i], 1);
+                ImGui::PopID();
+            }
+            ImGui::EndChild();
+        }
+    }
+}
+
 void render_types_editor(ApexProject *p, UiState *s)
 {
     static char new_type_name[64] = "";
@@ -2910,6 +3070,262 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
         }
         ImGui::EndTable();
     }
+}
+
+void render_code_candidates(ApexProject *project,
+                            const ApexRenderedDocument **document_ptr,
+                            UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+
+    /* ---- Header row ---- */
+    bool want_scan = ImGui::Button("Scan");
+    ImGui::SameLine();
+    if (state->code_candidates_stale)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "stale – rescan recommended");
+    else if (state->code_candidates.count == 0 && !state->code_candidates_stale)
+        ImGui::TextDisabled("no candidates (run scan)");
+    else
+        ImGui::Text("%zu candidates", state->code_candidates.count);
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("| Tier 1 = far-ptr  Tier 2 = probe");
+
+    if (want_scan) {
+        apex_free_code_candidates(&state->code_candidates);
+        apex_scan_code_candidates(project, &state->code_candidates);
+        state->code_candidates_stale = false;
+    }
+
+    if (state->code_candidates.count == 0) return;
+
+    ImGui::Separator();
+
+    /* ---- Table ---- */
+    if (!ImGui::BeginTable("cand_tbl", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, 0)))
+        return;
+
+    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed,  48.0f);
+    ImGui::TableSetupColumn("T",     ImGuiTableColumnFlags_WidthFixed,  18.0f);
+    ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f);
+    ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+    ImGui::TableHeadersRow();
+
+    /* iterate a copy index so "Accept" can remove items without iterator UB */
+    size_t i = 0;
+    while (i < state->code_candidates.count) {
+        ApexCodeCandidate *c = &state->code_candidates.items[i];
+        ImGui::PushID((int)i);
+        ImGui::TableNextRow();
+
+        /* score column — colour-coded */
+        ImGui::TableSetColumnIndex(0);
+        ImVec4 score_col = c->score >= 80
+            ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f)
+            : c->score >= 60
+                ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
+                : ImVec4(0.9f, 0.55f, 0.2f, 1.0f);
+        ImGui::TextColored(score_col, "%d", c->score);
+
+        /* tier column */
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextDisabled("%d", c->tier);
+
+        /* address column */
+        ImGui::TableSetColumnIndex(2);
+        char addr_buf[24];
+        snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x",
+                 c->bank, (unsigned)c->addr & 0xffffu);
+        ImGui::TextUnformatted(addr_buf);
+
+        /* preview column */
+        ImGui::TableSetColumnIndex(3);
+        ImGui::TextUnformatted(c->preview);
+
+        /* action column */
+        ImGui::TableSetColumnIndex(4);
+        if (ImGui::SmallButton("Go")) {
+            size_t li;
+            if (!apex_render_find_line_by_address(document, c->bank, c->addr, &li)) {
+                /* Exact match missing (unclassified region): find the nearest
+                   rendered line with matching bank and cpu_addr <= candidate. */
+                li = (size_t)-1;
+                for (size_t di = 0; di < document->line_count; di++) {
+                    const ApexRenderedLine *dl = &document->lines[di];
+                    if (dl->has_location && dl->bank == c->bank &&
+                        dl->cpu_addr <= c->addr) {
+                        if (li == (size_t)-1 ||
+                            dl->cpu_addr > document->lines[li].cpu_addr)
+                            li = di;
+                    }
+                }
+            }
+            if (li != (size_t)-1)
+                select_line(state, li, 1);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Accept")) {
+            /* classify as code and rerender */
+            if (apex_project_set_kind(project, 1, c->bank, c->addr,
+                                      APEX_KIND_CODE, NULL) == 0) {
+                state->overlay_dirty = true;
+                state->labels_valid  = false;
+                state->code_candidates_stale = true;
+                rerender_and_reselect(project, document_ptr, state, c->bank, c->addr);
+            }
+            document = *document_ptr;
+            /* remove this candidate from the list */
+            size_t rem = state->code_candidates.count - i - 1;
+            if (rem > 0)
+                memmove(&state->code_candidates.items[i],
+                        &state->code_candidates.items[i + 1],
+                        rem * sizeof(state->code_candidates.items[0]));
+            state->code_candidates.count--;
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dismiss")) {
+            size_t rem = state->code_candidates.count - i - 1;
+            if (rem > 0)
+                memmove(&state->code_candidates.items[i],
+                        &state->code_candidates.items[i + 1],
+                        rem * sizeof(state->code_candidates.items[0]));
+            state->code_candidates.count--;
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::PopID();
+        i++;
+    }
+    ImGui::EndTable();
+}
+
+void render_inline_candidates(ApexProject *project,
+                              const ApexRenderedDocument **document_ptr,
+                              UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+
+    bool want_scan = ImGui::Button("Scan");
+    ImGui::SameLine();
+    if (state->inline_candidates_stale)
+        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "stale – rescan recommended");
+    else if (state->inline_candidates.count == 0)
+        ImGui::TextDisabled("no candidates (run scan)");
+    else
+        ImGui::Text("%zu candidates", state->inline_candidates.count);
+
+    ImGui::SameLine();
+    ImGui::TextDisabled("| score: green>=80 yellow>=60 orange<60");
+
+    if (want_scan) {
+        apex_free_inline_candidates(&state->inline_candidates);
+        apex_scan_inline_candidates(project, &state->inline_candidates);
+        state->inline_candidates_stale = false;
+    }
+
+    if (state->inline_candidates.count == 0) return;
+
+    ImGui::Separator();
+
+    if (!ImGui::BeginTable("icand_tbl", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, 0)))
+        return;
+
+    ImGui::TableSetupColumn("Score",     ImGuiTableColumnFlags_WidthFixed,  48.0f);
+    ImGui::TableSetupColumn("Addr",      ImGuiTableColumnFlags_WidthFixed,  90.0f);
+    ImGui::TableSetupColumn("Spec",      ImGuiTableColumnFlags_WidthFixed, 120.0f);
+    ImGui::TableSetupColumn("Callsites", ImGuiTableColumnFlags_WidthFixed,  70.0f);
+    ImGui::TableSetupColumn("##act",     ImGuiTableColumnFlags_WidthFixed, 100.0f);
+    ImGui::TableHeadersRow();
+
+    size_t i = 0;
+    while (i < state->inline_candidates.count) {
+        ApexInlineCandidate *c = &state->inline_candidates.items[i];
+        ImGui::PushID((int)i);
+        ImGui::TableNextRow();
+
+        ImGui::TableSetColumnIndex(0);
+        ImVec4 score_col = c->score >= 80
+            ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f)
+            : c->score >= 60
+                ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
+                : ImVec4(0.9f, 0.55f, 0.2f, 1.0f);
+        ImGui::TextColored(score_col, "%d", c->score);
+
+        ImGui::TableSetColumnIndex(1);
+        char addr_buf[24];
+        snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x",
+                 c->bank, (unsigned)c->addr & 0xffffu);
+        ImGui::TextUnformatted(addr_buf);
+
+        ImGui::TableSetColumnIndex(2);
+        /* Editable spec field so user can correct before accepting */
+        ImGui::SetNextItemWidth(-1.0f);
+        ImGui::InputText("##spec", c->spec, sizeof(c->spec));
+
+        ImGui::TableSetColumnIndex(3);
+        if (c->callsite_count > 0)
+            ImGui::Text("%d/%d", c->callsite_valid, c->callsite_count);
+        else
+            ImGui::TextDisabled("?");
+
+        ImGui::TableSetColumnIndex(4);
+        if (ImGui::SmallButton("Go")) {
+            size_t li;
+            if (!apex_render_find_line_by_address(document, c->bank, c->addr, &li)) {
+                li = (size_t)-1;
+                for (size_t di = 0; di < document->line_count; di++) {
+                    const ApexRenderedLine *dl = &document->lines[di];
+                    if (dl->has_location && dl->bank == c->bank &&
+                        dl->cpu_addr <= c->addr &&
+                        (li == (size_t)-1 ||
+                         dl->cpu_addr > document->lines[li].cpu_addr))
+                        li = di;
+                }
+            }
+            if (li != (size_t)-1) select_line(state, li, 1);
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Accept")) {
+            if (apex_project_set_inline(project, 1, c->bank, c->addr, c->spec) == 0) {
+                state->overlay_dirty = true;
+                state->labels_valid  = false;
+                state->inline_candidates_stale = true;
+                rerender_and_reselect(project, document_ptr, state, c->bank, c->addr);
+                document = *document_ptr;
+            }
+            size_t rem = state->inline_candidates.count - i - 1;
+            if (rem > 0)
+                memmove(&state->inline_candidates.items[i],
+                        &state->inline_candidates.items[i + 1],
+                        rem * sizeof(state->inline_candidates.items[0]));
+            state->inline_candidates.count--;
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Dismiss")) {
+            size_t rem = state->inline_candidates.count - i - 1;
+            if (rem > 0)
+                memmove(&state->inline_candidates.items[i],
+                        &state->inline_candidates.items[i + 1],
+                        rem * sizeof(state->inline_candidates.items[0]));
+            state->inline_candidates.count--;
+            ImGui::PopID();
+            continue;
+        }
+        ImGui::PopID();
+        i++;
+    }
+    ImGui::EndTable();
 }
 
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr,

@@ -872,6 +872,8 @@ void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiSt
     apex_project_analyze(p);
     *dp = apex_project_render(p, 0, 0);
     s->labels_valid = false;
+    s->code_candidates_stale   = true;
+    s->inline_candidates_stale = true;
     if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
@@ -1931,6 +1933,9 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
         }
         s.types.push_back(std::move(st));
     }
+    for (size_t i = 0; i < p->symbols.count; i++) {
+        s.symbols.push_back({p->symbols.items[i].name, p->symbols.items[i].value});
+    }
     return s;
 }
 
@@ -2193,6 +2198,25 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new or changed symbols; deletions require full save */
+    std::vector<SnapshotSymbol> csym;
+    for (size_t i = 0; i < p->symbols.count; i++) {
+        const char *sname = p->symbols.items[i].name;
+        uint32_t    sval  = p->symbols.items[i].value;
+        bool found = false;
+        for (auto &ss : s->symbols) {
+            if (ss.name == sname) { found = true; if (ss.value != sval) csym.push_back({sname, sval}); break; }
+        }
+        if (!found) csym.push_back({sname, sval});
+    }
+    for (auto &ss : s->symbols) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->symbols.count; j++) {
+            if (p->symbols.items[j].name == ss.name) { still_there = true; break; }
+        }
+        if (!still_there) { *st = "symbol deletion needs full snapshot"; return 0; }
+    }
+
     FILE *o = fopen(path, "w");
     if (!o) {
         *st = "open failed";
@@ -2208,12 +2232,10 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     if (!ctype.empty()) {
         fputs("\n[types]\n", o);
         for (auto &t : ctype) {
-            fprintf(o, "%s:%s =", t.name.c_str(), t.is_word ? "word" : "byte");
+            fprintf(o, "%s:%s =\n", t.name.c_str(), t.is_word ? "word" : "byte");
             for (size_t vi = 0; vi < t.values.size(); vi++) {
-                if (vi > 0) fputc(',', o);
-                fprintf(o, " 0x%02x:%s", t.values[vi].value, t.values[vi].name.c_str());
+                fprintf(o, "\t0x%02x:%s\n", t.values[vi].value, t.values[vi].name.c_str());
             }
-            fputc('\n', o);
         }
     }
     if (!cl.empty()) {
@@ -2282,6 +2304,12 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             fputc('\n', o);
         }
     }
+    if (!csym.empty()) {
+        fputs("\n[symbols]\n", o);
+        for (auto &sym : csym) {
+            fprintf(o, "%s = 0x%04x\n", sym.name.c_str(), sym.value & 0xffffu);
+        }
+    }
     fclose(o);
     *st = "saved delta";
     return 1;
@@ -2301,12 +2329,10 @@ int write_full_config(const ApexProject *p, const char *path, std::string *st)
         fputs("\n[types]\n", o);
         for (size_t i = 0; i < p->config_types.count; i++) {
             const ConfigType *ct = &p->config_types.items[i];
-            fprintf(o, "%s:%s =", ct->name, (ct->kind == TABLE_WORD) ? "word" : "byte");
+            fprintf(o, "%s:%s =\n", ct->name, (ct->kind == TABLE_WORD) ? "word" : "byte");
             for (size_t j = 0; j < ct->value_count; j++) {
-                if (j > 0) fputc(',', o);
-                fprintf(o, " 0x%02x:%s", ct->values[j].value, ct->values[j].name);
+                fprintf(o, "\t0x%02x:%s\n", ct->values[j].value, ct->values[j].name);
             }
-            fputc('\n', o);
         }
     }
     if (p->schemas.count > 0) {

@@ -235,6 +235,56 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
     symbols->count++;
 }
 
+int config_valid_symbol_name(const char *name)
+{
+    return name && *name && valid_symbol_name(name) && !reserved_symbol_name(name);
+}
+
+int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value)
+{
+    size_t i;
+    ConfigSymbol *new_items;
+    size_t new_cap;
+
+    if (!symbols || !config_valid_symbol_name(name) || value > 0xffffu) {
+        return 1;
+    }
+    for (i = 0; i < symbols->count; i++) {
+        if (strcmp(symbols->items[i].name, name) == 0) {
+            symbols->items[i].value = value;
+            return 0;
+        }
+    }
+    if (symbols->count == symbols->cap) {
+        new_cap  = symbols->cap == 0 ? 8 : symbols->cap * 2;
+        new_items = (ConfigSymbol *)realloc(symbols->items,
+                                            new_cap * sizeof(symbols->items[0]));
+        if (!new_items) return 1;
+        symbols->items = new_items;
+        symbols->cap   = new_cap;
+    }
+    symbols->items[symbols->count].name  = dup_string(name);
+    symbols->items[symbols->count].value = value;
+    symbols->count++;
+    return 0;
+}
+
+int config_clear_symbol(ConfigSymbols *symbols, const char *name)
+{
+    size_t i;
+    if (!symbols || !name) return 1;
+    for (i = 0; i < symbols->count; i++) {
+        if (strcmp(symbols->items[i].name, name) == 0) {
+            free((void *)symbols->items[i].name);
+            memmove(&symbols->items[i], &symbols->items[i + 1],
+                    (symbols->count - i - 1) * sizeof(symbols->items[0]));
+            symbols->count--;
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static void add_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, uint32_t addr,
                              const char *name)
 {

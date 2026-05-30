@@ -182,9 +182,19 @@ struct UiState {
     int request_focus_ram_refs;
 
     bool show_ref_exclusions;
+    bool show_symbols_editor;
+    char sym_edit_name[64];
+    char sym_edit_value[16];
+    int  sym_selected;       /* index into project->symbols, -1 = none */
     bool show_rom_map;
     bool show_dmd_list;
     bool show_sprite_list;
+    bool show_code_candidates;
+    ApexCodeCandidates code_candidates;
+    bool code_candidates_stale;
+    bool show_inline_candidates;
+    ApexInlineCandidates inline_candidates;
+    bool inline_candidates_stale;
 
     bool refs_pinned;
     uint8_t refs_pinned_bank;
@@ -285,6 +295,11 @@ struct SnapshotType {
     std::vector<SnapshotTypeValue> values;
 };
 
+struct SnapshotSymbol {
+    std::string name;
+    uint32_t    value;
+};
+
 struct OriginalSnapshot {
     std::vector<SnapshotLabel> labels;
     std::vector<SnapshotEntry> entries;
@@ -295,6 +310,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotDoc> table_docs;
     std::vector<SnapshotInline> inline_sigs;
     std::vector<SnapshotType> types;
+    std::vector<SnapshotSymbol> symbols;
 };
 
 struct LineByteSpan {
@@ -458,6 +474,7 @@ const HardwareRegister *get_hardware_register(size_t index);
 void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_entries_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_types_editor(ApexProject *project, UiState *state);
+void render_symbols_editor(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 // Analysis: Pattern Search & RAM XRefs
 std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input);
@@ -467,6 +484,8 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
 
 // Analysis: Ref Exclusions
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_code_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_inline_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // DMD and Sprite list windows

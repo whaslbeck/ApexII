@@ -217,4 +217,8 @@ int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t 
                           const char *spec, const ConfigTypes *types);
 int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr);
 
+int config_valid_symbol_name(const char *name);
+int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value);
+int config_clear_symbol(ConfigSymbols *symbols, const char *name);
+
 #endif

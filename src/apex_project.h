@@ -88,5 +88,49 @@ int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t b
                                    uint32_t addr);
 int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
                                       uint32_t addr);
+int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
+int apex_project_clear_symbol(ApexProject *project, const char *name);
+
+/* Code candidate scanner ------------------------------------------------- */
+#define APEX_CANDIDATE_PREVIEW 80
+
+typedef struct {
+    uint8_t  bank;
+    uint32_t addr;
+    int      score;       /* 0-100 */
+    int      tier;        /* 1=far-ptr, 2=probe */
+    int      instr_count;
+    char     preview[APEX_CANDIDATE_PREVIEW];
+} ApexCodeCandidate;
+
+typedef struct {
+    ApexCodeCandidate *items;
+    size_t             count;
+    size_t             cap;
+} ApexCodeCandidates;
+
+void apex_scan_code_candidates(const ApexProject *project, ApexCodeCandidates *out);
+void apex_free_code_candidates(ApexCodeCandidates *candidates);
+
+/* Inline-dispatcher candidate scanner ------------------------------------ */
+#define APEX_INLINE_SPEC_MAX 128
+
+typedef struct {
+    uint8_t  bank;
+    uint32_t addr;
+    char     spec[APEX_INLINE_SPEC_MAX]; /* e.g. "byte", "far_code", "byte, word" */
+    int      score;           /* 0-100 */
+    int      callsite_count;
+    int      callsite_valid;  /* callsites whose inline bytes validate the spec */
+} ApexInlineCandidate;
+
+typedef struct {
+    ApexInlineCandidate *items;
+    size_t               count;
+    size_t               cap;
+} ApexInlineCandidates;
+
+void apex_scan_inline_candidates(const ApexProject *project, ApexInlineCandidates *out);
+void apex_free_inline_candidates(ApexInlineCandidates *candidates);
 
 #endif
