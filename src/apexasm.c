@@ -840,7 +840,23 @@ static void assemble_file(AsmState *st, const char *path)
     }
     while (fgets(line, sizeof(line), f)) {
         lineno++;
-        parse_line(st, line);
+        /* If fgets filled the buffer without reaching a newline the logical
+           line is longer than our buffer.  Consume and discard the rest of
+           the physical line before attempting to parse what we have: the
+           partial remainder would otherwise be fed back as the next line
+           without its leading ';', causing a spurious parse error on long
+           "; referenced_by ..." xref comments. */
+        if (line[0] != '\0' && strchr(line, '\n') == NULL && !feof(f)) {
+            /* We already have a valid comment prefix in `line`; parse it. */
+            parse_line(st, line);
+            /* Drain the rest of the physical line without parsing it. */
+            int ch;
+            while ((ch = fgetc(f)) != EOF && ch != '\n')
+                ;
+            lineno++; /* counts as one logical source line */
+        } else {
+            parse_line(st, line);
+        }
     }
     if (ferror(f)) {
         die("failed to read %s", path);

@@ -1089,6 +1089,27 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
         size_t row_start = *pos;
         size_t i;
 
+        /* Labels at row boundaries after the first: the outer emit_db_with_labels
+           loop already called emit_labels_at for the table's own start address
+           (row 0).  Rows 1..N are consumed entirely within this function, so
+           their addresses are never visited by the outer loop.  Emit any named
+           label definitions here so the assembler can resolve references to them. */
+        if (row > 0) {
+            uint32_t row_addr = base_addr + (uint32_t)row_start;
+            size_t li;
+
+            for (li = 0; li < label_count; li++) {
+                if (labels[li].addr == row_addr) {
+                    fprintf(out, "%s:\n", labels[li].name);
+                }
+            }
+            for (li = 0; li < extra_label_count; li++) {
+                if (extra_labels[li].addr == row_addr) {
+                    fprintf(out, "%s:\n", extra_labels[li].name);
+                }
+            }
+        }
+
         fprintf(out, "; [row %lu]\n", (unsigned long)row);
 
         for (i = 0; i < table->schema.count; i++) {
@@ -1508,7 +1529,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             continue;
         }
         if (decoding_code) {
-            char inst[64];
+            char inst[256];
             Cpu6809InstrInfo info =
                 cpu6809_disassemble_info_ex(data + pos, len - pos, base_addr + (uint32_t)pos, inst,
                                             sizeof(inst), lookup_label_for_cpu, &lookup);
