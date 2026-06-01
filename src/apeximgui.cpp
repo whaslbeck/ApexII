@@ -85,7 +85,6 @@ int main(int argc, char **argv)
         return 1;
     }
     original_snapshot = build_config_snapshot(config_path[0] ? config_path : NULL);
-    load_rom_session(rom_path, &state, document);
 
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
@@ -156,6 +155,9 @@ int main(int argc, char **argv)
     state.show_bookmarks     = true;
     state.show_transitions   = false;
     state.request_layout_reset = true;
+
+    /* Restore session state after defaults are set so saved values win. */
+    load_rom_session(rom_path, &state, document);
 
     if (config_path[0]) {
         /* save_path_input is 512 bytes; ".apeximgui.ini" is 14 chars → cap path at 497 chars */

@@ -688,6 +688,27 @@ int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, siz
     if (!apex_render_find_line_by_address(d, b, a, &li)) {
         return 0;
     }
+    /* apex_render_find_line_by_address returns the first line at address a,
+       which may be a doc-comment or transition line rendered before the actual
+       label (both share the same cpu_addr).  Scan forward within the same
+       address block first to find the label, before falling back to the
+       backward walk — otherwise the backward walk overshoots into the
+       preceding function. */
+    /* Scan forward, skipping non-located lines (doc-comments with
+       has_location=false that sit between the LOCATION marker and the label).
+       Stop when hitting a located line with a different address. */
+    for (size_t fwd = li; fwd < d->line_count; fwd++) {
+        const ApexRenderedLine *fl = &d->lines[fwd];
+        if (fl->has_location) {
+            if (fl->bank != b || fl->cpu_addr != a) break;
+            if (fl->kind == APEX_RENDER_LINE_LABEL) {
+                *o = fwd;
+                return 1;
+            }
+        }
+        /* has_location=false: skip without stopping */
+    }
+    /* Fallback: walk backward to the nearest label (mid-function cursor). */
     while (li > 0) {
         if (d->lines[li].kind == APEX_RENDER_LINE_LABEL && d->lines[li].has_location) {
             *o = li;
@@ -706,8 +727,51 @@ void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *
     if (s->graph_pinned) {
         b = s->graph_pinned_bank;
         a = s->graph_pinned_addr;
-    } else if (!selected_address(d, s, &b, &a)) {
-        return;
+    } else {
+        if (!d || s->selected_line >= d->line_count) return;
+        size_t li = s->selected_line;
+
+        /* Step 1: find the nearest has_location line at or before the cursor.
+           This resolves the reference address even when the cursor sits on a
+           non-located doc-comment line (has_location=false). */
+        size_t ref = li;
+        while (ref > 0 && !d->lines[ref].has_location) ref--;
+
+        bool found = false;
+        if (d->lines[ref].has_location) {
+            uint8_t  cb = d->lines[ref].bank;
+            uint32_t ca = d->lines[ref].cpu_addr;
+
+            /* Step 2: scan forward from ref looking for a LABEL at address
+               (cb, ca).  Non-located lines (doc-comments between LOCATION
+               marker and the actual label) are skipped; a located line with
+               a different address stops the scan. */
+            for (size_t fwd = ref; fwd < d->line_count; fwd++) {
+                const ApexRenderedLine *fl = &d->lines[fwd];
+                if (fl->has_location) {
+                    if (fl->bank != cb || fl->cpu_addr != ca) break;
+                    if (fl->kind == APEX_RENDER_LINE_LABEL) {
+                        b = fl->bank;
+                        a = fl->cpu_addr;
+                        found = true;
+                        break;
+                    }
+                }
+                /* has_location=false: skip without stopping */
+            }
+        }
+
+        if (!found) {
+            /* Step 3: cursor is mid-function — walk backward to the nearest
+               preceding label. */
+            while (!(d->lines[li].kind == APEX_RENDER_LINE_LABEL &&
+                     d->lines[li].has_location)) {
+                if (li == 0) return;
+                li--;
+            }
+            b = d->lines[li].bank;
+            a = d->lines[li].cpu_addr;
+        }
     }
     s->graph_nodes.clear();
     s->graph_root_idx = get_or_create_graph_node(s, d, b, a, 0);
@@ -1105,14 +1169,18 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_hardware=%d\nshow_tables=%d\nshow_types=%d\nshow_inline_list=%d\n"
             "show_entries_list=%d\nshow_pattern_search=%d\nshow_ram_refs=%d\n"
             "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
-            "show_dmd_list=%d\nshow_sprite_list=%d\n",
+            "show_dmd_list=%d\nshow_sprite_list=%d\n"
+            "show_flow_arrows=%d\nshow_symbols=%d\n"
+            "show_code_candidates=%d\nshow_inline_candidates=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
             s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
             s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
             s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
-            s->show_dmd_list, s->show_sprite_list);
+            s->show_dmd_list, s->show_sprite_list,
+            s->show_flow_arrows, s->show_symbols_editor,
+            s->show_code_candidates, s->show_inline_candidates);
     fclose(f);
 }
 
@@ -1249,6 +1317,14 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_dmd_list = atoi(l + 14) != 0;
         } else if (strncmp(l, "show_sprite_list=", 17) == 0) {
             s->show_sprite_list = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_flow_arrows=", 17) == 0) {
+            s->show_flow_arrows = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_symbols=", 13) == 0) {
+            s->show_symbols_editor = atoi(l + 13) != 0;
+        } else if (strncmp(l, "show_code_candidates=", 21) == 0) {
+            s->show_code_candidates = atoi(l + 21) != 0;
+        } else if (strncmp(l, "show_inline_candidates=", 23) == 0) {
+            s->show_inline_candidates = atoi(l + 23) != 0;
         }
     }
     fclose(f);
