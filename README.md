@@ -11,6 +11,8 @@ ApexII is a specialized toolset designed for the high-performance reverse engine
     *   **Automatic Table Discovery**: Pattern-based search for text and data tables.
     *   **Hex Inspector**: Multi-format inspection (Hex, Dec, Bin, ASCII) with ROM-to-CPU address mapping.
     *   **DMD Preview**: Real-time decoding and scrubbing of DMD full-frame images.
+    *   **Match from Reference**: GUI front-end for `apexmatch` — accept hundreds of OS labels from a reference ROM with a single click, review medium-confidence matches individually.
+*   **ROM-to-ROM Label Transfer (apexmatch)**: Fingerprint-based matching propagates labels, inline signatures, and docs from an annotated ROM to any other WPC ROM — including cross-game OS layer transfer (~250–300 matches out of the box).
 *   **Modular Architecture**: Extensible design allowing for deep integration of game-specific logic.
 
 ---
@@ -71,13 +73,66 @@ Treat its output as suggestions, not ground truth.
 
 
 ### `apeximgui` (Interactive GUI)
-The primary analysis workstation. It allows for live exploration, labeling, and structure definition.
 
-**Usage:**
+The primary analysis workstation for interactive disassembly, labeling, and structure definition.
+
+**Launch:**
+
 ```bash
-apeximgui ROM_PATH [CONFIG_PATH]
+apeximgui <rom> [config.ini]   # open ROM with optional config
+apeximgui                      # file pickers open automatically at startup
 ```
-*If no CONFIG_PATH is provided, it will start with a fresh analysis. Changes can be saved as an `.ini` overlay.*
+
+When started without arguments (and no saved session), a file picker appears to select the ROM, followed by an optional INI picker.
+
+**File menu:**
+
+| Item | Description |
+|---|---|
+| Save Overlay (`Ctrl+S`) | Write accumulated edits to `<config>.apeximgui.ini` |
+| Save INI As… | Export the full merged config (base + all edits) to a new `.ini` file |
+| Consolidate into Base INI | Merge overlay into the base INI and reset the overlay to empty |
+| Re-analyze (`F5`) | Re-run analysis |
+| Force Full Re-analyze (`Shift+F5`) | Flush cache and re-analyze from scratch |
+
+**Key panels:**
+
+- **Disassembly** — annotated listing with syntax highlighting, clickable labels, flow arrows
+- **Labels / Banks / Bookmarks** — navigation panels
+- **Edit** — set labels, classify bytes (code/data/string/table/inline), add docs
+- **References** — incoming and outgoing cross-references for the selected address
+- **Hex** — raw byte view, synced to disassembly selection
+- **Inline Sigs / Code Entries** — bulk-edit inline signatures and code entry points
+- **Symbols** — named RAM/hardware address definitions
+- **ROM Map** — visual block overview across all banks
+- **Match from Reference** — GUI front-end for `apexmatch` (see below)
+
+**Keyboard shortcuts:**
+
+| Key | Action |
+|---|---|
+| `J` / `K` | Move selection down / up |
+| `N` / `P` | Next / prev block boundary |
+| `F` / `Enter` | Follow link / jump to target |
+| `[` / `]` | History back / forward |
+| `G` | Go to address |
+| `L` | Edit label |
+| `C` | Mark as code |
+| `D` | Mark as data |
+| `Ctrl+S` | Save overlay |
+| `F5` | Re-analyze |
+
+**Match from Reference panel** (Windows → Match from Reference):
+
+GUI front-end for the `apexmatch` fingerprint engine. Transfers labels and inline signatures from an annotated reference ROM to the currently open ROM without leaving the GUI:
+
+1. Enter or browse for the reference ROM and its config INI.
+2. Click **Run Match**. With **System scan** enabled, the scan phase runs automatically.
+3. Results appear sorted by confidence tier — **Exact** (≥90%), **High** (≥75%), **Medium** (≥55%).
+4. Click **Accept All Exact** to apply all exact matches in one step. The disassembly updates immediately.
+5. Review High/Medium matches — click the address button to navigate to the target, then **Accept** individually or tier-by-tier.
+
+Accepted matches write labels, code entries, inline signatures, and routine docs to the active overlay.
 
 ### `apexasm` (6809 Assembler)
 A assembler optimized for WPC development. Used to re-assemble the reconstructed code back into a valid ROM image.
@@ -124,6 +179,52 @@ overlap:  [inline] B3d_A7840 (byte, 4 bytes, ends 0x7843) into [data] B3d_A7842 
 apexini merge combined.ini base.ini overlay.apexgui.ini
 ```
 
+### `apexmatch` (ROM-to-ROM Label Transfer)
+
+Transfers labels, inline signatures, and routine documentation from a well-annotated source ROM to a different target ROM by fingerprint matching — no manual re-analysis needed.
+
+**Usage:**
+```bash
+apexmatch <source.rom> <source.ini> <target.rom> [options]
+```
+
+**Examples:**
+```bash
+# Propagate WPC OS labels from Addams Family to Gilligan's Island
+apexmatch roms/addam_h4.rom addam_h4.ini roms/afgldlx3.rom \
+    --scan --output afgldlx3_os_labels.ini --stats
+
+# Transfer full label set between two versions of the same game
+apexmatch roms/taf_l7.rom taf_l7.ini roms/taf_l8.rom \
+    --inject-paged --output taf_l8_from_l7.ini --verbose
+```
+
+**Options:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--min-confidence N` | 55 | Skip matches below N% |
+| `--min-instrs N` | 5 | Min instructions for medium-confidence matches (filters short stubs) |
+| `--inject-paged` | off | Also inject paged-bank entries into target analysis (default: system bank only) |
+| `--scan` | off | Scan every byte of the target's system bank for exact matches; finds functions at shifted addresses not reached by code-flow injection; recommended for cross-game use; ~1–2 s extra |
+| `--output FILE` | stdout | Write generated `.ini` to FILE |
+| `--stats` | off | Print per-phase match counts to stderr |
+| `--verbose` | off | List named source functions that found no match |
+
+**How it works:**
+
+Each named code label is fingerprinted using three independent FNV-32 hashes:
+
+- **L1** — mnemonic sequence only (address-independent): finds routines that have simply moved
+- **L2** — mnemonic sequence + immediate operand values: distinguishes routines with different constants
+- **L3** — sequence of callee L1 hashes: structural match based on call graph shape
+
+Confidence levels: **exact** (L1 + L2, 90%) / **high** (L1 + callees, 75%) / **medium** (L1 only, 55%).
+
+**Output** is a valid `.ini` overlay with `[labels]`, `[inline]` signatures, and `[routine_docs]` transferred from the source. Validate with `apexini check` before use.
+
+**Cross-game WPC OS transfer:** WPC games share the same operating system in the system bank (0x8000–0xffff). After annotating one game's OS layer, `apexmatch` propagates ~250–300 labels (e.g. `JSR_Far`, `DisplayEffect_Start`, `LampLogical_SetInline`) and their inline signatures to any other WPC ROM automatically.
+
 ---
 
 ## Build And Test
@@ -145,10 +246,10 @@ Build products:
 
 - `build/apexdis`
 - `build/apexasm`
-- `build/apexgui`
 - `build/apeximgui`
 - `build/apextab`
 - `build/apexini`
+- `build/apexmatch`
 
 ### Dependencies
 
@@ -161,7 +262,7 @@ For the full build including `apeximgui` you need:
 - SDL2 development headers and libraries
 - OpenGL development headers and libraries
 
-The browser UI `apexgui` and the CLI tools do not depend on SDL2/OpenGL.
+The CLI tools do not depend on SDL2/OpenGL.
 
 ### Linux
 

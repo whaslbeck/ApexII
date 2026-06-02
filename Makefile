@@ -14,6 +14,7 @@ COMMON_OBJS := $(BUILD_DIR)/cpu6809.o $(BUILD_DIR)/util.o
 APEXDIS_CORE_OBJS := $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
 APEXDMD_OBJS := $(COMMON_OBJS) $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o
 APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(COMMON_OBJS)
+APEXMATCH_OBJS := $(BUILD_DIR)/apexmatch.o $(BUILD_DIR)/apex_match.o $(APEXDIS_CORE_OBJS)
 
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 APEXIMGUI_SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
@@ -26,12 +27,14 @@ else
 APEXIMGUI_GL_LIBS := $(shell $(PKG_CONFIG) --libs gl 2>/dev/null)
 endif
 
-APEXIMGUI_CPPFLAGS := $(CPPFLAGS) -I$(SRC_DIR) -Ithird_party/imgui -Ithird_party/imgui/backends $(APEXIMGUI_SDL_CFLAGS)
+APEXIMGUI_CPPFLAGS := $(CPPFLAGS) -I$(SRC_DIR) -Ithird_party/imgui -Ithird_party/imgui/backends -Ithird_party/ImGuiFileDialog $(APEXIMGUI_SDL_CFLAGS)
 APEXIMGUI_LDLIBS := $(APEXIMGUI_SDL_LIBS) $(APEXIMGUI_GL_LIBS)
 APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 	$(BUILD_DIR)/apeximgui_data.o \
 	$(BUILD_DIR)/apeximgui_analysis.o \
 	$(BUILD_DIR)/apeximgui_views.o \
+	$(BUILD_DIR)/apex_match.o \
+	$(BUILD_DIR)/ImGuiFileDialog.o \
 	$(BUILD_DIR)/imgui.o \
 	$(BUILD_DIR)/imgui_draw.o \
 	$(BUILD_DIR)/imgui_tables.o \
@@ -43,9 +46,9 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
 
-apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini
+apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -76,6 +79,9 @@ $(BUILD_DIR)/imgui_demo.o: third_party/imgui/imgui_demo.cpp | $(BUILD_DIR)
 $(BUILD_DIR)/imgui_impl_%.o: third_party/imgui/backends/imgui_impl_%.cpp | $(BUILD_DIR)
 	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/ImGuiFileDialog.o: third_party/ImGuiFileDialog/ImGuiFileDialog.cpp | $(BUILD_DIR)
+	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+
 $(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_DIR)/apex_project.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
@@ -101,6 +107,9 @@ $(BUILD_DIR)/apexini: $(APEXINI_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(COMMON_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/apexmatch: $(APEXMATCH_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 test: all

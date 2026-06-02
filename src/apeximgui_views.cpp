@@ -1,4 +1,5 @@
 #include "apeximgui_core.h"
+#include "ImGuiFileDialog.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
 #include <SDL.h>
@@ -4297,6 +4298,352 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
                 ImGui::TextUnformatted(lbl.c_str());
                 ImGui::PopID();
             }
+        }
+        ImGui::EndTable();
+    }
+}
+
+// ============================================================
+// Match from Reference window
+// ============================================================
+
+static void apply_one_match(ApexProject *dst, const ApexProject *src,
+                             const MatchWindowState::Result &r)
+{
+    int has_bank = (r.dst_bank != 0xffu) ? 1 : 0;
+    apex_project_set_label(dst, has_bank, r.dst_bank, r.dst_addr, r.label_name.c_str());
+    apex_project_set_kind(dst, has_bank, r.dst_bank, r.dst_addr, APEX_KIND_CODE, "code");
+
+    const InlineSignature *sig = inline_signature_for(&src->inline_sigs, r.src_bank, r.src_addr);
+    if (sig) {
+        std::string spec = inline_sig_spec_string(sig);
+        if (!spec.empty())
+            apex_project_set_inline(dst, has_bank, r.dst_bank, r.dst_addr, spec.c_str());
+    }
+    const char *doc = config_doc_at(&src->routine_docs, r.src_bank, r.src_addr);
+    if (doc && doc[0])
+        apex_project_set_doc(dst, 0, has_bank, r.dst_bank, r.dst_addr, doc);
+}
+
+/* Accept all results within [min_conf, max_conf], return count applied. */
+static int accept_tier(ApexProject *dst, MatchWindowState &ms, int min_conf, int max_conf)
+{
+    int n = 0;
+    for (auto &r : ms.results) {
+        if (r.accepted) continue;
+        if (r.confidence < min_conf || r.confidence > max_conf) continue;
+        apply_one_match(dst, ms.src_project, r);
+        r.accepted = true;
+        n++;
+    }
+    return n;
+}
+
+void render_match_window(ApexProject *project,
+                         const ApexRenderedDocument **document_ptr,
+                         UiState *state)
+{
+    const ApexRenderedDocument *d = *document_ptr;
+    MatchWindowState &ms = state->match_state;
+
+    /* --- Path inputs with Browse buttons --- */
+    ImGui::SetNextItemWidth(-100.0f);
+    ImGui::InputText("Ref ROM", ms.ref_rom_path, sizeof(ms.ref_rom_path));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##brom")) {
+        IGFD::FileDialogConfig cfg;
+        cfg.path = ms.ref_rom_path[0] ? ms.ref_rom_path : ".";
+        ImGuiFileDialog::Instance()->OpenDialog("MatchRefRom", "Select Reference ROM",
+                                                ".rom,.bin", cfg);
+    }
+    if (ImGuiFileDialog::Instance()->Display("MatchRefRom",
+            ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+            strncpy(ms.ref_rom_path, p.c_str(), sizeof(ms.ref_rom_path) - 1);
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+
+    ImGui::SetNextItemWidth(-100.0f);
+    ImGui::InputText("Ref INI", ms.ref_ini_path, sizeof(ms.ref_ini_path));
+    ImGui::SameLine();
+    if (ImGui::Button("Browse##bini")) {
+        IGFD::FileDialogConfig cfg;
+        cfg.path = ms.ref_ini_path[0] ? ms.ref_ini_path : ".";
+        ImGuiFileDialog::Instance()->OpenDialog("MatchRefIni", "Select Reference INI",
+                                                ".ini", cfg);
+    }
+    if (ImGuiFileDialog::Instance()->Display("MatchRefIni",
+            ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+            strncpy(ms.ref_ini_path, p.c_str(), sizeof(ms.ref_ini_path) - 1);
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+
+    /* --- Options --- */
+    ImGui::Checkbox("System scan (--scan)", &ms.scan_enabled);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(50.0f);
+    ImGui::InputInt("Min conf%", &ms.min_confidence);
+    ms.min_confidence = std::max(0, std::min(100, ms.min_confidence));
+    ImGui::SameLine();
+
+    bool can_run = ms.ref_rom_path[0] != '\0' && ms.ref_ini_path[0] != '\0'
+                   && project->rom_path != NULL;
+    if (!can_run) ImGui::BeginDisabled();
+    bool run_clicked = ImGui::Button("Run Match");
+    if (!can_run) ImGui::EndDisabled();
+
+    if (!ms.run_status.empty())
+        ImGui::TextDisabled("%s", ms.run_status.c_str());
+
+    /* --- Execute match --- */
+    if (run_clicked && can_run) {
+        if (ms.src_project) {
+            apex_project_free(ms.src_project);
+            ms.src_project = nullptr;
+        }
+        ms.results.clear();
+        ms.has_results = false;
+        ms.run_status  = "Running...";
+
+        ApexProject *src = apex_project_open(ms.ref_rom_path, ms.ref_ini_path);
+        if (!src) {
+            ms.run_status = "Error: cannot open reference ROM/INI";
+            return;
+        }
+        if (apex_project_analyze(src)) {
+            apex_project_free(src);
+            ms.run_status = "Error: reference analysis failed";
+            return;
+        }
+
+        ApexProject *dst_tmp = apex_project_open(project->rom_path, NULL);
+        if (!dst_tmp) {
+            apex_project_free(src);
+            ms.run_status = "Error: cannot re-open target ROM";
+            return;
+        }
+        apex_match_inject_entries(dst_tmp, src, 1 /* system_only */);
+        if (apex_project_analyze(dst_tmp)) {
+            apex_project_free(dst_tmp);
+            apex_project_free(src);
+            ms.run_status = "Error: target analysis failed";
+            return;
+        }
+
+        ApexFingerprintDB *src_db = apex_fingerprint_build(src);
+        ApexFingerprintDB *dst_db = apex_fingerprint_build(dst_tmp);
+        if (!src_db || !dst_db) {
+            apex_fingerprint_free(src_db);
+            apex_fingerprint_free(dst_db);
+            apex_project_free(dst_tmp);
+            apex_project_free(src);
+            ms.run_status = "Error: out of memory";
+            return;
+        }
+
+        size_t result_count = 0;
+        ApexMatchResult *raw = apex_match_roms(src_db, dst_db,
+                                               ms.min_confidence, 5, &result_count);
+
+        if (ms.scan_enabled) {
+            size_t scan_count = 0;
+            ApexMatchResult *scan_raw = apex_match_scan_system_bank(
+                src_db, dst_db, dst_tmp, raw, result_count, 5, &scan_count);
+            if (scan_count > 0) {
+                ApexMatchResult *combined = (ApexMatchResult *)realloc(
+                    raw, (result_count + scan_count) * sizeof(*raw));
+                if (combined) {
+                    raw = combined;
+                    memcpy(raw + result_count, scan_raw, scan_count * sizeof(*scan_raw));
+                    result_count += scan_count;
+                }
+                apex_match_results_free(scan_raw, scan_count);
+            }
+        }
+
+        int n_exact = 0, n_high = 0, n_med = 0;
+        ms.results.reserve(result_count);
+        for (size_t i = 0; i < result_count; i++) {
+            const ApexMatchResult &rr = raw[i];
+            MatchWindowState::Result r;
+            r.label_name = rr.label_name ? rr.label_name : "";
+            r.src_addr   = rr.src_addr;
+            r.src_bank   = rr.src_bank;
+            r.dst_addr   = rr.dst_addr;
+            r.dst_bank   = rr.dst_bank;
+            r.confidence = rr.confidence;
+            r.accepted   = false;
+            if      (r.confidence >= APEX_MATCH_CONF_EXACT) n_exact++;
+            else if (r.confidence >= APEX_MATCH_CONF_HIGH)  n_high++;
+            else                                             n_med++;
+            ms.results.push_back(std::move(r));
+        }
+
+        apex_match_results_free(raw, result_count);
+        apex_fingerprint_free(src_db);
+        apex_fingerprint_free(dst_db);
+        apex_project_free(dst_tmp);
+        ms.src_project = src;
+        ms.has_results = true;
+
+        char buf[256];
+        snprintf(buf, sizeof(buf),
+                 "%zu matches: %d exact  %d high  %d medium",
+                 result_count, n_exact, n_high, n_med);
+        ms.run_status = buf;
+    }
+
+    if (!ms.has_results) return;
+
+    ImGui::Separator();
+
+    /* Pending counts per tier */
+    int p_exact = 0, p_high = 0, p_med = 0;
+    for (const auto &r : ms.results) {
+        if (r.accepted) continue;
+        if      (r.confidence >= APEX_MATCH_CONF_EXACT) p_exact++;
+        else if (r.confidence >= APEX_MATCH_CONF_HIGH)  p_high++;
+        else                                             p_med++;
+    }
+    int p_total = p_exact + p_high + p_med;
+
+    /* --- Accept All buttons --- */
+    {
+        char btn[64];
+
+        snprintf(btn, sizeof(btn), "Accept All Exact (%d)", p_exact);
+        if (p_exact == 0) ImGui::BeginDisabled();
+        if (ImGui::Button(btn)) {
+            accept_tier(project, ms, APEX_MATCH_CONF_EXACT, 100);
+            state->overlay_dirty = true;
+            uint8_t cb = 0xffu; uint32_t ca = 0u;
+            selected_address(d, state, &cb, &ca);
+            rerender_and_reselect(project, document_ptr, state, cb, ca);
+            d = *document_ptr;
+        }
+        if (p_exact == 0) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        snprintf(btn, sizeof(btn), "Accept All High (%d)", p_high);
+        if (p_high == 0) ImGui::BeginDisabled();
+        if (ImGui::Button(btn)) {
+            accept_tier(project, ms, APEX_MATCH_CONF_HIGH, APEX_MATCH_CONF_EXACT - 1);
+            state->overlay_dirty = true;
+            uint8_t cb = 0xffu; uint32_t ca = 0u;
+            selected_address(d, state, &cb, &ca);
+            rerender_and_reselect(project, document_ptr, state, cb, ca);
+            d = *document_ptr;
+        }
+        if (p_high == 0) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        snprintf(btn, sizeof(btn), "Accept All Med (%d)", p_med);
+        if (p_med == 0) ImGui::BeginDisabled();
+        if (ImGui::Button(btn)) {
+            accept_tier(project, ms, ms.min_confidence, APEX_MATCH_CONF_HIGH - 1);
+            state->overlay_dirty = true;
+            uint8_t cb = 0xffu; uint32_t ca = 0u;
+            selected_address(d, state, &cb, &ca);
+            rerender_and_reselect(project, document_ptr, state, cb, ca);
+            d = *document_ptr;
+        }
+        if (p_med == 0) ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        snprintf(btn, sizeof(btn), "Accept All (%d)", p_total);
+        if (p_total == 0) ImGui::BeginDisabled();
+        if (ImGui::Button(btn)) {
+            accept_tier(project, ms, ms.min_confidence, 100);
+            state->overlay_dirty = true;
+            uint8_t cb = 0xffu; uint32_t ca = 0u;
+            selected_address(d, state, &cb, &ca);
+            rerender_and_reselect(project, document_ptr, state, cb, ca);
+            d = *document_ptr;
+        }
+        if (p_total == 0) ImGui::EndDisabled();
+    }
+
+    /* --- Filter bar --- */
+    ImGui::SetNextItemWidth(150.0f);
+    ImGui::InputText("##matchfilter", ms.filter, sizeof(ms.filter));
+    ImGui::SameLine();
+    ImGui::RadioButton("All",      &ms.show_mode, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("Pending",  &ms.show_mode, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Accepted", &ms.show_mode, 2);
+
+    /* --- Results table --- */
+    static const ImGuiTableFlags kMatchTblFlags =
+        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+        ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
+        ImGuiTableFlags_SizingFixedFit;
+
+    if (ImGui::BeginTable("match_results", 4, kMatchTblFlags)) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed,   16.0f);
+        ImGui::TableSetupColumn("Conf",   ImGuiTableColumnFlags_WidthFixed,   52.0f);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed,  105.0f);
+        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        int row_id = 0;
+        for (auto &r : ms.results) {
+            if (ms.show_mode == 1 && r.accepted)  continue;
+            if (ms.show_mode == 2 && !r.accepted) continue;
+            if (ms.filter[0] && !str_icontains(r.label_name.c_str(), ms.filter)) continue;
+
+            ImGui::PushID(row_id++);
+            ImGui::TableNextRow();
+
+            /* Col 0: accepted checkmark */
+            ImGui::TableSetColumnIndex(0);
+            if (r.accepted)
+                ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "\xe2\x9c\x93");
+
+            /* Col 1: confidence tier */
+            ImGui::TableSetColumnIndex(1);
+            if (r.confidence >= APEX_MATCH_CONF_EXACT)
+                ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "Exact");
+            else if (r.confidence >= APEX_MATCH_CONF_HIGH)
+                ImGui::TextColored(ImVec4(0.47f, 0.70f, 0.95f, 1.0f), "High");
+            else
+                ImGui::TextColored(ImVec4(0.95f, 0.82f, 0.45f, 1.0f), "Med");
+
+            /* Col 2: destination address — click to navigate */
+            ImGui::TableSetColumnIndex(2);
+            char addrstr[32];
+            if (r.dst_bank == 0xffu)
+                snprintf(addrstr, sizeof(addrstr), "0x%04x", r.dst_addr);
+            else
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", r.dst_bank, r.dst_addr);
+            size_t target_li = 0;
+            bool found = apex_render_find_line_by_address(d, r.dst_bank, r.dst_addr,
+                                                          &target_li) != NULL;
+            if (ImGui::SmallButton(addrstr) && found)
+                select_line(state, target_li, 1);
+
+            /* Col 3: label name + per-row Accept button */
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(r.label_name.c_str());
+            if (!r.accepted) {
+                ImGui::SameLine();
+                if (ImGui::SmallButton("Accept")) {
+                    apply_one_match(project, ms.src_project, r);
+                    r.accepted = true;
+                    state->overlay_dirty = true;
+                    rerender_and_reselect(project, document_ptr, state,
+                                         r.dst_bank, r.dst_addr);
+                    d = *document_ptr;
+                }
+            }
+
+            ImGui::PopID();
         }
         ImGui::EndTable();
     }

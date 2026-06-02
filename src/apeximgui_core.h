@@ -14,7 +14,37 @@ extern "C" {
 #include "apex_project.h"
 #include "apex_render.h"
 #include "apex_analysis.h"
+#include "apex_match.h"
 }
+
+// --- Match Window State ---
+
+struct MatchWindowState {
+    char ref_rom_path[1024];
+    char ref_ini_path[1024];
+    bool scan_enabled;
+    int  min_confidence;
+    bool has_results;
+    std::string run_status;
+    ApexProject *src_project;
+
+    struct Result {
+        std::string label_name;
+        uint32_t    src_addr;
+        uint8_t     src_bank;
+        uint32_t    dst_addr;
+        uint8_t     dst_bank;
+        int         confidence;
+        bool        accepted;
+    };
+    std::vector<Result> results;
+    char filter[128];
+    int  show_mode;  /* 0=all, 1=pending, 2=accepted */
+
+    ~MatchWindowState() {
+        if (src_project) { apex_project_free(src_project); src_project = nullptr; }
+    }
+};
 
 // --- Constants and Enums ---
 
@@ -168,6 +198,8 @@ struct UiState {
     int graph_depth_out;
     bool graph_needs_rebuild;
 
+    bool show_match_window;
+    MatchWindowState match_state;
     bool show_inline_list;
     bool show_entries_list;
     bool show_types_editor;
@@ -469,6 +501,9 @@ void auto_search_tables(ApexProject *project, const ApexRenderedDocument **docum
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document);
 size_t hardware_register_count();
 const HardwareRegister *get_hardware_register(size_t index);
+
+// Match from Reference
+void render_match_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // Analysis: Inline list, Entries list & Types editor
 void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);

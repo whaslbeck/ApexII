@@ -998,11 +998,11 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
             }
             if (resolve_symbols) {
                 uint32_t next_pc = pc + (op->prefix ? 2u : 1u) + 2u;
-                int32_t delta = (int32_t)value - (int32_t)next_pc;
-                if (delta < -32768 || delta > 32767) {
-                    die("%s target out of 16-bit branch range", mnemonic);
-                }
-                value = (uint16_t)delta;
+                /* 6809 is a 16-bit CPU: the entire 64 KB address space is
+                   reachable with a 16-bit relative offset.  Compute the
+                   offset with 16-bit modular arithmetic so cross-bank branches
+                   (e.g. paged bank → system bank) assemble correctly. */
+                value = (uint32_t)(uint16_t)((uint32_t)value - next_pc);
             }
             emit_opcode(op, emit, ctx);
             emit(ctx, (uint8_t)(value >> 8));

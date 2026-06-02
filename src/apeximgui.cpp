@@ -2,6 +2,7 @@
 #include "imgui_internal.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
+#include "ImGuiFileDialog.h"
 #include <SDL.h>
 #include <SDL_opengl.h>
 #include <cstdio>
@@ -28,10 +29,71 @@ static void handle_fatal_signal(int sig)
     raise(sig);
 }
 
+/* Helper: render one frame for the startup file picker loop */
+static void startup_frame_render(SDL_Window *win)
+{
+    ImGui::Render();
+    ImGuiIO &fio = ImGui::GetIO();
+    glViewport(0, 0, (int)fio.DisplaySize.x, (int)fio.DisplaySize.y);
+    glClearColor(0.10f, 0.10f, 0.12f, 1.0f);
+    glClear(GL_COLOR_BUFFER_BIT);
+    ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+    SDL_GL_SwapWindow(win);
+}
+
+/* Show a file dialog in a mini-loop before the main project is loaded.
+   Returns true when a path was chosen; false means user cancelled/quit.
+   If ini_mode is true, Cancel means "no INI" (still returns true). */
+static bool startup_pick_file(SDL_Window *win, bool ini_mode,
+                               char *out_path, size_t out_size)
+{
+    const char *key     = ini_mode ? "StartupIni" : "StartupRom";
+    const char *title   = ini_mode ? "Select Config INI  (Cancel = no INI)"
+                                   : "Select ROM File";
+    const char *filters = ini_mode ? ".ini" : ".rom,.bin";
+
+    IGFD::FileDialogConfig cfg;
+    cfg.path = ".";
+    ImGuiFileDialog::Instance()->OpenDialog(key, title, filters, cfg);
+
+    bool picked = false;
+    bool user_quit = false;
+    while (!picked && !user_quit) {
+        SDL_Event ev;
+        while (SDL_PollEvent(&ev)) {
+            ImGui_ImplSDL2_ProcessEvent(&ev);
+            if (ev.type == SDL_QUIT) { user_quit = true; }
+        }
+        ImGui_ImplOpenGL3_NewFrame();
+        ImGui_ImplSDL2_NewFrame();
+        ImGui::NewFrame();
+
+        ImGuiIO &fio = ImGui::GetIO();
+        ImVec2 dlg_min(std::min(700.0f, fio.DisplaySize.x * 0.85f),
+                       std::min(450.0f, fio.DisplaySize.y * 0.85f));
+        if (ImGuiFileDialog::Instance()->Display(key,
+                ImGuiWindowFlags_NoCollapse, dlg_min)) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+                strncpy(out_path, p.c_str(), out_size - 1);
+                out_path[out_size - 1] = '\0';
+            } else if (!ini_mode) {
+                user_quit = true;  /* Cancel on ROM dialog = quit */
+            }
+            /* Cancel on INI dialog = no INI (out_path stays empty) */
+            ImGuiFileDialog::Instance()->Close();
+            picked = true;
+        }
+
+        startup_frame_render(win);
+    }
+    return !user_quit;
+}
+
 int main(int argc, char **argv)
 {
-    ApexProject *project;
-    const ApexRenderedDocument *document;
+    ApexProject *project = NULL;
+    const ApexRenderedDocument *document = NULL;
     OriginalSnapshot original_snapshot;
     SDL_Window *window = NULL;
     SDL_GLContext gl_context = NULL;
@@ -39,6 +101,7 @@ int main(int argc, char **argv)
     bool done = false;
     bool want_quit = false;
     bool want_consolidate = false;
+    bool want_save_ini_as = false;
     char rom_path[1024] = "";
     char config_path[1024] = "";
 
@@ -49,20 +112,67 @@ int main(int argc, char **argv)
         strncpy(rom_path, argv[1], 1023);
         config_path[0] = '\0';
     } else if (argc == 1) {
-        if (!load_global_session(rom_path, config_path)) {
-            fprintf(stderr, "usage: %s ROM [CONFIG]\n", argv[0]);
-            return 2;
-        }
+        load_global_session(rom_path, config_path);
+        /* If session also empty, rom_path stays ""; picker runs below */
     } else {
         fprintf(stderr, "usage: %s ROM [CONFIG]\n", argv[0]);
         return 2;
     }
 
-    /* If an overlay from a previous session exists, load it as the effective config
-       so all prior work is available. The snapshot is always built from the base config
-       only, ensuring the saved delta covers all sessions cumulatively. */
+    /* --- SDL + OpenGL + ImGui init (must happen before any file picker) --- */
+    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
+        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
+        return 1;
+    }
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
+    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
+    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
+    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
+
+    window = SDL_CreateWindow("ApexII",
+                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
+                              1600, 950,
+                              SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
+                              SDL_WINDOW_ALLOW_HIGHDPI);
+    if (!window) {
+        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
+        SDL_Quit();
+        return 1;
+    }
+    gl_context = SDL_GL_CreateContext(window);
+    SDL_GL_MakeCurrent(window, gl_context);
+    SDL_GL_SetSwapInterval(1);
+
+    IMGUI_CHECKVERSION();
+    ImGui::CreateContext();
+    ImGuiIO &io = ImGui::GetIO();
+    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
+    ImGui::StyleColorsDark();
+    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
+    ImGui_ImplOpenGL3_Init("#version 150");
+
+    /* --- Startup file picker (when no ROM was specified) --- */
+    if (rom_path[0] == '\0') {
+        if (!startup_pick_file(window, false, rom_path, sizeof(rom_path))) {
+            /* User quit the ROM picker */
+            ImGui_ImplOpenGL3_Shutdown();
+            ImGui_ImplSDL2_Shutdown();
+            ImGui::DestroyContext();
+            SDL_GL_DeleteContext(gl_context);
+            SDL_DestroyWindow(window);
+            SDL_Quit();
+            return 0;
+        }
+        /* Optionally pick an INI */
+        startup_pick_file(window, true, config_path, sizeof(config_path));
+    }
+
+    /* --- Load project --- */
+    /* If an overlay from a previous session exists, use it as effective config. */
     const char *effective_config = config_path[0] ? config_path : NULL;
-    /* config_path can be up to 1023 chars; ".apeximgui.ini" is 14 chars → need 1038 + NUL */
     char overlay_path[1040] = "";
     if (config_path[0]) {
         FILE *of;
@@ -77,47 +187,27 @@ int main(int argc, char **argv)
     project = apex_project_open(rom_path, effective_config);
     if (!project || apex_project_analyze(project) != 0) {
         fprintf(stderr, "failed to analyze\n");
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext();
+        SDL_GL_DeleteContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
         return 1;
     }
     document = apex_project_render(project, 0, 0);
     if (!document) {
         fprintf(stderr, "failed to render\n");
+        apex_project_free(project);
+        ImGui_ImplOpenGL3_Shutdown();
+        ImGui_ImplSDL2_Shutdown();
+        ImGui::DestroyContext();
+        SDL_GL_DeleteContext(gl_context);
+        SDL_DestroyWindow(window);
+        SDL_Quit();
         return 1;
     }
     original_snapshot = build_config_snapshot(config_path[0] ? config_path : NULL);
-
-    if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
-        fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 2);
-    SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
-    SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
-    SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
-
-    window = SDL_CreateWindow("ApexII ImGui",
-                              SDL_WINDOWPOS_CENTERED, SDL_WINDOWPOS_CENTERED,
-                              1600, 950,
-                              SDL_WINDOW_OPENGL | SDL_WINDOW_RESIZABLE |
-                              SDL_WINDOW_ALLOW_HIGHDPI);
-    if (!window) {
-        fprintf(stderr, "SDL_CreateWindow failed: %s\n", SDL_GetError());
-        return 1;
-    }
-    gl_context = SDL_GL_CreateContext(window);
-    SDL_GL_MakeCurrent(window, gl_context);
-    SDL_GL_SetSwapInterval(1);
-
-    IMGUI_CHECKVERSION();
-    ImGui::CreateContext();
-    ImGuiIO &io = ImGui::GetIO();
-    io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
-    ImGui::StyleColorsDark();
-    ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
-    ImGui_ImplOpenGL3_Init("#version 150");
 
     state.editor_bound_line  = (size_t)-1;
     state.labels_valid       = false;
@@ -136,6 +226,9 @@ int main(int argc, char **argv)
     state.show_call_graph    = false;
     state.show_hardware      = false;
     state.show_tables        = false;
+    state.show_match_window     = false;
+    state.match_state.scan_enabled   = true;
+    state.match_state.min_confidence = APEX_MATCH_CONF_MEDIUM;
     state.show_inline_list      = false;
     state.show_entries_list     = false;
     state.show_types_editor     = false;
@@ -194,6 +287,13 @@ int main(int argc, char **argv)
         state.base_config_path[0] = '\0';
     }
 
+    /* Update window title to show ROM filename */
+    {
+        const char *base = strrchr(rom_path, '/');
+        if (!base) base = strrchr(rom_path, '\\');
+        SDL_SetWindowTitle(window, base ? base + 1 : rom_path);
+    }
+
     g_crash_project  = project;
     g_crash_snapshot = &original_snapshot;
     snprintf(g_crash_overlay_path, sizeof(g_crash_overlay_path), "%s", state.save_path_input);
@@ -225,6 +325,9 @@ int main(int argc, char **argv)
             if (ImGui::BeginMenu("File")) {
                 if (ImGui::MenuItem("Save Overlay", "Ctrl+S")) {
                     state.request_save_overlay = 1;
+                }
+                if (ImGui::MenuItem("Save INI As...")) {
+                    want_save_ini_as = true;
                 }
                 if (ImGui::MenuItem("Re-analyze", "F5")) {
                     uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
@@ -263,6 +366,7 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Transitions",  NULL, &state.show_transitions);
                 ImGui::MenuItem("Flow Arrows",  NULL, &state.show_flow_arrows);
                 ImGui::Separator();
+                ImGui::MenuItem("Match from Reference", NULL, &state.show_match_window);
                 ImGui::MenuItem("Call Graph",     NULL, &state.show_call_graph);
                 ImGui::MenuItem("Hardware",       NULL, &state.show_hardware);
                 ImGui::MenuItem("Tables",         NULL, &state.show_tables);
@@ -322,6 +426,7 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Details",     dock_right_id);
             ImGui::DockBuilderDockWindow("DMD",         dock_right_id);
             ImGui::DockBuilderDockWindow("Edit",        dock_right_id);
+            ImGui::DockBuilderDockWindow("Match from Reference", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Call Graph",     dock_bottom_id);
             ImGui::DockBuilderDockWindow("References",     dock_bottom_id);
             ImGui::DockBuilderDockWindow("Hardware",       dock_bottom_id);
@@ -573,6 +678,11 @@ int main(int argc, char **argv)
         if (state.show_types_editor) {
             ImGui::Begin("Types", &state.show_types_editor);
             render_types_editor(project, &state);
+            ImGui::End();
+        }
+        if (state.show_match_window) {
+            ImGui::Begin("Match from Reference", &state.show_match_window);
+            render_match_window(project, &document, &state);
             ImGui::End();
         }
         if (state.show_inline_list) {
@@ -974,6 +1084,28 @@ int main(int argc, char **argv)
                 ImGui::CloseCurrentPopup();
             }
             ImGui::EndPopup();
+        }
+
+        /* --- Save INI As dialog --- */
+        if (want_save_ini_as) {
+            IGFD::FileDialogConfig cfg;
+            cfg.path     = state.base_config_path[0] ? state.base_config_path : ".";
+            cfg.fileName = "config.ini";
+            cfg.flags    = ImGuiFileDialogFlags_ConfirmOverwrite;
+            ImGuiFileDialog::Instance()->OpenDialog("SaveIniAs", "Save INI As", ".ini", cfg);
+            want_save_ini_as = false;
+        }
+        if (ImGuiFileDialog::Instance()->Display("SaveIniAs",
+                ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+                std::string st;
+                if (write_full_config(project, p.c_str(), &st) > 0)
+                    set_status(&state, ("saved: " + p).c_str());
+                else
+                    set_status(&state, ("save failed: " + st).c_str());
+            }
+            ImGuiFileDialog::Instance()->Close();
         }
 
         if (want_consolidate) {
