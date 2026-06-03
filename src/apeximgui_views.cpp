@@ -1,4 +1,5 @@
 #include "apeximgui_core.h"
+#include "apex_rominfo.h"
 #include "ImGuiFileDialog.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -1238,16 +1239,18 @@ void render_global_search(const ApexRenderedDocument *d, UiState *s)
         ImGui::SetKeyboardFocusHere();
         s->request_focus_global_search = 0;
     }
-    if (ImGui::InputText("Query", s->global_search_input, 128)) {
-        s->search_results.clear();
-        if (s->global_search_input[0]) {
-            for (size_t i = 0; i < d->line_count; i++) {
-                if (line_matches_filter(&d->lines[i], s->global_search_input)) {
-                    s->search_results.push_back(i);
-                }
-            }
-        }
-    }
+    bool changed = ImGui::InputText("##gsquery", s->global_search_input, 128);
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_ForTooltip))
+        ImGui::SetTooltip("Wildcards: * = any chars, ? = any char\n"
+                          "Sequence:  lda #*\\nstb *  (\\n = next instruction)");
+    ImGui::SameLine();
+    ImGui::TextDisabled("(* ? \\n)");
+    if (changed)
+        run_global_search(d, s->global_search_input, s->search_results);
+    if (!s->search_results.empty())
+        ImGui::TextDisabled("%zu result(s)", s->search_results.size());
+    else if (s->global_search_input[0])
+        ImGui::TextDisabled("no results");
     if (ImGui::BeginTable("search_results", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
@@ -2105,8 +2108,6 @@ static void render_field_chips(ApexEditField *fields, int *count)
 void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
                    const OriginalSnapshot *sn, UiState *s)
 {
-    static const char *dom[] = {"routine_docs", "table_docs"};
-
     uint8_t b;
     uint32_t a;
     if (!selected_address(*dp, s, &b, &a)) {
@@ -2282,9 +2283,6 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
 
     /* ── Doc ────────────────────────────────────────────────────── */
     ImGui::SeparatorText("Doc");
-    if (ImGui::Combo("##doctype", &s->edit_doc_mode, dom, 2)) {
-        load_doc_editor_buffer(p, s, b, a);
-    }
     if (s->request_focus_doc) {
         ImGui::SetKeyboardFocusHere();
         s->request_focus_doc = 0;
@@ -2294,15 +2292,14 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
                               ImGuiInputTextFlags_WordWrap);
     if (ImGui::Button("Apply##doc")) {
         if (s->edit_doc_input[0]) {
-            if (apex_project_set_doc(p, s->edit_doc_mode == EDIT_DOC_TABLE, 1, b, a,
-                                     s->edit_doc_input) == 0) {
+            if (apex_project_set_doc(p, 1, b, a, s->edit_doc_input) == 0) {
                 rerender_and_reselect(p, dp, s, b, a);
             }
         }
     }
     ImGui::SameLine();
     if (ImGui::Button("Clear##doc")) {
-        if (apex_project_clear_doc(p, s->edit_doc_mode == EDIT_DOC_TABLE, 1, b, a) == 0) {
+        if (apex_project_clear_doc(p, 1, b, a) == 0) {
             rerender_and_reselect(p, dp, s, b, a);
         }
     }
@@ -2476,7 +2473,7 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             ImGui::PopItemWidth();
 
             ImGui::TableSetColumnIndex(2);
-            const char *existing_doc = config_doc_at(&p->table_docs, t->bank, t->addr);
+            const char *existing_doc = config_doc_at(&p->docs, t->bank, t->addr);
             char doc_buf[512] = "";
             if (existing_doc) {
                 strncpy(doc_buf, existing_doc, 511);
@@ -2484,7 +2481,7 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             }
             ImGui::PushItemWidth(-FLT_MIN);
             if (ImGui::InputText("##doc", doc_buf, 512, ImGuiInputTextFlags_EnterReturnsTrue)) {
-                if (apex_project_set_doc(p, 1, 1, t->bank, t->addr, doc_buf) == 0) {
+                if (apex_project_set_doc(p, 1, t->bank, t->addr, doc_buf) == 0) {
                     rerender_and_reselect(p, dp, s, t->bank, t->addr);
                     set_status(s, "Table comment updated");
                 }
@@ -4304,6 +4301,133 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
 }
 
 // ============================================================
+// ROM Info panel
+// ============================================================
+
+void render_rom_info(const ApexProject *p, UiState *state)
+{
+    RomInfoState &ri = state->rom_info;
+
+    if (!ri.computed) {
+        if (p->rom.data && p->rom.size >= 32768u) {
+            ApexRomInfo info;
+            apex_rominfo_compute(p->rom.data, p->rom.size, &info);
+            ri.os_valid    = info.os_valid;
+            ri.os_major    = info.os_major;
+            ri.os_minor    = info.os_minor;
+            ri.reset_addr  = info.reset_addr;
+            memcpy(ri.game_version, info.game_version, sizeof(ri.game_version));
+            ri.stored_csum  = info.stored_csum;
+            ri.computed_csum = info.computed_csum;
+            ri.stored_delta  = info.stored_delta;
+            ri.crc32_val     = info.crc32_val;
+            memcpy(ri.sha1,   info.sha1,   20);
+            memcpy(ri.sha256, info.sha256, 32);
+            ri.computed = true;
+        } else {
+            ImGui::TextDisabled("No ROM loaded.");
+            return;
+        }
+    }
+
+    const char *rom_name = p->rom_path ? p->rom_path : "(unknown)";
+    /* Show just the filename */
+    const char *base = strrchr(rom_name, '/');
+    if (!base) base = strrchr(rom_name, '\\');
+    if (!base) base = rom_name - 1;
+    ImGui::TextUnformatted(base + 1);
+
+    size_t rom_size = p->rom.size;
+    if (rom_size >= 1048576u)
+        ImGui::Text("%zu bytes (%zu MB)", rom_size, rom_size / 1048576u);
+    else
+        ImGui::Text("%zu bytes (%zu KB)", rom_size, rom_size / 1024u);
+
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("##rominfo", 2,
+            ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX)) {
+        ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthStretch);
+
+        auto row = [&](const char *label, const char *value) {
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", label);
+            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(value);
+        };
+        auto rowf = [&](const char *label, const char *fmt, ...) {
+            char buf[128]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
+            row(label, buf);
+        };
+
+        /* OS version */
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("OS Version");
+        ImGui::TableSetColumnIndex(1);
+        if (ri.os_valid)
+            ImGui::Text("%u.%u", (unsigned)ri.os_major, (unsigned)ri.os_minor);
+        else
+            ImGui::TextDisabled("unknown (reset 0x%04X)", ri.reset_addr);
+
+        /* Game version */
+        row("Game Version", ri.game_version[0] ? ri.game_version : "(not found)");
+
+        ImGui::TableNextRow(); /* spacer */
+
+        /* Checksum */
+        rowf("Checksum", "0x%04X (stored)  0x%04X (computed)",
+             ri.stored_csum, ri.computed_csum);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Status");
+        ImGui::TableSetColumnIndex(1);
+        if (ri.computed_csum == ri.stored_csum)
+            ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "VALID");
+        else
+            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "INVALID");
+
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Delta");
+        ImGui::TableSetColumnIndex(1);
+        if (ri.stored_delta == APEX_ROMINFO_DISABLE_DELTA)
+            ImGui::Text("0x%04X  (check disabled)", ri.stored_delta);
+        else
+            ImGui::Text("0x%04X", ri.stored_delta);
+
+        ImGui::TableNextRow(); /* spacer */
+
+        /* Hashes */
+        rowf("CRC-32", "%08X", ri.crc32_val);
+
+        { char buf[48]; int i;
+          for (i = 0; i < 20; i++) snprintf(buf + i*2, 3, "%02x", ri.sha1[i]);
+          row("SHA-1", buf); }
+
+        { char buf[72]; int i;
+          for (i = 0; i < 32; i++) snprintf(buf + i*2, 3, "%02x", ri.sha256[i]);
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("SHA-256");
+          ImGui::TableSetColumnIndex(1);
+          /* Split across two lines for readability */
+          char lo[36], hi[36];
+          memcpy(lo, buf,      32); lo[32] = '\0';
+          memcpy(hi, buf + 32, 32); hi[32] = '\0';
+          ImGui::TextUnformatted(lo);
+          ImGui::TableNextRow();
+          ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(hi);
+        }
+
+        ImGui::EndTable();
+    }
+
+    ImGui::Separator();
+    if (ImGui::Button("Refresh")) {
+        ri.computed = false;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Recompute hashes (takes ~1s for 1MB ROM)");
+}
+
+// ============================================================
 // Match from Reference window
 // ============================================================
 
@@ -4320,9 +4444,9 @@ static void apply_one_match(ApexProject *dst, const ApexProject *src,
         if (!spec.empty())
             apex_project_set_inline(dst, has_bank, r.dst_bank, r.dst_addr, spec.c_str());
     }
-    const char *doc = config_doc_at(&src->routine_docs, r.src_bank, r.src_addr);
+    const char *doc = config_doc_at(&src->docs, r.src_bank, r.src_addr);
     if (doc && doc[0])
-        apex_project_set_doc(dst, 0, has_bank, r.dst_bank, r.dst_addr, doc);
+        apex_project_set_doc(dst, has_bank, r.dst_bank, r.dst_addr, doc);
 }
 
 /* Accept all results within [min_conf, max_conf], return count applied. */

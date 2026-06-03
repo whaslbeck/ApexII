@@ -973,7 +973,7 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
 
     load_config(project->config_path, &project->inline_sigs, &project->config_labels,
                 &project->config_entries, &project->tables, &project->schemas,
-                &project->routine_docs, &project->table_docs, &project->symbols,
+                &project->docs, &project->symbols,
                 &project->data_ranges, &project->options, &project->config_types,
                 &project->ref_exclusions);
     validate_config_classification(&project->config_entries, &project->tables,
@@ -1020,8 +1020,7 @@ void apex_project_free(ApexProject *project)
     free_config_entries(&project->ref_exclusions);
     free_table_defs(&project->tables);
     free_schema_defs(&project->schemas);
-    free_config_docs(&project->routine_docs);
-    free_config_docs(&project->table_docs);
+    free_config_docs(&project->docs);
     free_config_symbols(&project->symbols);
     free(project->data_ranges.items);
     if (project->render_cache) {
@@ -1318,30 +1317,24 @@ int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, u
     return 0;
 }
 
-int apex_project_set_doc(ApexProject *project, int is_table_doc, int has_bank, uint8_t bank,
+int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
                          uint32_t addr, const char *text)
 {
-    ConfigDocs *docs;
-
     if (!project || !text || !*text) {
         return 1;
     }
-    docs = is_table_doc ? &project->table_docs : &project->routine_docs;
-    upsert_config_doc(docs, has_bank, bank, addr, text);
+    upsert_config_doc(&project->docs, has_bank, bank, addr, text);
     apex_project_invalidate(project, APEX_DIRTY_DOCS | APEX_DIRTY_RENDER);
     return 0;
 }
 
-int apex_project_clear_doc(ApexProject *project, int is_table_doc, int has_bank, uint8_t bank,
+int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
                            uint32_t addr)
 {
-    ConfigDocs *docs;
-
     if (!project) {
         return 1;
     }
-    docs = is_table_doc ? &project->table_docs : &project->routine_docs;
-    if (!remove_config_doc(docs, has_bank, bank, addr)) {
+    if (!remove_config_doc(&project->docs, has_bank, bank, addr)) {
         return 1;
     }
     apex_project_invalidate(project, APEX_DIRTY_DOCS | APEX_DIRTY_RENDER);
@@ -1547,8 +1540,7 @@ int apex_project_save_overlay(const ApexProject *project, const char *path, cons
     write_inline_section(out, &project->inline_sigs);
     write_data_section(out, &project->data_ranges);
     write_tables_section(out, &project->tables);
-    write_docs_section(out, "routine_docs", &project->routine_docs);
-    write_docs_section(out, "table_docs", &project->table_docs);
+    write_docs_section(out, "docs", &project->docs);
     if (fclose(out) != 0) {
         return 1;
     }
@@ -1695,8 +1687,10 @@ static int probe_code(const uint8_t *data, size_t len, uint32_t base_addr,
 
         if (info.size == 0) return 0;   /* invalid opcode → disqualify */
 
-        if (instr_count == 0 && preview && preview_size > 0)
+        if (instr_count == 0 && preview && preview_size > 0) {
             strncpy(preview, buf, preview_size - 1);
+            preview[preview_size - 1] = '\0';
+        }
 
         if (!unique[(unsigned char)data[pos]]) {
             unique[(unsigned char)data[pos]] = 1;
@@ -2135,7 +2129,7 @@ static void inline_push(ApexInlineCandidates *out,
                 out->items[i].score          = score;
                 out->items[i].callsite_count = callsite_count;
                 out->items[i].callsite_valid = callsite_valid;
-                strncpy(out->items[i].spec, spec, APEX_INLINE_SPEC_MAX - 1);
+                snprintf(out->items[i].spec, APEX_INLINE_SPEC_MAX, "%s", spec);
             }
             return;
         }

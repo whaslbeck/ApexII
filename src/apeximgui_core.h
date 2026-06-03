@@ -17,6 +17,25 @@ extern "C" {
 #include "apex_match.h"
 }
 
+// --- ROM Info State ---
+
+struct RomInfoState {
+    bool     computed;
+    /* metadata */
+    bool     os_valid;
+    uint8_t  os_major;
+    uint8_t  os_minor;
+    uint32_t reset_addr;
+    char     game_version[32];
+    uint16_t stored_csum;
+    uint16_t computed_csum;
+    uint16_t stored_delta;
+    /* hashes */
+    uint32_t crc32_val;
+    uint8_t  sha1[20];
+    uint8_t  sha256[32];
+};
+
 // --- Match Window State ---
 
 struct MatchWindowState {
@@ -57,10 +76,6 @@ typedef struct {
     char type_name[32]; /* valid when kind == -1 */
 } ApexEditField;
 
-enum {
-    EDIT_DOC_ROUTINE = 0,
-    EDIT_DOC_TABLE
-};
 
 // --- Structures ---
 
@@ -156,7 +171,6 @@ struct UiState {
     int edit_inline_count;
     ApexEditField edit_schema_fields[APEX_MAX_EDIT_FIELDS];
     int edit_schema_count;
-    int edit_doc_mode;
     std::vector<size_t> history_back;
     std::vector<size_t> history_forward;
     int dmd_scrub_offset;
@@ -198,6 +212,8 @@ struct UiState {
     int graph_depth_out;
     bool graph_needs_rebuild;
 
+    bool show_rom_info;
+    RomInfoState rom_info;
     bool show_match_window;
     MatchWindowState match_state;
     bool show_inline_list;
@@ -338,8 +354,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotEntry> ref_exclusions;
     std::vector<SnapshotData> data;
     std::vector<SnapshotTable> tables;
-    std::vector<SnapshotDoc> routine_docs;
-    std::vector<SnapshotDoc> table_docs;
+    std::vector<SnapshotDoc> docs;
     std::vector<SnapshotInline> inline_sigs;
     std::vector<SnapshotType> types;
     std::vector<SnapshotSymbol> symbols;
@@ -407,6 +422,8 @@ std::string inline_sig_spec_string(const InlineSignature *s);
 // Parsing & Utilities
 int parse_target_address(const char *input, uint8_t *bank, uint32_t *cpu_addr);
 int line_matches_filter(const ApexRenderedLine *line, const char *filter);
+void run_global_search(const ApexRenderedDocument *document, const char *query,
+                       std::vector<size_t> &results);
 const char *block_name(ApexRenderedBlockKind kind);
 const char *transition_name(ApexRenderedTransitionKind kind);
 std::string line_to_string(const ApexRenderedLine *line);
@@ -501,6 +518,9 @@ void auto_search_tables(ApexProject *project, const ApexRenderedDocument **docum
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document);
 size_t hardware_register_count();
 const HardwareRegister *get_hardware_register(size_t index);
+
+// ROM Info
+void render_rom_info(const ApexProject *project, UiState *state);
 
 // Match from Reference
 void render_match_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);

@@ -6,10 +6,12 @@
 #include "apex_project.h"
 #include "cpu6809.h"
 #include "apexdis_api.h"
+#include "apex_rominfo.h"
 
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 typedef enum {
     BLOCK_UNKNOWN,
@@ -590,7 +592,7 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                            const InlineSignatures *inline_sigs, const TableDef *table,
                            const DataRange *data_range,
                            const uint8_t *data, size_t len, size_t pos,
-                           const ConfigDocs *routine_docs, const ConfigDocs *table_docs,
+                           const ConfigDocs *docs,
                            const ReferenceSet *refs, int emit_explain,
                            const uint8_t *paged_rom, size_t banks)
 {
@@ -608,7 +610,7 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
         }
         if (!emitted_block && table) {
                 emit_table_comment_block(out, bank, addr, base_addr, rom_base, table, data, len, pos,
-                                         config_doc_at(table_docs, bank, addr), refs);
+                                         config_doc_at(docs, bank, addr), refs);
                 if (emit_explain) {
                     emit_explain_comment(out, BLOCK_TABLE, &labels[i], NULL);
                 }
@@ -622,7 +624,7 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                 emitted_block = 1;
             } else if (!emitted_block && labels[i].is_code) {
                 emit_routine_comment_block(out, bank, addr, base_addr, rom_base, inline_sig,
-                                           config_doc_at(routine_docs, bank, addr), refs);
+                                           config_doc_at(docs, bank, addr), refs);
                 if (emit_explain) {
                     emit_explain_comment(out, BLOCK_CODE, &labels[i], inline_sig);
                 }
@@ -1429,7 +1431,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                 const VectorInfo *vectors, size_t vector_count,
                                 const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                                 size_t banks, const LabelSet *bank_labels, const TableDefs *tables,
-                                const ConfigDocs *routine_docs, const ConfigDocs *table_docs,
+                                const ConfigDocs *docs,
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
                                 uint8_t current_bank,
@@ -1480,7 +1482,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                 base_addr + (uint32_t)pos, rom_base + pos);
         emit_labels_at(out, base_addr + (uint32_t)pos, labels, label_count, sorted,
                        current_bank, base_addr, rom_base, inline_sigs, table, data_range,
-                       data, len, pos, routine_docs, table_docs, refs, emit_explain,
+                       data, len, pos, docs, refs, emit_explain,
                        paged_rom, banks);
         if (data_range && emit_data_range(out, data_range, data, len, base_addr, &pos, labels, label_count,
                                           extra_labels, extra_label_count, paged_rom, banks,
@@ -1595,8 +1597,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
 static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *labels,
                                const LabelSet *system_labels, const InlineSignatures *inline_sigs,
                                const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
-                               const TableDefs *tables, const ConfigDocs *routine_docs,
-                               const ConfigDocs *table_docs, const ConfigSymbols *symbols,
+                               const TableDefs *tables, const ConfigDocs *docs,
+                               const ConfigSymbols *symbols,
                                const DataRanges *data_ranges, const ReferenceSet *refs,
                                size_t rom_bank_base, int emit_explain, const ConfigTypes *types)
 {
@@ -1615,7 +1617,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
         emit_db_with_labels(out, data + 1, used - 1, APEX_PAGED_ORG + 1, labels->items,
                             labels->count, labels->sorted, system_labels->items,
                             system_labels->count, NULL, 0, inline_sigs, paged_rom, banks,
-                            bank_labels, tables, routine_docs, table_docs, symbols, data_ranges,
+                            bank_labels, tables, docs, symbols, data_ranges,
                             refs, bank_id, rom_bank_base + 1u, emit_explain, types);
     }
     if (used < APEX_BANK_SIZE) {
@@ -1704,7 +1706,7 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
                                 size_t vector_count, const InlineSignatures *inline_sigs,
                                 const LabelSet *labels, const uint8_t *paged_rom, size_t banks,
                                 const LabelSet *bank_labels, const TableDefs *tables,
-                                const ConfigDocs *routine_docs, const ConfigDocs *table_docs,
+                                const ConfigDocs *docs,
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
                                 size_t rom_system_base, int emit_explain, const ConfigTypes *types)
@@ -1719,7 +1721,7 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
     if (used > 0) {
         emit_db_with_labels(out, data, used, APEX_SYSTEM_ORG, labels->items, labels->count,
                             labels->sorted, NULL, 0, vectors, vector_count, inline_sigs,
-                            paged_rom, banks, bank_labels, tables, routine_docs, table_docs,
+                            paged_rom, banks, bank_labels, tables, docs,
                             symbols, data_ranges, refs, 0xff, rom_system_base, emit_explain,
                             types);
     }
@@ -2280,12 +2282,90 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
     }
 }
 
+static void emit_preamble(FILE *out, const ApexProject *project)
+{
+    ApexRomInfo info;
+    char timebuf[32];
+    time_t now = time(NULL);
+    struct tm *tm_info = localtime(&now);
+    int j;
+
+    apex_rominfo_compute(project->rom.data, project->rom.size, &info);
+    if (tm_info)
+        strftime(timebuf, sizeof(timebuf), "%Y-%m-%d %H:%M:%S", tm_info);
+    else
+        strcpy(timebuf, "unknown");
+
+    fputs("; ============================================================\n", out);
+    fputs("; ApexII Disassembly\n", out);
+    fputs("; ============================================================\n", out);
+
+    /* ROM path (basename only to keep it tidy) */
+    {
+        const char *path = project->rom_path ? project->rom_path : "(unknown)";
+        const char *base = path;
+        const char *p;
+        for (p = path; *p; p++)
+            if (*p == '/' || *p == '\\') base = p + 1;
+        fprintf(out, "; %-14s%s\n", "ROM:", base);
+    }
+
+    fprintf(out, "; %-14s%s\n", "Generated:", timebuf);
+
+    /* Size */
+    if (project->rom.size >= 1048576u)
+        fprintf(out, "; %-14s%zu bytes (%zu MB)\n",
+                "Size:", project->rom.size, project->rom.size / 1048576u);
+    else
+        fprintf(out, "; %-14s%zu bytes (%zu KB)\n",
+                "Size:", project->rom.size, project->rom.size / 1024u);
+
+    fputs(";\n", out);
+
+    /* OS + game version */
+    if (info.os_valid)
+        fprintf(out, "; %-14s%u.%u\n",
+                "OS Version:", (unsigned)info.os_major, (unsigned)info.os_minor);
+    else
+        fprintf(out, "; %-14sunknown\n", "OS Version:");
+
+    if (info.game_version[0])
+        fprintf(out, "; %-14s%s\n", "Game Version:", info.game_version);
+    else
+        fprintf(out, "; %-14snot found\n", "Game Version:");
+
+    fputs(";\n", out);
+
+    /* Checksum */
+    fprintf(out, "; %-14s0x%04X  %s  (delta 0x%04X)\n",
+            "Checksum:",
+            info.stored_csum,
+            info.computed_csum == info.stored_csum ? "VALID" : "INVALID",
+            info.stored_delta);
+
+    /* CRC-32 */
+    fprintf(out, "; %-14s%08X\n", "CRC-32:", info.crc32_val);
+
+    /* SHA-1 (40 hex chars) */
+    fprintf(out, "; %-14s", "SHA-1:");
+    for (j = 0; j < 20; j++) fprintf(out, "%02x", info.sha1[j]);
+    fputc('\n', out);
+
+    /* SHA-256 (64 hex chars — split at 32 for readability) */
+    fprintf(out, "; %-14s", "SHA-256:");
+    for (j = 0; j < 32; j++) fprintf(out, "%02x", info.sha256[j]);
+    fputc('\n', out);
+
+    fputs("; ============================================================\n", out);
+    fputc('\n', out);
+}
+
 int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
                                   int emit_explain)
 {
     size_t i;
 
-    fprintf(out, "; Generated by ApexII conservative disassembler\n");
+    emit_preamble(out, project);
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols);
     emit_type_equates(out, &project->config_types);
@@ -2297,7 +2377,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
         emit_paged_region(out, project->rom.data + i * APEX_BANK_SIZE, &project->bank_labels[i],
                           &project->system_labels, &project->inline_sigs, project->rom.data,
                           project->banks, project->bank_labels, &project->tables,
-                          &project->routine_docs, &project->table_docs, &project->symbols,
+                          &project->docs, &project->symbols,
                           &project->data_ranges, &project->refs, i * APEX_BANK_SIZE,
                           emit_explain, &project->config_types);
         fputc('\n', out);
@@ -2309,7 +2389,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                        sizeof(project->vectors) / sizeof(project->vectors[0]),
                        &project->inline_sigs, &project->system_labels, project->rom.data,
                        project->banks, project->bank_labels, &project->tables,
-                       &project->routine_docs, &project->table_docs, &project->symbols,
+                       &project->docs, &project->symbols,
                        &project->data_ranges, &project->refs, project->paged_size, emit_explain,
                        &project->config_types);
     if (emit_xrefs) {

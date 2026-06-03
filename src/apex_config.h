@@ -196,7 +196,7 @@ void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank,
 
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
-                 ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
+                 ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
                  ConfigEntries *ref_exclusions);
 void free_config_types(ConfigTypes *types);

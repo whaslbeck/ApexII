@@ -161,7 +161,7 @@ int main(int argc, char **argv)
         return 1;
     }
 
-    if (apex_project_set_doc(project, 0, 0, 0xffu, 0x8005u, "Helper doc") != 0) {
+    if (apex_project_set_doc(project, 0, 0xffu, 0x8005u, "Helper doc") != 0) {
         fprintf(stderr, "set_doc failed\n");
         apex_project_free(project);
         return 1;
@@ -187,13 +187,13 @@ int main(int argc, char **argv)
     fclose(saved);
     overlay_buf[overlay_len] = '\0';
     if (!contains(overlay_buf, "[labels]") || !contains(overlay_buf, "HelperRenamed") ||
-        !contains(overlay_buf, "[routine_docs]") || !contains(overlay_buf, "Helper doc")) {
+        !contains(overlay_buf, "[docs]") || !contains(overlay_buf, "Helper doc")) {
         fprintf(stderr, "saved overlay missing expected content\n");
         apex_project_free(project);
         return 1;
     }
 
-    if (apex_project_clear_doc(project, 0, 0, 0xffu, 0x8005u) != 0 ||
+    if (apex_project_clear_doc(project, 0, 0xffu, 0x8005u) != 0 ||
         apex_project_clear_label(project, 0, 0xffu, 0x8005u) != 0) {
         fprintf(stderr, "clear operation failed\n");
         apex_project_free(project);

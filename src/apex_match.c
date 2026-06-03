@@ -851,17 +851,17 @@ void apex_match_write_ini(FILE *out,
         if (printed_header) fprintf(out, "\n");
     }
 
-    /* ---- [routine_docs] — transfer docs for matched functions ---- */
+    /* ---- [docs] — transfer docs for matched functions ---- */
     {
         int printed_header = 0;
 
         for (i = 0; i < count; i++) {
             const ApexMatchResult *r = &results[i];
-            const char *doc = config_doc_at(&src->routine_docs, r->src_bank, r->src_addr);
+            const char *doc = config_doc_at(&src->docs, r->src_bank, r->src_addr);
             if (!doc) continue;
 
             if (!printed_header) {
-                fprintf(out, "[routine_docs]\n");
+                fprintf(out, "[docs]\n");
                 printed_header = 1;
             }
             if (r->dst_bank == 0xffu) {

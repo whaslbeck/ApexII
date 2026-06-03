@@ -366,6 +366,7 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Transitions",  NULL, &state.show_transitions);
                 ImGui::MenuItem("Flow Arrows",  NULL, &state.show_flow_arrows);
                 ImGui::Separator();
+                ImGui::MenuItem("ROM Info",             NULL, &state.show_rom_info);
                 ImGui::MenuItem("Match from Reference", NULL, &state.show_match_window);
                 ImGui::MenuItem("Call Graph",     NULL, &state.show_call_graph);
                 ImGui::MenuItem("Hardware",       NULL, &state.show_hardware);
@@ -426,6 +427,7 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Details",     dock_right_id);
             ImGui::DockBuilderDockWindow("DMD",         dock_right_id);
             ImGui::DockBuilderDockWindow("Edit",        dock_right_id);
+            ImGui::DockBuilderDockWindow("ROM Info",            dock_right_id);
             ImGui::DockBuilderDockWindow("Match from Reference", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Call Graph",     dock_bottom_id);
             ImGui::DockBuilderDockWindow("References",     dock_bottom_id);
@@ -678,6 +680,11 @@ int main(int argc, char **argv)
         if (state.show_types_editor) {
             ImGui::Begin("Types", &state.show_types_editor);
             render_types_editor(project, &state);
+            ImGui::End();
+        }
+        if (state.show_rom_info) {
+            ImGui::Begin("ROM Info", &state.show_rom_info);
+            render_rom_info(project, &state);
             ImGui::End();
         }
         if (state.show_match_window) {

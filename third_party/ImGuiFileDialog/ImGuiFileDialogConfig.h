@@ -9,8 +9,10 @@
 // uncomment if you need to use your FileSystem Interface
 // if commented, you have two defualt interface, std::filesystem or dirent
 // #define USE_CUSTOM_FILESYSTEM
-// this options need c++17
-// #define USE_STD_FILESYSTEM
+// Use std::filesystem (C++17) — avoids the bundled dirent dependency.
+// Required on Windows/MSYS2 where the bundled dirent is not present and
+// MinGW's dirent.h lacks d_type. All supported platforms have C++17.
+#define USE_STD_FILESYSTEM
 
 /////////////////////////////////
 //// MISC ///////////////////////

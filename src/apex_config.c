@@ -1034,7 +1034,7 @@ int config_remove_type(ConfigTypes *types, const char *name)
 
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
-                 ConfigDocs *routine_docs, ConfigDocs *table_docs, ConfigSymbols *symbols,
+                 ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
                  ConfigEntries *ref_exclusions)
 {
@@ -1046,8 +1046,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_entries = 0;
     int in_schemas = 0;
     int in_tables = 0;
-    int in_routine_docs = 0;
-    int in_table_docs = 0;
+    int in_docs = 0;
     int in_symbols = 0;
     int in_data = 0;
     int in_types = 0;
@@ -1105,8 +1104,10 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_entries = strcmp(s + 1, "entries") == 0;
             in_schemas = strcmp(s + 1, "schemas") == 0;
             in_tables = strcmp(s + 1, "tables") == 0;
-            in_routine_docs = strcmp(s + 1, "routine_docs") == 0;
-            in_table_docs = strcmp(s + 1, "table_docs") == 0;
+            /* [docs], [routine_docs], [table_docs] all map to the same set */
+            in_docs = strcmp(s + 1, "docs") == 0 ||
+                      strcmp(s + 1, "routine_docs") == 0 ||
+                      strcmp(s + 1, "table_docs") == 0;
             in_symbols = strcmp(s + 1, "symbols") == 0;
             in_data = strcmp(s + 1, "data") == 0;
             in_types = strcmp(s + 1, "types") == 0;
@@ -1123,8 +1124,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *value = dup_config_value(eq + 1);
             char *include_path = resolve_include_path(path, value);
 
-            load_config(include_path, sigs, labels, entries, tables, schemas, routine_docs,
-                        table_docs, symbols, data_ranges, options, types, ref_exclusions);
+            load_config(include_path, sigs, labels, entries, tables, schemas, docs,
+                        symbols, data_ranges, options, types, ref_exclusions);
             free(value);
             free(include_path);
             continue;
@@ -1203,7 +1204,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             }
             add_schema_def(schemas, key, schema);
             free(value);
-        } else if (in_routine_docs || in_table_docs) {
+        } else if (in_docs) {
             uint32_t addr;
             uint8_t bank = 0;
             int has_bank = 0;
@@ -1215,11 +1216,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             } else if (!parse_u32(key, &addr)) {
                 die("invalid doc config '%s = %s'", key, value);
             }
-            if (in_routine_docs) {
-                add_config_doc(routine_docs, has_bank, bank, addr, value);
-            } else {
-                add_config_doc(table_docs, has_bank, bank, addr, value);
-            }
+            add_config_doc(docs, has_bank, bank, addr, value);
             free(value);
         } else if (in_symbols) {
             uint32_t value;

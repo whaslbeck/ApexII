@@ -899,7 +899,7 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     for (size_t i = 0; i < p->tables.count; i++) {
         const TableDef *td = &p->tables.items[i];
         if (td->bank == b && td->addr == a) {
-            std::string spec = table_def_spec_string(td);
+            std::string spec = table_schema_to_string(&td->schema);
             spec_to_fields(spec.c_str(), s->edit_schema_fields, &s->edit_schema_count,
                            APEX_MAX_EDIT_FIELDS, p);
             s->edit_table_is_rows = td->has_header ? 0 : 1;
@@ -907,8 +907,6 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
             break;
         }
     }
-    s->edit_doc_mode = (d->lines[s->selected_line].block_kind == APEX_RENDER_BLOCK_TABLE)
-                       ? EDIT_DOC_TABLE : EDIT_DOC_ROUTINE;
     load_doc_editor_buffer(p, s, b, a);
     const char *m = strstr(d->lines[s->selected_line].text, "; data type=");
     if (m) {
@@ -1778,11 +1776,55 @@ int parse_target_address(const char *i, uint8_t *b, uint32_t *a)
     return 0;
 }
 
+/* Wildcard match: * = any sequence, ? = any single char, case-insensitive.
+   Matches pattern against the entire string (not substring). */
+static int wildcard_match_ci(const char *pat, const char *text)
+{
+    const char *star = NULL;
+    const char *mark = text;
+    while (*text) {
+        if (*pat == '*') {
+            star = pat++; mark = text;
+        } else if (*pat == '?' || tolower((unsigned char)*pat) == tolower((unsigned char)*text)) {
+            pat++; text++;
+        } else if (star) {
+            pat = star + 1; text = ++mark;
+        } else {
+            return 0;
+        }
+    }
+    while (*pat == '*') pat++;
+    return !*pat;
+}
+
+/* Returns true if the line text contains a substring matching pat
+   (wildcards: * = any chars, ? = any single char, case-insensitive). */
+static int line_matches_wildcard(const ApexRenderedLine *l, const char *pat)
+{
+    /* Build null-terminated line text */
+    char buf[512];
+    size_t len = l->length < sizeof(buf) - 1 ? l->length : sizeof(buf) - 1;
+    memcpy(buf, l->text, len);
+    buf[len] = '\0';
+
+    /* Wrap pattern with implicit * on each side for substring semantics */
+    char wrapped[512];
+    snprintf(wrapped, sizeof(wrapped), "*%s*", pat);
+    return wildcard_match_ci(wrapped, buf);
+}
+
 int line_matches_filter(const ApexRenderedLine *l, const char *f)
 {
     if (!f || !*f) {
         return 1;
     }
+
+    /* Wildcard mode when pattern contains * or ? */
+    if (strchr(f, '*') || strchr(f, '?')) {
+        return line_matches_wildcard(l, f);
+    }
+
+    /* Plain substring match (case-insensitive) */
     size_t fl = strlen(f);
     if (l->length < fl) {
         return 0;
@@ -1799,6 +1841,73 @@ int line_matches_filter(const ApexRenderedLine *l, const char *f)
         }
     }
     return 0;
+}
+
+/* Sequence search: split query on literal \n, match each part against
+   consecutive instruction lines (skipping labels/blanks between them).
+   Pushes the line index of the first instruction in each match into results. */
+static void run_sequence_search(const ApexRenderedDocument *d,
+                                 const char *const parts[], int nparts,
+                                 std::vector<size_t> &results)
+{
+    for (size_t i = 0; i < d->line_count; i++) {
+        if (d->lines[i].kind != APEX_RENDER_LINE_INSTRUCTION) continue;
+
+        size_t cur = i;
+        int p;
+        for (p = 0; p < nparts; p++) {
+            /* advance to next instruction line (skip labels/blanks) */
+            while (cur < d->line_count &&
+                   d->lines[cur].kind != APEX_RENDER_LINE_INSTRUCTION)
+                cur++;
+            if (cur >= d->line_count) break;
+            if (!line_matches_filter(&d->lines[cur], parts[p])) break;
+            cur++;
+        }
+        if (p == nparts)
+            results.push_back(i);
+    }
+}
+
+/* Top-level search: handles plain, wildcard, and multi-line (\n-separated)
+   patterns.  Clears and fills results. */
+void run_global_search(const ApexRenderedDocument *d,
+                       const char *query,
+                       std::vector<size_t> &results)
+{
+    results.clear();
+    if (!query || !*query) return;
+
+    /* Split on literal \n (backslash + n) */
+    /* Max 5 parts for sequence search */
+    const int MAX_PARTS = 5;
+    char parts_buf[MAX_PARTS][128];
+    const char *parts[MAX_PARTS];
+    int nparts = 0;
+
+    const char *p = query;
+    while (*p && nparts < MAX_PARTS) {
+        const char *next = strstr(p, "\\n");
+        size_t len = next ? (size_t)(next - p) : strlen(p);
+        if (len >= sizeof(parts_buf[0])) len = sizeof(parts_buf[0]) - 1;
+        memcpy(parts_buf[nparts], p, len);
+        parts_buf[nparts][len] = '\0';
+        parts[nparts] = parts_buf[nparts];
+        nparts++;
+        if (!next) break;
+        p = next + 2;
+    }
+
+    if (nparts <= 1) {
+        /* Single-line: search all line types */
+        for (size_t i = 0; i < d->line_count; i++) {
+            if (line_matches_filter(&d->lines[i], query))
+                results.push_back(i);
+        }
+    } else {
+        /* Multi-line: instruction-only sequence search */
+        run_sequence_search(d, parts, nparts, results);
+    }
 }
 
 const char *block_name(ApexRenderedBlockKind k)
@@ -1944,8 +2053,7 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
 
 void load_doc_editor_buffer(const ApexProject *p, UiState *s, uint8_t b, uint32_t a)
 {
-    const char *d = (s->edit_doc_mode == EDIT_DOC_TABLE) ? config_doc_at(&p->table_docs, b, a)
-                                                          : config_doc_at(&p->routine_docs, b, a);
+    const char *d = config_doc_at(&p->docs, b, a);
     s->edit_doc_input[0] = '\0';
     if (d) {
         snprintf(s->edit_doc_input, 1024, "%s", d);
@@ -1976,17 +2084,11 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                             p->tables.items[i].addr,
                             table_def_spec_string(&p->tables.items[i])});
     }
-    for (size_t i = 0; i < p->routine_docs.count; i++) {
-        s.routine_docs.push_back({p->routine_docs.items[i].has_bank,
-                                  p->routine_docs.items[i].bank,
-                                  p->routine_docs.items[i].addr,
-                                  p->routine_docs.items[i].text});
-    }
-    for (size_t i = 0; i < p->table_docs.count; i++) {
-        s.table_docs.push_back({p->table_docs.items[i].has_bank,
-                                p->table_docs.items[i].bank,
-                                p->table_docs.items[i].addr,
-                                p->table_docs.items[i].text});
+    for (size_t i = 0; i < p->docs.count; i++) {
+        s.docs.push_back({p->docs.items[i].has_bank,
+                          p->docs.items[i].bank,
+                          p->docs.items[i].addr,
+                          p->docs.items[i].text});
     }
     for (size_t i = 0; i < p->inline_sigs.count; i++) {
         s.inline_sigs.push_back({p->inline_sigs.items[i].has_bank,
@@ -2026,7 +2128,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigEntries entries = {};
     TableDefs tables = {};
     SchemaDefs schemas = {};
-    ConfigDocs routine_docs = {}, table_docs = {};
+    ConfigDocs docs = {};
     ConfigSymbols symbols = {};
     DataRanges data_ranges = {};
     ConfigOptions options = {};
@@ -2034,7 +2136,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigTypes types = {};
     ConfigEntries ref_exclusions = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
-                &routine_docs, &table_docs, &symbols, &data_ranges, &options, &types,
+                &docs, &symbols, &data_ranges, &options, &types,
                 &ref_exclusions);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
@@ -2057,17 +2159,11 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
                             tables.items[i].addr,
                             table_def_spec_string(&tables.items[i])});
     }
-    for (size_t i = 0; i < routine_docs.count; i++) {
-        s.routine_docs.push_back({routine_docs.items[i].has_bank,
-                                  routine_docs.items[i].bank,
-                                  routine_docs.items[i].addr,
-                                  routine_docs.items[i].text});
-    }
-    for (size_t i = 0; i < table_docs.count; i++) {
-        s.table_docs.push_back({table_docs.items[i].has_bank,
-                                table_docs.items[i].bank,
-                                table_docs.items[i].addr,
-                                table_docs.items[i].text});
+    for (size_t i = 0; i < docs.count; i++) {
+        s.docs.push_back({docs.items[i].has_bank,
+                          docs.items[i].bank,
+                          docs.items[i].addr,
+                          docs.items[i].text});
     }
     for (size_t i = 0; i < sigs.count; i++) {
         s.inline_sigs.push_back({sigs.items[i].has_bank,
@@ -2103,7 +2199,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotEntry> cexcl;
     std::vector<SnapshotData> cd;
     std::vector<SnapshotTable> ct;
-    std::vector<SnapshotDoc> crd, ctd;
+    std::vector<SnapshotDoc> cdocs;
     std::vector<SnapshotInline> ci;
     std::vector<SnapshotType> ctype;
 
@@ -2157,26 +2253,15 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             ct.push_back({p->tables.items[i].bank, p->tables.items[i].addr, spec});
         }
     }
-    for (size_t i = 0; i < p->routine_docs.count; i++) {
-        const auto *o = find_snapshot_doc(s->routine_docs, p->routine_docs.items[i].has_bank,
-                                          p->routine_docs.items[i].bank,
-                                          p->routine_docs.items[i].addr);
-        if (!o || o->text != p->routine_docs.items[i].text) {
-            crd.push_back({p->routine_docs.items[i].has_bank,
-                           p->routine_docs.items[i].bank,
-                           p->routine_docs.items[i].addr,
-                           p->routine_docs.items[i].text});
-        }
-    }
-    for (size_t i = 0; i < p->table_docs.count; i++) {
-        const auto *o = find_snapshot_doc(s->table_docs, p->table_docs.items[i].has_bank,
-                                          p->table_docs.items[i].bank,
-                                          p->table_docs.items[i].addr);
-        if (!o || o->text != p->table_docs.items[i].text) {
-            ctd.push_back({p->table_docs.items[i].has_bank,
-                           p->table_docs.items[i].bank,
-                           p->table_docs.items[i].addr,
-                           p->table_docs.items[i].text});
+    for (size_t i = 0; i < p->docs.count; i++) {
+        const auto *o = find_snapshot_doc(s->docs, p->docs.items[i].has_bank,
+                                          p->docs.items[i].bank,
+                                          p->docs.items[i].addr);
+        if (!o || o->text != p->docs.items[i].text) {
+            cdocs.push_back({p->docs.items[i].has_bank,
+                             p->docs.items[i].bank,
+                             p->docs.items[i].addr,
+                             p->docs.items[i].text});
         }
     }
 
@@ -2362,18 +2447,9 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             fputc('\n', o);
         }
     }
-    if (!crd.empty()) {
-        fputs("\n[routine_docs]\n", o);
-        for (auto &i : crd) {
-            write_config_address(o, i.has_bank, i.bank, i.addr);
-            fputs(" = ", o);
-            write_escaped_value(o, i.text.c_str());
-            fputc('\n', o);
-        }
-    }
-    if (!ctd.empty()) {
-        fputs("\n[table_docs]\n", o);
-        for (auto &i : ctd) {
+    if (!cdocs.empty()) {
+        fputs("\n[docs]\n", o);
+        for (auto &i : cdocs) {
             write_config_address(o, i.has_bank, i.bank, i.addr);
             fputs(" = ", o);
             write_escaped_value(o, i.text.c_str());
@@ -2476,25 +2552,14 @@ int write_full_config(const ApexProject *p, const char *path, std::string *st)
             fprintf(o, " = %s\n", table_def_spec_string(&p->tables.items[i]).c_str());
         }
     }
-    if (p->routine_docs.count > 0) {
-        fputs("\n[routine_docs]\n", o);
-        for (size_t i = 0; i < p->routine_docs.count; i++) {
-            write_config_address(o, p->routine_docs.items[i].has_bank,
-                                 p->routine_docs.items[i].bank,
-                                 p->routine_docs.items[i].addr);
+    if (p->docs.count > 0) {
+        fputs("\n[docs]\n", o);
+        for (size_t i = 0; i < p->docs.count; i++) {
+            write_config_address(o, p->docs.items[i].has_bank,
+                                 p->docs.items[i].bank,
+                                 p->docs.items[i].addr);
             fputs(" = ", o);
-            write_escaped_value(o, p->routine_docs.items[i].text);
-            fputc('\n', o);
-        }
-    }
-    if (p->table_docs.count > 0) {
-        fputs("\n[table_docs]\n", o);
-        for (size_t i = 0; i < p->table_docs.count; i++) {
-            write_config_address(o, p->table_docs.items[i].has_bank,
-                                 p->table_docs.items[i].bank,
-                                 p->table_docs.items[i].addr);
-            fputs(" = ", o);
-            write_escaped_value(o, p->table_docs.items[i].text);
+            write_escaped_value(o, p->docs.items[i].text);
             fputc('\n', o);
         }
     }

@@ -44,8 +44,7 @@ typedef struct {
     ConfigEntries    entries;
     TableDefs        tables;
     SchemaDefs       schemas;
-    ConfigDocs       rdocs;
-    ConfigDocs       tdocs;
+    ConfigDocs       docs;
     ConfigSymbols    syms;
     DataRanges       data;
     ConfigOptions    opts;
@@ -61,7 +60,7 @@ static int cfg_load(Cfg *c, const char *path)
     failed = setjmp(s_jmp);
     if (!failed) {
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
-                    &c->schemas, &c->rdocs, &c->tdocs, &c->syms, &c->data,
+                    &c->schemas, &c->docs, &c->syms, &c->data,
                     &c->opts, &c->types, &c->ref_exclusions);
     }
     s_catching = 0;
@@ -92,13 +91,9 @@ static void cfg_free(Cfg *c)
     }
     free(c->schemas.items);
 
-    for (i = 0; i < c->rdocs.count; i++)
-        free(c->rdocs.items[i].text);
-    free(c->rdocs.items);
-
-    for (i = 0; i < c->tdocs.count; i++)
-        free(c->tdocs.items[i].text);
-    free(c->tdocs.items);
+    for (i = 0; i < c->docs.count; i++)
+        free(c->docs.items[i].text);
+    free(c->docs.items);
 
     for (i = 0; i < c->syms.count; i++)
         free((char *)c->syms.items[i].name);
@@ -323,8 +318,7 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
     if (c->sigs.count)    qsort(c->sigs.items,     c->sigs.count,    sizeof(c->sigs.items[0]),    cmp_sig);
     if (c->data.count)    qsort(c->data.items,     c->data.count,    sizeof(c->data.items[0]),    cmp_data);
     if (c->tables.count)  qsort(c->tables.items,   c->tables.count,  sizeof(c->tables.items[0]),  cmp_table);
-    if (c->rdocs.count)   qsort(c->rdocs.items,    c->rdocs.count,   sizeof(c->rdocs.items[0]),   cmp_doc);
-    if (c->tdocs.count)   qsort(c->tdocs.items,    c->tdocs.count,   sizeof(c->tdocs.items[0]),   cmp_doc);
+    if (c->docs.count)    qsort(c->docs.items,     c->docs.count,    sizeof(c->docs.items[0]),    cmp_doc);
     if (c->ref_exclusions.count)
         qsort(c->ref_exclusions.items, c->ref_exclusions.count,
               sizeof(c->ref_exclusions.items[0]), cmp_entry);
@@ -410,24 +404,13 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
         }
     }
 
-    if (c->rdocs.count) {
-        fputs("\n[routine_docs]\n", f);
-        for (i = 0; i < c->rdocs.count; i++) {
-            addr_fn(f, c->rdocs.items[i].has_bank, c->rdocs.items[i].bank,
-                    c->rdocs.items[i].addr);
+    if (c->docs.count) {
+        fputs("\n[docs]\n", f);
+        for (i = 0; i < c->docs.count; i++) {
+            addr_fn(f, c->docs.items[i].has_bank, c->docs.items[i].bank,
+                    c->docs.items[i].addr);
             fputs(" = ", f);
-            w_escaped(f, c->rdocs.items[i].text);
-            fputc('\n', f);
-        }
-    }
-
-    if (c->tdocs.count) {
-        fputs("\n[table_docs]\n", f);
-        for (i = 0; i < c->tdocs.count; i++) {
-            addr_fn(f, c->tdocs.items[i].has_bank, c->tdocs.items[i].bank,
-                    c->tdocs.items[i].addr);
-            fputs(" = ", f);
-            w_escaped(f, c->tdocs.items[i].text);
+            w_escaped(f, c->docs.items[i].text);
             fputc('\n', f);
         }
     }
@@ -769,10 +752,8 @@ static int cmd_normalize(int argc, char **argv)
         if (!c.entries.items[i].has_bank) { c.entries.items[i].has_bank = 1; c.entries.items[i].bank = 0xff; }
     for (i = 0; i < c.sigs.count; i++)
         if (!c.sigs.items[i].has_bank) { c.sigs.items[i].has_bank = 1; c.sigs.items[i].bank = 0xff; }
-    for (i = 0; i < c.rdocs.count; i++)
-        if (!c.rdocs.items[i].has_bank) { c.rdocs.items[i].has_bank = 1; c.rdocs.items[i].bank = 0xff; }
-    for (i = 0; i < c.tdocs.count; i++)
-        if (!c.tdocs.items[i].has_bank) { c.tdocs.items[i].has_bank = 1; c.tdocs.items[i].bank = 0xff; }
+    for (i = 0; i < c.docs.count; i++)
+        if (!c.docs.items[i].has_bank) { c.docs.items[i].has_bank = 1; c.docs.items[i].bank = 0xff; }
     for (i = 0; i < c.ref_exclusions.count; i++)
         if (!c.ref_exclusions.items[i].has_bank) { c.ref_exclusions.items[i].has_bank = 1; c.ref_exclusions.items[i].bank = 0xff; }
 
@@ -1327,6 +1308,79 @@ static int cmd_check_bounds(int argc, char **argv)
     return issues > 0 ? 1 : 0;
 }
 
+/* ── migrate ─────────────────────────────────────────────────────────────── */
+/*
+ * apexini migrate <file.ini> [<file.ini> ...]
+ *
+ * Rewrites each file in-place, replacing [routine_docs] and [table_docs]
+ * sections with a single [docs] section.  The rest of the file is unchanged.
+ * A .bak backup is written before overwriting.
+ */
+static int cmd_migrate(int argc, char **argv)
+{
+    int i;
+    int total_errors = 0;
+
+    if (argc < 1) {
+        fputs("usage: apexini migrate <file.ini> ...\n", stderr);
+        return 2;
+    }
+
+    for (i = 0; i < argc; i++) {
+        const char *path = argv[i];
+        Cfg c;
+        memset(&c, 0, sizeof(c));
+        FILE *f;
+        char bak[1040];
+
+        if (cfg_load(&c, path)) {
+            fprintf(stderr, "%s: error: %s\n", path, s_err);
+            total_errors++;
+            cfg_free(&c);
+            continue;
+        }
+
+        /* Write backup */
+        snprintf(bak, sizeof(bak), "%s.bak", path);
+        {
+            FILE *src = fopen(path, "rb");
+            FILE *dst = src ? fopen(bak, "wb") : NULL;
+            if (src && dst) {
+                char buf[4096];
+                size_t n;
+                while ((n = fread(buf, 1, sizeof(buf), src)) > 0)
+                    fwrite(buf, 1, n, dst);
+            }
+            if (src) fclose(src);
+            if (dst) fclose(dst);
+            if (!src || !dst) {
+                fprintf(stderr, "%s: warning: could not write backup to %s\n", path, bak);
+            }
+        }
+
+        /* Re-emit with [docs] */
+        f = fopen(path, "w");
+        if (!f) {
+            perror(path);
+            cfg_free(&c);
+            total_errors++;
+            continue;
+        }
+        write_cfg_ex(f, &c, w_addr_norm);
+        fclose(f);
+
+        {
+            size_t ndocs = c.docs.count;
+            cfg_free(&c);
+            if (ndocs > 0)
+                printf("migrated %s  (%zu doc entries → [docs])\n", path, ndocs);
+            else
+                printf("migrated %s  (no doc entries)\n", path);
+        }
+    }
+    return total_errors > 0 ? 1 : 0;
+}
+
 /* ── main ───────────────────────────────────────────────────────────────── */
 
 int main(int argc, char **argv)
@@ -1334,7 +1388,7 @@ int main(int argc, char **argv)
     apex_die_hook = catch_die;
 
     if (argc < 2) {
-        fputs("usage: apexini <check|overlaps|merge|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
+        fputs("usage: apexini <check|overlaps|merge|migrate|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
         return 2;
     }
     if (strcmp(argv[1], "check") == 0)
@@ -1343,6 +1397,8 @@ int main(int argc, char **argv)
         return cmd_overlaps(argc - 2, argv + 2);
     if (strcmp(argv[1], "merge") == 0)
         return cmd_merge(argc - 2, argv + 2);
+    if (strcmp(argv[1], "migrate") == 0)
+        return cmd_migrate(argc - 2, argv + 2);
     if (strcmp(argv[1], "normalize") == 0)
         return cmd_normalize(argc - 2, argv + 2);
     if (strcmp(argv[1], "find-redundant") == 0)
@@ -1357,6 +1413,6 @@ int main(int argc, char **argv)
         return cmd_check_bounds(argc - 2, argv + 2);
 
     fprintf(stderr, "apexini: unknown command '%s'\n", argv[1]);
-    fputs("usage: apexini <check|overlaps|merge|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
+    fputs("usage: apexini <check|overlaps|merge|migrate|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
     return 2;
 }

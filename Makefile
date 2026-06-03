@@ -46,9 +46,9 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexmeta $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
 
-apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch
+apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexmeta
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -80,7 +80,7 @@ $(BUILD_DIR)/imgui_impl_%.o: third_party/imgui/backends/imgui_impl_%.cpp | $(BUI
 	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/ImGuiFileDialog.o: third_party/ImGuiFileDialog/ImGuiFileDialog.cpp | $(BUILD_DIR)
-	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
+	$(CXX) $(APEXIMGUI_CPPFLAGS) $(filter-out -std=%,$(CXXFLAGS)) -std=c++17 -c $< -o $@
 
 $(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_DIR)/apex_project.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
@@ -110,6 +110,9 @@ $(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(COMMON_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexmatch: $(APEXMATCH_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/apexmeta: $(BUILD_DIR)/apexmeta.o
 	$(CC) $(LDFLAGS) $^ -o $@
 
 test: all

@@ -36,8 +36,7 @@ typedef struct ApexProject {
     ConfigEntries config_entries;
     TableDefs tables;
     SchemaDefs schemas;
-    ConfigDocs routine_docs;
-    ConfigDocs table_docs;
+    ConfigDocs docs;
     ConfigSymbols symbols;
     DataRanges data_ranges;
     ConfigOptions options;
@@ -62,9 +61,9 @@ void apex_project_invalidate(ApexProject *project, unsigned dirty_flags);
 int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
                            const char *name);
 int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
-int apex_project_set_doc(ApexProject *project, int is_table_doc, int has_bank, uint8_t bank,
+int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
                          uint32_t addr, const char *text);
-int apex_project_clear_doc(ApexProject *project, int is_table_doc, int has_bank, uint8_t bank,
+int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
                            uint32_t addr);
 int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
                           ApexConfigKind kind, const char *spec);

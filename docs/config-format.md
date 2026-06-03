@@ -1,6 +1,6 @@
 # ApexII Config File Format
 
-Config files are INI-like text files passed to `apexdis`, `apexgui`, and `apeximgui`. They annotate a ROM with labels, entry points, table layouts, inline signatures, data ranges, and documentation.
+Config files are INI-like text files passed to `apexdis` and `apeximgui`. They annotate a ROM with labels, entry points, table layouts, inline signatures, data ranges, and documentation.
 
 ## General Syntax
 
@@ -240,20 +240,26 @@ DMD_FRAMEBUFFER  = 0x3800
 
 Symbol names follow the same naming rules as labels.
 
-### `[routine_docs]` and `[table_docs]`
+### `[docs]`
 
-Attaches a documentation string to a routine or table. The string is emitted as a `; doc …` comment in the disassembly.
+Attaches a documentation string to any address — code, table, or data. The string is emitted as a `; doc …` comment in the disassembly.
 
 ```ini
-[routine_docs]
+[docs]
 0x8990 = "WPC far-call helper\; consumes a 3-byte far-code pointer."
 0x82d1 = Short inline byte selects behavior mode.
-
-[table_docs]
 Bff_A8001 = Headerless far-code dispatcher table.
+B3c_A4001 = Classic WPC counted string pointer table.
 ```
 
 Values may be unquoted (everything after `=` up to the end-of-line comment) or quoted. Inside quotes: `\;`, `\#`, `\\`, `\"`, and `\n` are recognized.
+
+**Backwards compatibility:** The legacy section names `[routine_docs]` and `[table_docs]` are still accepted and merged into `[docs]` on load. New files and all write paths (GUI overlay, `apexini merge`) always use `[docs]`. To migrate existing files in-place:
+
+```sh
+apexini migrate myconfig.ini          # rewrites in-place, writes .bak backup
+apexini migrate base.ini overlay.ini  # migrate multiple files at once
+```
 
 ### `[types]`
 

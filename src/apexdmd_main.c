@@ -120,8 +120,7 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
     ConfigEntries entries = {0};
     TableDefs tables = {0};
     SchemaDefs schemas = {0};
-    ConfigDocs routine_docs = {0};
-    ConfigDocs table_docs = {0};
+    ConfigDocs docs = {0};
     ConfigSymbols symbols = {0};
     DataRanges data_ranges = {0};
     ConfigOptions options = {0};
@@ -142,8 +141,8 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
     {
         ConfigTypes types = {0};
 
-        load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &routine_docs,
-                    &table_docs, &symbols, &data_ranges, &options, &types, NULL);
+        load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &docs,
+                    &symbols, &data_ranges, &options, &types, NULL);
         free_config_types(&types);
     }
     table = find_table(&tables, table_bank, table_addr);

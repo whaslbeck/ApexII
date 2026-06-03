@@ -12,7 +12,9 @@ ApexII is a specialized toolset designed for the high-performance reverse engine
     *   **Hex Inspector**: Multi-format inspection (Hex, Dec, Bin, ASCII) with ROM-to-CPU address mapping.
     *   **DMD Preview**: Real-time decoding and scrubbing of DMD full-frame images.
     *   **Match from Reference**: GUI front-end for `apexmatch` — accept hundreds of OS labels from a reference ROM with a single click, review medium-confidence matches individually.
+    *   **ROM Info**: OS version, game version string, checksum status, and CRC-32/SHA-1/SHA-256 hashes at a glance.
 *   **ROM-to-ROM Label Transfer (apexmatch)**: Fingerprint-based matching propagates labels, inline signatures, and docs from an annotated ROM to any other WPC ROM — including cross-game OS layer transfer (~250–300 matches out of the box).
+*   **ROM Metadata (apexmeta)**: Inspect and fix WPC ROM checksums; display OS version, game version, and file hashes (CRC-32, SHA-1, SHA-256).
 *   **Modular Architecture**: Extensible design allowing for deep integration of game-specific logic.
 
 ---
@@ -105,6 +107,7 @@ When started without arguments (and no saved session), a file picker appears to 
 - **Inline Sigs / Code Entries** — bulk-edit inline signatures and code entry points
 - **Symbols** — named RAM/hardware address definitions
 - **ROM Map** — visual block overview across all banks
+- **ROM Info** — OS version, game version string, checksum status, CRC-32/SHA-1/SHA-256 hashes (read-only; computed lazily on first open)
 - **Match from Reference** — GUI front-end for `apexmatch` (see below)
 
 **Keyboard shortcuts:**
@@ -179,6 +182,13 @@ overlap:  [inline] B3d_A7840 (byte, 4 bytes, ends 0x7843) into [data] B3d_A7842 
 apexini merge combined.ini base.ini overlay.apexgui.ini
 ```
 
+**`migrate`** — rewrites config files in-place, replacing the legacy `[routine_docs]` and `[table_docs]` sections with a single `[docs]` section. A `.bak` backup is written before overwriting:
+
+```bash
+apexini migrate myconfig.ini
+# migrated myconfig.ini  (12 doc entries → [docs])
+```
+
 ### `apexmatch` (ROM-to-ROM Label Transfer)
 
 Transfers labels, inline signatures, and routine documentation from a well-annotated source ROM to a different target ROM by fingerprint matching — no manual re-analysis needed.
@@ -221,9 +231,52 @@ Each named code label is fingerprinted using three independent FNV-32 hashes:
 
 Confidence levels: **exact** (L1 + L2, 90%) / **high** (L1 + callees, 75%) / **medium** (L1 only, 55%).
 
-**Output** is a valid `.ini` overlay with `[labels]`, `[inline]` signatures, and `[routine_docs]` transferred from the source. Validate with `apexini check` before use.
+**Output** is a valid `.ini` overlay with `[labels]`, `[inline]` signatures, and `[docs]` transferred from the source. Validate with `apexini check` before use.
 
 **Cross-game WPC OS transfer:** WPC games share the same operating system in the system bank (0x8000–0xffff). After annotating one game's OS layer, `apexmatch` propagates ~250–300 labels (e.g. `JSR_Far`, `DisplayEffect_Start`, `LampLogical_SetInline`) and their inline signatures to any other WPC ROM automatically.
+
+### `apexmeta` (ROM Metadata)
+
+Displays metadata for a WPC ROM and can fix or disable the hardware checksum check.
+
+**Usage:**
+```bash
+apexmeta <rom-file> [options]
+```
+
+**Example output:**
+```text
+ROM:           roms/addam_h4.rom
+Size:          524288 bytes (512 KB)
+
+OS Version:    3.21
+Game Version:  REV. H-4  (offset 0x4CDC2)
+
+Checksum:
+  Stored:      0xFB06  (CPU 0xFFEE / file +0x7FFEE)
+  Computed:    0xFB06
+  Status:      VALID
+  Delta:       0x3404  (CPU 0xFFEC / file +0x7FFEC)
+
+Hashes:
+  CRC-32:      D0BBD679
+  SHA-1:       ebd8c4981dd68a4f8e2dea90144486cb3cbd6b84
+  SHA-256:     571b53155d62ae9ed8f8b357ae33cecb1cbc72b642aca3a67b06118a786e73b9
+```
+
+**Options:**
+
+| Option | Description |
+|---|---|
+| `--fix -o out.rom` | Recompute a valid (checksum, delta) pair and write modified ROM |
+| `--disable -o out.rom` | Set delta to `0x00FF` — WPC hardware skips checksum check |
+| `--verify` | Exit 0 if checksum valid, 1 if invalid (no output; for scripting) |
+
+**Checksum algorithm:** the 16-bit sum of all ROM bytes mod 65536 must equal the stored value at CPU `0xFFEE`. A companion fixup word at `0xFFEC` participates in the sum and is adjusted by `--fix` to satisfy the equation. Setting the fixup to `0x00FF` disables the hardware check entirely (a feature of original WPC ROMs).
+
+**OS Version** is read from the two bytes immediately before the reset routine, located via the 6809 reset vector at `0xFFFE`. **Game Version** is found by scanning for the pattern `REV. [A-Z]-[0-9]+`.
+
+No external dependencies — CRC-32, SHA-1, and SHA-256 are implemented in a single header (`src/apex_rominfo.h`), also used by the GUI ROM Info panel.
 
 ---
 
@@ -250,6 +303,7 @@ Build products:
 - `build/apextab`
 - `build/apexini`
 - `build/apexmatch`
+- `build/apexmeta`
 
 ### Dependencies
 
@@ -622,19 +676,18 @@ _ASIC_ROM_PAGE = 0x3ffc
 DMD_FRAMEBUFFER_3800 = 0x3800
 ```
 
-### `[routine_docs]` And `[table_docs]`
+### `[docs]`
 
-Adds docs to routine/table comment blocks.
+Attaches a documentation string to any address — code, table, or data. The string is emitted as a `; doc …` comment in the disassembly.
 
 ```ini
-[routine_docs]
+[docs]
 0x8990 = "WPC far-call helper\; consumes a far-code pointer.\nUse \# for literal hash."
-
-[table_docs]
 Bff_A8001 = Headerless dispatcher table containing far-code routine entry pointers.
+B3c_A4001 = Classic WPC counted string pointer table.
 ```
 
-Multi-line docs should be quoted and use `\n`.
+Multi-line docs should be quoted and use `\n`. The legacy section names `[routine_docs]` and `[table_docs]` are still accepted on load for backwards compatibility — use `apexini migrate` to convert them.
 
 ## Cross References And Explain Output
 
@@ -685,7 +738,7 @@ B20_A40d5 = far_code
 [entries]
 B20_A40d5 = code
 
-[routine_docs]
+[docs]
 B20_A40d5 = "Roundtrip GUI routine doc"
 ```
 
@@ -696,8 +749,7 @@ Current GUI overlay sections:
 - `[entries]`
 - `[data]`
 - `[tables]`
-- `[routine_docs]`
-- `[table_docs]`
+- `[docs]`
 
 ## Diagnostics And Validation
 
