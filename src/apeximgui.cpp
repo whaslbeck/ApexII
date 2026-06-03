@@ -234,6 +234,10 @@ int main(int argc, char **argv)
     state.show_types_editor     = false;
     state.show_symbols_editor   = false;
     state.sym_selected          = -1;
+    state.sym_usages_sel        = -1;
+    state.sym_usages_doc        = nullptr;
+    state.disasm_vis_doc        = nullptr;
+    state.disasm_vis_filter[0]  = '\0';
     state.show_ref_exclusions    = false;
     state.show_code_candidates    = false;
     state.code_candidates         = {};

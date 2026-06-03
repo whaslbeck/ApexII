@@ -151,6 +151,11 @@ struct UiState {
     char goto_input[64];
     char filter_input[128];
     char label_filter_input[128];
+    /* Cached visible-line index for the disassembly table.
+       Rebuilt only when the document pointer or filter string changes. */
+    std::vector<size_t> disasm_visible_cache;
+    const ApexRenderedDocument *disasm_vis_doc;
+    char disasm_vis_filter[128];
     char edit_label_input[128];
     char edit_doc_input[1024];
     char save_path_input[512];
@@ -234,6 +239,9 @@ struct UiState {
     char sym_edit_name[64];
     char sym_edit_value[16];
     int  sym_selected;       /* index into project->symbols, -1 = none */
+    int  sym_usages_sel;
+    const ApexRenderedDocument *sym_usages_doc;
+    std::vector<size_t> sym_usages_cache;
     bool show_rom_map;
     bool show_dmd_list;
     bool show_sprite_list;

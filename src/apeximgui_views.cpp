@@ -347,17 +347,31 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                        UiState *state)
 {
     const ApexRenderedDocument *document = *document_ptr;
-    std::vector<size_t> visible;
     int selected_visible_row = -1;
     ensure_label_index(document, state);
-    visible.reserve(document->line_count);
-    for (size_t i = 0; i < document->line_count; i++) {
-        if (line_matches_filter(&document->lines[i], state->filter_input)) {
-            if (state->selected_line == i) {
-                selected_visible_row = (int)visible.size();
-            }
-            visible.push_back(i);
+
+    /* Rebuild the visible-line cache only when doc or filter changes. */
+    if (state->disasm_vis_doc != document ||
+        strncmp(state->disasm_vis_filter, state->filter_input,
+                sizeof(state->disasm_vis_filter)) != 0) {
+        state->disasm_visible_cache.clear();
+        state->disasm_visible_cache.reserve(document->line_count);
+        for (size_t i = 0; i < document->line_count; i++) {
+            if (line_matches_filter(&document->lines[i], state->filter_input))
+                state->disasm_visible_cache.push_back(i);
         }
+        state->disasm_vis_doc = document;
+        strncpy(state->disasm_vis_filter, state->filter_input,
+                sizeof(state->disasm_vis_filter) - 1);
+        state->disasm_vis_filter[sizeof(state->disasm_vis_filter) - 1] = '\0';
+    }
+    const std::vector<size_t> &visible = state->disasm_visible_cache;
+
+    /* Find selected row in the (now cached) visible list. */
+    {
+        auto it = std::lower_bound(visible.begin(), visible.end(), state->selected_line);
+        if (it != visible.end() && *it == state->selected_line)
+            selected_visible_row = (int)(it - visible.begin());
     }
     /* Flow-arrow gutter constants */
     static constexpr int   FA_MAX_LANES  = 5;
@@ -2652,18 +2666,23 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
         ImGui::EndTable();
     }
 
-    /* ---- Usages of selected symbol ---- */
+    /* ---- Usages of selected symbol (cached — recompute only on selection/doc change) ---- */
     if (s->sym_selected >= 0 && (size_t)s->sym_selected < p->symbols.count && document) {
-        const char *selname = p->symbols.items[s->sym_selected].name;
+        if (s->sym_usages_sel != s->sym_selected || s->sym_usages_doc != document) {
+            const char *selname = p->symbols.items[s->sym_selected].name;
+            s->sym_usages_cache = find_symbol_usages(document, selname);
+            s->sym_usages_sel   = s->sym_selected;
+            s->sym_usages_doc   = document;
+        }
+        const auto &usages = s->sym_usages_cache;
         ImGui::SeparatorText("Usages in disassembly");
-        auto usages = find_symbol_usages(document, selname);
         if (usages.empty()) {
             ImGui::TextDisabled("none found");
         } else {
             float list_h = std::min((float)usages.size() * ImGui::GetFrameHeightWithSpacing() + 4.0f,
                                     120.0f);
             ImGui::BeginChild("sym_usages", ImVec2(0, list_h), false);
-            for (size_t i = 0; i < usages.size(); i++) {
+            for (size_t i = 0; i < usages.size() && usages[i] < document->line_count; i++) {
                 const ApexRenderedLine *l = &document->lines[usages[i]];
                 char lbuf[160];
                 snprintf(lbuf, sizeof(lbuf), "B%02x_A%04x  %.*s",

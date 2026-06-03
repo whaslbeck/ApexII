@@ -502,11 +502,18 @@ int label_entry_matches_filter(const LabelIndexEntry &e, const char *f)
 std::string label_at_address(const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a)
 {
     ensure_label_index(d, s);
-    for (auto &e : s->cached_labels) {
-        if (e.bank == b && e.cpu_addr == a) {
-            return e.name;
-        }
+    /* Binary search — cached_labels is sorted by (bank, cpu_addr). */
+    const auto &cl = s->cached_labels;
+    size_t lo = 0, hi = cl.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        if (cl[mid].bank < b || (cl[mid].bank == b && cl[mid].cpu_addr < a))
+            lo = mid + 1;
+        else
+            hi = mid;
     }
+    if (lo < cl.size() && cl[lo].bank == b && cl[lo].cpu_addr == a)
+        return cl[lo].name;
     return "";
 }
 
@@ -629,12 +636,17 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
                                          UiState *s, uint8_t b, uint32_t a)
 {
     std::vector<RefEntry> rs;
-    for (size_t i = 0; i < p->refs.count; i++) {
+    /* Use binary search when sorted (always true after analysis). */
+    size_t start = p->refs.sorted ? refs_lower_bound(&p->refs, b, a) : 0;
+    for (size_t i = start; i < p->refs.count; i++) {
         const auto &r = p->refs.items[i];
-        size_t li;
-        if (r.bank != b || r.addr != a) {
+        if (p->refs.sorted && (r.bank != b || r.addr != a)) {
+            break; /* refs are sorted by (bank, addr) — past the range */
+        }
+        if (!p->refs.sorted && (r.bank != b || r.addr != a)) {
             continue;
         }
+        size_t li;
         if (apex_render_find_line_by_address(d, r.source_bank, r.source_addr, &li)) {
             rs.push_back({li, r.source_bank, r.source_addr,
                           label_at_address(d, s, r.source_bank, r.source_addr),
