@@ -901,13 +901,14 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
                             const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
-                            const ConfigTypes *types);
+                            const ConfigTypes *types, const ConfigDocs *docs);
 
 static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
                                uint32_t base_addr, size_t *pos, uint8_t bank, const Label *labels,
                                size_t label_count, const Label *extra_labels,
                                size_t extra_label_count, const uint8_t *paged_rom, size_t banks,
-                               const LabelSet *bank_labels, const ConfigTypes *types)
+                               const LabelSet *bank_labels, const ConfigTypes *types,
+                               const ConfigDocs *docs)
 {
     uint16_t count;
     uint8_t row_width;
@@ -922,7 +923,7 @@ static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *
     *pos += 3u;
     emit_table_rows(out, table, data, len, base_addr, pos, bank, count, row_width, labels,
                     label_count, extra_labels, extra_label_count, paged_rom, banks, bank_labels,
-                    types);
+                    types, docs);
 }
 
 static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint8_t bank,
@@ -1083,7 +1084,7 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
                             const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
-                            const ConfigTypes *types)
+                            const ConfigTypes *types, const ConfigDocs *docs)
 {
     size_t row;
 
@@ -1113,6 +1114,7 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
         }
 
         fprintf(out, "; [row %lu]\n", (unsigned long)row);
+        emit_doc_comment(out, config_doc_at(docs, current_bank, base_addr + (uint32_t)row_start));
 
         for (i = 0; i < table->schema.count; i++) {
             size_t n;
@@ -1508,12 +1510,12 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             if (table->has_header) {
                 emit_counted_table(out, table, data, len, base_addr, &pos, current_bank, labels,
                                    label_count, extra_labels, extra_label_count, paged_rom, banks,
-                                   bank_labels, types);
+                                   bank_labels, types, docs);
             } else {
                 emit_table_rows(out, table, data, len, base_addr, &pos, current_bank, table->rows,
                                 table_schema_width(&table->schema), labels, label_count,
                                 extra_labels, extra_label_count, paged_rom, banks, bank_labels,
-                                types);
+                                types, docs);
             }
             decoding_code = 0;
             previous_kind = BLOCK_TABLE;
@@ -1546,7 +1548,19 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                             base_addr + (uint32_t)pos, rom_base + pos);
                     current_kind = BLOCK_UNCLASSIFIED;
                 } else {
-                    fprintf(out, "    %s\n", inst);
+                    /* Append doc as end-of-line comment when no code label at this
+                       address (label-address docs are already in the label header). */
+                    const char *idoc = has_code_label ? NULL
+                        : config_doc_at(docs, current_bank, base_addr + (uint32_t)pos);
+                    if (idoc) {
+                        const char *nl = strchr(idoc, '\n');
+                        if (nl)
+                            fprintf(out, "    %-40s ; %.*s\n", inst, (int)(nl - idoc), idoc);
+                        else
+                            fprintf(out, "    %-40s ; %s\n", inst, idoc);
+                    } else {
+                        fprintf(out, "    %s\n", inst);
+                    }
                     pos += info.size;
                     if (info.has_target) {
                         inline_sig = inline_signature_for(inline_sigs, current_bank, info.target);

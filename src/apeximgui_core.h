@@ -151,12 +151,6 @@ struct UiState {
     char goto_input[64];
     char filter_input[128];
     char label_filter_input[128];
-    /* Cached visible-line index for the disassembly table.
-       Rebuilt only when the document pointer or filter string changes. */
-    std::vector<size_t> disasm_visible_cache;
-    const ApexRenderedDocument *disasm_vis_doc;
-    const ApexRenderedLine     *disasm_vis_lines; /* tracks document->lines for re-render detection */
-    char disasm_vis_filter[128];
     char edit_label_input[128];
     char edit_doc_input[1024];
     char save_path_input[512];

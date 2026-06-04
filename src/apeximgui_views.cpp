@@ -48,36 +48,50 @@ static void render_text_chunk(const char *start, const char *end, const ImVec4 *
 static void render_line_text(const ApexRenderedDocument *document, UiState *state,
                              const ApexRenderedLine *line)
 {
-    static const ImVec4 label_color  = ImVec4(0.95f, 0.82f, 0.45f, 1.0f);
-    static const ImVec4 target_color = ImVec4(0.45f, 0.80f, 0.95f, 1.0f);
+    static const ImVec4 label_color   = ImVec4(0.95f, 0.82f, 0.45f, 1.0f);
+    static const ImVec4 target_color  = ImVec4(0.45f, 0.80f, 0.95f, 1.0f);
+    static const ImVec4 comment_color = ImVec4(0.55f, 0.75f, 0.55f, 1.0f);
     if (line->kind == APEX_RENDER_LINE_LABEL) {
         render_text_chunk(line->text, line->text + line->length, &label_color);
         return;
     }
-    auto targets = find_line_targets(document, state, line);
-    if (targets.empty()) {
-        render_text_chunk(line->text, line->text + line->length, NULL);
+    if (line->kind == APEX_RENDER_LINE_COMMENT ||
+        line->kind == APEX_RENDER_LINE_LOCATION) {
+        render_text_chunk(line->text, line->text + line->length, &comment_color);
         return;
     }
+    /* For instruction lines, find an inline '; comment' suffix and colour it. */
+    const char *comment_start = NULL;
+    if (line->kind == APEX_RENDER_LINE_INSTRUCTION) {
+        for (int ci = 0; ci < (int)line->length; ci++) {
+            if (line->text[ci] == ';') {
+                comment_start = line->text + ci;
+                break;
+            }
+        }
+    }
+    const char *line_end = line->text + (comment_start ? (size_t)(comment_start - line->text) : line->length);
+    auto targets = find_line_targets(document, state, line);
     const char *cursor = line->text;
     for (auto &target : targets) {
         const char *m_start = line->text + target.match_pos;
         const char *m_end   = m_start + target.name.size();
-        if (m_start < cursor) {
-            continue;
-        }
+        if (m_start >= line_end) break;
+        if (m_start < cursor) continue;
         if (cursor < m_start) {
             render_text_chunk(cursor, m_start, NULL);
             ImGui::SameLine(0, 0);
         }
         render_text_chunk(m_start, m_end, &target_color);
         cursor = m_end;
-        if (cursor < line->text + line->length) {
-            ImGui::SameLine(0, 0);
-        }
+        if (cursor < line_end) ImGui::SameLine(0, 0);
     }
-    if (cursor < line->text + line->length) {
-        render_text_chunk(cursor, line->text + line->length, NULL);
+    if (cursor < line_end) {
+        render_text_chunk(cursor, line_end, NULL);
+    }
+    if (comment_start) {
+        ImGui::SameLine(0, 0);
+        render_text_chunk(comment_start, line->text + line->length, &comment_color);
     }
 }
 
@@ -350,32 +364,14 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
     int selected_visible_row = -1;
     ensure_label_index(document, state);
 
-    /* Rebuild the visible-line cache when doc struct, lines buffer, or filter changes.
-       document pointer is stable (render_cache never moves), but document->lines is
-       freed+reallocated on every re-render, so we track it separately. */
-    if (state->disasm_vis_doc != document ||
-        state->disasm_vis_lines != document->lines ||
-        strncmp(state->disasm_vis_filter, state->filter_input,
-                sizeof(state->disasm_vis_filter)) != 0) {
-        state->disasm_visible_cache.clear();
-        state->disasm_visible_cache.reserve(document->line_count);
-        for (size_t i = 0; i < document->line_count; i++) {
-            if (line_matches_filter(&document->lines[i], state->filter_input))
-                state->disasm_visible_cache.push_back(i);
+    std::vector<size_t> visible;
+    visible.reserve(document->line_count);
+    for (size_t i = 0; i < document->line_count; i++) {
+        if (line_matches_filter(&document->lines[i], state->filter_input)) {
+            if (state->selected_line == i)
+                selected_visible_row = (int)visible.size();
+            visible.push_back(i);
         }
-        state->disasm_vis_doc   = document;
-        state->disasm_vis_lines = document->lines;
-        strncpy(state->disasm_vis_filter, state->filter_input,
-                sizeof(state->disasm_vis_filter) - 1);
-        state->disasm_vis_filter[sizeof(state->disasm_vis_filter) - 1] = '\0';
-    }
-    const std::vector<size_t> &visible = state->disasm_visible_cache;
-
-    /* Find selected row in the (now cached) visible list. */
-    {
-        auto it = std::lower_bound(visible.begin(), visible.end(), state->selected_line);
-        if (it != visible.end() && *it == state->selected_line)
-            selected_visible_row = (int)(it - visible.begin());
     }
     /* Flow-arrow gutter constants */
     static constexpr int   FA_MAX_LANES  = 5;
@@ -454,9 +450,11 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     ImVec2 rmax = ImGui::GetItemRectMax();
                     fa_row_y[(size_t)row] = (rmin.y + rmax.y) * 0.5f;
                 }
-                /* Collect branch target for flow arrows */
+                /* Collect branch target for flow arrows (code blocks only) */
                 if (state->show_flow_arrows &&
-                    line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location &&
+                    line->kind == APEX_RENDER_LINE_INSTRUCTION &&
+                    line->block_kind == APEX_RENDER_BLOCK_CODE &&
+                    line->has_location &&
                     line->rom_addr < project->rom.size) {
                     const uint8_t *rb = project->rom.data + line->rom_addr;
                     size_t         rl = project->rom.size  - line->rom_addr;
@@ -524,10 +522,6 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     ImGui::TextUnformatted(block_name(line->block_kind));
                 }
                 ImGui::TableSetColumnIndex(3);
-                if (line->transition_kind != APEX_RENDER_TRANSITION_NONE) {
-                    ImGui::TextDisabled("%s", transition_name(line->transition_kind));
-                    ImGui::SameLine();
-                }
                 ImGui::BeginGroup();
                 render_line_text(document, state, line);
                 {
@@ -643,6 +637,17 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             ImGui::Text("%s", h->desc);
                             ImGui::Text("Flags: %s", h->flags);
                             ImGui::Text("Cycles: %s", h->cycles);
+                        }
+                        /* Doc comment for this instruction address */
+                        if (line->has_location) {
+                            const char *idoc = config_doc_at(
+                                &project->docs, line->bank, line->cpu_addr);
+                            if (idoc && *idoc) {
+                                ImGui::Separator();
+                                ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+                                ImGui::TextUnformatted(idoc);
+                                ImGui::PopTextWrapPos();
+                            }
                         }
                     }
                     if (bm) {
