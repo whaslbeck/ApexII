@@ -350,8 +350,11 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
     int selected_visible_row = -1;
     ensure_label_index(document, state);
 
-    /* Rebuild the visible-line cache only when doc or filter changes. */
+    /* Rebuild the visible-line cache when doc struct, lines buffer, or filter changes.
+       document pointer is stable (render_cache never moves), but document->lines is
+       freed+reallocated on every re-render, so we track it separately. */
     if (state->disasm_vis_doc != document ||
+        state->disasm_vis_lines != document->lines ||
         strncmp(state->disasm_vis_filter, state->filter_input,
                 sizeof(state->disasm_vis_filter)) != 0) {
         state->disasm_visible_cache.clear();
@@ -360,7 +363,8 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
             if (line_matches_filter(&document->lines[i], state->filter_input))
                 state->disasm_visible_cache.push_back(i);
         }
-        state->disasm_vis_doc = document;
+        state->disasm_vis_doc   = document;
+        state->disasm_vis_lines = document->lines;
         strncpy(state->disasm_vis_filter, state->filter_input,
                 sizeof(state->disasm_vis_filter) - 1);
         state->disasm_vis_filter[sizeof(state->disasm_vis_filter) - 1] = '\0';

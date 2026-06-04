@@ -155,6 +155,7 @@ struct UiState {
        Rebuilt only when the document pointer or filter string changes. */
     std::vector<size_t> disasm_visible_cache;
     const ApexRenderedDocument *disasm_vis_doc;
+    const ApexRenderedLine     *disasm_vis_lines; /* tracks document->lines for re-render detection */
     char disasm_vis_filter[128];
     char edit_label_input[128];
     char edit_doc_input[1024];
