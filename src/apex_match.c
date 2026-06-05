@@ -779,15 +779,9 @@ void apex_match_write_ini(FILE *out,
     fprintf(out, "[labels]\n");
     for (i = 0; i < count; i++) {
         const ApexMatchResult *r = &results[i];
-        if (r->dst_bank == 0xffu) {
-            fprintf(out, "0x%04x = %s ; matched confidence=%s src=B%02x_A%04x\n",
-                    r->dst_addr, r->label_name, conf_label(r->confidence),
-                    r->src_bank, r->src_addr);
-        } else {
-            fprintf(out, "B%02x_A%04x = %s ; matched confidence=%s src=B%02x_A%04x\n",
-                    r->dst_bank, r->dst_addr, r->label_name, conf_label(r->confidence),
-                    r->src_bank, r->src_addr);
-        }
+        fprintf(out, "B%02x_A%04x = %s ; matched confidence=%s src=B%02x_A%04x\n",
+                r->dst_bank, r->dst_addr, r->label_name, conf_label(r->confidence),
+                r->src_bank, r->src_addr);
     }
     fprintf(out, "\n");
 
@@ -795,11 +789,7 @@ void apex_match_write_ini(FILE *out,
     fprintf(out, "[entries]\n");
     for (i = 0; i < count; i++) {
         const ApexMatchResult *r = &results[i];
-        if (r->dst_bank == 0xffu) {
-            fprintf(out, "0x%04x = code\n", r->dst_addr);
-        } else {
-            fprintf(out, "B%02x_A%04x = code\n", r->dst_bank, r->dst_addr);
-        }
+        fprintf(out, "B%02x_A%04x = code\n", r->dst_bank, r->dst_addr);
     }
     fprintf(out, "\n");
 
@@ -822,11 +812,7 @@ void apex_match_write_ini(FILE *out,
             /* Rebuild the spec string from the signature schema */
             {
                 size_t f;
-                if (r->dst_bank == 0xffu) {
-                    fprintf(out, "0x%04x = ", r->dst_addr);
-                } else {
-                    fprintf(out, "B%02x_A%04x = ", r->dst_bank, r->dst_addr);
-                }
+                fprintf(out, "B%02x_A%04x = ", r->dst_bank, r->dst_addr);
                 for (f = 0; f < sig->schema.count; f++) {
                     const TableField *tf = &sig->schema.items[f];
                     size_t n;
@@ -864,11 +850,7 @@ void apex_match_write_ini(FILE *out,
                 fprintf(out, "[docs]\n");
                 printed_header = 1;
             }
-            if (r->dst_bank == 0xffu) {
-                fprintf(out, "0x%04x = \"%s\"\n", r->dst_addr, doc);
-            } else {
-                fprintf(out, "B%02x_A%04x = \"%s\"\n", r->dst_bank, r->dst_addr, doc);
-            }
+            fprintf(out, "B%02x_A%04x = \"%s\"\n", r->dst_bank, r->dst_addr, doc);
         }
     }
 }
