@@ -1517,7 +1517,125 @@ const ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_x
     return project->render_cache;
 }
 
-int apex_project_save_overlay(const ApexProject *project, const char *path, const char *include_path)
+/* ---- deterministic config ordering (mirrors apexini's sorted output) ---- */
+
+/* Effective-bank address compare: a no-bank item sorts as the system bank. */
+static int cfg_addr_cmp(int ha, uint8_t ba, uint32_t aa, int hb, uint8_t bb, uint32_t ab)
+{
+    uint8_t ea = ha ? ba : 0xffu;
+    uint8_t eb = hb ? bb : 0xffu;
+    if (ea != eb) return (int)(unsigned)ea - (int)(unsigned)eb;
+    if (aa != ab) return aa < ab ? -1 : 1;
+    return 0;
+}
+
+static int cfg_cmp_label(const void *a, const void *b)
+{
+    const ConfigLabel *x = (const ConfigLabel *)a, *y = (const ConfigLabel *)b;
+    return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
+}
+
+static int cfg_cmp_entry(const void *a, const void *b)
+{
+    const ConfigEntry *x = (const ConfigEntry *)a, *y = (const ConfigEntry *)b;
+    return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
+}
+
+static int cfg_cmp_doc(const void *a, const void *b)
+{
+    const ConfigDoc *x = (const ConfigDoc *)a, *y = (const ConfigDoc *)b;
+    return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
+}
+
+static int cfg_cmp_sig(const void *a, const void *b)
+{
+    const InlineSignature *x = (const InlineSignature *)a, *y = (const InlineSignature *)b;
+    return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
+}
+
+static int cfg_cmp_type(const void *a, const void *b)
+{
+    return strcmp(((const ConfigType *)a)->name, ((const ConfigType *)b)->name);
+}
+
+static int cfg_cmp_typeval(const void *a, const void *b)
+{
+    uint32_t va = ((const ConfigTypeValue *)a)->value;
+    uint32_t vb = ((const ConfigTypeValue *)b)->value;
+    if (va != vb) return va < vb ? -1 : 1;
+    return 0;
+}
+
+static int cfg_cmp_sym(const void *a, const void *b)
+{
+    return strcmp(((const ConfigSymbol *)a)->name, ((const ConfigSymbol *)b)->name);
+}
+
+static int cfg_cmp_schema(const void *a, const void *b)
+{
+    return strcmp(((const SchemaDef *)a)->name, ((const SchemaDef *)b)->name);
+}
+
+/*
+ * Sort every config section into the same deterministic order apexini emits:
+ * address-keyed sections by (effective bank, address), name-keyed sections by
+ * name, and enum values by value.  Reorders the project's owned arrays in place
+ * (order is not semantically significant; lookups are by key, not index).
+ * inline/data/table sections reuse the analysis comparators so their order stays
+ * compatible with the binary-search lookups built on them.
+ */
+void apex_project_sort_config(ApexProject *project)
+{
+    size_t i;
+
+    if (!project) {
+        return;
+    }
+    if (project->config_types.count) {
+        qsort(project->config_types.items, project->config_types.count,
+              sizeof(project->config_types.items[0]), cfg_cmp_type);
+        for (i = 0; i < project->config_types.count; i++) {
+            ConfigType *t = &project->config_types.items[i];
+            if (t->value_count > 1) {
+                qsort(t->values, t->value_count, sizeof(t->values[0]), cfg_cmp_typeval);
+            }
+        }
+    }
+    if (project->schemas.count > 1) {
+        qsort(project->schemas.items, project->schemas.count,
+              sizeof(project->schemas.items[0]), cfg_cmp_schema);
+    }
+    if (project->symbols.count > 1) {
+        qsort(project->symbols.items, project->symbols.count,
+              sizeof(project->symbols.items[0]), cfg_cmp_sym);
+    }
+    if (project->config_labels.count > 1) {
+        qsort(project->config_labels.items, project->config_labels.count,
+              sizeof(project->config_labels.items[0]), cfg_cmp_label);
+    }
+    if (project->config_entries.count > 1) {
+        qsort(project->config_entries.items, project->config_entries.count,
+              sizeof(project->config_entries.items[0]), cfg_cmp_entry);
+    }
+    if (project->docs.count > 1) {
+        qsort(project->docs.items, project->docs.count,
+              sizeof(project->docs.items[0]), cfg_cmp_doc);
+    }
+    if (project->ref_exclusions.count > 1) {
+        qsort(project->ref_exclusions.items, project->ref_exclusions.count,
+              sizeof(project->ref_exclusions.items[0]), cfg_cmp_entry);
+    }
+    /* inline by (bank, addr) to match apexini; the lookup is order-independent.
+       data/table sections are already (bank, addr)-sorted by these helpers. */
+    if (project->inline_sigs.count > 1) {
+        qsort(project->inline_sigs.items, project->inline_sigs.count,
+              sizeof(project->inline_sigs.items[0]), cfg_cmp_sig);
+    }
+    sort_data_ranges(&project->data_ranges);
+    sort_table_defs(&project->tables);
+}
+
+int apex_project_save_overlay(ApexProject *project, const char *path, const char *include_path)
 {
     FILE *out;
     const char *inc;
@@ -1525,6 +1643,7 @@ int apex_project_save_overlay(const ApexProject *project, const char *path, cons
     if (!project || !path || !*path) {
         return 1;
     }
+    apex_project_sort_config(project);
     out = fopen(path, "w");
     if (!out) {
         return 1;

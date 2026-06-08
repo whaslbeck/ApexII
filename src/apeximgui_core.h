@@ -485,7 +485,7 @@ std::vector<const HardwareRegister*> find_hardware_in_text(const char *text, siz
 OriginalSnapshot build_original_snapshot(const ApexProject *project);
 OriginalSnapshot build_config_snapshot(const char *config_path);
 int write_delta_overlay(const ApexProject *project, const OriginalSnapshot *snapshot, const char *path, const char *include_path, std::string *status);
-int write_full_config(const ApexProject *project, const char *path, std::string *status);
+int write_full_config(ApexProject *project, const char *path, std::string *status);
 
 // Session
 void clear_session();

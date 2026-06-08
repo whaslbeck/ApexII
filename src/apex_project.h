@@ -79,7 +79,9 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                                   int emit_explain);
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
                            int emit_explain);
-int apex_project_save_overlay(const ApexProject *project, const char *path, const char *include_path);
+int apex_project_save_overlay(ApexProject *project, const char *path, const char *include_path);
+/* Sort all config sections into apexini's deterministic order (in place). */
+void apex_project_sort_config(ApexProject *project);
 int apex_project_set_type(ApexProject *project, const char *name, int is_word,
                           const char *values_str);
 int apex_project_remove_type(ApexProject *project, const char *name);

@@ -295,30 +295,23 @@ const char *make_generated_label(uint32_t addr)
 const InlineSignature *inline_signature_for(const InlineSignatures *sigs, uint8_t bank,
                                             uint32_t addr)
 {
-    size_t lo = 0, hi = sigs->count;
     const InlineSignature *unbanked = NULL;
     uint8_t callee_bank = (addr >= APEX_SYSTEM_ORG) ? 0xffu : bank;
+    size_t i;
 
-    while (lo < hi) {
-        size_t mid = lo + (hi - lo) / 2;
-
-        if (sigs->items[mid].addr < addr) {
-            lo = mid + 1;
-        } else if (sigs->items[mid].addr > addr) {
-            hi = mid;
-        } else {
-            lo = mid;
-            break;
+    /* Linear scan: the signature set is small (≈ tens) and this stays correct
+       regardless of how the array is ordered (callers may sort it by addr or by
+       (bank, addr) for output), so it has no sort-order dependency. */
+    for (i = 0; i < sigs->count; i++) {
+        if (sigs->items[i].addr != addr) {
+            continue;
         }
-    }
-    while (lo < sigs->count && sigs->items[lo].addr == addr) {
-        if (sigs->items[lo].has_bank && sigs->items[lo].bank == callee_bank) {
-            return &sigs->items[lo];
+        if (sigs->items[i].has_bank && sigs->items[i].bank == callee_bank) {
+            return &sigs->items[i];
         }
-        if (!sigs->items[lo].has_bank) {
-            unbanked = &sigs->items[lo];
+        if (!sigs->items[i].has_bank) {
+            unbanked = &sigs->items[i];
         }
-        lo++;
     }
     return unbanked;
 }

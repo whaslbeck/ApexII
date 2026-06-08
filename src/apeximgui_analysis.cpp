@@ -2486,8 +2486,9 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     return 1;
 }
 
-int write_full_config(const ApexProject *p, const char *path, std::string *st)
+int write_full_config(ApexProject *p, const char *path, std::string *st)
 {
+    apex_project_sort_config(p);
     FILE *o = fopen(path, "w");
     if (!o) {
         *st = "open failed";
