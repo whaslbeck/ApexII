@@ -151,6 +151,7 @@ struct UiState {
     char goto_input[64];
     char filter_input[128];
     char label_filter_input[128];
+    char strings_filter_input[128];
     char edit_label_input[128];
     char edit_doc_input[1024];
     char save_path_input[512];
@@ -218,6 +219,7 @@ struct UiState {
     MatchWindowState match_state;
     bool show_inline_list;
     bool show_entries_list;
+    bool show_strings_list;
     bool show_types_editor;
     bool show_pattern_search;
     char pattern_search_input[128];
@@ -530,7 +532,8 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
 
 // Analysis: Inline list, Entries list & Types editor
 void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
-void render_entries_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+void render_entries_list(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_strings_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_types_editor(ApexProject *project, UiState *state);
 void render_symbols_editor(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 

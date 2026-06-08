@@ -231,6 +231,7 @@ int main(int argc, char **argv)
     state.match_state.min_confidence = APEX_MATCH_CONF_MEDIUM;
     state.show_inline_list      = false;
     state.show_entries_list     = false;
+    state.show_strings_list     = false;
     state.show_types_editor     = false;
     state.show_symbols_editor   = false;
     state.sym_selected          = -1;
@@ -375,6 +376,7 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Tables",         NULL, &state.show_tables);
                 ImGui::MenuItem("Inline Sigs",    NULL, &state.show_inline_list);
                 ImGui::MenuItem("Code Entries",   NULL, &state.show_entries_list);
+                ImGui::MenuItem("Strings",        NULL, &state.show_strings_list);
                 ImGui::MenuItem("Symbols",        NULL, &state.show_symbols_editor);
                 ImGui::MenuItem("Types",          NULL, &state.show_types_editor);
                 ImGui::MenuItem("Pattern Search", NULL, &state.show_pattern_search);
@@ -438,6 +440,7 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Hex",            dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Sigs",    dock_bottom_id);
             ImGui::DockBuilderDockWindow("Code Entries",   dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Strings",        dock_bottom_id);
             ImGui::DockBuilderDockWindow("Symbols",        dock_bottom_id);
             ImGui::DockBuilderDockWindow("Types",          dock_bottom_id);
             ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
@@ -701,7 +704,12 @@ int main(int argc, char **argv)
         }
         if (state.show_entries_list) {
             ImGui::Begin("Code Entries", &state.show_entries_list);
-            render_entries_list(project, document, &state);
+            render_entries_list(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_strings_list) {
+            ImGui::Begin("Strings", &state.show_strings_list);
+            render_strings_list(project, document, &state);
             ImGui::End();
         }
         if (state.show_pattern_search) {

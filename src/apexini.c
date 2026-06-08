@@ -1,12 +1,7 @@
 /* apexini — INI config utilities for ApexII projects.
  *
- * Subcommands:
- *   check          <file.ini> ...        syntax-check one or more config files
- *   overlaps       <file.ini>            report address conflicts and range overlaps
- *   merge          <out.ini> <file.ini>... merge multiple configs into one sorted file
- *   normalize      <file.ini> [<out.ini>] rewrite with Bxx_Ayyyy address format
- *   find-redundant <rom> <file.ini>      list [entries] reachable without explicit entry
- *   strip-redundant <rom> <file.ini>     remove redundant [entries] in-place
+ * Run `apexini help` for the full list of subcommands and their arguments
+ * (see print_help() near main()).
  */
 #include "apex.h"
 #include "apex_config.h"
@@ -301,6 +296,15 @@ static int cmp_doc(const void *a, const void *b)
                     db->has_bank, db->bank, db->addr);
 }
 
+static int cmp_type_value(const void *a, const void *b)
+{
+    const ConfigTypeValue *va = (const ConfigTypeValue *)a;
+    const ConfigTypeValue *vb = (const ConfigTypeValue *)b;
+    if (va->value != vb->value)
+        return va->value < vb->value ? -1 : 1;
+    return 0;
+}
+
 /* ── write a complete config ────────────────────────────────────────────── */
 
 /* addr_fn: either w_addr (preserve format) or w_addr_norm (always Bxx_Ayyyy) */
@@ -330,6 +334,8 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
         fputs("\n[types]\n", f);
         for (i = 0; i < c->types.count; i++) {
             const ConfigType *t = &c->types.items[i];
+            if (t->value_count)
+                qsort(t->values, t->value_count, sizeof(t->values[0]), cmp_type_value);
             fprintf(f, "%s:%s =\n", t->name, t->kind == TABLE_BYTE ? "byte" : "word");
             for (j = 0; j < t->value_count; j++) {
                 fprintf(f, "\t0x%02x:%s\n", t->values[j].value, t->values[j].name);
@@ -1383,13 +1389,45 @@ static int cmd_migrate(int argc, char **argv)
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
+static void print_help(FILE *out)
+{
+    fputs(
+"apexini — INI config utilities for ApexII projects\n"
+"\n"
+"Usage: apexini <command> [args]\n"
+"\n"
+"Commands:\n"
+"  check <file.ini>...              Syntax-check configs; non-zero exit on any error.\n"
+"  overlaps <file.ini>             Report address conflicts and overlapping data/table ranges.\n"
+"  merge <out.ini> <in.ini>...     Merge configs into one sorted file; reports conflicts.\n"
+"  migrate <file.ini>...           Upgrade old syntax to the current format in place\n"
+"                                  (writes a .bak backup first).\n"
+"  normalize <file.ini> [out.ini]  Rewrite canonically: fixed section order, sorted entries,\n"
+"                                  sorted enum values, Bxx_Ayyyy addresses. In place if\n"
+"                                  out.ini is omitted.\n"
+"  find-redundant <rom> <file.ini> List [entries] already reached by code flow (removable).\n"
+"  strip-redundant <rom> <file.ini> Remove those redundant [entries] in place.\n"
+"  coverage <rom> <file.ini>       Report ROM classification coverage (code/data/unknown/...).\n"
+"  orphan-labels <rom> <file.ini>  List [labels] whose address is absent from the disassembly.\n"
+"  check-bounds <rom> <file.ini>   Verify data/table ranges stay within bank/ROM bounds.\n"
+"  help                            Show this help.\n"
+"\n"
+"Addresses: Bxx_Ayyyy (xx = bank in hex, yyyy = CPU address) or 0xyyyy for the system bank.\n",
+        out);
+}
+
 int main(int argc, char **argv)
 {
     apex_die_hook = catch_die;
 
     if (argc < 2) {
-        fputs("usage: apexini <check|overlaps|merge|migrate|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
+        print_help(stderr);
         return 2;
+    }
+    if (strcmp(argv[1], "help") == 0 || strcmp(argv[1], "-h") == 0 ||
+        strcmp(argv[1], "--help") == 0) {
+        print_help(stdout);
+        return 0;
     }
     if (strcmp(argv[1], "check") == 0)
         return cmd_check(argc - 2, argv + 2);
@@ -1412,7 +1450,7 @@ int main(int argc, char **argv)
     if (strcmp(argv[1], "check-bounds") == 0)
         return cmd_check_bounds(argc - 2, argv + 2);
 
-    fprintf(stderr, "apexini: unknown command '%s'\n", argv[1]);
-    fputs("usage: apexini <check|overlaps|merge|migrate|normalize|find-redundant|strip-redundant|coverage|orphan-labels|check-bounds> ...\n", stderr);
+    fprintf(stderr, "apexini: unknown command '%s'\n\n", argv[1]);
+    print_help(stderr);
     return 2;
 }

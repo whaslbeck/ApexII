@@ -487,13 +487,17 @@ static void parse_string(AsmState *st, char *args)
             p++;
             if (*p == '"' || *p == '\\') {
                 ch = (unsigned char)*p++;
+            } else if (*p == 'n') {
+                ch = 0x0au; p++;
+            } else if (*p == 'a') {
+                ch = 0x07u; p++;
             } else {
                 die("invalid STRING escape");
             }
         } else {
             ch = (unsigned char)*p++;
         }
-        if (ch < 0x20u || ch > 0x7fu) {
+        if (ch != 0x0au && ch != 0x07u && (ch < 0x20u || ch > 0x7fu)) {
             die("STRING byte out of supported ASCII range");
         }
         emit_byte(st, ch);
@@ -523,13 +527,17 @@ static void parse_string_fixed(AsmState *st, char *args)
             p++;
             if (*p == '"' || *p == '\\') {
                 ch = (unsigned char)*p++;
+            } else if (*p == 'n') {
+                ch = 0x0au; p++;
+            } else if (*p == 'a') {
+                ch = 0x07u; p++;
             } else {
                 die("invalid STRING_FIXED escape");
             }
         } else {
             ch = (unsigned char)*p++;
         }
-        if (ch < 0x20u || ch > 0x7fu) {
+        if (ch != 0x0au && ch != 0x07u && (ch < 0x20u || ch > 0x7fu)) {
             die("STRING_FIXED byte out of supported ASCII range");
         }
         emit_byte(st, ch);
@@ -563,13 +571,17 @@ static void parse_string_lp(AsmState *st, char *args)
             p++;
             if (*p == '"' || *p == '\\') {
                 ch = (unsigned char)*p++;
+            } else if (*p == 'n') {
+                ch = 0x0au; p++;
+            } else if (*p == 'a') {
+                ch = 0x07u; p++;
             } else {
                 die("invalid STRING_LP escape");
             }
         } else {
             ch = (unsigned char)*p++;
         }
-        if (ch < 0x20u || ch > 0x7fu) {
+        if (ch != 0x0au && ch != 0x07u && (ch < 0x20u || ch > 0x7fu)) {
             die("STRING_LP byte out of supported ASCII range");
         }
         if (len >= 255u) {

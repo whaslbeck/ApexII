@@ -660,9 +660,12 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
         if (a.kind != b.kind) return a.kind < b.kind;
         return a.row_index < b.row_index;
     });
+    /* Collapse multiple references from the same source+kind into one (e.g. a
+       text table that points at the same string from several rows) — they all
+       navigate to the same source line, so distinct row indices are just noise
+       and would also produce duplicate-looking popup rows. */
     rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind &&
-               a.row_index == b.row_index;
+        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
     }), rs.end());
     return rs;
 }
@@ -1181,7 +1184,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
-            "show_code_candidates=%d\nshow_inline_candidates=%d\n",
+            "show_code_candidates=%d\nshow_inline_candidates=%d\n"
+            "show_strings_list=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
@@ -1190,7 +1194,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
             s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor,
-            s->show_code_candidates, s->show_inline_candidates);
+            s->show_code_candidates, s->show_inline_candidates,
+            s->show_strings_list);
     fclose(f);
 }
 
@@ -1313,6 +1318,8 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_inline_list = atoi(l + 17) != 0;
         } else if (strncmp(l, "show_entries_list=", 18) == 0) {
             s->show_entries_list = atoi(l + 18) != 0;
+        } else if (strncmp(l, "show_strings_list=", 18) == 0) {
+            s->show_strings_list = atoi(l + 18) != 0;
         } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {

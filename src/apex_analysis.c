@@ -1055,6 +1055,12 @@ size_t valid_string_len(const uint8_t *data, size_t len)
         if (data[i] == 0x00) {
             return i + 1u;
         }
+        /* 0x0a (newline) and 0x07 (BELL) are legitimate string content (e.g.
+           multi-line DMD text); they are escaped as \n / \a on emit and decoded
+           back by the assembler. */
+        if (data[i] == 0x0au || data[i] == 0x07u) {
+            continue;
+        }
         if (data[i] < 0x20u || data[i] > 0x7fu) {
             return 0;
         }

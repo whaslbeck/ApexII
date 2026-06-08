@@ -387,7 +387,13 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                             ImGuiTableColumnFlags_NoHeaderLabel, FA_GUTTER_W);
         ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,   120.0f);
         ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,    60.0f);
-        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch);
+        /* WidthFixed (auto-fit to content) rather than WidthStretch: a stretch
+           column always shrinks to the viewport, so the table never reports
+           horizontal overflow and no horizontal scrollbar appears — long lines and
+           off-screen inline xref buttons get clipped with no way to reach them.
+           Auto-fit lets the table grow past the viewport so ScrollX shows a usable
+           horizontal scrollbar. */
+        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthFixed);
         ImGui::TableHeadersRow();
         /* Flow-arrow data collected during clipper loop, drawn after EndTable */
         struct FlowArrow { int src_row, dst_row; bool backward; int lane; ImU32 color; };
@@ -534,11 +540,17 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         ImGui::TextColored(ImVec4(0.85f, 0.55f, 0.20f, 1.0f), "%s", excl_buf);
                     }
                 }
-                /* Inline xref annotations for label lines */
+                /* Inline xref annotations for label lines.
+                   These MUST stay on the same line as the label: the disasm table
+                   uses ImGuiListClipper, which assumes a uniform row height.  If the
+                   xref buttons stacked vertically, label rows with incoming refs would
+                   be taller than the rest, the clipper would underestimate the total
+                   height, and the final rows (e.g. the reset vector ".DW ENTRY_RESET")
+                   would be pushed past the reachable scroll range. */
                 if (line->kind == APEX_RENDER_LINE_LABEL && line->has_location) {
                     auto in_refs = find_incoming_refs(project, document, state,
                                                      line->bank, line->cpu_addr);
-                    static const int kMaxInline = 8;
+                    static const int kMaxInline = 3;
                     int shown = 0;
                     for (auto &r : in_refs) {
                         if (shown >= kMaxInline) break;
@@ -550,6 +562,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             snprintf(rbuf, sizeof(rbuf), "<- %s  B%02x_A%04x",
                                      r.kind.c_str(), r.bank,
                                      (unsigned)r.cpu_addr & 0xffff);
+                        ImGui::SameLine();
                         ImGui::PushID((int)(0xc0de0000u ^ line_idx ^ (size_t)shown));
                         ImGui::PushStyleColor(ImGuiCol_Text,
                             ImVec4(0.55f, 0.75f, 0.55f, 1.0f));
@@ -561,6 +574,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         shown++;
                     }
                     if ((int)in_refs.size() > kMaxInline) {
+                        ImGui::SameLine();
                         ImGui::PushID((int)(0xc0de0000u ^ line_idx ^ 0xff));
                         char more[32];
                         snprintf(more, sizeof(more), "<- +%d more...",
@@ -1170,6 +1184,7 @@ void render_xref_popup(ApexProject *p, const ApexRenderedDocument *d, UiState *s
             ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch);
             ImGui::TableSetupColumn("Type",   ImGuiTableColumnFlags_WidthFixed, 80.0f);
             ImGui::TableHeadersRow();
+            int ref_id = 0;
             for (auto &r : in) {
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
@@ -1180,10 +1195,15 @@ void render_xref_popup(ApexProject *p, const ApexRenderedDocument *d, UiState *s
                 } else {
                     snprintf(lbl, 128, "B%02x_A%04x", r.bank, (unsigned)r.cpu_addr & 0xffffu);
                 }
+                /* Unique ID per row: distinct sources may share a label/address
+                   string, which would otherwise collide and trip ImGui's
+                   conflicting-ID warning. */
+                ImGui::PushID(ref_id++);
                 if (ImGui::Selectable(lbl, false, ImGuiSelectableFlags_SpanAllColumns)) {
                     select_line(s, r.line_index, 1);
                     ImGui::CloseCurrentPopup();
                 }
+                ImGui::PopID();
                 ImGui::TableSetColumnIndex(1);
                 if (r.row_index >= 0)
                     ImGui::Text("%s [%d]", r.kind.c_str(), r.row_index);
@@ -2895,35 +2915,97 @@ void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *
     }
 }
 
-void render_entries_list(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+void render_entries_list(ApexProject *p, const ApexRenderedDocument **document_ptr, UiState *s)
 {
+    const ApexRenderedDocument *d = *document_ptr;
     static char filter[128] = "";
+    /* Kind filter: 0 = all, 1 = necessary only ("entry"), 2 = redundant only
+       ("entry~", i.e. already reached by code flow). */
+    static int kind_filter = 0;
     ImGui::InputText("Filter##entlist", filter, sizeof(filter));
+    ImGui::RadioButton("All", &kind_filter, 0);
     ImGui::SameLine();
-    ImGui::TextDisabled("(%zu)", p->config_entries.count);
+    ImGui::RadioButton("Necessary", &kind_filter, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("Redundant", &kind_filter, 2);
 
-    if (ImGui::BeginTable("entries", 2,
+    /* Collect all redundant entries (reached by flow ⇒ the explicit [entries]
+       line is unnecessary) so we can offer a one-click bulk cleanup. */
+    std::vector<std::pair<uint8_t, uint32_t>> redundant;
+    for (size_t i = 0; i < p->config_entries.count; i++) {
+        const ConfigEntry *e = &p->config_entries.items[i];
+        uint8_t bank = e->has_bank ? e->bank : 0xffu;
+        const Label *el = find_explicit_entry_label(p, bank, e->addr);
+        if (el && el->reached_by_flow)
+            redundant.emplace_back(bank, e->addr);
+    }
+
+    ImGui::SameLine();
+    ImGui::BeginDisabled(redundant.empty());
+    if (ImGui::Button("Delete redundant"))
+        ImGui::OpenPopup("del_redundant");
+    ImGui::EndDisabled();
+
+    if (ImGui::BeginPopupModal("del_redundant", NULL, ImGuiWindowFlags_AlwaysAutoResize)) {
+        ImGui::Text("Delete %zu redundant entr%s?", redundant.size(),
+                    redundant.size() == 1 ? "y" : "ies");
+        ImGui::TextDisabled("These are still reached by code-flow analysis,\n"
+                            "so the disassembly is unchanged.");
+        ImGui::Separator();
+        if (ImGui::Button("Delete")) {
+            /* Preserve the current selection (deleting redundant entries leaves the
+               disassembly unchanged) so the view doesn't jump. */
+            uint8_t keep_bank = 0; uint32_t keep_addr = 0;
+            selected_address(d, s, &keep_bank, &keep_addr);
+            for (auto &r : redundant)
+                apex_project_clear_kind(p, r.first != 0xffu, r.first, r.second);
+            ImGui::CloseCurrentPopup();
+            ImGui::EndPopup();
+            /* clear_kind frees and rebuilds the document on the next render; do it
+               now and bail so the rest of this frame doesn't touch the stale `d`. */
+            rerender_and_reselect(p, document_ptr, s, keep_bank, keep_addr);
+            set_status(s, "deleted redundant entries");
+            return;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel"))
+            ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
+    }
+
+    /* Collect the visible rows (text + kind filter) before drawing the table so
+       the match count can sit next to the filter controls. */
+    std::vector<size_t> rows;
+    for (size_t i = 0; i < p->config_entries.count; i++) {
+        const ConfigEntry *e = &p->config_entries.items[i];
+        uint8_t bank = e->has_bank ? e->bank : 0xffu;
+        uint32_t addr = e->addr;
+        if (kind_filter != 0) {
+            const Label *el = find_explicit_entry_label(p, bank, addr);
+            bool redundant = el && el->reached_by_flow;
+            if (kind_filter == 1 && redundant) continue;   /* want necessary only */
+            if (kind_filter == 2 && !redundant) continue;  /* want redundant only */
+        }
+        if (filter[0]) {
+            char addrstr[32];
+            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
+            std::string lbl = label_at_address(d, s, bank, addr);
+            bool match = str_icontains(addrstr, filter) ||
+                         (!lbl.empty() && str_icontains(lbl.c_str(), filter));
+            if (!match) continue;
+        }
+        rows.push_back(i);
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%zu / %zu)", rows.size(), p->config_entries.count);
+
+    if (ImGui::BeginTable("entries", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,  55.0f);
         ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
-
-        std::vector<size_t> rows;
-        for (size_t i = 0; i < p->config_entries.count; i++) {
-            const ConfigEntry *e = &p->config_entries.items[i];
-            uint8_t bank = e->has_bank ? e->bank : 0xffu;
-            uint32_t addr = e->addr;
-            if (filter[0]) {
-                char addrstr[32];
-                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
-                std::string lbl = label_at_address(d, s, bank, addr);
-                bool match = str_icontains(addrstr, filter) ||
-                             (!lbl.empty() && str_icontains(lbl.c_str(), filter));
-                if (!match) continue;
-            }
-            rows.push_back(i);
-        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)rows.size());
@@ -2945,13 +3027,149 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
                 ImGui::TableSetColumnIndex(0);
                 bool sel = found && s->selected_line == li;
                 if (ImGui::Selectable(addrstr, sel,
-                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowDoubleClick)) {
+                        ImGuiSelectableFlags_SpanAllColumns)) {
                     if (found) {
-                        select_line(s, li, ImGui::IsMouseDoubleClicked(0) ? 1 : 0);
+                        select_line(s, li, 1);
                     }
                 }
+                /* Kind: "entry" (green) when this explicit entry is necessary, or
+                   "entry~" (grey) when code flow already reaches it, so the entry
+                   is redundant — same distinction the disassembly draws. */
+                ImGui::TableSetColumnIndex(1);
+                const Label *el = find_explicit_entry_label(p, bank, addr);
+                if (el && el->reached_by_flow)
+                    ImGui::TextDisabled("entry~");
+                else if (el)
+                    ImGui::TextColored(ImVec4(0.35f, 0.90f, 0.35f, 1.0f), "entry");
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(lbl.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* Classify a rendered directive line as a string and return its type name, or
+   NULL if it is not a STRING/STRING_LP/STRING_FIXED directive. */
+static const char *string_directive_type(const ApexRenderedLine *l)
+{
+    /* STRING* directives render as indented lines, which classify_line() tags as
+       APEX_RENDER_LINE_INSTRUCTION (DIRECTIVE is reserved for unindented lines
+       like .ORG); accept either and rely on the text prefix below. */
+    if (l->kind != APEX_RENDER_LINE_INSTRUCTION &&
+        l->kind != APEX_RENDER_LINE_DIRECTIVE)
+        return NULL;
+    size_t i = 0;
+    while (i < l->length && (l->text[i] == ' ' || l->text[i] == '\t'))
+        i++;
+    const char *p = l->text + i;
+    size_t rem = l->length - i;
+    #define STR_STARTS(kw) (rem >= sizeof(kw) - 1 && memcmp(p, kw, sizeof(kw) - 1) == 0)
+    if (STR_STARTS("STRING_LP"))    return "string_lp";
+    if (STR_STARTS("STRING_FIXED")) return "string_fixed";
+    if (STR_STARTS("STRING"))       return "string";
+    #undef STR_STARTS
+    return NULL;
+}
+
+/* Extract the quoted content of a STRING directive line (escapes kept as-is). */
+static std::string string_directive_content(const ApexRenderedLine *l)
+{
+    size_t a = 0;
+    while (a < l->length && l->text[a] != '"')
+        a++;
+    if (a >= l->length)
+        return std::string();
+    size_t b = l->length;
+    while (b > a + 1 && l->text[b - 1] != '"')
+        b--;
+    if (b <= a + 1)
+        return std::string();
+    return std::string(l->text + a + 1, (b - 1) - (a + 1));
+}
+
+void render_strings_list(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    ImGui::InputText("Filter##strlist", s->strings_filter_input,
+                     sizeof(s->strings_filter_input));
+    const char *filter = s->strings_filter_input;
+
+    /* Collect string directive lines, applying the case-insensitive filter to
+       content / label / address. */
+    struct StrRow { size_t line_idx; std::string content; const char *type; };
+    std::vector<StrRow> rows;
+    for (size_t i = 0; i < d->line_count; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        const char *type = string_directive_type(l);
+        if (!type || !l->has_location)
+            continue;
+        std::string content = string_directive_content(l);
+        if (filter[0]) {
+            char addrstr[32];
+            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", l->bank,
+                     (unsigned)l->cpu_addr & 0xffffu);
+            std::string lbl = label_at_address(d, s, l->bank, l->cpu_addr);
+            bool match = str_icontains(content.c_str(), filter) ||
+                         str_icontains(addrstr, filter) ||
+                         (!lbl.empty() && str_icontains(lbl.c_str(), filter));
+            if (!match)
+                continue;
+        }
+        rows.push_back({i, content, type});
+    }
+    ImGui::SameLine();
+    ImGui::TextDisabled("(%zu)", rows.size());
+
+    if (ImGui::BeginTable("strings", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed, 160.0f);
+        ImGui::TableSetupColumn("Type",    ImGuiTableColumnFlags_WidthFixed,  85.0f);
+        ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Refs",    ImGuiTableColumnFlags_WidthFixed,  60.0f);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const StrRow &sr = rows[(size_t)row];
+                const ApexRenderedLine *l = &d->lines[sr.line_idx];
+                std::string lbl = label_at_address(d, s, l->bank, l->cpu_addr);
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", l->bank,
+                         (unsigned)l->cpu_addr & 0xffffu);
+
+                ImGui::PushID((int)sr.line_idx);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                /* Address: click jumps the disassembly to the string. */
+                if (ImGui::Selectable(addrstr, s->selected_line == sr.line_idx,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap))
+                    select_line(s, sr.line_idx, 1);
+
                 ImGui::TableSetColumnIndex(1);
                 ImGui::TextUnformatted(lbl.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextDisabled("%s", sr.type);
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(sr.content.c_str());
+
+                /* Refs: count of incoming references; button opens the xref popup
+                   (which lists every reference and jumps to it). */
+                ImGui::TableSetColumnIndex(4);
+                auto refs = find_incoming_refs(p, d, s, l->bank, l->cpu_addr);
+                if (!refs.empty()) {
+                    char rbuf[24];
+                    snprintf(rbuf, sizeof(rbuf), "%zu refs", refs.size());
+                    if (ImGui::SmallButton(rbuf)) {
+                        s->request_xref_popup = true;
+                        s->xref_popup_bank    = l->bank;
+                        s->xref_popup_addr    = l->cpu_addr;
+                    }
+                }
                 ImGui::PopID();
             }
         }

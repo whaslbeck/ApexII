@@ -780,6 +780,8 @@ static void emit_string(FILE *out, const uint8_t *data, size_t len)
 
     fprintf(out, "    STRING \"");
     for (i = 0; i + 1u < len; i++) {
+        if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') {
             fputc('\\', out);
         }
@@ -796,6 +798,7 @@ static size_t valid_string_lp_len(const uint8_t *data, size_t len)
     n = data[0];
     if (n == 0 || 1u + n > len) return 0;
     for (i = 1u; i <= n; i++) {
+        if (data[i] == 0x0au || data[i] == 0x07u) continue;  /* \n / \a, see emit_string */
         if (data[i] < 0x20u || data[i] > 0x7fu) return 0;
     }
     return 1u + n;
@@ -807,6 +810,8 @@ static void emit_string_lp(FILE *out, const uint8_t *data, size_t len)
     size_t i;
     fprintf(out, "    STRING_LP \"");
     for (i = 1u; i < len; i++) {
+        if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
         fputc(data[i], out);
     }
@@ -819,6 +824,8 @@ static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
     size_t i;
     fprintf(out, "    STRING_FIXED \"");
     for (i = 0; i < len; i++) {
+        if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
         fputc(data[i], out);
     }
