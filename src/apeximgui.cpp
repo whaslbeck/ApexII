@@ -247,6 +247,7 @@ int main(int argc, char **argv)
     state.show_rom_map           = false;
     state.show_dmd_list         = false;
     state.show_sprite_list      = false;
+    state.show_sprite_gallery   = false;
     state.sprite_scan_done      = false;
     state.show_bookmarks     = true;
     state.show_transitions   = false;
@@ -387,6 +388,7 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("ROM Map",        NULL, &state.show_rom_map);
                 ImGui::MenuItem("DMD Frames",     NULL, &state.show_dmd_list);
                 ImGui::MenuItem("Sprites",        NULL, &state.show_sprite_list);
+                ImGui::MenuItem("Sprite Gallery", NULL, &state.show_sprite_gallery);
                 ImGui::Separator();
                 ImGui::MenuItem("Details",     NULL, &state.show_details);
                 ImGui::MenuItem("References",  NULL, &state.show_refs);
@@ -438,6 +440,8 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Hardware",       dock_bottom_id);
             ImGui::DockBuilderDockWindow("Tables",         dock_bottom_id);
             ImGui::DockBuilderDockWindow("Hex",            dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Sprites",        dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Sprite Gallery", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Sigs",    dock_bottom_id);
             ImGui::DockBuilderDockWindow("Code Entries",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("Strings",        dock_bottom_id);
@@ -751,6 +755,11 @@ int main(int argc, char **argv)
         if (state.show_dmd_list) {
             ImGui::Begin("DMD Frames", &state.show_dmd_list);
             render_dmd_list_window(project, document, &state);
+            ImGui::End();
+        }
+        if (state.show_sprite_gallery) {
+            ImGui::Begin("Sprite Gallery", &state.show_sprite_gallery);
+            render_sprite_gallery_window(project, &document, &state);
             ImGui::End();
         }
         if (state.show_sprite_list) {

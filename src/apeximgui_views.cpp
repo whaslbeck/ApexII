@@ -4286,6 +4286,10 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
         scan_sprite_candidates(p, s);
     }
     ImGui::SameLine();
+    if (ImGui::Button("Gallery")) {
+        s->show_sprite_gallery = true;
+    }
+    ImGui::SameLine();
     {
         size_t vsi_count  = s->vsi_table_scan_done ? s->vsi_table_entries.size() : 0;
         size_t cand_count = 0;
@@ -4329,16 +4333,21 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
             ImGui::TableSetupColumn("",      0, 90.0f); /* Classify button */
             ImGui::TableHeadersRow();
 
+            /* Precompute per-table (pass, done) counts in a single pass instead
+               of re-scanning every entry for every sub-table row. */
+            std::map<int, std::pair<int, int>> tbl_counts;
+            for (auto &e : s->vsi_table_entries) {
+                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+                auto &c = tbl_counts[e.table_idx];
+                c.first++;
+                if (e.classified) c.second++;
+            }
+
             bool vsi_reclassified = false;
             for (auto &st : s->vsi_sub_tables) {
-                int pass = 0, done = 0;
-                for (auto &e : s->vsi_table_entries) {
-                    if (e.table_idx != st.table_idx) continue;
-                    if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-                    if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-                    pass++;
-                    if (e.classified) done++;
-                }
+                int pass = tbl_counts[st.table_idx].first;
+                int done = tbl_counts[st.table_idx].second;
 
                 ImGui::PushID(st.table_idx);
                 ImGui::TableNextRow();
@@ -4389,6 +4398,48 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
         ImGui::Separator();
     }
 
+    /* Build a flat list of rows to display (cheap metadata only — no sprite
+       decoding here).  The table is then virtualised with ImGuiListClipper so
+       per-row work (label lookup, line lookup, and sprite decode for size/hover)
+       only happens for the handful of rows actually on screen.  Decoding every
+       sprite every frame was what made this window crawl with many sprites. */
+    enum RowSrc { ROW_VSI, ROW_CLASS, ROW_SCAN };
+    struct SpriteRow {
+        RowSrc   src;
+        uint8_t  bank;
+        uint32_t addr;
+        uint16_t w, h;        /* known for VSI/SCAN; 0 for CLASS (decode on demand) */
+        bool     is_noheader;
+        bool     classified;  /* VSI: already applied to config */
+        int      table_idx, image_idx;  /* VSI */
+        bool     class_noheader;         /* CLASS: DATA_SPRITE_NOHEADER */
+    };
+    std::vector<SpriteRow> rows;
+
+    if (s->vsi_table_scan_done) {
+        for (auto &e : s->vsi_table_entries) {
+            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+            rows.push_back({ROW_VSI, e.bank, e.cpu_addr, e.width, e.height,
+                            e.is_noheader, e.classified, e.table_idx, e.image_idx, false});
+        }
+    }
+    for (size_t i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *dr = &p->data_ranges.items[i];
+        if (dr->kind != DATA_SPRITE && dr->kind != DATA_SPRITE_NOHEADER) continue;
+        rows.push_back({ROW_CLASS, dr->bank, dr->addr, 0, 0, false, false, 0, 0,
+                        dr->kind == DATA_SPRITE_NOHEADER});
+    }
+    if (s->sprite_scan_done) {
+        for (auto &e : s->sprite_candidates) {
+            if (e.classified) continue;
+            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+            rows.push_back({ROW_SCAN, e.bank, e.cpu_addr, e.width, e.height,
+                            false, false, 0, 0, false});
+        }
+    }
+
     if (ImGui::BeginTable("sprite_list", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
@@ -4399,23 +4450,27 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
         ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
-        int row_id = 0;
-
-        /* --- VSI table entries (from "Scan VSI Tables") --- */
-        if (s->vsi_table_scan_done) {
-            for (auto &e : s->vsi_table_entries) {
-                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-
+        ImGuiListClipper clipper;
+        clipper.Begin((int)rows.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const SpriteRow &r = rows[(size_t)row];
                 char addrstr[32];
                 snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                         (unsigned)e.bank, (unsigned)e.cpu_addr & 0xffffu);
-                std::string lbl = label_at_address(d, s, e.bank, e.cpu_addr);
+                         (unsigned)r.bank, (unsigned)r.addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, r.bank, r.addr);
                 size_t li = 0;
-                bool found = apex_render_find_line_by_address(d, e.bank, e.cpu_addr, &li) != NULL;
+                bool found = apex_render_find_line_by_address(d, r.bank, r.addr, &li) != NULL;
                 bool sel = found && s->selected_line == li;
 
-                ImGui::PushID(row_id++);
+                /* CLASS rows need a decode to show their size; reuse it for the
+                   hover preview.  VSI/SCAN already carry dimensions. */
+                SpritePreviewInfo pr = {};
+                bool have_pr = false;
+                if (r.src == ROW_CLASS)
+                    have_pr = decode_sprite_preview_at(p, r.bank, r.addr, &pr) != 0;
+
+                ImGui::PushID(row);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 if (ImGui::Selectable(addrstr, sel,
@@ -4424,120 +4479,176 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
                     if (found) select_line(s, li, 1);
                 }
                 if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
-                    SpritePreviewInfo pr = {};
-                    if (decode_sprite_preview_at(p, e.bank, e.cpu_addr, &pr)) {
+                    if (r.src != ROW_CLASS)
+                        have_pr = decode_sprite_preview_at(p, r.bank, r.addr, &pr) != 0;
+                    if (have_pr) {
                         ImGui::BeginTooltip();
                         render_sprite_preview(pr, 6.0f);
-                        char info[64];
-                        snprintf(info, sizeof(info),
-                                 "T%d I%d  %ux%u  tbl_h=%u  %s",
-                                 e.table_idx, e.image_idx,
-                                 (unsigned)e.width, (unsigned)e.height,
-                                 (unsigned)e.table_height,
-                                 e.is_noheader ? "no-hdr" : "hdr");
-                        ImGui::TextUnformatted(info);
+                        if (r.src == ROW_VSI) {
+                            char info[64];
+                            snprintf(info, sizeof(info), "T%d I%d  %ux%u  %s",
+                                     r.table_idx, r.image_idx,
+                                     (unsigned)r.w, (unsigned)r.h,
+                                     r.is_noheader ? "no-hdr" : "hdr");
+                            ImGui::TextUnformatted(info);
+                        }
                         ImGui::EndTooltip();
                     }
                 }
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%ux%u", (unsigned)e.width, (unsigned)e.height);
+                if (r.src == ROW_CLASS) {
+                    if (have_pr) ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
+                    else         ImGui::TextDisabled("?");
+                } else {
+                    ImGui::Text("%ux%u", (unsigned)r.w, (unsigned)r.h);
+                }
                 ImGui::TableSetColumnIndex(2);
-                if (e.classified)
+                if (r.src == ROW_VSI) {
+                    if (r.classified)
+                        ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
+                                           r.is_noheader ? "vsi_nh*" : "vsi*");
+                    else
+                        ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f),
+                                           r.is_noheader ? "vsi_nh" : "vsi");
+                } else if (r.src == ROW_CLASS) {
                     ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
-                                       e.is_noheader ? "vsi_nh*" : "vsi*");
-                else
-                    ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f),
-                                       e.is_noheader ? "vsi_nh" : "vsi");
+                                       r.class_noheader ? "spr_nh" : "sprite");
+                } else {
+                    ImGui::TextDisabled("scan");
+                }
                 ImGui::TableSetColumnIndex(3);
-                ImGui::Text("T%d I%d", e.table_idx, e.image_idx);
+                if (r.src == ROW_VSI)
+                    ImGui::Text("T%d I%d", r.table_idx, r.image_idx);
                 ImGui::TableSetColumnIndex(4);
                 ImGui::TextUnformatted(lbl.c_str());
                 ImGui::PopID();
             }
-        } else if (s->vsi_table_entries.empty()) {
-            /* no scan yet — show hint */
         }
+        ImGui::EndTable();
+    }
+}
 
-        /* --- Classified sprites from data_ranges --- */
-        for (size_t i = 0; i < p->data_ranges.count; i++) {
-            const DataRange *dr = &p->data_ranges.items[i];
-            if (dr->kind != DATA_SPRITE && dr->kind != DATA_SPRITE_NOHEADER) continue;
-
-            char addrstr[32];
-            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                     (unsigned)dr->bank, (unsigned)dr->addr & 0xffffu);
-            std::string lbl = label_at_address(d, s, dr->bank, dr->addr);
-            size_t li = 0;
-            bool found = apex_render_find_line_by_address(d, dr->bank, dr->addr, &li) != NULL;
-            bool sel = found && s->selected_line == li;
-
-            SpritePreviewInfo pr = {};
-            bool have_pr = decode_sprite_preview_at(p, dr->bank, dr->addr, &pr) != 0;
-
-            ImGui::PushID(row_id++);
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            if (ImGui::Selectable(addrstr, sel,
-                    ImGuiSelectableFlags_SpanAllColumns |
-                    ImGuiSelectableFlags_AllowOverlap)) {
-                if (found) select_line(s, li, 1);
+/* Draw a decoded sprite image into a fixed (box_w × box_h) cell, scaled to fit
+   while preserving aspect ratio.  Reserves exactly the box so gallery table rows
+   stay uniform height (required by ImGuiListClipper).  Only lit pixels are
+   drawn over a dark background to keep the rect count down. */
+static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, float box_h)
+{
+    ImVec2 origin = ImGui::GetCursorScreenPos();
+    ImGui::Dummy(ImVec2(box_w, box_h));
+    if (!pr.valid || pr.width == 0 || pr.height == 0) {
+        return;
+    }
+    float scale = box_h / (float)pr.height;
+    if ((float)pr.width * scale > box_w) {
+        scale = box_w / (float)pr.width;
+    }
+    float img_w = (float)pr.width * scale;
+    float img_h = (float)pr.height * scale;
+    ImDrawList *draw = ImGui::GetWindowDrawList();
+    draw->AddRectFilled(origin, ImVec2(origin.x + img_w, origin.y + img_h),
+                        IM_COL32(6, 18, 28, 255));
+    uint8_t row_bytes = (uint8_t)((pr.width + 7u) / 8u);
+    float psz = scale > 1.0f ? scale : 1.0f;
+    for (uint8_t row = 0; row < pr.height; row++) {
+        for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
+            uint8_t bits = pr.pixels[row * row_bytes + col_byte];
+            if (!bits) continue;
+            for (size_t bit = 0; bit < 8u; bit++) {
+                int px = (int)(col_byte * 8u + bit);
+                if (px >= (int)pr.width) break;
+                if (!((bits >> bit) & 1u)) continue;
+                ImVec2 p0(origin.x + px * scale, origin.y + row * scale);
+                draw->AddRectFilled(p0, ImVec2(p0.x + psz, p0.y + psz),
+                                    IM_COL32(120, 220, 255, 255));
             }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem) && have_pr) {
-                ImGui::BeginTooltip();
-                render_sprite_preview(pr, 6.0f);
-                ImGui::EndTooltip();
-            }
-            ImGui::TableSetColumnIndex(1);
-            if (have_pr)
-                ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
-            else
-                ImGui::TextDisabled("?");
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
-                               dr->kind == DATA_SPRITE_NOHEADER ? "spr_nh" : "sprite");
-            ImGui::TableSetColumnIndex(3); /* Tbl/Img — not applicable */
-            ImGui::TableSetColumnIndex(4);
-            ImGui::TextUnformatted(lbl.c_str());
-            ImGui::PopID();
         }
+    }
+}
 
-        /* --- ROM scan candidates (unclassified, dimension-filtered) --- */
-        if (s->sprite_scan_done) {
-            for (auto &e : s->sprite_candidates) {
-                if (e.classified) continue;
-                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+/* Gallery view: every detected/defined sprite as a thumbnail image alongside its
+   address and label.  Sources (classified data ranges, VSI table entries, ROM
+   scan candidates) are merged and de-duplicated by address.  Virtualised with a
+   clipper so only the on-screen thumbnails are decoded and drawn each frame. */
+void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    const ApexRenderedDocument *d = *dp;
+
+    /* Merge + de-dup the three sources by (bank, addr); classified always shown,
+       VSI/scan respect the dimension filter (same as the Sprites list). */
+    std::vector<std::pair<uint8_t, uint32_t>> items;
+    for (size_t i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *dr = &p->data_ranges.items[i];
+        if (dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER)
+            items.push_back({dr->bank, dr->addr});
+    }
+    if (s->vsi_table_scan_done) {
+        for (auto &e : s->vsi_table_entries) {
+            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+            items.push_back({e.bank, e.cpu_addr});
+        }
+    }
+    if (s->sprite_scan_done) {
+        for (auto &e : s->sprite_candidates) {
+            if (e.classified) continue;
+            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
+            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
+            items.push_back({e.bank, e.cpu_addr});
+        }
+    }
+    std::sort(items.begin(), items.end());
+    items.erase(std::unique(items.begin(), items.end()), items.end());
+
+    ImGui::TextDisabled("%zu sprite(s) — scan VSI/ROM in the Sprites window to add more",
+                        items.size());
+    if (items.empty()) {
+        return;
+    }
+
+    static const float kImgW = 140.0f;
+    static const float kImgH = 28.0f;
+
+    if (ImGui::BeginTable("sprite_gallery", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Image",   ImGuiTableColumnFlags_WidthFixed, kImgW + 6.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,  55.0f);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)items.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                uint8_t  bank = items[(size_t)row].first;
+                uint32_t addr = items[(size_t)row].second;
+
+                SpritePreviewInfo pr = {};
+                bool have_pr = decode_sprite_preview_at(p, bank, addr, &pr) != 0;
 
                 char addrstr[32];
                 snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                         (unsigned)e.bank, (unsigned)e.cpu_addr & 0xffffu);
-                std::string lbl = label_at_address(d, s, e.bank, e.cpu_addr);
+                         (unsigned)bank, (unsigned)addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, bank, addr);
                 size_t li = 0;
-                bool found = apex_render_find_line_by_address(d, e.bank, e.cpu_addr, &li) != NULL;
+                bool found = apex_render_find_line_by_address(d, bank, addr, &li) != NULL;
                 bool sel = found && s->selected_line == li;
 
-                ImGui::PushID(row_id++);
+                ImGui::PushID(row);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
+                draw_sprite_thumbnail(pr, kImgW, kImgH);
+                ImGui::TableSetColumnIndex(1);
                 if (ImGui::Selectable(addrstr, sel,
-                        ImGuiSelectableFlags_SpanAllColumns |
-                        ImGuiSelectableFlags_AllowOverlap)) {
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
                     if (found) select_line(s, li, 1);
                 }
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
-                    SpritePreviewInfo pr = {};
-                    if (decode_sprite_preview_at(p, e.bank, e.cpu_addr, &pr)) {
-                        ImGui::BeginTooltip();
-                        render_sprite_preview(pr, 6.0f);
-                        ImGui::EndTooltip();
-                    }
-                }
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%ux%u", (unsigned)e.width, (unsigned)e.height);
                 ImGui::TableSetColumnIndex(2);
-                ImGui::TextDisabled("scan");
-                ImGui::TableSetColumnIndex(3); /* Tbl/Img — not applicable */
-                ImGui::TableSetColumnIndex(4);
+                if (have_pr) ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
+                else         ImGui::TextDisabled("?");
+                ImGui::TableSetColumnIndex(3);
                 ImGui::TextUnformatted(lbl.c_str());
                 ImGui::PopID();
             }

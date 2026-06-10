@@ -1185,7 +1185,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
             "show_code_candidates=%d\nshow_inline_candidates=%d\n"
-            "show_strings_list=%d\n",
+            "show_strings_list=%d\nshow_sprite_gallery=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
@@ -1195,7 +1195,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor,
             s->show_code_candidates, s->show_inline_candidates,
-            s->show_strings_list);
+            s->show_strings_list, s->show_sprite_gallery);
     fclose(f);
 }
 
@@ -1320,6 +1320,8 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_entries_list = atoi(l + 18) != 0;
         } else if (strncmp(l, "show_strings_list=", 18) == 0) {
             s->show_strings_list = atoi(l + 18) != 0;
+        } else if (strncmp(l, "show_sprite_gallery=", 20) == 0) {
+            s->show_sprite_gallery = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {

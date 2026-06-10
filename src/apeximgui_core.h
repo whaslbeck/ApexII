@@ -242,6 +242,7 @@ struct UiState {
     bool show_rom_map;
     bool show_dmd_list;
     bool show_sprite_list;
+    bool show_sprite_gallery;
     bool show_code_candidates;
     ApexCodeCandidates code_candidates;
     bool code_candidates_stale;
@@ -552,5 +553,6 @@ void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_
 // DMD and Sprite list windows
 void render_dmd_list_window(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void render_sprite_list_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_sprite_gallery_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 #endif
