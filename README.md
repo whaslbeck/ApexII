@@ -146,7 +146,49 @@ apexasm game.asm output.rom
 ```
 
 ### `apexdmd` (DMD Utility)
-A utility to decode and extract DMD frames from binary data.
+
+Decodes WPC DMD (dot-matrix display) full-frame images out of a ROM and writes
+them as portable bitmap/greymap files openable in any image viewer. A DMD full
+frame is 128×32 pixels; the hardware shows 4 brightness levels by combining two
+1-bit planes.
+
+**Usage:**
+```bash
+apexdmd <rom> <Bxx_Ayyyy|0xhhhh> <out.pbm>          # one plane  -> PBM (1-bit)
+apexdmd --pair <rom> <addr0> <addr1> <out.pgm>      # two planes -> PGM (4 grey levels)
+apexdmd --table <rom> <config.ini> <table_addr> <outdir>   # whole frame table
+```
+
+Addresses use the usual forms: `Bxx_Ayyyy` (`xx` = bank in hex, `yyyy` = CPU
+address) or `0xhhhh` for the system bank.
+
+**Single frame** — decode one full frame to a 1-bit PBM:
+
+```bash
+apexdmd roms/taf_l7.rom B34_A4001 out/frame.pbm
+```
+
+**Plane pair** — many images store two planes that combine into a 4-level
+greyscale frame; give both plane addresses to get a PGM:
+
+```bash
+apexdmd --pair roms/taf_l7.rom B34_A4001 B34_A41c2 out/frame.pgm
+```
+
+**Frame table** — bulk-decode every frame referenced by a far-pointer table. The
+table must be classified in the config as a headerless `rows[n](far_dmd)` (or
+`rows[n](far_data)`) table — exactly what the GUI *Tables* search or a `[tables]`
+entry produces:
+
+```bash
+apexdmd --table roms/taf_l7.rom tests/taf_l7.ini Bff_Ae735 out/dmd_frames
+```
+
+This writes one `frameNNN.pbm` per row into the output directory plus a
+`summary.tsv` listing each frame's index, target address, decoder type, and byte
+length — the quickest way to dump a whole animation. The printed `type=0x..`
+reports which WPC full-frame encoding (raw or run-length/“skip”) was used. PBM/PGM
+are written directly, with no external dependencies.
 
 ### `apexini` (Config File Utilities)
 
