@@ -1022,6 +1022,34 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
     }
 }
 
+/* The effective bank a far reference resolves to.  A "phantom" bank byte that
+   names no real ROM bank is read by WPC through tied-high upper address lines as
+   an existing bank (e.g. 0x18 -> 0x38 on a 512 KB ROM); this returns that bank,
+   or the original byte when no remap happens. */
+static uint8_t far_effective_bank(const uint8_t *paged_rom, size_t banks, uint8_t bank)
+{
+    int idx;
+    if (bank == 0xffu || !paged_rom) {
+        return bank;
+    }
+    idx = bank_index_for_far_ref(paged_rom, banks, bank);
+    if (idx < 0) {
+        return bank;
+    }
+    return bank_id_for_index(paged_rom, idx);
+}
+
+/* Emit a standalone comment line flagging a phantom-bank remap, if any. */
+static void emit_phantom_bank_comment(FILE *out, const char *indent,
+                                      const uint8_t *paged_rom, size_t banks, uint8_t bank)
+{
+    uint8_t eff = far_effective_bank(paged_rom, banks, bank);
+    if (eff != bank) {
+        fprintf(out, "%s; phantom bank 0x%02x -> 0x%02x (unmapped ROM addr line reads high)\n",
+                indent, (unsigned)bank, (unsigned)eff);
+    }
+}
+
 static const char *table_far_pseudo(TableFieldKind kind)
 {
     if (kind == TABLE_FAR_STRING) {
@@ -1224,6 +1252,7 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                     uint16_t addr = read_be16(data + *pos);
                     uint8_t bank = data[*pos + 2u];
 
+                    emit_phantom_bank_comment(out, "    ", paged_rom, banks, bank);
                     emit_far_code_ref(out, table_far_pseudo(kind), addr, bank, labels, label_count,
                                       extra_labels, extra_label_count, paged_rom, banks,
                                       bank_labels);
@@ -1333,6 +1362,7 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (*pos + 3u > len) {
             return 0;
         }
+        emit_phantom_bank_comment(out, "    ", paged_rom, banks, data[*pos + 2u]);
         emit_far_code_ref(out, data_far_pseudo(range->kind), read_be16(data + *pos),
                           data[*pos + 2u], labels, label_count, extra_labels, extra_label_count,
                           paged_rom, banks, bank_labels);
@@ -1443,6 +1473,7 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                     emit_inline_far_warning(out, current_bank, base_addr + (uint32_t)*pos,
                                             rom_base + *pos, inst, target, bank);
                 }
+                emit_phantom_bank_comment(out, "        ", paged_rom, banks, bank);
                 fputs("    ", out);
                 emit_far_code_ref(out, inline_far_pseudo(kind), target, bank, labels, label_count,
                                   extra_labels, extra_label_count, paged_rom, banks, bank_labels);
@@ -1504,6 +1535,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
     lookup.extra_label_count = extra_label_count;
     lookup.symbols = symbols;
     lookup.sorted = sorted;
+    lookup.bank_labels = bank_labels;
+    lookup.banks = banks;
 
     while (pos < len) {
         size_t col = 0;

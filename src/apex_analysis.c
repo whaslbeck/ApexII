@@ -609,7 +609,32 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
     if (name) {
         return name;
     }
-    return label_name_at(addr, lookup->extra_labels, lookup->extra_label_count, lookup->sorted);
+    name = label_name_at(addr, lookup->extra_labels, lookup->extra_label_count, lookup->sorted);
+    if (name) {
+        return name;
+    }
+    /* Cross-bank fallback for a paged-window operand the current bank can't
+       resolve (e.g. a JSR in the system bank, after switching banks, into
+       0x4000-0x7fff).  If exactly one paged bank has a label at this address it
+       is the only candidate, so use it; if several do it is ambiguous (we don't
+       track the live bank register) and we leave the raw address. */
+    if (lookup->bank_labels && lookup->banks > 0 &&
+        addr >= APEX_PAGED_ORG && addr < 0x8000u) {
+        const char *found = NULL;
+        size_t i;
+        for (i = 0; i < lookup->banks; i++) {
+            const LabelSet *ls = &lookup->bank_labels[i];
+            const char *n = label_name_at(addr, ls->items, ls->count, ls->sorted);
+            if (n) {
+                if (found) {
+                    return NULL;  /* ambiguous across banks */
+                }
+                found = n;
+            }
+        }
+        return found;
+    }
+    return NULL;
 }
 
 const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables)

@@ -42,6 +42,11 @@ typedef struct {
     size_t extra_label_count;
     const ConfigSymbols *symbols;
     int sorted;
+    /* All paged-bank label sets, used as a fallback to resolve a paged-window
+       operand (0x4000-0x7fff) when the current bank has no label there — e.g. a
+       cross-bank JSR from the system bank after a bank switch. */
+    const LabelSet *bank_labels;
+    size_t banks;
 } LabelLookup;
 
 typedef struct {
