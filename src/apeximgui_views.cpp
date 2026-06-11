@@ -1497,6 +1497,20 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         }
     }
 
+    /* Legend for the code-annotation corner marks (the label colors match the
+       corner-mark colors; no glyph, since the default font has no box char). */
+    {
+        ImGui::TextDisabled("code marks:");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.27f, 0.90f, 0.35f, 1.0f), "entry");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.43f, 1.0f, 1.0f), "entry+inline");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.27f, 0.67f, 1.0f, 1.0f), "end:flow-stop");
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.24f, 0.16f, 1.0f), "end:into-data");
+    }
+
     ImGui::BeginChild("hex_grid", ImVec2(0.0f, -inspector_h), false);
     s->hex_window_focused = ImGui::IsWindowFocused();
 
@@ -1608,6 +1622,59 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 kinds[fill++ - vis_start] = cur_kind;
         }
 
+        /* Per-byte code annotations, drawn as small corner marks on the hex digit:
+             top-left    = entry point (green) / entry with inline params (magenta)
+             bottom-right = code-block end — clean flow-stop (blue, RTS/RTI/JMP/
+                            PULS..PC/BRA) vs. falls straight into a non-code block
+                            (red — often an undeclared inline-byte callee). */
+        const uint8_t ANNOT_ENTRY        = 1u;
+        const uint8_t ANNOT_ENTRY_INLINE = 2u;
+        const uint8_t ANNOT_END_CLEAN    = 4u;
+        const uint8_t ANNOT_END_FALL     = 8u;
+        std::vector<uint8_t> annot(vis_count, 0u);
+        {
+            size_t li0 = 0;
+            find_line_by_rom_offset(d, vis_start, &li0);
+            const ApexRenderedLine *last_code = NULL;
+            for (size_t li = li0; li < d->line_count; li++) {
+                const ApexRenderedLine *l = &d->lines[li];
+                if (!l->has_location) continue;
+                bool past = l->rom_addr >= vis_end;
+                if (l->block_kind == APEX_RENDER_BLOCK_CODE) {
+                    if (!past && l->kind == APEX_RENDER_LINE_LABEL &&
+                        l->rom_addr >= vis_start) {
+                        bool is_entry  = find_explicit_entry_label(p, l->bank, l->cpu_addr) != NULL;
+                        bool has_inline = inline_signature_for(&p->inline_sigs,
+                                                               l->bank, l->cpu_addr) != NULL;
+                        if (is_entry || has_inline) {
+                            annot[l->rom_addr - vis_start] |= ANNOT_ENTRY;
+                            if (has_inline)
+                                annot[l->rom_addr - vis_start] |= ANNOT_ENTRY_INLINE;
+                        }
+                    }
+                    if (l->kind == APEX_RENDER_LINE_INSTRUCTION) last_code = l;
+                    if (past) break;  /* code continues past the view */
+                } else {
+                    /* code -> non-code transition: classify the last code instr */
+                    if (last_code && last_code->rom_addr >= vis_start &&
+                        last_code->rom_addr < vis_end) {
+                        const uint8_t *isrc; size_t irem;
+                        if (project_locate_rom_bytes(p, last_code->bank, last_code->cpu_addr,
+                                                     &isrc, &irem, NULL)) {
+                            char mn[32];
+                            Cpu6809InstrInfo info = cpu6809_disassemble_info(
+                                isrc, irem < 8u ? irem : 8u, last_code->cpu_addr, mn, sizeof(mn));
+                            annot[last_code->rom_addr - vis_start] |=
+                                (info.flags & CPU6809_FLOW_STOP) ? ANNOT_END_CLEAN
+                                                                 : ANNOT_END_FALL;
+                        }
+                    }
+                    last_code = NULL;
+                    if (past) break;
+                }
+            }
+        }
+
         for (int row_idx = clipper.DisplayStart; row_idx < clipper.DisplayEnd; row_idx++) {
             size_t row_start = (size_t)row_idx * (size_t)bytes_per_row;
 
@@ -1677,6 +1744,24 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         dl->AddRect(rmin, rmax, IM_COL32(180, 100, 255, 220), 0.0f, 0, 1.5f);
                     }
                 }
+                {
+                    uint8_t an = (o >= vis_start && o < vis_end) ? annot[o - vis_start] : 0u;
+                    if (an) {
+                        ImVec2 rmin = ImGui::GetItemRectMin();
+                        ImVec2 rmax = ImGui::GetItemRectMax();
+                        float m = char_w * 0.55f;
+                        if (an & ANNOT_ENTRY) {
+                            ImU32 c = (an & ANNOT_ENTRY_INLINE) ? IM_COL32(255, 110, 255, 255)
+                                                               : IM_COL32(70, 230, 90, 255);
+                            dl->AddRectFilled(rmin, ImVec2(rmin.x + m, rmin.y + m), c);
+                        }
+                        if (an & (ANNOT_END_CLEAN | ANNOT_END_FALL)) {
+                            ImU32 c = (an & ANNOT_END_FALL) ? IM_COL32(255, 60, 40, 255)
+                                                            : IM_COL32(70, 170, 255, 255);
+                            dl->AddRectFilled(ImVec2(rmax.x - m, rmax.y - m), rmax, c);
+                        }
+                    }
+                }
 
                 if (ImGui::IsItemHovered()) {
                     ImGui::BeginTooltip();
@@ -1700,6 +1785,19 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                                        d->lines[li].block_kind == APEX_RENDER_BLOCK_UNCLASSIFIED;
                         if (is_data) render_disasm_preview(p, o, bank, cpu_addr);
                     }
+                    uint8_t an = (o >= vis_start && o < vis_end) ? annot[o - vis_start] : 0u;
+                    if (an & ANNOT_ENTRY)
+                        ImGui::TextColored(
+                            (an & ANNOT_ENTRY_INLINE) ? ImVec4(1.0f, 0.43f, 1.0f, 1.0f)
+                                                      : ImVec4(0.27f, 0.90f, 0.35f, 1.0f),
+                            (an & ANNOT_ENTRY_INLINE) ? "entry (inline params)"
+                                                      : "entry point");
+                    if (an & ANNOT_END_CLEAN)
+                        ImGui::TextColored(ImVec4(0.27f, 0.67f, 1.0f, 1.0f),
+                                           "code-block end (flow-stop)");
+                    if (an & ANNOT_END_FALL)
+                        ImGui::TextColored(ImVec4(1.0f, 0.24f, 0.16f, 1.0f),
+                                           "code falls into non-code (inline bytes?)");
                     ImGui::EndTooltip();
                 }
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
