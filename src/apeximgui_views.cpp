@@ -2477,11 +2477,12 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
         auto_search_tables(p, dp, s);
     }
     ImGui::Separator();
-    if (ImGui::BeginTable("tables_list", 4,
+    if (ImGui::BeginTable("tables_list", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
             ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,  100.0f);
         ImGui::TableSetupColumn("Setup",   ImGuiTableColumnFlags_WidthFixed,  200.0f);
+        ImGui::TableSetupColumn("Rows",    ImGuiTableColumnFlags_WidthFixed,   50.0f);
         ImGui::TableSetupColumn("Comment", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,   80.0f);
         ImGui::TableHeadersRow();
@@ -2515,7 +2516,23 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             }
             ImGui::PopItemWidth();
 
+            /* Rows: counted tables store their length as a leading BE16 in ROM;
+               fixed tables carry it in the spec. */
             ImGui::TableSetColumnIndex(2);
+            if (t->has_header) {
+                const uint8_t *tsrc; size_t trem;
+                if (project_locate_rom_bytes(p, t->bank, t->addr, &tsrc, &trem, NULL) &&
+                    trem >= 2u) {
+                    unsigned cnt = ((unsigned)tsrc[0] << 8) | tsrc[1];
+                    ImGui::Text("%u", cnt);
+                } else {
+                    ImGui::TextDisabled("?");
+                }
+            } else {
+                ImGui::Text("%lu", (unsigned long)t->rows);
+            }
+
+            ImGui::TableSetColumnIndex(3);
             const char *existing_doc = config_doc_at(&p->docs, t->bank, t->addr);
             char doc_buf[512] = "";
             if (existing_doc) {
@@ -2531,7 +2548,7 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             }
             ImGui::PopItemWidth();
 
-            ImGui::TableSetColumnIndex(3);
+            ImGui::TableSetColumnIndex(4);
             if (ImGui::SmallButton("Del")) {
                 uint8_t  del_bank = t->bank;
                 uint32_t del_addr = t->addr;

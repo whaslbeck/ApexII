@@ -432,6 +432,7 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Transitions", dock_left_id);
             ImGui::DockBuilderDockWindow("Details",     dock_right_id);
             ImGui::DockBuilderDockWindow("DMD",         dock_right_id);
+            ImGui::DockBuilderDockWindow("DMD Frames",  dock_bottom_id);
             ImGui::DockBuilderDockWindow("Edit",        dock_right_id);
             ImGui::DockBuilderDockWindow("ROM Info",            dock_right_id);
             ImGui::DockBuilderDockWindow("Match from Reference", dock_bottom_id);

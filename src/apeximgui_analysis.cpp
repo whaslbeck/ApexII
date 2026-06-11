@@ -1185,7 +1185,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
             "show_code_candidates=%d\nshow_inline_candidates=%d\n"
-            "show_strings_list=%d\nshow_sprite_gallery=%d\n",
+            "show_strings_list=%d\nshow_sprite_gallery=%d\n"
+            "show_rom_info=%d\nshow_match_window=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
@@ -1195,7 +1196,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor,
             s->show_code_candidates, s->show_inline_candidates,
-            s->show_strings_list, s->show_sprite_gallery);
+            s->show_strings_list, s->show_sprite_gallery,
+            s->show_rom_info, s->show_match_window);
     fclose(f);
 }
 
@@ -1322,6 +1324,10 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_strings_list = atoi(l + 18) != 0;
         } else if (strncmp(l, "show_sprite_gallery=", 20) == 0) {
             s->show_sprite_gallery = atoi(l + 20) != 0;
+        } else if (strncmp(l, "show_rom_info=", 14) == 0) {
+            s->show_rom_info = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_match_window=", 18) == 0) {
+            s->show_match_window = atoi(l + 18) != 0;
         } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {
@@ -1419,6 +1425,53 @@ static bool is_text_table_at_internal(const uint8_t *rom, uint32_t size, uint32_
     return true;
 }
 
+/* Resolve a 3-byte far pointer (CPU addr + bank byte) to a ROM file offset,
+   mirroring the resolution used for far_data tables above. */
+static uint32_t resolve_far_off_internal(const ApexProject *p, uint16_t addr, uint8_t bid,
+                                         int total_banks)
+{
+    for (int b = 0; b < total_banks; b++) {
+        if (p->rom.data[b * 0x4000] == bid && addr >= 0x4000 && addr <= 0x7FFF) {
+            return (uint32_t)b * 0x4000 + (addr - 0x4000);
+        }
+    }
+    if (addr >= 0x8000 && bid == 0xFF) {
+        return translate_ptr16_internal(addr, 0, total_banks);
+    }
+    return 0xFFFFFFFFu;
+}
+
+/* True if the 3-byte far pointer at ROM offset `off` targets a decodable DMD
+   full-frame.  Used to discover far_dmd pointer tables. */
+static bool far_ptr_is_dmd_internal(const ApexProject *p, uint32_t off, int total_banks)
+{
+    if ((size_t)off + 3u > p->rom.size) return false;
+    uint16_t addr = (uint16_t)((p->rom.data[off] << 8) | p->rom.data[off + 1]);
+    uint8_t  bid  = p->rom.data[off + 2];
+    uint32_t toff = resolve_far_off_internal(p, addr, bid, total_banks);
+    if (toff == 0xFFFFFFFFu || (size_t)toff >= p->rom.size) return false;
+    uint8_t plane[APEX_DMD_PAGE_BYTES];
+    size_t consumed = 0;
+    uint8_t type = 0;
+    return apexdmd_decode_fullframe(p->rom.data + toff, p->rom.size - (size_t)toff,
+                                    plane, &consumed, &type) != 0;
+}
+
+/* Given a ROM offset, compute the (bank_id, cpu_addr) the disassembler uses. */
+static void off_to_bank_addr_internal(const ApexProject *p, uint32_t off, int total_banks,
+                                      uint8_t *bank_id, uint16_t *addr)
+{
+    int phys_bank = (int)(off / 0x4000);
+    if (phys_bank >= total_banks - 2) {
+        *bank_id = 0xFF;
+        *addr = (uint16_t)((phys_bank == total_banks - 2) ? 0x8000 + (off % 0x4000)
+                                                          : 0xC000 + (off % 0x4000));
+    } else {
+        *bank_id = p->rom.data[phys_bank * 0x4000];
+        *addr = (uint16_t)(0x4000 + (off % 0x4000));
+    }
+}
+
 void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
     int total_banks = (int)(p->rom.size / 0x4000);
@@ -1487,6 +1540,57 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
                                       "rows[3](far_data)") == 0) {
                 count++;
                 i += 8;
+            }
+        }
+    }
+
+    // Step 3: DMD tables — lists of far pointers to DMD full-frames.
+    //   (a) counted(far_dmd_fullframe): DW count, DB width=3, then `count` rows.
+    //   (b) rows[N](far_dmd_fullframe): a headerless run of far_dmd pointers (the
+    //       common case).  Requiring several consecutive decodable targets keeps
+    //       random byte sequences from matching.
+    static const int kMinDmdRun = 3;
+    if (p->rom.size >= 6) {
+        for (uint32_t i = 0; i + 3u <= p->rom.size; ) {
+            // (a) counted header: [count_hi count_lo width=3]
+            uint16_t hdr_count = (uint16_t)((p->rom.data[i] << 8) | p->rom.data[i + 1]);
+            uint8_t  hdr_width = p->rom.data[i + 2];
+            if (hdr_width == 3u && hdr_count >= 2u &&
+                (size_t)i + 3u + (size_t)hdr_count * 3u <= p->rom.size) {
+                bool all_dmd = true;
+                for (uint16_t r = 0; r < hdr_count && all_dmd; r++) {
+                    if (!far_ptr_is_dmd_internal(p, i + 3u + (uint32_t)r * 3u, total_banks))
+                        all_dmd = false;
+                }
+                if (all_dmd) {
+                    uint8_t bank_id; uint16_t addr;
+                    off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
+                    if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE,
+                                              "counted(far_dmd_fullframe)") == 0) {
+                        count++;
+                    }
+                    i += 3u + (uint32_t)hdr_count * 3u;
+                    continue;
+                }
+            }
+            // (b) headerless run of far_dmd pointers
+            int n = 0;
+            uint32_t k = i;
+            while (k + 3u <= p->rom.size && far_ptr_is_dmd_internal(p, k, total_banks)) {
+                n++;
+                k += 3u;
+            }
+            if (n >= kMinDmdRun) {
+                uint8_t bank_id; uint16_t addr;
+                off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
+                char spec[40];
+                snprintf(spec, sizeof(spec), "rows[%d](far_dmd_fullframe)", n);
+                if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE, spec) == 0) {
+                    count++;
+                }
+                i = k;
+            } else {
+                i++;
             }
         }
     }
