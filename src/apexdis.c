@@ -570,20 +570,67 @@ static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uin
     emit_doc_comment(out, doc);
 }
 
+/* List the origins of all references that target (bank,addr) into `buf`, e.g.
+   "code@B21_A4006, table@B20_A4007".  This turns a generic conflict reason like
+   "inline_far_code_ref" into the concrete locations that point here, so a
+   classification conflict can be traced back to its source. */
+static void format_ref_sources(char *buf, size_t bufsz, const ReferenceSet *refs,
+                               uint8_t bank, uint32_t addr)
+{
+    size_t i, j, off = 0, n = 0;
+
+    buf[0] = '\0';
+    if (!refs) {
+        return;
+    }
+    for (i = 0; i < refs->count && n < 6u; i++) {
+        const Reference *r = &refs->items[i];
+        int dup = 0;
+        int w;
+
+        if (r->bank != bank || r->addr != addr) continue;
+        /* dedup identical (kind, source location) pairs */
+        for (j = 0; j < i; j++) {
+            const Reference *q = &refs->items[j];
+            if (q->bank == bank && q->addr == addr &&
+                q->source_bank == r->source_bank && q->source_addr == r->source_addr &&
+                ((q->kind == r->kind) || (q->kind && r->kind && strcmp(q->kind, r->kind) == 0))) {
+                dup = 1;
+                break;
+            }
+        }
+        if (dup) continue;
+        w = snprintf(buf + off, bufsz - off, "%s%s@B%02x_A%04x", n ? ", " : "",
+                     r->kind ? r->kind : "ref",
+                     r->source_bank, (unsigned)r->source_addr & 0xffffu);
+        if (w < 0 || (size_t)w >= bufsz - off) break;
+        off += (size_t)w;
+        n++;
+    }
+}
+
 static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, size_t rom_addr,
-                                   const char *code_from, const char *data_from)
+                                   const char *code_from, const char *data_from,
+                                   const ReferenceSet *refs)
 {
     const char *cf = code_from ? code_from : "unknown";
     const char *df = data_from ? data_from : "unknown";
+    char srcs[256], extra[280];
+
+    format_ref_sources(srcs, sizeof(srcs), refs, bank, cpu_addr);
+    extra[0] = '\0';
+    if (srcs[0]) {
+        snprintf(extra, sizeof(extra), " referenced_by=%s", srcs);
+    }
 
     fprintf(stderr,
             "warning: classification conflict at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
-            "code_from=%s data_from=%s\n",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df);
+            "code_from=%s data_from=%s%s\n",
+            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
     fprintf(out,
             "; WARNING classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
-            "code_from=%s data_from=%s\n",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df);
+            "code_from=%s data_from=%s%s\n",
+            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
 }
 
 static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
@@ -665,7 +712,7 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
             if (labels[i].is_conflict && !emitted_conflict) {
                 emit_conflict_warning(out, bank, addr,
                                       rom_base + (size_t)(addr - base_addr),
-                                      labels[i].explain, labels[i].kind_explain);
+                                      labels[i].explain, labels[i].kind_explain, refs);
                 emitted_conflict = 1;
             }
             fprintf(out, "%s:\n", labels[i].name);
