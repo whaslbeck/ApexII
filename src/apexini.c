@@ -386,6 +386,9 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
                     c->sigs.items[i].addr);
             fputs(" = ", f);
             w_schema(f, &c->sigs.items[i].schema);
+            if (c->sigs.items[i].flow_stop) {
+                fputs(", flow_stop", f);
+            }
             fputc('\n', f);
         }
     }

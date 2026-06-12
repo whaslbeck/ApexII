@@ -1664,6 +1664,11 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                                types);
                         }
                     }
+                    if (inline_sig && inline_sig->flow_stop) {
+                        /* tail-call helper: control never returns past the inline
+                           data, so stop decoding code here. */
+                        decoding_code = 0;
+                    }
                     if (info.flags & CPU6809_FLOW_STOP) {
                         decoding_code = 0;
                     }

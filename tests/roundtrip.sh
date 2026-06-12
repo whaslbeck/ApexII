@@ -140,6 +140,23 @@ else
     exit 1
 fi
 
+# A string may contain control bytes 0x0a (newline) and 0x07 (BELL): they must
+# be emitted with \n / \a escapes and survive a full
+# assemble→disassemble→assemble byte roundtrip.
+string_nl_rom="$OUT/string_newline.rom"
+string_nl_asm="$OUT/string_newline.disasm"
+string_nl_rom2="$OUT/string_newline.rebuilt"
+"$ROOT/build/apexasm" "$string_nl_rom" "$ROOT/tests/string_newline.asm"
+"$ROOT/build/apexdis" "$string_nl_rom" "$string_nl_asm" "$ROOT/tests/string_newline.ini"
+"$ROOT/build/apexasm" "$string_nl_rom2" "$string_nl_asm"
+if grep -qF '    STRING "\nA\aB"' "$string_nl_asm" &&
+    cmp -s "$string_nl_rom" "$string_nl_rom2"; then
+    printf 'PASS string_newline.asm\n'
+else
+    printf 'FAIL string_newline.asm\n' >&2
+    exit 1
+fi
+
 if "$ROOT/build/apexdis" "$data_range_rom" "$OUT/config_duplicate_label.disasm" \
     "$ROOT/tests/config_duplicate_label.ini" 2>"$OUT/config_duplicate_label.stderr"; then
     printf 'FAIL config_duplicate_label.ini\n' >&2
@@ -553,5 +570,37 @@ if "$ROOT/build/apexdmd" --table "$apexdmd_table_rom" "$apexdmd_table_ini" Bff_A
     printf 'PASS apexdmd_table\n'
 else
     printf 'FAIL apexdmd_table\n' >&2
+    exit 1
+fi
+
+# ---- ROM compare (apexcompare) -------------------------------------------
+cmp_base_rom="$OUT/compare_base.rom"
+cmp_mod_rom="$OUT/compare_mod.rom"
+cmp_out="$OUT/compare_out.txt"
+"$ROOT/build/apexasm" "$cmp_base_rom" "$ROOT/tests/compare_base.asm"
+"$ROOT/build/apexasm" "$cmp_mod_rom"  "$ROOT/tests/compare_mod.asm"
+"$ROOT/build/apexcompare" "$cmp_base_rom" "$cmp_mod_rom" \
+    "$ROOT/tests/compare_base.ini" --show-identical >"$cmp_out" 2>&1
+if grep -Eq 'identical +code +Bff_A8040 .*R_id'              "$cmp_out" &&
+   grep -Eq 'changed +code +Bff_A8060 .*R_chg .*operands'    "$cmp_out" &&
+   grep -Eq 'moved +code +Bff_A8080 +-> +Bff_A80c0 .*R_mv'   "$cmp_out" &&
+   grep -Eq 'removed +code +Bff_A80a0 .*R_rm'                "$cmp_out" &&
+   grep -Eq 'added +code +-- +-> +Bff_A80e0'                 "$cmp_out" &&
+   grep -Eq 'changed +string +Bff_A8100'                     "$cmp_out"; then
+    printf 'PASS apexcompare\n'
+else
+    printf 'FAIL apexcompare\n' >&2
+    cat "$cmp_out" >&2
+    exit 1
+fi
+
+# self-compare must report no differences
+"$ROOT/build/apexcompare" "$cmp_base_rom" "$cmp_base_rom" \
+    "$ROOT/tests/compare_base.ini" >"$cmp_out" 2>&1
+if head -1 "$cmp_out" | grep -Eq '0 moved, 0 changed, 0 removed, 0 added'; then
+    printf 'PASS apexcompare_self\n'
+else
+    printf 'FAIL apexcompare_self\n' >&2
+    cat "$cmp_out" >&2
     exit 1
 fi

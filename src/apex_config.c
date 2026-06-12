@@ -568,8 +568,51 @@ static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr)
     return 1;
 }
 
+/* Remove any 'flow_stop' token from a comma-separated inline spec list, in
+   place.  Returns 1 if the token was present.  The remaining string is the
+   plain field schema, ready for parse_table_schema. */
+static int extract_flow_stop(char *value)
+{
+    char buf[512];
+    char *p = value;
+    size_t outlen = 0;
+    int found = 0;
+
+    buf[0] = '\0';
+    while (*p) {
+        char *comma = strchr(p, ',');
+        size_t toklen = comma ? (size_t)(comma - p) : strlen(p);
+        char tok[128];
+        size_t n = toklen < sizeof(tok) - 1u ? toklen : sizeof(tok) - 1u;
+
+        memcpy(tok, p, n);
+        tok[n] = '\0';
+        if (strcmp(trim(tok), "flow_stop") == 0) {
+            found = 1;
+        } else {
+            size_t cap;
+            if (outlen && outlen < sizeof(buf) - 2u) {
+                buf[outlen++] = ',';
+            }
+            cap = sizeof(buf) - 1u - outlen;
+            n = toklen < cap ? toklen : cap;
+            memcpy(buf + outlen, p, n);
+            outlen += n;
+            buf[outlen] = '\0';
+        }
+        if (!comma) {
+            break;
+        }
+        p = comma + 1;
+    }
+    if (found) {
+        memcpy(value, buf, outlen + 1u);
+    }
+    return found;
+}
+
 void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema)
+                                 uint32_t addr, const TableSchema *schema, int flow_stop)
 {
     size_t i;
     unsigned length = (unsigned)table_schema_width(schema);
@@ -581,6 +624,7 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
         if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank,
                                 sigs->items[i].addr, has_bank, bank, addr)) {
             sigs->items[i].length = length;
+            sigs->items[i].flow_stop = flow_stop;
             free(sigs->items[i].schema.items);
             copy_inline_schema(&sigs->items[i].schema, schema);
             return;
@@ -600,6 +644,7 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
     sigs->items[sigs->count].bank = bank;
     sigs->items[sigs->count].addr = addr;
     sigs->items[sigs->count].length = length;
+    sigs->items[sigs->count].flow_stop = flow_stop;
     copy_inline_schema(&sigs->items[sigs->count].schema, schema);
     sigs->count++;
 }
@@ -611,7 +656,7 @@ void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank,
 
     memset(&schema, 0, sizeof(schema));
     add_table_field(&schema, kind, length);
-    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
+    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, 0);
     free(schema.items);
 }
 
@@ -1156,11 +1201,14 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 die("invalid inline signature '%s = %s'", key, value);
             }
             memset(&schema, 0, sizeof(schema));
-            if (parse_table_schema(value, &schema, types)) {
-                add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
-                free(schema.items);
-            } else {
-                die("invalid inline signature '%s = %s'", key, value);
+            {
+                int flow_stop = extract_flow_stop(value);
+                if (parse_table_schema(value, &schema, types)) {
+                    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, flow_stop);
+                    free(schema.items);
+                } else {
+                    die("invalid inline signature '%s = %s'", key, value);
+                }
             }
             free(value);
         } else if (in_labels) {
@@ -1406,12 +1454,13 @@ int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, u
     }
     value = dup_string(spec);
     memset(&schema, 0, sizeof(schema));
+    int flow_stop = extract_flow_stop(value);
     if (!parse_table_schema(value, &schema, types)) {
         free(schema.items);
         free(value);
         return 1;
     }
-    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema);
+    add_inline_signature_schema(sigs, has_bank, bank, addr, &schema, flow_stop);
     free(schema.items);
     free(value);
     return 0;

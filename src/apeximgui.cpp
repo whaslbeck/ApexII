@@ -227,6 +227,8 @@ int main(int argc, char **argv)
     state.show_hardware      = false;
     state.show_tables        = false;
     state.show_match_window     = false;
+    state.show_rom_compare      = false;
+    state.show_coverage         = false;
     state.match_state.scan_enabled   = true;
     state.match_state.min_confidence = APEX_MATCH_CONF_MEDIUM;
     state.show_inline_list      = false;
@@ -358,6 +360,28 @@ int main(int argc, char **argv)
                 }
                 ImGui::EndMenu();
             }
+            if (ImGui::BeginMenu("Edit")) {
+                const char *ul = apex_project_undo_label(project);
+                const char *rl = apex_project_redo_label(project);
+                char ulbl[64], rlbl[64];
+                if (ul) snprintf(ulbl, sizeof(ulbl), "Undo %s", ul);
+                else    snprintf(ulbl, sizeof(ulbl), "Undo");
+                if (rl) snprintf(rlbl, sizeof(rlbl), "Redo %s", rl);
+                else    snprintf(rlbl, sizeof(rlbl), "Redo");
+                if (ImGui::MenuItem(ulbl, "Ctrl+Z", false, apex_project_can_undo(project))) {
+                    uint8_t cb = 0xffu; uint32_t ca = 0u;
+                    selected_address(document, &state, &cb, &ca);
+                    if (apex_project_undo(project) == 0)
+                        rerender_and_reselect(project, &document, &state, cb, ca);
+                }
+                if (ImGui::MenuItem(rlbl, "Ctrl+Y", false, apex_project_can_redo(project))) {
+                    uint8_t cb = 0xffu; uint32_t ca = 0u;
+                    selected_address(document, &state, &cb, &ca);
+                    if (apex_project_redo(project) == 0)
+                        rerender_and_reselect(project, &document, &state, cb, ca);
+                }
+                ImGui::EndMenu();
+            }
             if (ImGui::BeginMenu("Windows")) {
                 ImGui::MenuItem("Navigator",    "N",      &state.show_navigator);
                 ImGui::MenuItem("Disassembly",  "D",      &state.show_disasm);
@@ -372,6 +396,8 @@ int main(int argc, char **argv)
                 ImGui::Separator();
                 ImGui::MenuItem("ROM Info",             NULL, &state.show_rom_info);
                 ImGui::MenuItem("Match from Reference", NULL, &state.show_match_window);
+                ImGui::MenuItem("ROM Compare",          NULL, &state.show_rom_compare);
+                ImGui::MenuItem("Coverage",             NULL, &state.show_coverage);
                 ImGui::MenuItem("Call Graph",     NULL, &state.show_call_graph);
                 ImGui::MenuItem("Hardware",       NULL, &state.show_hardware);
                 ImGui::MenuItem("Tables",         NULL, &state.show_tables);
@@ -436,6 +462,8 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Edit",        dock_right_id);
             ImGui::DockBuilderDockWindow("ROM Info",            dock_right_id);
             ImGui::DockBuilderDockWindow("Match from Reference", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("ROM Compare",          dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Coverage",             dock_bottom_id);
             ImGui::DockBuilderDockWindow("Call Graph",     dock_bottom_id);
             ImGui::DockBuilderDockWindow("References",     dock_bottom_id);
             ImGui::DockBuilderDockWindow("Hardware",       dock_bottom_id);
@@ -702,6 +730,16 @@ int main(int argc, char **argv)
             render_match_window(project, &document, &state);
             ImGui::End();
         }
+        if (state.show_rom_compare) {
+            ImGui::Begin("ROM Compare", &state.show_rom_compare);
+            render_rom_compare_window(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_coverage) {
+            ImGui::Begin("Coverage", &state.show_coverage);
+            render_coverage_window(project, &document, &state);
+            ImGui::End();
+        }
         if (state.show_inline_list) {
             ImGui::Begin("Inline Sigs", &state.show_inline_list);
             render_inline_list(project, document, &state);
@@ -901,6 +939,8 @@ int main(int argc, char **argv)
                 krow("Ctrl+F",   "Global search");
                 krow("Ctrl+C",   "Copy selection");
                 krow("Ctrl+S",   "Save config overlay");
+                krow("Ctrl+Z",   "Undo last edit");
+                krow("Ctrl+Y",   "Redo");
                 krow("F5",       "Re-analyze");
                 krow("Shift+F5", "Force full re-analyze");
                 ImGui::EndTable();
@@ -926,6 +966,16 @@ int main(int argc, char **argv)
         }
 
         if (!io.WantTextInput) {
+            if (io.KeyCtrl && (ImGui::IsKeyPressed(ImGuiKey_Z) ||
+                               ImGui::IsKeyPressed(ImGuiKey_Y))) {
+                bool redo = ImGui::IsKeyPressed(ImGuiKey_Y) ||
+                            (ImGui::IsKeyPressed(ImGuiKey_Z) && io.KeyShift);
+                uint8_t cb = 0xffu; uint32_t ca = 0u;
+                selected_address(document, &state, &cb, &ca);
+                int rc = redo ? apex_project_redo(project) : apex_project_undo(project);
+                if (rc == 0)
+                    rerender_and_reselect(project, &document, &state, cb, ca);
+            }
             if (ImGui::IsKeyPressed(ImGuiKey_H)) {
                 state.show_help = !state.show_help;
             }

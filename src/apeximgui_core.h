@@ -15,6 +15,7 @@ extern "C" {
 #include "apex_render.h"
 #include "apex_analysis.h"
 #include "apex_match.h"
+#include "apex_compare.h"
 }
 
 // --- ROM Info State ---
@@ -63,6 +64,50 @@ struct MatchWindowState {
     ~MatchWindowState() {
         if (src_project) { apex_project_free(src_project); src_project = nullptr; }
     }
+};
+
+struct CompareWindowState {
+    char rom_b_path[1024] = {0};
+    char ini_b_path[1024] = {0};
+    int  min_instrs       = 5;
+    bool inc_code         = true;
+    bool inc_strings      = true;
+    bool inc_tables       = true;
+    bool inject_paged     = false;
+    bool has_results      = false;
+    std::string run_status;
+    ApexProject       *b_project = nullptr;
+    ApexFingerprintDB *a_db      = nullptr;  /* snapshot of A at run time */
+    ApexFingerprintDB *b_db      = nullptr;
+    std::vector<ApexCompareEntry> results;
+    size_t n_identical = 0, n_moved = 0, n_changed = 0, n_removed = 0, n_added = 0;
+    char filter[128] = {0};
+    bool show_identical = false;
+    bool show_moved     = true;
+    bool show_changed   = true;
+    bool show_removed   = true;
+    bool show_added     = true;
+
+    void reset() {
+        if (b_db)      { apex_fingerprint_free(b_db);  b_db = nullptr; }
+        if (a_db)      { apex_fingerprint_free(a_db);  a_db = nullptr; }
+        if (b_project) { apex_project_free(b_project); b_project = nullptr; }
+        results.clear();
+        has_results = false;
+    }
+    ~CompareWindowState() { reset(); }
+};
+
+struct CoverageWindowState {
+    bool        computed = false;
+    const void *doc_ptr  = nullptr;   /* staleness check against the rendered doc */
+    size_t      rom_size = 0;
+    size_t      totals[7] = {0,0,0,0,0,0,0};  /* indexed by ApexRenderedBlockKind */
+    bool        include_unknown = false;       /* also list never-reached UNKNOWN runs */
+    int         min_gap = 2;                    /* ignore gaps shorter than this */
+    struct Gap { size_t off; size_t len; uint8_t bank; uint32_t addr; int unknown; };
+    std::vector<Gap> gaps;
+    int         next_gap = 0;                   /* cursor for "jump to next gap" */
 };
 
 // --- Constants and Enums ---
@@ -170,6 +215,7 @@ struct UiState {
     int edit_field_add_count;  /* repeat count used when clicking a field button */
     ApexEditField edit_inline_fields[APEX_MAX_EDIT_FIELDS];
     int edit_inline_count;
+    bool edit_inline_flow_stop;
     ApexEditField edit_schema_fields[APEX_MAX_EDIT_FIELDS];
     int edit_schema_count;
     std::vector<size_t> history_back;
@@ -217,6 +263,10 @@ struct UiState {
     RomInfoState rom_info;
     bool show_match_window;
     MatchWindowState match_state;
+    bool show_rom_compare;
+    CompareWindowState compare_state;
+    bool show_coverage;
+    CoverageWindowState coverage_state;
     bool show_inline_list;
     bool show_entries_list;
     bool show_strings_list;
@@ -530,6 +580,8 @@ void render_rom_info(const ApexProject *project, UiState *state);
 
 // Match from Reference
 void render_match_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_rom_compare_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_coverage_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // Analysis: Inline list, Entries list & Types editor
 void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);

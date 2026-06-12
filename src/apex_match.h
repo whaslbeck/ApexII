@@ -44,6 +44,16 @@ const ApexFunctionFingerprint *apex_fingerprint_get(const ApexFingerprintDB *db,
 const ApexFunctionFingerprint *apex_fingerprint_at(const ApexFingerprintDB *db,
                                                     uint8_t bank, uint32_t addr);
 
+/*
+ * Fingerprint raw ROM bytes at (bank, addr) for up to max_instrs instructions
+ * (0 = internal default), without stopping at labels.  Used by ROM compare to
+ * re-fingerprint version B at version A's address and instruction count, so an
+ * unchanged routine hashes identically regardless of B's own config/analysis.
+ * Writes the L1/L2 hashes and returns the instruction count actually decoded.
+ */
+uint16_t apex_fingerprint_raw(const struct ApexProject *p, uint8_t bank, uint32_t addr,
+                              uint16_t max_instrs, uint32_t *l1_out, uint32_t *l2_out);
+
 /* ---------- matching ---------- */
 
 #define APEX_MATCH_CONF_EXACT   90  /* l1 + l2 match */

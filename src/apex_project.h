@@ -8,6 +8,7 @@
 #include "apex_config.h"
 
 struct ApexRenderedDocument;
+struct ApexUndo;
 
 typedef enum {
     APEX_DIRTY_NONE = 0,
@@ -52,6 +53,7 @@ typedef struct ApexProject {
     struct ApexRenderedDocument *render_cache;
     int render_cache_emit_xrefs;
     int render_cache_emit_explain;
+    struct ApexUndo *undo;   /* config edit history (lazily allocated) */
 } ApexProject;
 
 ApexProject *apex_project_open(const char *rom_path, const char *config_path);
@@ -91,6 +93,21 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
                                       uint32_t addr);
 int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
 int apex_project_clear_symbol(ApexProject *project, const char *name);
+
+/* Undo/redo of config edits -----------------------------------------------
+ * The project snapshots its full config before every mutating edit; undo and
+ * redo restore whole-config snapshots and trigger a full re-analysis. Multiple
+ * mutations can be coalesced into one undo step by wrapping them in a group
+ * (used e.g. by the "delete all redundant entries" batch action). Groups may
+ * be nested; only the outermost begin captures the snapshot. */
+void apex_project_begin_edit_group(ApexProject *project, const char *label);
+void apex_project_end_edit_group(ApexProject *project);
+int apex_project_can_undo(const ApexProject *project);
+int apex_project_can_redo(const ApexProject *project);
+const char *apex_project_undo_label(const ApexProject *project);
+const char *apex_project_redo_label(const ApexProject *project);
+int apex_project_undo(ApexProject *project);
+int apex_project_redo(ApexProject *project);
 
 /* Code candidate scanner ------------------------------------------------- */
 #define APEX_CANDIDATE_PREVIEW 80

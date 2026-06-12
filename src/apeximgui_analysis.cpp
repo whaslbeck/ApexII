@@ -893,6 +893,7 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     s->editor_bound_line = s->selected_line;
     s->edit_label_input[0] = '\0';
     s->edit_inline_count = 0;
+    s->edit_inline_flow_stop = false;
     s->edit_schema_count = 0;
     s->edit_data_length = 1;
     s->edit_table_rows = 1;
@@ -910,6 +911,7 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
         std::string spec = inline_sig_spec_string(is);
         spec_to_fields(spec.c_str(), s->edit_inline_fields, &s->edit_inline_count,
                        APEX_MAX_EDIT_FIELDS, p);
+        s->edit_inline_flow_stop = is->flow_stop != 0;
     }
     for (size_t i = 0; i < p->tables.count; i++) {
         const TableDef *td = &p->tables.items[i];
@@ -1186,7 +1188,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_flow_arrows=%d\nshow_symbols=%d\n"
             "show_code_candidates=%d\nshow_inline_candidates=%d\n"
             "show_strings_list=%d\nshow_sprite_gallery=%d\n"
-            "show_rom_info=%d\nshow_match_window=%d\n",
+            "show_rom_info=%d\nshow_match_window=%d\nshow_rom_compare=%d\n"
+            "show_coverage=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
             s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
@@ -1197,7 +1200,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_flow_arrows, s->show_symbols_editor,
             s->show_code_candidates, s->show_inline_candidates,
             s->show_strings_list, s->show_sprite_gallery,
-            s->show_rom_info, s->show_match_window);
+            s->show_rom_info, s->show_match_window, s->show_rom_compare,
+            s->show_coverage);
     fclose(f);
 }
 
@@ -1328,6 +1332,10 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_rom_info = atoi(l + 14) != 0;
         } else if (strncmp(l, "show_match_window=", 18) == 0) {
             s->show_match_window = atoi(l + 18) != 0;
+        } else if (strncmp(l, "show_rom_compare=", 17) == 0) {
+            s->show_rom_compare = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_coverage=", 14) == 0) {
+            s->show_coverage = atoi(l + 14) != 0;
         } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {
@@ -2660,7 +2668,9 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
             write_config_address(o, p->inline_sigs.items[i].has_bank,
                                  p->inline_sigs.items[i].bank,
                                  p->inline_sigs.items[i].addr);
-            fprintf(o, " = %s\n", inline_sig_spec_string(&p->inline_sigs.items[i]).c_str());
+            fprintf(o, " = %s", inline_sig_spec_string(&p->inline_sigs.items[i]).c_str());
+            if (p->inline_sigs.items[i].flow_stop) fputs(", flow_stop", o);
+            fputc('\n', o);
         }
     }
     if (p->data_ranges.count > 0) {

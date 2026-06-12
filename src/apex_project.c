@@ -240,6 +240,9 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
 static void write_inline_signature_value(FILE *out, const InlineSignature *sig)
 {
     write_table_schema_text(out, &sig->schema);
+    if (sig->flow_stop) {
+        fputs(", flow_stop", out);
+    }
 }
 
 static void write_data_range_value(FILE *out, const DataRange *range)
@@ -962,6 +965,463 @@ static int remove_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint3
     return 0;
 }
 
+/* -------------------------------------------------------------------------
+ * Undo/redo
+ *
+ * Each edit is recorded as a full deep copy of every mutable config section.
+ * Restoring a snapshot replaces the live config wholesale and forces a full
+ * re-analysis; the derived label/reference/render state is rebuilt from it.
+ *
+ * The only borrowed pointer in the config is TableField.type_name, which aims
+ * into a ConfigType.name owned by config_types. A snapshot deep-copies its own
+ * config_types first and rebinds every schema's type_name into that copy, so
+ * each snapshot is internally self-consistent and can be moved around (and into
+ * the project) without dangling.
+ * ------------------------------------------------------------------------- */
+
+#define APEX_UNDO_MAX 50
+
+typedef struct {
+    InlineSignatures inline_sigs;
+    ConfigLabels     config_labels;
+    ConfigEntries    config_entries;
+    TableDefs        tables;
+    SchemaDefs       schemas;
+    ConfigDocs       docs;
+    ConfigSymbols    symbols;
+    DataRanges       data_ranges;
+    ConfigTypes      config_types;
+    ConfigEntries    ref_exclusions;
+    ConfigOptions    options;
+    char             action[24];
+} ApexConfigSnapshot;
+
+struct ApexUndo {
+    ApexConfigSnapshot undo[APEX_UNDO_MAX];
+    size_t             undo_count;
+    ApexConfigSnapshot redo[APEX_UNDO_MAX];
+    size_t             redo_count;
+    int                group_depth;
+    int                group_captured;
+    char               group_label[24];
+};
+
+static const char *rebind_type_name(const ConfigTypes *types, const char *old_name)
+{
+    size_t i;
+
+    if (!old_name) {
+        return NULL;
+    }
+    for (i = 0; i < types->count; i++) {
+        if (strcmp(types->items[i].name, old_name) == 0) {
+            return types->items[i].name;
+        }
+    }
+    return NULL; /* type no longer exists — degrade to raw kind */
+}
+
+static TableSchema copy_schema_rebind(const TableSchema *src, const ConfigTypes *types)
+{
+    TableSchema dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    for (i = 0; i < src->count; i++) {
+        add_table_field(&dst, src->items[i].kind, src->items[i].count);
+        dst.items[dst.count - 1u].type_name = rebind_type_name(types, src->items[i].type_name);
+    }
+    return dst;
+}
+
+static ConfigTypes copy_config_types(const ConfigTypes *src)
+{
+    ConfigTypes dst;
+    size_t i, j;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        const ConfigType *s = &src->items[i];
+        ConfigType *t = &dst.items[i];
+
+        t->name = project_dup_string(s->name);
+        t->kind = s->kind;
+        t->value_count = s->value_count;
+        t->value_cap = s->value_count;
+        t->values = s->value_count ? xmalloc(s->value_count * sizeof(t->values[0])) : NULL;
+        for (j = 0; j < s->value_count; j++) {
+            t->values[j].value = s->values[j].value;
+            t->values[j].name = project_dup_string(s->values[j].name);
+        }
+    }
+    return dst;
+}
+
+static InlineSignatures copy_inline_sigs(const InlineSignatures *src, const ConfigTypes *types)
+{
+    InlineSignatures dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i].has_bank = src->items[i].has_bank;
+        dst.items[i].bank = src->items[i].bank;
+        dst.items[i].addr = src->items[i].addr;
+        dst.items[i].length = src->items[i].length;
+        dst.items[i].flow_stop = src->items[i].flow_stop;
+        dst.items[i].schema = copy_schema_rebind(&src->items[i].schema, types);
+    }
+    return dst;
+}
+
+static TableDefs copy_table_defs(const TableDefs *src, const ConfigTypes *types)
+{
+    TableDefs dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i].bank = src->items[i].bank;
+        dst.items[i].addr = src->items[i].addr;
+        dst.items[i].has_header = src->items[i].has_header;
+        dst.items[i].rows = src->items[i].rows;
+        dst.items[i].schema = copy_schema_rebind(&src->items[i].schema, types);
+    }
+    return dst;
+}
+
+static SchemaDefs copy_schema_defs(const SchemaDefs *src, const ConfigTypes *types)
+{
+    SchemaDefs dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i].name = project_dup_string(src->items[i].name);
+        dst.items[i].schema = copy_schema_rebind(&src->items[i].schema, types);
+    }
+    return dst;
+}
+
+static ConfigLabels copy_config_labels(const ConfigLabels *src)
+{
+    ConfigLabels dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i] = src->items[i];
+        dst.items[i].name = project_dup_string(src->items[i].name);
+    }
+    return dst;
+}
+
+static ConfigDocs copy_config_docs(const ConfigDocs *src)
+{
+    ConfigDocs dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i] = src->items[i];
+        dst.items[i].text = project_dup_string(src->items[i].text);
+    }
+    return dst;
+}
+
+static ConfigSymbols copy_config_symbols(const ConfigSymbols *src)
+{
+    ConfigSymbols dst;
+    size_t i;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    for (i = 0; i < src->count; i++) {
+        dst.items[i] = src->items[i];
+        dst.items[i].name = project_dup_string(src->items[i].name);
+    }
+    return dst;
+}
+
+static ConfigEntries copy_config_entries(const ConfigEntries *src)
+{
+    ConfigEntries dst;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    memcpy(dst.items, src->items, src->count * sizeof(dst.items[0]));
+    return dst;
+}
+
+static DataRanges copy_data_ranges(const DataRanges *src)
+{
+    DataRanges dst;
+
+    memset(&dst, 0, sizeof(dst));
+    if (src->count == 0) {
+        return dst;
+    }
+    dst.items = xmalloc(src->count * sizeof(dst.items[0]));
+    dst.cap = src->count;
+    dst.count = src->count;
+    memcpy(dst.items, src->items, src->count * sizeof(dst.items[0]));
+    return dst;
+}
+
+static void snapshot_capture(const ApexProject *p, const char *action, ApexConfigSnapshot *out)
+{
+    memset(out, 0, sizeof(*out));
+    out->config_types   = copy_config_types(&p->config_types);
+    out->inline_sigs    = copy_inline_sigs(&p->inline_sigs, &out->config_types);
+    out->tables         = copy_table_defs(&p->tables, &out->config_types);
+    out->schemas        = copy_schema_defs(&p->schemas, &out->config_types);
+    out->config_labels  = copy_config_labels(&p->config_labels);
+    out->config_entries = copy_config_entries(&p->config_entries);
+    out->docs           = copy_config_docs(&p->docs);
+    out->symbols        = copy_config_symbols(&p->symbols);
+    out->data_ranges    = copy_data_ranges(&p->data_ranges);
+    out->ref_exclusions = copy_config_entries(&p->ref_exclusions);
+    out->options        = p->options;
+    snprintf(out->action, sizeof(out->action), "%s", action ? action : "edit");
+}
+
+static void snapshot_free(ApexConfigSnapshot *s)
+{
+    free_inline_signatures(&s->inline_sigs);
+    free_config_labels(&s->config_labels);
+    free_config_entries(&s->config_entries);
+    free_table_defs(&s->tables);
+    free_schema_defs(&s->schemas);
+    free_config_docs(&s->docs);
+    free_config_symbols(&s->symbols);
+    free(s->data_ranges.items);
+    free_config_types(&s->config_types);
+    free_config_entries(&s->ref_exclusions);
+    memset(s, 0, sizeof(*s));
+}
+
+/* Free the project's current config and move the snapshot's owned arrays in.
+   Leaves *s zeroed (ownership transferred to the project). */
+static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
+{
+    free_inline_signatures(&p->inline_sigs);
+    free_config_labels(&p->config_labels);
+    free_config_entries(&p->config_entries);
+    free_table_defs(&p->tables);
+    free_schema_defs(&p->schemas);
+    free_config_docs(&p->docs);
+    free_config_symbols(&p->symbols);
+    free(p->data_ranges.items);
+    memset(&p->data_ranges, 0, sizeof(p->data_ranges));
+    free_config_types(&p->config_types);
+    free_config_entries(&p->ref_exclusions);
+
+    p->inline_sigs    = s->inline_sigs;
+    p->config_labels  = s->config_labels;
+    p->config_entries = s->config_entries;
+    p->tables         = s->tables;
+    p->schemas        = s->schemas;
+    p->docs           = s->docs;
+    p->symbols        = s->symbols;
+    p->data_ranges    = s->data_ranges;
+    p->config_types   = s->config_types;
+    p->ref_exclusions = s->ref_exclusions;
+    p->options        = s->options;
+    memset(s, 0, sizeof(*s));
+}
+
+static struct ApexUndo *undo_ensure(ApexProject *p)
+{
+    if (!p->undo) {
+        p->undo = xmalloc(sizeof(*p->undo));
+        memset(p->undo, 0, sizeof(*p->undo));
+    }
+    return p->undo;
+}
+
+/* Push *snap onto a fixed-capacity stack, dropping the oldest entry on
+   overflow. Moves ownership: *snap is zeroed. */
+static void undo_stack_push(ApexConfigSnapshot *stack, size_t *count, ApexConfigSnapshot *snap)
+{
+    if (*count == APEX_UNDO_MAX) {
+        snapshot_free(&stack[0]);
+        memmove(&stack[0], &stack[1], (APEX_UNDO_MAX - 1u) * sizeof(stack[0]));
+        (*count)--;
+    }
+    stack[(*count)++] = *snap;
+    memset(snap, 0, sizeof(*snap));
+}
+
+static void undo_clear_redo(struct ApexUndo *u)
+{
+    while (u->redo_count) {
+        snapshot_free(&u->redo[--u->redo_count]);
+    }
+}
+
+/* Record a pre-edit checkpoint. Called at the top of every mutator. Inside an
+   edit group only the first mutation captures (so the group is one undo step). */
+static void project_record_edit(ApexProject *p, const char *action)
+{
+    struct ApexUndo *u;
+    ApexConfigSnapshot snap;
+
+    if (!p) {
+        return;
+    }
+    u = undo_ensure(p);
+    if (u->group_depth > 0) {
+        if (u->group_captured) {
+            return;
+        }
+        u->group_captured = 1;
+        if (u->group_label[0]) {
+            action = u->group_label;
+        }
+    }
+    snapshot_capture(p, action, &snap);
+    undo_stack_push(u->undo, &u->undo_count, &snap);
+    undo_clear_redo(u);
+}
+
+void apex_project_begin_edit_group(ApexProject *project, const char *label)
+{
+    struct ApexUndo *u;
+
+    if (!project) {
+        return;
+    }
+    u = undo_ensure(project);
+    if (u->group_depth == 0) {
+        u->group_captured = 0;
+        snprintf(u->group_label, sizeof(u->group_label), "%s", label ? label : "edit");
+    }
+    u->group_depth++;
+}
+
+void apex_project_end_edit_group(ApexProject *project)
+{
+    struct ApexUndo *u;
+
+    if (!project || !project->undo) {
+        return;
+    }
+    u = project->undo;
+    if (u->group_depth > 0) {
+        u->group_depth--;
+    }
+    if (u->group_depth == 0) {
+        u->group_captured = 0;
+        u->group_label[0] = '\0';
+    }
+}
+
+int apex_project_can_undo(const ApexProject *project)
+{
+    return project && project->undo && project->undo->undo_count > 0;
+}
+
+int apex_project_can_redo(const ApexProject *project)
+{
+    return project && project->undo && project->undo->redo_count > 0;
+}
+
+const char *apex_project_undo_label(const ApexProject *project)
+{
+    if (!apex_project_can_undo(project)) {
+        return NULL;
+    }
+    return project->undo->undo[project->undo->undo_count - 1u].action;
+}
+
+const char *apex_project_redo_label(const ApexProject *project)
+{
+    if (!apex_project_can_redo(project)) {
+        return NULL;
+    }
+    return project->undo->redo[project->undo->redo_count - 1u].action;
+}
+
+int apex_project_undo(ApexProject *project)
+{
+    struct ApexUndo *u;
+    ApexConfigSnapshot cur, snap;
+
+    if (!apex_project_can_undo(project)) {
+        return 1;
+    }
+    u = project->undo;
+    snapshot_capture(project, u->undo[u->undo_count - 1u].action, &cur);
+    undo_stack_push(u->redo, &u->redo_count, &cur);
+    snap = u->undo[--u->undo_count];
+    snapshot_apply(project, &snap);
+    apex_project_invalidate(project, APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER);
+    return 0;
+}
+
+int apex_project_redo(ApexProject *project)
+{
+    struct ApexUndo *u;
+    ApexConfigSnapshot cur, snap;
+
+    if (!apex_project_can_redo(project)) {
+        return 1;
+    }
+    u = project->undo;
+    snapshot_capture(project, u->redo[u->redo_count - 1u].action, &cur);
+    undo_stack_push(u->undo, &u->undo_count, &cur);
+    snap = u->redo[--u->redo_count];
+    snapshot_apply(project, &snap);
+    apex_project_invalidate(project, APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER);
+    return 0;
+}
+
 ApexProject *apex_project_open(const char *rom_path, const char *config_path)
 {
     ApexProject *project = xmalloc(sizeof(*project));
@@ -1026,6 +1486,15 @@ void apex_project_free(ApexProject *project)
     if (project->render_cache) {
         apex_render_document_free(project->render_cache);
         free(project->render_cache);
+    }
+    if (project->undo) {
+        while (project->undo->undo_count) {
+            snapshot_free(&project->undo->undo[--project->undo->undo_count]);
+        }
+        while (project->undo->redo_count) {
+            snapshot_free(&project->undo->redo[--project->undo->redo_count]);
+        }
+        free(project->undo);
     }
     free(project->rom.data);
     free((char *)project->rom_path);
@@ -1275,13 +1744,20 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
     if (!labels) {
         return 1;
     }
+    project_record_edit(project, "set label");
     config_label = upsert_config_label(&project->config_labels, has_bank, bank, addr, name, &old_name);
+    /* Rename an existing runtime label at this address rather than adding a
+       second one: when renaming match the previous config name, otherwise take
+       over the auto-generated placeholder (Bxx_Ayyyy).  Without this a manual
+       label at an auto-labelled address leaves the placeholder behind and the
+       line renders two labels. */
     for (i = 0; i < labels->count; i++) {
         if (labels->items[i].addr == addr &&
             (old_name ? strcmp(labels->items[i].name, old_name) == 0
-                      : !generated_any_label_name(labels->items[i].name))) {
+                      : generated_any_label_name(labels->items[i].name))) {
             labels->items[i].name = config_label->name;
             updated = 1;
+            break;
         }
     }
     if (!updated) {
@@ -1289,6 +1765,20 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
                                  code_label_at(addr, labels->items, labels->count, 0));
 
         label->name = config_label->name;
+    }
+    /* Drop any other now-redundant label at this address (a stray generated
+       placeholder or a duplicate of the new name). */
+    for (i = 0; i < labels->count; ) {
+        if (labels->items[i].addr == addr &&
+            labels->items[i].name != config_label->name &&
+            (generated_any_label_name(labels->items[i].name) ||
+             strcmp(labels->items[i].name, config_label->name) == 0)) {
+            memmove(&labels->items[i], &labels->items[i + 1],
+                    (labels->count - i - 1u) * sizeof(labels->items[0]));
+            labels->count--;
+        } else {
+            i++;
+        }
     }
     free(old_name);
     apex_project_invalidate(project, APEX_DIRTY_LABELS | APEX_DIRTY_RENDER);
@@ -1307,6 +1797,7 @@ int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, u
     if (!labels) {
         return 1;
     }
+    project_record_edit(project, "clear label");
     removed_name = remove_config_label(&project->config_labels, has_bank, bank, addr);
     if (!removed_name) {
         return 1;
@@ -1323,6 +1814,7 @@ int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
     if (!project || !text || !*text) {
         return 1;
     }
+    project_record_edit(project, "set doc");
     upsert_config_doc(&project->docs, has_bank, bank, addr, text);
     apex_project_invalidate(project, APEX_DIRTY_DOCS | APEX_DIRTY_RENDER);
     return 0;
@@ -1334,6 +1826,7 @@ int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "clear doc");
     if (!remove_config_doc(&project->docs, has_bank, bank, addr)) {
         return 1;
     }
@@ -1349,6 +1842,7 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "set kind");
     config_clear_entry(&project->config_entries, has_bank, bank, addr);
     config_clear_data(&project->data_ranges, bank, addr);
     config_clear_table(&project->tables, bank, addr);
@@ -1400,6 +1894,7 @@ int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "clear kind");
     config_clear_entry(&project->config_entries, has_bank, bank, addr);
     config_clear_data(&project->data_ranges, bank, addr);
     config_clear_table(&project->tables, bank, addr);
@@ -1420,6 +1915,7 @@ int apex_project_set_inline(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project || !spec || !*spec) {
         return 1;
     }
+    project_record_edit(project, "set inline");
     if (config_set_inline_spec(&project->inline_sigs, has_bank, bank, addr, spec,
                                &project->config_types) != 0) {
         return 1;
@@ -1440,6 +1936,7 @@ int apex_project_clear_inline(ApexProject *project, int has_bank, uint8_t bank, 
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "clear inline");
     if (config_clear_inline(&project->inline_sigs, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -1459,6 +1956,7 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
     if (!project || !spec || !*spec) {
         return 1;
     }
+    project_record_edit(project, "set table");
     if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, spec,
                                &project->config_types) != 0) {
         return 1;
@@ -1479,6 +1977,7 @@ int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr)
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "clear table");
     if (config_clear_table(&project->tables, bank, addr) != 0) {
         return 1;
     }
@@ -1672,6 +2171,7 @@ int apex_project_set_type(ApexProject *project, const char *name, int is_word,
     if (!project || !name || !*name) {
         return 1;
     }
+    project_record_edit(project, "set type");
     TableFieldKind kind = is_word ? TABLE_WORD : TABLE_BYTE;
     config_set_type(&project->config_types, name, kind, values_str ? values_str : "");
     apex_project_invalidate(project, APEX_DIRTY_RENDER);
@@ -1683,6 +2183,7 @@ int apex_project_remove_type(ApexProject *project, const char *name)
     if (!project || !name) {
         return 1;
     }
+    project_record_edit(project, "remove type");
     return config_remove_type(&project->config_types, name) ? 0 : 1;
 }
 
@@ -1692,6 +2193,7 @@ int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t b
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "add exclusion");
     config_set_entry(&project->ref_exclusions, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
@@ -1704,6 +2206,7 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
     if (!project) {
         return 1;
     }
+    project_record_edit(project, "remove exclusion");
     if (config_clear_entry(&project->ref_exclusions, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -1715,6 +2218,7 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
 int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value)
 {
     if (!project) return 1;
+    project_record_edit(project, "set symbol");
     if (config_set_symbol(&project->symbols, name, value) != 0) return 1;
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
@@ -1724,6 +2228,7 @@ int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t val
 int apex_project_clear_symbol(ApexProject *project, const char *name)
 {
     if (!project) return 1;
+    project_record_edit(project, "clear symbol");
     if (config_clear_symbol(&project->symbols, name) != 0) return 1;
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);

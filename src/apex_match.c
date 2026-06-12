@@ -175,6 +175,7 @@ static int db_add(ApexFingerprintDB *db, const FPEntry *e)
 static void fingerprint_one(const uint8_t *rom, size_t banks,
                              uint8_t bank, uint32_t addr,
                              const LabelSet *labels,  /* for stop-at-label */
+                             uint16_t cap,            /* max instructions */
                              FPEntry *out)
 {
     const uint8_t *data;
@@ -194,8 +195,9 @@ static void fingerprint_one(const uint8_t *rom, size_t banks,
     out->fp.callee_hash = FNV32_INIT;
 
     if (!rom_bytes_at(rom, banks, bank, addr, &data, &avail)) return;
+    if (cap == 0 || cap > MAX_INSTRS) cap = MAX_INSTRS;
 
-    while (n < MAX_INSTRS) {
+    while (n < cap) {
         size_t pos = (size_t)(cur - addr);
         if (pos >= avail) break;
 
@@ -307,7 +309,7 @@ static void fp_callback(const uint8_t *rom, size_t banks,
                          ApexFingerprintDB *db)
 {
     FPEntry e;
-    fingerprint_one(rom, banks, bank, addr, bank_ls, &e);
+    fingerprint_one(rom, banks, bank, addr, bank_ls, MAX_INSTRS, &e);
     if (e.fp.instr_count < 2) return;  /* too short to be reliable */
     e.fp.label_name = label_name;
     db_add(db, &e);
@@ -364,6 +366,24 @@ ApexFingerprintDB *apex_fingerprint_build(const struct ApexProject *p)
 
     resolve_callee_hashes(db);
     return db;
+}
+
+uint16_t apex_fingerprint_raw(const struct ApexProject *p, uint8_t bank, uint32_t addr,
+                              uint16_t max_instrs, uint32_t *l1_out, uint32_t *l2_out)
+{
+    FPEntry e;
+
+    if (!p) {
+        if (l1_out) *l1_out = 0;
+        if (l2_out) *l2_out = 0;
+        return 0;
+    }
+    /* labels = NULL: do not stop at named boundaries — version B is being
+       fingerprinted at version A's address, capped to A's instruction count. */
+    fingerprint_one(p->rom.data, p->banks, bank, addr, NULL, max_instrs, &e);
+    if (l1_out) *l1_out = e.fp.l1_hash;
+    if (l2_out) *l2_out = e.fp.l2_hash;
+    return e.fp.instr_count;
 }
 
 void apex_fingerprint_free(ApexFingerprintDB *db)
@@ -570,7 +590,7 @@ static uint32_t scan_callee_l1(const uint8_t *rom, size_t banks,
 
     /* Not in DB (unreachable from vectors): fingerprint on-the-fly. */
     FPEntry tmp;
-    fingerprint_one(rom, banks, callee_bank, callee_addr, NULL, &tmp);
+    fingerprint_one(rom, banks, callee_bank, callee_addr, NULL, MAX_INSTRS, &tmp);
     return tmp.fp.l1_hash;
 }
 
@@ -653,7 +673,7 @@ ApexMatchResult *apex_match_scan_system_bank(
         for (off = 0; off < (uint32_t)sys_avail; off++) {
             FPEntry cand;
             uint32_t cpu = APEX_SYSTEM_ORG + off;
-            fingerprint_one(dst->rom.data, dst->banks, 0xffu, cpu, NULL, &cand);
+            fingerprint_one(dst->rom.data, dst->banks, 0xffu, cpu, NULL, MAX_INSTRS, &cand);
             if (cand.fp.instr_count < (uint16_t)min_instrs) continue;
 
             /* Binary search for L1 match in index. */
@@ -830,6 +850,7 @@ void apex_match_write_ini(FILE *out,
                         }
                     }
                 }
+                if (sig->flow_stop) fprintf(out, ", flow_stop");
                 fprintf(out, " ; transferred from B%02x_A%04x\n",
                         r->src_bank, r->src_addr);
             }

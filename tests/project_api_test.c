@@ -245,6 +245,64 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* ---- undo / redo ---- */
+    if (apex_project_set_label(project, 0, 0xffu, 0x8005u, "UndoProbeLabel") != 0) {
+        fprintf(stderr, "undo: set_label failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "UndoProbeLabel") || !apex_project_can_undo(project)) {
+        fprintf(stderr, "undo: probe label not applied\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (apex_project_undo(project) != 0) {
+        fprintf(stderr, "undo: undo failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || contains(doc4->text, "UndoProbeLabel") || !apex_project_can_redo(project)) {
+        fprintf(stderr, "undo: edit not reverted\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (apex_project_redo(project) != 0) {
+        fprintf(stderr, "undo: redo failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "UndoProbeLabel")) {
+        fprintf(stderr, "undo: redo did not restore edit\n");
+        apex_project_free(project);
+        return 1;
+    }
+    /* grouped edits collapse into a single undo step */
+    apex_project_begin_edit_group(project, "grp");
+    apex_project_set_label(project, 0, 0xffu, 0x8005u, "GrpLabelA");
+    apex_project_set_doc(project, 0, 0xffu, 0x8005u, "grp doc body");
+    apex_project_end_edit_group(project);
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || !contains(doc4->text, "GrpLabelA") || !contains(doc4->text, "grp doc body")) {
+        fprintf(stderr, "undo: grouped edit not applied\n");
+        apex_project_free(project);
+        return 1;
+    }
+    if (apex_project_undo(project) != 0) {
+        fprintf(stderr, "undo: group undo failed\n");
+        apex_project_free(project);
+        return 1;
+    }
+    doc4 = apex_project_render(project, 0, 0);
+    if (!doc4 || contains(doc4->text, "GrpLabelA") || contains(doc4->text, "grp doc body") ||
+        !contains(doc4->text, "UndoProbeLabel")) {
+        fprintf(stderr, "undo: group did not revert in one step\n");
+        apex_project_free(project);
+        return 1;
+    }
+
     apex_project_free(project);
 
     if (argc >= 5) {

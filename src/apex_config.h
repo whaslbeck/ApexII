@@ -57,6 +57,7 @@ typedef struct {
     uint8_t bank;
     uint32_t addr;
     unsigned length;
+    int flow_stop;          /* tail-call helper: control never returns past inline data */
     TableSchema schema;
 } InlineSignature;
 
@@ -190,7 +191,7 @@ size_t table_schema_width(const TableSchema *schema);
 int table_kind_is_far(TableFieldKind kind);
 
 void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema);
+                                 uint32_t addr, const TableSchema *schema, int flow_stop);
 void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
                              unsigned length, TableFieldKind kind);
 

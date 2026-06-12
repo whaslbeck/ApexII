@@ -1035,6 +1035,13 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             pos += info.size;
             pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used);
+            if (info.has_target) {
+                const InlineSignature *fs =
+                    inline_signature_for(inline_sigs, current_bank, info.target);
+                if (fs && fs->flow_stop) {
+                    break; /* tail-call helper consumes inline args and never returns */
+                }
+            }
             if (!(info.flags & CPU6809_FLOW_STOP) && pos < used) {
                 uint32_t next_addr = base_addr + (uint32_t)pos;
                 size_t j;
