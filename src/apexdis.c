@@ -414,8 +414,12 @@ static void emit_sprite_comment(FILE *out, const uint8_t *src, size_t len)
     uint8_t tmp[APEX_SPRITE_MAX_BYTES];
 
     if (apexsprite_decode(src, len, tmp, &hdr, &vert, &horiz, &width, &height, &enc_type, &consumed)) {
-        fprintf(out, " ; sprite hdr=0x%02x vert=%u horiz=%u width=%u height=%u consumed=%lu",
-                (unsigned)hdr, (unsigned)vert, (unsigned)horiz,
+        const char *enc =
+            enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT   ? "bicolor_direct" :
+            enc_type == APEX_SPRITE_ENC_BICOLOR_INDIRECT ? "bicolor_indirect" :
+            enc_type == APEX_SPRITE_ENC_FD               ? "fd" : "mono";
+        fprintf(out, " ; sprite hdr=0x%02x enc=%s vert=%u horiz=%u width=%u height=%u consumed=%lu",
+                (unsigned)hdr, enc, (unsigned)vert, (unsigned)horiz,
                 (unsigned)width, (unsigned)height, (unsigned long)consumed);
     } else {
         fputs(" ; sprite invalid=1", out);
@@ -475,8 +479,8 @@ static void emit_routine_comment_block(FILE *out, uint8_t bank, uint32_t addr, u
 
 static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
                                     size_t rom_base, const DataRange *range,
-                                    const ReferenceSet *refs, const uint8_t *paged_rom,
-                                    size_t banks)
+                                    const char *doc, const ReferenceSet *refs,
+                                    const uint8_t *paged_rom, size_t banks)
 {
     fputc('\n', out);
     emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
@@ -522,6 +526,7 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
             fputc('\n', out);
         }
     }
+    emit_doc_comment(out, doc);
 }
 
 static int label_is_dmd_fullframe(const Label *label)
@@ -663,7 +668,8 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                 }
                 emitted_block = 1;
             } else if (!emitted_block && data_range) {
-                emit_data_comment_block(out, bank, addr, base_addr, rom_base, data_range, refs,
+                emit_data_comment_block(out, bank, addr, base_addr, rom_base, data_range,
+                                        config_doc_at(docs, bank, addr), refs,
                                         paged_rom, banks);
                 if (emit_explain) {
                     emit_explain_comment(out, BLOCK_DATA, &labels[i], NULL);
@@ -1396,6 +1402,9 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (!apexsprite_decode(data + *pos, len - *pos, tmp,
                                NULL, NULL, NULL, NULL, NULL, NULL, &consumed) ||
             consumed == 0u) {
+            fprintf(out, "; WARNING sprite_invalid bank=0x%02x cpu=0x%04x"
+                         " (decode failed; emitting 1 byte as data)\n",
+                    range->bank, (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu);
             consumed = 1u;
         }
         emit_data_bytes(out, data, len, base_addr, pos, consumed);
@@ -1408,6 +1417,10 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (!apexsprite_decode_noheader(data + *pos, len - *pos, tmp,
                                         (uint8_t)range->length, NULL, &consumed) ||
             consumed == 0u) {
+            fprintf(out, "; WARNING sprite_noheader_invalid bank=0x%02x cpu=0x%04x height=%lu"
+                         " (decode failed; emitting 1 byte as data)\n",
+                    range->bank, (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu,
+                    (unsigned long)range->length);
             consumed = 1u;
         }
         emit_data_bytes(out, data, len, base_addr, pos, consumed);

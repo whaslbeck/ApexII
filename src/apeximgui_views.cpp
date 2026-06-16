@@ -31,6 +31,31 @@ static bool str_icontains(const char *hay, const char *needle)
     return false;
 }
 
+/* Click-to-sort support for the data tables.  Add the flags below to a
+   BeginTable, give each column a user id in TableSetupColumn, then call
+   ui_table_sort() once after the header to learn the active sort column. */
+#define APEX_TABLE_SORT_FLAGS (ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate)
+
+/* Returns true and fills *col (column user id) + *asc when a column is sorted;
+   false in the tri-state "unsorted" state.  Always clears SpecsDirty. */
+static bool ui_table_sort(int *col, bool *asc)
+{
+    ImGuiTableSortSpecs *sp = ImGui::TableGetSortSpecs();
+    if (!sp || sp->SpecsCount == 0) {
+        if (sp) sp->SpecsDirty = false;
+        return false;
+    }
+    *col = (int)sp->Specs[0].ColumnUserID;
+    *asc = sp->Specs[0].SortDirection != ImGuiSortDirection_Descending;
+    sp->SpecsDirty = false;
+    return true;
+}
+
+/* Three-way compares for use inside per-table sort comparators. */
+static int ui_cmp_u32(uint32_t a, uint32_t b) { return a < b ? -1 : a > b ? 1 : 0; }
+static int ui_cmp_sz(size_t a, size_t b)      { return a < b ? -1 : a > b ? 1 : 0; }
+static int ui_cmp_int(long a, long b)         { return a < b ? -1 : a > b ? 1 : 0; }
+
 static void render_text_chunk(const char *start, const char *end, const ImVec4 *color)
 {
     if (!start || !end || end <= start) {
@@ -201,17 +226,25 @@ static void render_sprite_preview(const SpritePreviewInfo &pr, float max_scale =
     draw->AddRectFilled(canvas_pos,
                         ImVec2(canvas_pos.x + pr.width * scale, canvas_pos.y + pr.height * scale),
                         IM_COL32(8, 8, 8, 255));
+    /* Bicolor sprites carry two planes -> 4 grey levels; monochrome uses 2. */
+    static const ImU32 kGrey4[4] = {
+        IM_COL32(6, 18, 28, 255), IM_COL32(60, 95, 120, 255),
+        IM_COL32(110, 170, 210, 255), IM_COL32(150, 230, 255, 255)
+    };
     for (uint8_t row = 0; row < pr.height; row++) {
         for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
-            uint8_t bits = pr.pixels[row * row_bytes + col_byte];
+            uint8_t b0 = pr.pixels[row * row_bytes + col_byte];
+            uint8_t b1 = pr.two_plane ? pr.pixels1[row * row_bytes + col_byte] : 0u;
             for (size_t bit = 0; bit < 8u; bit++) {
                 int px = (int)(col_byte * 8u + bit);
                 if (px >= (int)pr.width) break;
-                bool lit = ((bits >> bit) & 1u) != 0u; /* LSB = leftmost pixel, same as DMD renderer */
+                /* LSB = leftmost pixel, same as DMD renderer */
+                int level = ((b0 >> bit) & 1u) | (((b1 >> bit) & 1u) << 1);
+                ImU32 col = pr.two_plane ? kGrey4[level]
+                          : (level ? IM_COL32(120, 220, 255, 255) : IM_COL32(6, 18, 28, 255));
                 ImVec2 p0(canvas_pos.x + px * scale, canvas_pos.y + row * scale);
                 draw->AddRectFilled(p0,
-                                    ImVec2(p0.x + scale - 1.0f, p0.y + scale - 1.0f),
-                                    lit ? IM_COL32(120, 220, 255, 255) : IM_COL32(6, 18, 28, 255));
+                                    ImVec2(p0.x + scale - 1.0f, p0.y + scale - 1.0f), col);
             }
         }
     }
@@ -1071,11 +1104,26 @@ void render_label_list(const ApexRenderedDocument *document, UiState *state)
     }
     if (ImGui::BeginTable("labels", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  120.0f);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,   60.0f);
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  120.0f, 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,   60.0f, 1);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            const auto &cl = state->cached_labels;
+            std::stable_sort(visible.begin(), visible.end(), [&](size_t ia, size_t ib) {
+                const auto &a = cl[ia]; const auto &b = cl[ib];
+                int c = 0;
+                switch (sort_col) {
+                case 0: c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.cpu_addr&0xffffu),
+                                       ((uint32_t)b.bank<<16)|(b.cpu_addr&0xffffu)); break;
+                case 1: c = ui_cmp_int(a.block_kind, b.block_kind); break;
+                case 2: c = a.name.compare(b.name); break;
+                }
+                return sort_asc ? c < 0 : c > 0;
+            });
+        }
         ImGuiListClipper clipper;
         clipper.Begin((int)visible.size());
         while (clipper.Step()) {
@@ -1233,11 +1281,25 @@ void render_bookmark_list(const ApexRenderedDocument *d, UiState *s)
     }
     if (ImGui::BeginTable("bookmarks", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,  100.0f);
-        ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,   60.0f);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,  100.0f, 0);
+        ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                60.0f, 2);
         ImGui::TableHeadersRow();
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc) && s->bookmarks.size() > 1) {
+                std::stable_sort(s->bookmarks.begin(), s->bookmarks.end(),
+                    [&](const Bookmark &a, const Bookmark &b) {
+                        int c = sort_col == 1
+                            ? a.name.compare(b.name)
+                            : ui_cmp_u32(((uint32_t)a.bank<<16)|(a.addr&0xffffu),
+                                         ((uint32_t)b.bank<<16)|(b.addr&0xffffu));
+                        return sort_asc ? c < 0 : c > 0;
+                    });
+            }
+        }
         ImGuiListClipper clipper;
         clipper.Begin((int)s->bookmarks.size());
         while (clipper.Step()) {
@@ -1296,11 +1358,33 @@ void render_global_search(const ApexRenderedDocument *d, UiState *s)
         ImGui::TextDisabled("no results");
     if (ImGui::BeginTable("search_results", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  100.0f);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,   60.0f);
-        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  100.0f, 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,   60.0f, 1);
+        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(s->search_results.begin(), s->search_results.end(),
+                    [&](size_t ia, size_t ib) {
+                        const ApexRenderedLine *a = &d->lines[ia];
+                        const ApexRenderedLine *b = &d->lines[ib];
+                        int c = 0;
+                        if (sort_col == 0)
+                            c = ui_cmp_u32(((uint32_t)a->bank<<16)|(a->cpu_addr&0xffffu),
+                                           ((uint32_t)b->bank<<16)|(b->cpu_addr&0xffffu));
+                        else if (sort_col == 1)
+                            c = ui_cmp_int(a->block_kind, b->block_kind);
+                        else {
+                            size_t n = a->length < b->length ? a->length : b->length;
+                            c = memcmp(a->text, b->text, n);
+                            if (c == 0) c = ui_cmp_sz(a->length, b->length);
+                        }
+                        return sort_asc ? c < 0 : c > 0;
+                    });
+            }
+        }
         ImGuiListClipper clipper;
         clipper.Begin((int)s->search_results.size());
         while (clipper.Step()) {
@@ -2104,7 +2188,7 @@ void render_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s
    Clicking a button appends a field to `fields`/`count` if there is room.
    Returns true if any button was clicked. */
 static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *count,
-                                 int add_count)
+                                 int add_count, int *sprite_height)
 {
     /* Row 1: primitive and 16-bit pointer kinds */
     static const struct { int kind; const char *label; } kRow1[] = {
@@ -2133,6 +2217,10 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
                 ApexEditField f = {};
                 f.kind  = kind;
                 f.count = add_count > 0 ? add_count : 1;
+                if ((kind == TABLE_PTR16_SPRITE || kind == TABLE_FAR_SPRITE) &&
+                    sprite_height && *sprite_height > 0) {
+                    f.param = *sprite_height;
+                }
                 fields[(*count)++] = f;
                 changed = true;
             }
@@ -2146,6 +2234,16 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
     for (int i = 0; i < (int)(sizeof(kRow2)/sizeof(kRow2[0])); i++) {
         if (i > 0) ImGui::SameLine();
         push_kind(kRow2[i].kind, kRow2[i].label);
+    }
+    /* No-header sprite image height applied to ptr16_spr / far_spr fields. */
+    if (sprite_height) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(46.0f);
+        ImGui::InputInt("sprH", sprite_height, 0, 0);
+        if (*sprite_height < 0) *sprite_height = 0;
+        if (*sprite_height > 32) *sprite_height = 32;
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("no-header sprite image height (px) for ptr16_spr / far_spr fields");
     }
     /* named types from config — combo with search filter */
     if (p && p->config_types.count > 0) {
@@ -2197,7 +2295,7 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
 static void render_field_chips(ApexEditField *fields, int *count)
 {
     for (int i = 0; i < *count; i++) {
-        char chip[48];
+        char chip[96];
         const char *kname = (fields[i].kind >= 0) ? fields[i].type_name : fields[i].type_name;
         if (fields[i].kind >= 0) {
             /* look up name from kind */
@@ -2222,10 +2320,15 @@ static void render_field_chips(ApexEditField *fields, int *count)
                 if (kN[k].kind == fields[i].kind) { kname = kN[k].name; break; }
             }
         }
+        char hbuf[16] = "";
+        if (fields[i].param > 0 &&
+            (fields[i].kind == TABLE_PTR16_SPRITE || fields[i].kind == TABLE_FAR_SPRITE)) {
+            snprintf(hbuf, sizeof(hbuf), "(%d)", fields[i].param);
+        }
         if (fields[i].count > 1) {
-            snprintf(chip, sizeof(chip), "%s[%d]##chip%d", kname, fields[i].count, i);
+            snprintf(chip, sizeof(chip), "%s%s[%d]##chip%d", kname, hbuf, fields[i].count, i);
         } else {
-            snprintf(chip, sizeof(chip), "%s##chip%d", kname, i);
+            snprintf(chip, sizeof(chip), "%s%s##chip%d", kname, hbuf, i);
         }
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.25f, 0.45f, 0.70f, 1.0f));
         if (ImGui::SmallButton(chip)) {
@@ -2361,7 +2464,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("repeat count for next added field");
     ImGui::PushID("inl");
     render_field_buttons(p, s->edit_inline_fields, &s->edit_inline_count,
-                         s->edit_field_add_count);
+                         s->edit_field_add_count, NULL);
     render_field_chips(s->edit_inline_fields, &s->edit_inline_count);
     ImGui::PopID();
     ImGui::Checkbox("flow_stop (tail-call: never returns)", &s->edit_inline_flow_stop);
@@ -2406,7 +2509,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("repeat count for next added field");
     ImGui::PushID("tbl");
     render_field_buttons(p, s->edit_schema_fields, &s->edit_schema_count,
-                         s->edit_field_add_count);
+                         s->edit_field_add_count, &s->sprite_nh_height);
     render_field_chips(s->edit_schema_fields, &s->edit_schema_count);
     ImGui::PopID();
     if (ImGui::Button("Apply##tbl")) {
@@ -2582,15 +2685,36 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
     ImGui::Separator();
     if (ImGui::BeginTable("tables_list", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,  100.0f);
-        ImGui::TableSetupColumn("Setup",   ImGuiTableColumnFlags_WidthFixed,  200.0f);
-        ImGui::TableSetupColumn("Rows",    ImGuiTableColumnFlags_WidthFixed,   50.0f);
-        ImGui::TableSetupColumn("Comment", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed,   80.0f);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Addr",    ImGuiTableColumnFlags_WidthFixed,  100.0f, 0);
+        ImGui::TableSetupColumn("Setup",   ImGuiTableColumnFlags_WidthFixed,  200.0f, 1);
+        ImGui::TableSetupColumn("Rows",    ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                50.0f, 2);
+        ImGui::TableSetupColumn("Comment", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
+                                0.0f, 3);
+        ImGui::TableSetupColumn("Actions", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                80.0f, 4);
         ImGui::TableHeadersRow();
 
-        for (size_t i = 0; i < p->tables.count; i++) {
+        std::vector<size_t> order(p->tables.count);
+        for (size_t i = 0; i < order.size(); i++) order[i] = i;
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(order.begin(), order.end(), [&](size_t ia, size_t ib) {
+                    const TableDef *a = &p->tables.items[ia];
+                    const TableDef *b = &p->tables.items[ib];
+                    int c = sort_col == 1
+                        ? table_def_spec_string(a).compare(table_def_spec_string(b))
+                        : ui_cmp_u32(((uint32_t)a->bank<<16)|(a->addr&0xffffu),
+                                     ((uint32_t)b->bank<<16)|(b->addr&0xffffu));
+                    return sort_asc ? c < 0 : c > 0;
+                });
+            }
+        }
+
+        for (size_t oi = 0; oi < order.size(); oi++) {
+            size_t i = order[oi];
             const auto *t = &p->tables.items[i];
             ImGui::PushID((int)i);
             ImGui::TableNextRow();
@@ -2772,15 +2896,32 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
     /* ---- Symbol list ---- */
     if (ImGui::BeginTable("sym_list", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS,
             ImVec2(0, p->symbols.count > 0 ? 200.0f : 60.0f))) {
-        ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch, 0.0f, 0);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 70.0f, 1);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                60.0f, 2);
         ImGui::TableHeadersRow();
 
+        std::vector<size_t> order(p->symbols.count);
+        for (size_t k = 0; k < order.size(); k++) order[k] = k;
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(order.begin(), order.end(), [&](size_t ia, size_t ib) {
+                    const ConfigSymbol *a = &p->symbols.items[ia];
+                    const ConfigSymbol *b = &p->symbols.items[ib];
+                    int c = sort_col == 1 ? ui_cmp_u32(a->value, b->value)
+                                          : strcmp(a->name, b->name);
+                    return sort_asc ? c < 0 : c > 0;
+                });
+            }
+        }
+
         bool deleted = false;
-        for (size_t i = 0; i < p->symbols.count && !deleted; i++) {
+        for (size_t oi = 0; oi < order.size() && !deleted; oi++) {
+            size_t i = order[oi];
             ImGui::TableNextRow();
             ImGui::PushID((int)i);
             bool selected = (s->sym_selected == (int)i);
@@ -2973,10 +3114,11 @@ void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *
 
     if (ImGui::BeginTable("inlinesigs", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed, 130.0f);
-        ImGui::TableSetupColumn("Inline",  ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                130.0f, 1);
+        ImGui::TableSetupColumn("Inline",  ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
 
         ImGuiListClipper clipper;
@@ -2997,6 +3139,25 @@ void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *
                 if (!match) continue;
             }
             rows.push_back(i);
+        }
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(rows.begin(), rows.end(), [&](size_t ia, size_t ib) {
+                    const InlineSignature *a = &p->inline_sigs.items[ia];
+                    const InlineSignature *b = &p->inline_sigs.items[ib];
+                    int c;
+                    if (sort_col == 2) {
+                        c = inline_sig_spec_string(a).compare(inline_sig_spec_string(b));
+                    } else {
+                        uint8_t ab = a->has_bank ? a->bank : 0xffu;
+                        uint8_t bb = b->has_bank ? b->bank : 0xffu;
+                        c = ui_cmp_u32(((uint32_t)ab<<16)|(a->addr&0xffffu),
+                                       ((uint32_t)bb<<16)|(b->addr&0xffffu));
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+            }
         }
 
         clipper.Begin((int)rows.size());
@@ -3123,11 +3284,35 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument **document_p
 
     if (ImGui::BeginTable("entries", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,  55.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,  55.0f, 1);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
+                                0.0f, 2);
         ImGui::TableHeadersRow();
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(rows.begin(), rows.end(), [&](size_t ia, size_t ib) {
+                    const ConfigEntry *a = &p->config_entries.items[ia];
+                    const ConfigEntry *b = &p->config_entries.items[ib];
+                    uint8_t ab = a->has_bank ? a->bank : 0xffu;
+                    uint8_t bb = b->has_bank ? b->bank : 0xffu;
+                    int c;
+                    if (sort_col == 1) {
+                        const Label *la = find_explicit_entry_label(p, ab, a->addr);
+                        const Label *lb = find_explicit_entry_label(p, bb, b->addr);
+                        int ra = (la && la->reached_by_flow) ? 1 : 0;
+                        int rb = (lb && lb->reached_by_flow) ? 1 : 0;
+                        c = ui_cmp_int(ra, rb);
+                    } else {
+                        c = ui_cmp_u32(((uint32_t)ab<<16)|(a->addr&0xffffu),
+                                       ((uint32_t)bb<<16)|(b->addr&0xffffu));
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+            }
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)rows.size());
@@ -3245,13 +3430,32 @@ void render_strings_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
 
     if (ImGui::BeginTable("strings", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed, 160.0f);
-        ImGui::TableSetupColumn("Type",    ImGuiTableColumnFlags_WidthFixed,  85.0f);
-        ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Refs",    ImGuiTableColumnFlags_WidthFixed,  60.0f);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                160.0f, 1);
+        ImGui::TableSetupColumn("Type",    ImGuiTableColumnFlags_WidthFixed,  85.0f, 2);
+        ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
+        ImGui::TableSetupColumn("Refs",    ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                                60.0f, 4);
         ImGui::TableHeadersRow();
+
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            std::stable_sort(rows.begin(), rows.end(),
+                [&](const StrRow &a, const StrRow &b) {
+                    const ApexRenderedLine *la = &d->lines[a.line_idx];
+                    const ApexRenderedLine *lb = &d->lines[b.line_idx];
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_u32(((uint32_t)la->bank<<16)|(la->cpu_addr&0xffffu),
+                                           ((uint32_t)lb->bank<<16)|(lb->cpu_addr&0xffffu)); break;
+                    case 2: c = strcmp(a.type, b.type); break;
+                    case 3: c = a.content.compare(b.content); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)rows.size());
@@ -3399,11 +3603,35 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
     ImGui::Text("%lu result(s)", (unsigned long)state->ram_ref_results.size());
     if (ImGui::BeginTable("ram_results", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,  50.0f);
-        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f, 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,  50.0f, 1);
+        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(state->ram_ref_results.begin(), state->ram_ref_results.end(),
+                    [&](size_t ia, size_t ib) {
+                        if (ia >= document->line_count || ib >= document->line_count)
+                            return ia < ib;
+                        const ApexRenderedLine *a = &document->lines[ia];
+                        const ApexRenderedLine *b = &document->lines[ib];
+                        int c = 0;
+                        if (sort_col == 0)
+                            c = ui_cmp_u32(((uint32_t)a->bank<<16)|(a->cpu_addr&0xffffu),
+                                           ((uint32_t)b->bank<<16)|(b->cpu_addr&0xffffu));
+                        else if (sort_col == 1)
+                            c = ui_cmp_int(a->block_kind, b->block_kind);
+                        else {
+                            size_t n = a->length < b->length ? a->length : b->length;
+                            c = memcmp(a->text, b->text, n);
+                            if (c == 0) c = ui_cmp_sz(a->length, b->length);
+                        }
+                        return sort_asc ? c < 0 : c > 0;
+                    });
+            }
+        }
         ImGuiListClipper clipper;
         clipper.Begin((int)state->ram_ref_results.size());
         while (clipper.Step()) {
@@ -3470,16 +3698,36 @@ void render_code_candidates(ApexProject *project,
     /* ---- Table ---- */
     if (!ImGui::BeginTable("cand_tbl", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS,
             ImVec2(0, 0)))
         return;
 
-    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed,  48.0f);
-    ImGui::TableSetupColumn("T",     ImGuiTableColumnFlags_WidthFixed,  18.0f);
-    ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f);
-    ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed,  48.0f, 0);
+    ImGui::TableSetupColumn("T",     ImGuiTableColumnFlags_WidthFixed,  18.0f, 1);
+    ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f, 2);
+    ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
+    ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                            100.0f, 4);
     ImGui::TableHeadersRow();
+
+    {
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc) && state->code_candidates.count > 1) {
+            std::stable_sort(state->code_candidates.items,
+                state->code_candidates.items + state->code_candidates.count,
+                [&](const ApexCodeCandidate &a, const ApexCodeCandidate &b) {
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_int(a.score, b.score); break;
+                    case 1: c = ui_cmp_int(a.tier, b.tier); break;
+                    case 2: c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.addr&0xffffu),
+                                           ((uint32_t)b.bank<<16)|(b.addr&0xffffu)); break;
+                    case 3: c = strcmp(a.preview, b.preview); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
+    }
 
     /* iterate a copy index so "Accept" can remove items without iterator UB */
     size_t i = 0;
@@ -3601,16 +3849,36 @@ void render_inline_candidates(ApexProject *project,
 
     if (!ImGui::BeginTable("icand_tbl", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS,
             ImVec2(0, 0)))
         return;
 
-    ImGui::TableSetupColumn("Score",     ImGuiTableColumnFlags_WidthFixed,  48.0f);
-    ImGui::TableSetupColumn("Addr",      ImGuiTableColumnFlags_WidthFixed,  90.0f);
-    ImGui::TableSetupColumn("Spec",      ImGuiTableColumnFlags_WidthFixed, 120.0f);
-    ImGui::TableSetupColumn("Callsites", ImGuiTableColumnFlags_WidthFixed,  70.0f);
-    ImGui::TableSetupColumn("##act",     ImGuiTableColumnFlags_WidthFixed, 100.0f);
+    ImGui::TableSetupColumn("Score",     ImGuiTableColumnFlags_WidthFixed,  48.0f, 0);
+    ImGui::TableSetupColumn("Addr",      ImGuiTableColumnFlags_WidthFixed,  90.0f, 1);
+    ImGui::TableSetupColumn("Spec",      ImGuiTableColumnFlags_WidthFixed, 120.0f, 2);
+    ImGui::TableSetupColumn("Callsites", ImGuiTableColumnFlags_WidthFixed,  70.0f, 3);
+    ImGui::TableSetupColumn("##act",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                            100.0f, 4);
     ImGui::TableHeadersRow();
+
+    {
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc) && state->inline_candidates.count > 1) {
+            std::stable_sort(state->inline_candidates.items,
+                state->inline_candidates.items + state->inline_candidates.count,
+                [&](const ApexInlineCandidate &a, const ApexInlineCandidate &b) {
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_int(a.score, b.score); break;
+                    case 1: c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.addr&0xffffu),
+                                           ((uint32_t)b.bank<<16)|(b.addr&0xffffu)); break;
+                    case 2: c = strcmp(a.spec, b.spec); break;
+                    case 3: c = ui_cmp_int(a.callsite_count, b.callsite_count); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
+    }
 
     size_t i = 0;
     while (i < state->inline_candidates.count) {
@@ -3709,17 +3977,38 @@ void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **do
 
     if (!ImGui::BeginTable("excl_table", 3,
                            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp,
+                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp |
+                           APEX_TABLE_SORT_FLAGS,
                            ImVec2(0, 0))) {
         return;
     }
-    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.f);
-    ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("##act",   ImGuiTableColumnFlags_WidthFixed, 120.f);
+    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.f, 0);
+    ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
+                            0.0f, 1);
+    ImGui::TableSetupColumn("##act",   ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
+                            120.f, 2);
     ImGui::TableHeadersRow();
 
+    std::vector<size_t> order(project->ref_exclusions.count);
+    for (size_t k = 0; k < order.size(); k++) order[k] = k;
+    {
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            std::stable_sort(order.begin(), order.end(), [&](size_t ia, size_t ib) {
+                const ConfigEntry *a = &project->ref_exclusions.items[ia];
+                const ConfigEntry *b = &project->ref_exclusions.items[ib];
+                uint8_t ab = a->has_bank ? a->bank : 0xffu;
+                uint8_t bb = b->has_bank ? b->bank : 0xffu;
+                int c = ui_cmp_u32(((uint32_t)ab<<16)|(a->addr&0xffffu),
+                                   ((uint32_t)bb<<16)|(b->addr&0xffffu));
+                return sort_asc ? c < 0 : c > 0;
+            });
+        }
+    }
+
     int to_remove_idx = -1;
-    for (size_t i = 0; i < project->ref_exclusions.count; i++) {
+    for (size_t oi = 0; oi < order.size(); oi++) {
+        size_t i = order[oi];
         const ConfigEntry *e = &project->ref_exclusions.items[i];
         ImGui::PushID((int)i);
         ImGui::TableNextRow();
@@ -4018,15 +4307,32 @@ void render_dmd_list_window(const ApexProject *p, const ApexRenderedDocument *d,
 
     if (ImGui::BeginTable("dmd_list", 2,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,  110.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,  110.0f, 0);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
+                                0.0f, 1);
         ImGui::TableHeadersRow();
 
+        std::vector<size_t> dmd_rows;
+        for (size_t i = 0; i < p->data_ranges.count; i++)
+            if (p->data_ranges.items[i].kind == DATA_DMD_FULLFRAME)
+                dmd_rows.push_back(i);
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                std::stable_sort(dmd_rows.begin(), dmd_rows.end(), [&](size_t ia, size_t ib) {
+                    const DataRange *a = &p->data_ranges.items[ia];
+                    const DataRange *b = &p->data_ranges.items[ib];
+                    int c = ui_cmp_u32(((uint32_t)a->bank<<16)|(a->addr&0xffffu),
+                                       ((uint32_t)b->bank<<16)|(b->addr&0xffffu));
+                    return sort_asc ? c < 0 : c > 0;
+                });
+            }
+        }
+
         int row_id = 0;
-        for (size_t i = 0; i < p->data_ranges.count; i++) {
-            const DataRange *dr = &p->data_ranges.items[i];
-            if (dr->kind != DATA_DMD_FULLFRAME) continue;
+        for (size_t oi = 0; oi < dmd_rows.size(); oi++) {
+            const DataRange *dr = &p->data_ranges.items[dmd_rows[oi]];
 
             char addrstr[32];
             snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
@@ -4279,8 +4585,11 @@ static void scan_vsi_table_candidates(const ApexProject *p, UiState *s)
 }
 
 /* Bulk-classify a complete VSI sub-table: header bytes + pointer-array table + all images. */
-static void classify_vsi_table(ApexProject *p, const ApexRenderedDocument **dp,
-                               UiState *s, int table_idx)
+/* Classify one VSI sub-table's descriptor + pointer array, no re-analysis.
+   The image data ranges are produced later by inject_sprite_table_data_ranges
+   (a full analysis).  Caller wraps this in an edit group and triggers the
+   re-analysis / rescan. */
+static void classify_vsi_table_core(ApexProject *p, UiState *s, int table_idx)
 {
     const UiState::VsiSubTableInfo *st = nullptr;
     for (auto &t : s->vsi_sub_tables) {
@@ -4288,71 +4597,116 @@ static void classify_vsi_table(ApexProject *p, const ApexRenderedDocument **dp,
     }
     if (!st) return;
 
-    /* Sub-table header bytes (min/max pairs + 0x00 + height + spacing) */
+    /* Sub-table header bytes (min/max pairs + 0x00 + height + spacing).  The raw
+       bytes[] carry no semantics on their own, so attach a doc comment that
+       explains the descriptor layout and what the table holds. */
     if (st->header_len > 0) {
         char spec[32];
         snprintf(spec, sizeof(spec), "bytes[%zu]", st->header_len);
         apex_project_set_kind(p, 1, st->bank, st->cpu_addr, APEX_KIND_DATA, spec);
+
+        char doc[128];
+        snprintf(doc, sizeof(doc),
+                 "VSI sub-table header: %d image(s), height %u px "
+                 "[index-range pairs, 0x00, height, spacing]",
+                 st->num_images, (unsigned)st->table_height);
+        apex_project_set_doc(p, 1, st->bank, st->cpu_addr, doc);
     }
 
-    /* Pointer array: rows[N](ptr16_sprite), starting right after the header */
+    /* Pointer array: rows[N](ptr16_sprite(H)).  The height parameter lets the
+       analyser auto-classify the pointed-to images (header-format images are
+       self-describing; no-header ones need this height). */
     if (st->num_images > 0) {
         uint32_t ptr_addr = st->cpu_addr + (uint32_t)st->header_len;
         char spec[64];
-        snprintf(spec, sizeof(spec), "rows[%d](ptr16_sprite)", st->num_images);
+        snprintf(spec, sizeof(spec), "rows[%d](ptr16_sprite(%d))",
+                 st->num_images, (int)st->table_height);
         apex_project_set_kind(p, 1, st->bank, ptr_addr, APEX_KIND_TABLE, spec);
     }
+}
 
-    /* Individual images: walk the raw pointer array so we classify ALL entries,
-       including those the scan skipped (null check handles 0x0000 / unmapped). */
-    {
-        size_t sub_off;
-        if (vsi_resolve_far(p, st->cpu_addr, st->bank, &sub_off)) {
-            size_t ptr_off = sub_off + st->header_len;
-            uint8_t tmp[APEX_SPRITE_MAX_BYTES];
-            for (int iidx = 0; iidx < st->num_images; iidx++) {
-                size_t ppos = ptr_off + (size_t)iidx * 2u;
-                if (ppos + 2u > p->rom.size) break;
-                uint32_t img_cpu = ((uint32_t)p->rom.data[ppos] << 8) | p->rom.data[ppos+1];
-                size_t img_off;
-                uint8_t img_effective_bank;
-                if (!ptr16_sprite_resolve(p, img_cpu, st->bank, &img_off, &img_effective_bank)) continue;
-                uint8_t img_bank; uint32_t img_cpu_out;
-                if (!rom_offset_to_cpu_address(p, img_off, &img_bank, &img_cpu_out)) continue;
-
-                const uint8_t *img = p->rom.data + img_off;
-                size_t img_len = p->rom.size - img_off;
-                uint8_t b0 = img_len > 0 ? img[0] : 0;
-                char spec[32];
-                if (b0 >= 1u && b0 <= 128u) {
-                    snprintf(spec, sizeof(spec), "sprite_noheader[%d]", (int)st->table_height);
-                } else if (apexsprite_decode(img, img_len, tmp,
-                                             nullptr, nullptr, nullptr, nullptr,
-                                             nullptr, nullptr, nullptr)) {
-                    strcpy(spec, "sprite");
-                } else {
-                    /* Undecipherable format — classify as raw bytes so it gets a label */
-                    strcpy(spec, "sprite");
-                }
-                apex_project_set_kind(p, 1, img_bank, img_cpu_out, APEX_KIND_DATA, spec);
-            }
-        }
+static void classify_vsi_table(ApexProject *p, const ApexRenderedDocument **dp,
+                               UiState *s, int table_idx)
+{
+    uint8_t b = 0xffu; uint32_t a = 0;
+    for (auto &t : s->vsi_sub_tables) {
+        if (t.table_idx == table_idx) { b = t.bank; a = t.cpu_addr; break; }
     }
+    /* One logical action -> one undo step. */
+    apex_project_begin_edit_group(p, "classify VSI table");
+    classify_vsi_table_core(p, s, table_idx);
+    apex_project_end_edit_group(p);
 
-    /* Re-analyze, re-render, scroll to sub-table, then refresh the VSI scan. */
-    rerender_and_reselect(p, dp, s, st->bank, st->cpu_addr);
+    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS);
+    rerender_and_reselect(p, dp, s, b, a);
     scan_vsi_table_candidates(p, s);
 }
 
-static void scan_sprite_candidates(const ApexProject *p, UiState *s)
+/* Classify every detected VSI sub-table in one undo step / one re-analysis. */
+static void classify_all_vsi_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    /* Snapshot the table indices first: classify_vsi_table_core doesn't rescan,
+       so vsi_sub_tables is stable during the loop, but copying is robust. */
+    std::vector<int> idxs;
+    for (auto &t : s->vsi_sub_tables) idxs.push_back(t.table_idx);
+    if (idxs.empty()) return;
+
+    uint8_t keep_b = 0xffu; uint32_t keep_a = 0;
+    selected_address(*dp, s, &keep_b, &keep_a);
+
+    apex_project_begin_edit_group(p, "classify all VSI tables");
+    for (int idx : idxs) classify_vsi_table_core(p, s, idx);
+    apex_project_end_edit_group(p);
+
+    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS);
+    rerender_and_reselect(p, dp, s, keep_b, keep_a);
+    scan_vsi_table_candidates(p, s);
+    set_status(s, "classified all VSI tables");
+}
+
+/* Build a per-byte block-kind map of the ROM from the rendered document, the
+   same forward-fill used by the coverage panel.  Used to restrict the sprite
+   scan to not-yet-classified bytes. */
+static void build_kind_map(const ApexProject *p, const ApexRenderedDocument *d,
+                           std::vector<uint8_t> &kinds)
+{
+    size_t rom_size = p->rom.size, i, fill = 0;
+    uint8_t cur = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
+
+    kinds.assign(rom_size, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
+    if (!d) return;
+    for (i = 0; i < d->line_count && fill < rom_size; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        if (!l->has_location) continue;
+        if (l->rom_addr <= fill) {
+            cur = (uint8_t)l->block_kind;
+        } else {
+            size_t end = l->rom_addr < rom_size ? l->rom_addr : rom_size;
+            while (fill < end) kinds[fill++] = cur;
+            cur = (uint8_t)l->block_kind;
+        }
+    }
+    while (fill < rom_size) kinds[fill++] = cur;
+}
+
+static void scan_sprite_candidates(const ApexProject *p, const ApexRenderedDocument *d,
+                                   UiState *s)
 {
     s->sprite_candidates.clear();
     if (!p->rom.data || p->rom.size == 0) {
         s->sprite_scan_done = true;
         return;
     }
+    /* Only scan bytes that aren't already classified — this drops the bulk of
+       false hits that land inside known code/data/table/sprite regions. */
+    std::vector<uint8_t> kinds;
+    build_kind_map(p, d, kinds);
     uint8_t tmp[APEX_SPRITE_MAX_BYTES];
     for (size_t off = 0; off < p->rom.size; off++) {
+        uint8_t k = kinds[off];
+        if (k != (uint8_t)APEX_RENDER_BLOCK_UNKNOWN &&
+            k != (uint8_t)APEX_RENDER_BLOCK_UNCLASSIFIED)
+            continue;
         uint8_t b0 = p->rom.data[off];
         if (b0 != 0x00u && b0 != 0xFDu && b0 != 0xFEu && b0 != 0xFFu)
             continue;
@@ -4417,8 +4771,38 @@ static void sprite_navigate(ApexProject *p, const ApexRenderedDocument *d, UiSta
     s->show_hex    = true;
 }
 
+static bool sprite_addr_classified(const ApexProject *p, uint8_t bank, uint32_t addr)
+{
+    for (size_t i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *dr = &p->data_ranges.items[i];
+        if ((dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER) &&
+            dr->bank == bank && dr->addr == addr) {
+            return true;
+        }
+    }
+    return false;
+}
+
+/* Re-derive the cached "classified" flags from the live config so the sprite
+   windows reflect classify/clear edits — including undo/redo — without a
+   re-scan. */
+static void refresh_sprite_classified(const ApexProject *p, UiState *s)
+{
+    for (auto &e : s->vsi_table_entries)
+        e.classified = sprite_addr_classified(p, e.bank, e.cpu_addr);
+    for (auto &e : s->sprite_candidates)
+        e.classified = sprite_addr_classified(p, e.bank, e.cpu_addr);
+}
+
 void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
+    /* Auto-run the (cheap, structured) VSI table scan the first time the window
+       is shown so sprites appear without a manual click; the ROM byte scan stays
+       on its button. */
+    if (!s->vsi_table_scan_done) {
+        scan_vsi_table_candidates(p, s);
+    }
+    refresh_sprite_classified(p, s);
     const ApexRenderedDocument *d = *dp;
     size_t classified_count = 0;
     for (size_t i = 0; i < p->data_ranges.count; i++) {
@@ -4432,8 +4816,11 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
     }
     ImGui::SameLine();
     if (ImGui::Button("Scan ROM")) {
-        scan_sprite_candidates(p, s);
+        scan_sprite_candidates(p, d, s);
     }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Find sprite candidates in not-yet-classified ROM regions.\n"
+                          "Review each (hover/Gallery) and click Classify to apply.");
     ImGui::SameLine();
     if (ImGui::Button("Gallery")) {
         s->show_sprite_gallery = true;
@@ -4470,6 +4857,11 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
     if (s->vsi_table_scan_done && !s->vsi_sub_tables.empty()) {
         ImGui::Separator();
         ImGui::TextDisabled("VSI sub-tables — click Classify to apply all entries to config");
+        ImGui::SameLine();
+        if (ImGui::SmallButton("Classify all##vsi")) {
+            classify_all_vsi_tables(p, dp, s);
+            d = *dp; /* document + sub-table scan rebuilt; refresh local pointer */
+        }
 
         if (ImGui::BeginTable("vsi_subtables", 6,
                 ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
@@ -4589,15 +4981,40 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
         }
     }
 
+    /* Deferred classify: applied after the table loop so we never mutate the
+       config / rerender while iterating the clipped rows. */
+    bool     do_classify = false;
+    uint8_t  cls_bank = 0;
+    uint32_t cls_addr = 0;
+    bool     cls_noheader = false;
+
     if (ImGui::BeginTable("sprite_list", 5,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,   110.0f);
-        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,    60.0f);
-        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,    90.0f);
-        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed,    60.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,   110.0f, 0);
+        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,    60.0f, 1);
+        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,    90.0f, 2);
+        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed,    60.0f, 3);
+        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
+                                0.0f, 4);
         ImGui::TableHeadersRow();
+
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            std::stable_sort(rows.begin(), rows.end(),
+                [&](const SpriteRow &a, const SpriteRow &b) {
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_u32(((uint32_t)a.bank<<16)|a.addr,
+                                           ((uint32_t)b.bank<<16)|b.addr); break;
+                    case 1: c = ui_cmp_int(a.w*a.h, b.w*b.h); break;
+                    case 2: c = ui_cmp_int(a.src, b.src); break;
+                    case 3: c = a.table_idx != b.table_idx ? ui_cmp_int(a.table_idx, b.table_idx)
+                                                           : ui_cmp_int(a.image_idx, b.image_idx); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)rows.size());
@@ -4663,7 +5080,14 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
                     ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
                                        r.class_noheader ? "spr_nh" : "sprite");
                 } else {
-                    ImGui::TextDisabled("scan");
+                    /* Manual qualification: apply this scan candidate as a
+                       sprite only on explicit click (undoable single edit). */
+                    if (ImGui::SmallButton("Classify")) {
+                        do_classify  = true;
+                        cls_bank     = r.bank;
+                        cls_addr     = r.addr;
+                        cls_noheader = false;
+                    }
                 }
                 ImGui::TableSetColumnIndex(3);
                 if (r.src == ROW_VSI)
@@ -4674,6 +5098,13 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
             }
         }
         ImGui::EndTable();
+    }
+
+    if (do_classify) {
+        if (apex_project_set_kind(p, 1, cls_bank, cls_addr, APEX_KIND_DATA,
+                                  cls_noheader ? "sprite_noheader" : "sprite") == 0) {
+            rerender_and_reselect(p, dp, s, cls_bank, cls_addr);
+        }
     }
 }
 
@@ -4701,7 +5132,9 @@ static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, floa
     float psz = scale > 1.0f ? scale : 1.0f;
     for (uint8_t row = 0; row < pr.height; row++) {
         for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
-            uint8_t bits = pr.pixels[row * row_bytes + col_byte];
+            /* OR both planes for a clear silhouette at thumbnail scale. */
+            uint8_t bits = pr.pixels[row * row_bytes + col_byte] |
+                           (pr.two_plane ? pr.pixels1[row * row_bytes + col_byte] : 0u);
             if (!bits) continue;
             for (size_t bit = 0; bit < 8u; bit++) {
                 int px = (int)(col_byte * 8u + bit);
@@ -4722,6 +5155,11 @@ static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, floa
 void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
     const ApexRenderedDocument *d = *dp;
+
+    if (!s->vsi_table_scan_done) {
+        scan_vsi_table_candidates(p, s);
+    }
+    refresh_sprite_classified(p, s);
 
     /* Merge + de-dup the three sources by (bank, addr); classified always shown,
        VSI/scan respect the dimension filter (same as the Sprites list). */
@@ -4757,6 +5195,10 @@ void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **d
 
     static const float kImgW = 140.0f;
     static const float kImgH = 28.0f;
+
+    bool     do_classify = false;
+    uint8_t  cls_bank = 0;
+    uint32_t cls_addr = 0;
 
     if (ImGui::BeginTable("sprite_gallery", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
@@ -4799,10 +5241,24 @@ void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **d
                 else         ImGui::TextDisabled("?");
                 ImGui::TableSetColumnIndex(3);
                 ImGui::TextUnformatted(lbl.c_str());
+                if (!sprite_addr_classified(p, bank, addr)) {
+                    ImGui::SameLine();
+                    if (ImGui::SmallButton("Classify")) {
+                        do_classify = true;
+                        cls_bank = bank;
+                        cls_addr = addr;
+                    }
+                }
                 ImGui::PopID();
             }
         }
         ImGui::EndTable();
+    }
+
+    if (do_classify) {
+        if (apex_project_set_kind(p, 1, cls_bank, cls_addr, APEX_KIND_DATA, "sprite") == 0) {
+            rerender_and_reselect(p, dp, s, cls_bank, cls_addr);
+        }
     }
 }
 
@@ -5482,15 +5938,37 @@ void render_rom_compare_window(ApexProject *project,
 
     if (ImGui::BeginTable("##cmptbl", 6,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | APEX_TABLE_SORT_FLAGS)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 72.0f);
-        ImGui::TableSetupColumn("Kind",   ImGuiTableColumnFlags_WidthFixed, 50.0f);
-        ImGui::TableSetupColumn("A",      ImGuiTableColumnFlags_WidthFixed, 86.0f);
-        ImGui::TableSetupColumn("B",      ImGuiTableColumnFlags_WidthFixed, 86.0f);
-        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthFixed, 200.0f);
-        ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 72.0f, 0);
+        ImGui::TableSetupColumn("Kind",   ImGuiTableColumnFlags_WidthFixed, 50.0f, 1);
+        ImGui::TableSetupColumn("A",      ImGuiTableColumnFlags_WidthFixed, 86.0f, 2);
+        ImGui::TableSetupColumn("B",      ImGuiTableColumnFlags_WidthFixed, 86.0f, 3);
+        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthFixed, 200.0f, 4);
+        ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.0f, 5);
         ImGui::TableHeadersRow();
+
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            const std::vector<ApexCompareEntry> &res = cs.results;
+            std::stable_sort(visible.begin(), visible.end(),
+                [&](size_t ia, size_t ib) {
+                    const ApexCompareEntry &a = res[ia];
+                    const ApexCompareEntry &b = res[ib];
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_int(a.status, b.status); break;
+                    case 1: c = ui_cmp_int(a.kind, b.kind); break;
+                    case 2: c = a.has_a != b.has_a ? (a.has_a ? -1 : 1)
+                                : ui_cmp_u32((a.a_bank<<16)|a.a_addr, (b.a_bank<<16)|b.a_addr); break;
+                    case 3: c = a.has_b != b.has_b ? (a.has_b ? -1 : 1)
+                                : ui_cmp_u32((a.b_bank<<16)|a.b_addr, (b.b_bank<<16)|b.b_addr); break;
+                    case 4: c = strcmp(a.label, b.label); break;
+                    case 5: c = strcmp(a.detail, b.detail); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)visible.size());
@@ -5679,13 +6157,29 @@ void render_coverage_window(ApexProject *project,
 
     if (ImGui::BeginTable("##covtbl", 4,
             ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable)) {
+            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | APEX_TABLE_SORT_FLAGS)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f);
-        ImGui::TableSetupColumn("Bytes",   ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("ROM off", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
+        ImGui::TableSetupColumn("Bytes",   ImGuiTableColumnFlags_WidthFixed, 70.0f, 1);
+        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
+        ImGui::TableSetupColumn("ROM off", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
         ImGui::TableHeadersRow();
+
+        int sort_col; bool sort_asc;
+        if (ui_table_sort(&sort_col, &sort_asc)) {
+            std::stable_sort(cv.gaps.begin(), cv.gaps.end(),
+                [&](const CoverageWindowState::Gap &a, const CoverageWindowState::Gap &b) {
+                    int c = 0;
+                    switch (sort_col) {
+                    case 0: c = ui_cmp_u32(((uint32_t)a.bank<<16)|a.addr,
+                                           ((uint32_t)b.bank<<16)|b.addr); break;
+                    case 1: c = ui_cmp_sz(a.len, b.len); break;
+                    case 2: c = ui_cmp_int(a.unknown, b.unknown); break;
+                    case 3: c = ui_cmp_sz(a.off, b.off); break;
+                    }
+                    return sort_asc ? c < 0 : c > 0;
+                });
+        }
 
         ImGuiListClipper clipper;
         clipper.Begin((int)cv.gaps.size());

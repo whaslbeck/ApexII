@@ -29,8 +29,8 @@ int apexsprite_decode(const uint8_t *src, size_t src_size,
                       uint8_t *enc_type_out,
                       size_t  *consumed_out)
 {
-    uint8_t hdr, vert, horiz, height, width, row_bytes;
-    size_t page_bytes;
+    uint8_t hdr, vert, horiz, height, width, row_bytes, enc;
+    size_t page_bytes, plane0_off, consumed;
 
     if (!src || !dest || src_size < 5u) return 0;
 
@@ -50,18 +50,43 @@ int apexsprite_decode(const uint8_t *src, size_t src_size,
     row_bytes  = (uint8_t)((width + 7u) / 8u);
     page_bytes = (size_t)row_bytes * (size_t)height;
 
-    if (src_size < 5u + page_bytes) return 0;
+    /* Plane layout depends on the header byte (verified against real ROMs by
+       the gap between consecutive VSI image addresses). */
+    switch (hdr) {
+    case 0xFFu: /* bicolor-direct: [plane1][plane0] both inline */
+        enc        = APEX_SPRITE_ENC_BICOLOR_DIRECT;
+        plane0_off = 5u + page_bytes;
+        consumed   = 5u + 2u * page_bytes;
+        break;
+    case 0xFEu: /* bicolor-indirect: [2-byte ptr to plane1][plane0] */
+        enc        = APEX_SPRITE_ENC_BICOLOR_INDIRECT;
+        plane0_off = 5u + 2u;
+        consumed   = 5u + 2u + page_bytes;
+        break;
+    case 0xFDu:
+        enc        = APEX_SPRITE_ENC_FD;
+        plane0_off = 5u;
+        consumed   = 5u + page_bytes;
+        break;
+    default:    /* 0x00 monochrome */
+        enc        = APEX_SPRITE_ENC_MONO;
+        plane0_off = 5u;
+        consumed   = 5u + page_bytes;
+        break;
+    }
+
+    if (src_size < consumed) return 0;
 
     memset(dest, 0, APEX_SPRITE_MAX_BYTES);
-    memcpy(dest, src + 5u, page_bytes);
+    memcpy(dest, src + plane0_off, page_bytes);
 
     if (header_type_out)  *header_type_out  = hdr;
     if (vert_offset_out)  *vert_offset_out  = vert;
     if (horiz_offset_out) *horiz_offset_out = horiz;
     if (width_out)        *width_out        = width;
     if (height_out)       *height_out       = height;
-    if (enc_type_out)     *enc_type_out     = 0;
-    if (consumed_out)     *consumed_out     = 5u + page_bytes;
+    if (enc_type_out)     *enc_type_out     = enc;
+    if (consumed_out)     *consumed_out     = consumed;
     return 1;
 }
 

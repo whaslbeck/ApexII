@@ -123,6 +123,7 @@ static void copy_inline_schema(TableSchema *dst, const TableSchema *src)
     for (i = 0; i < src->count; i++) {
         add_table_field(dst, src->items[i].kind, src->items[i].count);
         dst->items[dst->count - 1u].type_name = src->items[i].type_name;
+        dst->items[dst->count - 1u].param = src->items[i].param;
     }
 }
 
@@ -389,6 +390,7 @@ void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count)
     schema->items[schema->count].kind = kind;
     schema->items[schema->count].count = count;
     schema->items[schema->count].type_name = NULL;
+    schema->items[schema->count].param = 0;
     schema->count++;
 }
 
@@ -401,6 +403,7 @@ static TableSchema copy_table_schema(const TableSchema *src)
     for (i = 0; i < src->count; i++) {
         add_table_field(&copy, src->items[i].kind, src->items[i].count);
         copy.items[copy.count - 1u].type_name = src->items[i].type_name;
+        copy.items[copy.count - 1u].param = src->items[i].param;
     }
     return copy;
 }
@@ -721,6 +724,9 @@ static int parse_table_field(char *value, TableField *field, const ConfigTypes *
     uint32_t count;
     size_t i;
 
+    uint32_t param = 0;
+    char *paren;
+
     value = trim(value);
     open = strchr(value, '[');
     if (open) {
@@ -736,9 +742,24 @@ static int parse_table_field(char *value, TableField *field, const ConfigTypes *
     } else {
         count = 1;
     }
+    /* optional (N) parameter — sprite image height for no-header targets */
+    paren = strchr(value, '(');
+    if (paren) {
+        char *pclose = strchr(paren, ')');
+        if (!pclose || *trim(pclose + 1) != '\0') {
+            die("invalid table field '%s'", value);
+        }
+        *paren = '\0';
+        *pclose = '\0';
+        if (!parse_u32(paren + 1, &param)) {
+            die("invalid table field param '%s'", paren + 1);
+        }
+    }
     field->type_name = NULL;
+    field->param = 0;
     if (parse_table_kind(value, &field->kind)) {
         field->count = count;
+        field->param = param;
         return 1;
     }
     if (types) {
@@ -773,6 +794,7 @@ static int parse_table_schema(char *value, TableSchema *schema, const ConfigType
         }
         add_table_field(schema, field.kind, field.count);
         schema->items[schema->count - 1u].type_name = field.type_name;
+        schema->items[schema->count - 1u].param = field.param;
         p = comma ? comma + 1 : NULL;
     }
     return schema->count > 0;

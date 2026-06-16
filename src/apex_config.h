@@ -44,6 +44,7 @@ typedef struct {
     TableFieldKind kind;
     size_t count;
     const char *type_name;  /* borrowed ptr into ConfigType.name, NULL if no type */
+    unsigned param;         /* *_sprite fields: image height for no-header targets; 0 = none */
 } TableField;
 
 typedef struct {

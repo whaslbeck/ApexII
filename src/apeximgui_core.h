@@ -119,6 +119,7 @@ typedef struct {
     int  kind;          /* TableFieldKind cast to int, or -1 for a named type */
     int  count;         /* repeat count (>= 1) */
     char type_name[32]; /* valid when kind == -1 */
+    int  param;         /* *_sprite fields: no-header image height; 0 = none */
 } ApexEditField;
 
 
@@ -448,7 +449,9 @@ struct SpritePreviewInfo {
     uint8_t width;
     uint8_t height;
     char title[128];
-    uint8_t pixels[APEX_SPRITE_MAX_BYTES];
+    uint8_t pixels[APEX_SPRITE_MAX_BYTES];   /* plane 0 */
+    bool    two_plane;                       /* bicolor: pixels1 holds plane 1 */
+    uint8_t pixels1[APEX_SPRITE_MAX_BYTES];  /* plane 1 (bicolor only) */
 };
 
 // --- Shared Helper Function Declarations ---

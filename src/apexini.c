@@ -187,6 +187,9 @@ static void w_schema(FILE *f, const TableSchema *s)
         if (i) fputs(", ", f);
         fputs(s->items[i].type_name ? s->items[i].type_name
                                     : kind_name(s->items[i].kind), f);
+        if (!s->items[i].type_name && s->items[i].param &&
+            (s->items[i].kind == TABLE_PTR16_SPRITE || s->items[i].kind == TABLE_FAR_SPRITE))
+            fprintf(f, "(%u)", s->items[i].param);
         if (s->items[i].count != 1u)
             fprintf(f, "[%lu]", (unsigned long)s->items[i].count);
     }

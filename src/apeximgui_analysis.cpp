@@ -256,6 +256,8 @@ static const char *table_field_kind_name(TableFieldKind k)
     case TABLE_PTR16_CODE:        return "ptr16_code";
     case TABLE_PTR16_TABLE:       return "ptr16_table";
     case TABLE_PTR16_DMD_FULLFRAME: return "ptr16_dmd_fullframe";
+    case TABLE_PTR16_SPRITE:      return "ptr16_sprite";
+    case TABLE_FAR_SPRITE:        return "far_sprite";
     case TABLE_FAR_STRING:        return "far_string";
     case TABLE_FAR_DATA:          return "far_data";
     case TABLE_FAR_TABLE:         return "far_table";
@@ -277,6 +279,11 @@ static std::string table_schema_to_string(const TableSchema *s)
         const char *name = s->items[i].type_name ? s->items[i].type_name
                                                   : table_field_kind_name(s->items[i].kind);
         t += name;
+        if (!s->items[i].type_name && s->items[i].param &&
+            (s->items[i].kind == TABLE_PTR16_SPRITE ||
+             s->items[i].kind == TABLE_FAR_SPRITE)) {
+            t += "(" + std::to_string(s->items[i].param) + ")";
+        }
         if (s->items[i].count != 1u) {
             t += "[" + std::to_string(s->items[i].count) + "]";
         }
@@ -293,6 +300,10 @@ static std::string data_range_spec_string(const DataRange *r)
     case DATA_STRING:          return "string";
     case DATA_STRING_LP:       return "string_lp";
     case DATA_STRING_FIXED:    return "string[" + std::to_string(r->length) + "]";
+    case DATA_PTR16_STRING:    return "ptr16_string";
+    case DATA_PTR16_DATA:      return "ptr16_data";
+    case DATA_PTR16_CODE:      return "ptr16_code";
+    case DATA_PTR16_TABLE:     return "ptr16_table";
     case DATA_FAR_STRING:      return "far_string";
     case DATA_FAR_DATA:        return "far_data";
     case DATA_FAR_TABLE:       return "far_table";
@@ -300,6 +311,7 @@ static std::string data_range_spec_string(const DataRange *r)
     case DATA_DMD_FULLFRAME:   return "dmd_fullframe";
     case DATA_FAR_DMD_FULLFRAME: return "far_dmd_fullframe";
     case DATA_SPRITE:          return "sprite";
+    case DATA_SPRITE_NOHEADER: return "sprite_noheader[" + std::to_string(r->length) + "]";
     case DATA_PTR16_SPRITE:    return "ptr16_sprite";
     case DATA_FAR_SPRITE:      return "far_sprite";
     default:                   return "bytes[1]";
@@ -1825,6 +1837,7 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
     if (!project_locate_rom_bytes(p, b, a, &src, &len, &ro)) {
         return 0;
     }
+    pr->two_plane = false;
 
     /* Check if this is a classified no-header sprite */
     const DataRange *dr = data_range_at(b, a, &p->data_ranges);
@@ -1861,6 +1874,29 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
     pr->horiz_offset = horiz;
     pr->width       = width;
     pr->height      = height;
+
+    /* Bicolor: fetch plane 1 so the preview can show 4 grey levels. */
+    if (enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT ||
+        enc_type == APEX_SPRITE_ENC_BICOLOR_INDIRECT) {
+        uint8_t rb = (uint8_t)((width + 7u) / 8u);
+        size_t page = (size_t)rb * (size_t)height;
+        memset(pr->pixels1, 0, sizeof(pr->pixels1));
+        if (enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT) {
+            if (len >= 5u + page) {
+                memcpy(pr->pixels1, src + 5u, page); /* plane 1 inline before plane 0 */
+                pr->two_plane = true;
+            }
+        } else if (len >= 7u) {
+            uint32_t p1cpu  = ((uint32_t)src[5] << 8) | src[6];
+            uint8_t  p1bank = (p1cpu >= 0x8000u) ? 0xffu : b;
+            const uint8_t *p1; size_t p1len, p1ro;
+            if (project_locate_rom_bytes(p, p1bank, (uint32_t)p1cpu, &p1, &p1len, &p1ro) &&
+                p1len >= page) {
+                memcpy(pr->pixels1, p1, page);
+                pr->two_plane = true;
+            }
+        }
+    }
     return 1;
 }
 
@@ -2118,6 +2154,11 @@ void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int coun
         if (pos + nlen >= cap) { break; }
         memcpy(buf + pos, name, nlen);
         pos += nlen;
+        if (fields[i].param > 0 &&
+            (fields[i].kind == TABLE_PTR16_SPRITE || fields[i].kind == TABLE_FAR_SPRITE)) {
+            int written = snprintf(buf + pos, cap - pos, "(%d)", fields[i].param);
+            if (written > 0) { pos += (size_t)written; }
+        }
         if (fields[i].count > 1) {
             int written = snprintf(buf + pos, cap - pos, "[%d]", fields[i].count);
             if (written > 0) { pos += (size_t)written; }
@@ -2152,9 +2193,22 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
                 while (end > tok && end[-1] == ' ') { *--end = '\0'; }
             }
         }
+        int param = 0;
+        char *paren = strchr(tok, '(');
+        if (paren) {
+            char *close = strchr(paren, ')');
+            if (close) {
+                *paren = '\0';
+                param = atoi(paren + 1);
+                if (param < 0) { param = 0; }
+                end = paren;
+                while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+            }
+        }
         if (*tok) {
             ApexEditField f;
             f.count = cnt;
+            f.param = param;
             f.kind = -1;
             f.type_name[0] = '\0';
             for (int i = 0; i < kKindCount; i++) {

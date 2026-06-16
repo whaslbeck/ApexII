@@ -160,6 +160,8 @@ When started without arguments (and no saved session), a file picker appears aut
 
 **Windows menu:** All panels can be shown or hidden individually. The layout can be reset to the default via Windows → Reset Layout.
 
+**Sorting:** the data/list tables (Labels, Tables, Symbols, Inline Sigs, Code Entries, Strings, Ref Exclusions, RAM References, Code/Inline Candidates, Sprites, ROM Compare, Coverage, Search, Bookmarks, DMD Frames) are click-to-sort: click a column header to cycle ascending → descending → unsorted; the arrow shows the current direction.
+
 **Key panels:**
 
 - **Disassembly** — scrollable listing with inline syntax highlighting and clickable label links

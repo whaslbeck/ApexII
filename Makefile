@@ -48,19 +48,22 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexmeta $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexmeta $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test $(BUILD_DIR)/apexsprite_test $(BUILD_DIR)/sprite_scope_test
 
 apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexmeta
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
 
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_DIR)/apex.h | $(BUILD_DIR)
+# Depend on all project headers: coarse but correct.  A struct-layout change in
+# e.g. apex_config.h must rebuild every translation unit that includes it, or
+# stale objects with a mismatched layout crash at runtime.
+SRC_HEADERS := $(wildcard $(SRC_DIR)/*.h)
+
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/apeximgui.o $(BUILD_DIR)/apeximgui_data.o $(BUILD_DIR)/apeximgui_analysis.o $(BUILD_DIR)/apeximgui_views.o: $(SRC_DIR)/apeximgui_core.h
-
-$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp | $(BUILD_DIR)
+$(BUILD_DIR)/%.o: $(SRC_DIR)/%.cpp $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CXX) $(APEXIMGUI_CPPFLAGS) $(CXXFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/imgui.o: third_party/imgui/imgui.cpp | $(BUILD_DIR)
@@ -90,6 +93,12 @@ $(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_DIR)/apex_projec
 $(BUILD_DIR)/apexdmd_test.o: tests/apexdmd_test.c $(SRC_DIR)/apexdmd.h | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
+$(BUILD_DIR)/apexsprite_test.o: tests/apexsprite_test.c $(SRC_DIR)/apexsprite.h | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
+
+$(BUILD_DIR)/sprite_scope_test.o: tests/sprite_scope_test.c $(SRC_HEADERS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
+
 $(BUILD_DIR)/apexdis: $(BUILD_DIR)/apexdis_main.o $(APEXDIS_CORE_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
@@ -103,6 +112,12 @@ $(BUILD_DIR)/project_api_test: $(BUILD_DIR)/project_api_test.o $(APEXDIS_CORE_OB
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexdmd_test: $(BUILD_DIR)/apexdmd_test.o $(BUILD_DIR)/apexdmd.o $(COMMON_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/apexsprite_test: $(BUILD_DIR)/apexsprite_test.o $(BUILD_DIR)/apexsprite.o
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/sprite_scope_test: $(BUILD_DIR)/sprite_scope_test.o $(APEXDIS_CORE_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexini: $(APEXINI_OBJS)

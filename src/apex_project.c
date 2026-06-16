@@ -116,6 +116,185 @@ static void inject_dmd_table_data_ranges(ApexProject *project)
     }
 }
 
+/* Locate the ROM bytes of a sprite/pointer target at (bank, addr).  Returns 0
+   if the address is not mapped; otherwise *out points at the bytes and *out_len
+   is the remaining byte count. */
+static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr,
+                         const uint8_t **out, size_t *out_len)
+{
+    size_t off;
+
+    if (bank == 0xffu || in_system_addr(addr)) {
+        if (addr < APEX_SYSTEM_ORG) {
+            return 0;
+        }
+        off = p->paged_size + (size_t)(addr - APEX_SYSTEM_ORG);
+    } else {
+        int bidx = bank_index_for_far_ref(p->rom.data, p->banks, bank);
+        if (bidx < 0 || addr < APEX_PAGED_ORG || addr >= 0x8000u) {
+            return 0;
+        }
+        off = (size_t)bidx * APEX_BANK_SIZE + (size_t)(addr - APEX_PAGED_ORG);
+    }
+    if (off >= p->rom.size) {
+        return 0;
+    }
+    *out     = p->rom.data + off;
+    *out_len = p->rom.size - off;
+    return 1;
+}
+
+/* Read the first byte of a sprite target at (bank, addr).  Returns 0 if the
+   address is not mapped. */
+static int sprite_target_first_byte(const ApexProject *p, uint8_t bank, uint16_t addr,
+                                    uint8_t *out)
+{
+    const uint8_t *data;
+    size_t len;
+
+    if (!sprite_locate(p, bank, addr, &data, &len)) {
+        return 0;
+    }
+    *out = data[0];
+    return 1;
+}
+
+/* Classify a single sprite-pointer target: header-format images are self
+   describing (DATA_SPRITE); no-header images need the height carried on the
+   table field (DATA_SPRITE_NOHEADER[height]).  Never overrides an existing
+   classification. */
+static void inject_one_sprite(ApexProject *p, uint8_t bank, uint16_t addr, unsigned height)
+{
+    uint8_t b0;
+
+    if (data_range_at(bank, addr, &p->data_ranges)) {
+        return;
+    }
+    if (!sprite_target_first_byte(p, bank, addr, &b0)) {
+        return;
+    }
+    if (b0 == 0x00u || b0 == 0xFDu || b0 == 0xFEu || b0 == 0xFFu) {
+        add_data_range(&p->data_ranges, bank, addr, DATA_SPRITE, 0);
+    } else if (b0 >= 1u && b0 <= 128u && height > 0u) {
+        add_data_range(&p->data_ranges, bank, addr, DATA_SPRITE_NOHEADER, height);
+    }
+    /* no-header without a known height, or implausible first byte: leave it */
+}
+
+/* For every TABLE_FAR_SPRITE / TABLE_PTR16_SPRITE field in all configured
+   tables, classify the pointed-to image as a sprite data range if not already
+   classified.  Mirrors inject_dmd_table_data_ranges; the field's param carries
+   the no-header image height from the VSI sub-table descriptor. */
+static void inject_sprite_table_data_ranges(ApexProject *project)
+{
+    size_t i;
+
+    for (i = 0; i < project->tables.count; i++) {
+        const TableDef *table = &project->tables.items[i];
+        const uint8_t *bank_data;
+        size_t bank_data_len;
+        size_t pos;
+        uint16_t row_count;
+        uint8_t row_width;
+        size_t row;
+
+        if (table->bank == 0xffu) {
+            if (!in_system_addr(table->addr))
+                continue;
+            bank_data     = project->rom.data + project->paged_size;
+            bank_data_len = project->rom.size  - project->paged_size;
+            pos           = (size_t)(table->addr - APEX_SYSTEM_ORG);
+        } else {
+            int bidx = bank_index_for_id(project->rom.data, project->banks, table->bank);
+
+            if (bidx < 0 || table->addr < APEX_PAGED_ORG || table->addr >= 0x8000u)
+                continue;
+            bank_data     = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
+            bank_data_len = APEX_BANK_SIZE;
+            pos           = (size_t)(table->addr - APEX_PAGED_ORG);
+        }
+
+        if (table->has_header) {
+            if (pos + 3u > bank_data_len)
+                continue;
+            row_count = read_be16(bank_data + pos);
+            row_width = bank_data[pos + 2u];
+            pos += 3u;
+        } else {
+            row_count = (uint16_t)table->rows;
+            row_width = (uint8_t)table_schema_width(&table->schema);
+        }
+
+        for (row = 0; row < row_count && pos + row_width <= bank_data_len; row++) {
+            size_t fp = pos;
+            size_t fi;
+
+            for (fi = 0; fi < table->schema.count; fi++) {
+                size_t n;
+                TableFieldKind kind = table->schema.items[fi].kind;
+                unsigned param      = table->schema.items[fi].param;
+
+                for (n = 0; n < table->schema.items[fi].count; n++) {
+                    if (kind == TABLE_FAR_SPRITE && fp + 3u <= bank_data_len) {
+                        uint16_t addr    = read_be16(bank_data + fp);
+                        uint8_t tgt_bank = bank_data[fp + 2u];
+
+                        inject_one_sprite(project, tgt_bank, addr, param);
+                        fp += 3u;
+                    } else if (kind == TABLE_PTR16_SPRITE && fp + 2u <= bank_data_len) {
+                        uint16_t ptr     = read_be16(bank_data + fp);
+                        uint8_t tgt_bank = in_system_addr(ptr) ? 0xffu : table->bank;
+
+                        inject_one_sprite(project, tgt_bank, ptr, param);
+                        fp += 2u;
+                    } else if (kind == TABLE_BYTE) {
+                        fp++;
+                    } else if (kind == TABLE_WORD) {
+                        fp += 2u;
+                    } else if (table_kind_is_far(kind)) {
+                        fp += 3u;
+                    } else {
+                        fp += 2u; /* ptr16 kinds */
+                    }
+                }
+            }
+            pos += row_width;
+        }
+    }
+}
+
+/* Classify the target of every single DATA_PTR16_SPRITE / DATA_FAR_SPRITE data
+   range (e.g. set via the Edit panel's "spr"/"far_spr" buttons), the same way
+   table fields do.  range->length carries the no-header image height (0 = none,
+   header-format only). */
+static void inject_sprite_pointer_data_ranges(ApexProject *project)
+{
+    size_t i;
+    size_t n = project->data_ranges.count; /* snapshot: add_data_range may realloc/append */
+
+    for (i = 0; i < n; i++) {
+        DataRange dr = project->data_ranges.items[i]; /* copy before any add */
+        const uint8_t *data;
+        size_t len;
+
+        if (dr.kind != DATA_PTR16_SPRITE && dr.kind != DATA_FAR_SPRITE) {
+            continue;
+        }
+        if (!sprite_locate(project, dr.bank, (uint16_t)dr.addr, &data, &len)) {
+            continue;
+        }
+        if (dr.kind == DATA_PTR16_SPRITE && len >= 2u) {
+            uint16_t ptr = (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+            uint8_t tb = in_system_addr(ptr) ? 0xffu : dr.bank;
+            inject_one_sprite(project, tb, ptr, (unsigned)dr.length);
+        } else if (dr.kind == DATA_FAR_SPRITE && len >= 3u) {
+            uint16_t a = (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
+            uint8_t fb = data[2];
+            inject_one_sprite(project, fb, a, (unsigned)dr.length);
+        }
+    }
+}
+
 static const char *basename_ptr(const char *path)
 {
     const char *slash;
@@ -231,6 +410,11 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
         }
         fputs(schema->items[i].type_name ? schema->items[i].type_name
                                          : table_field_kind_name(schema->items[i].kind), out);
+        if (!schema->items[i].type_name && schema->items[i].param &&
+            (schema->items[i].kind == TABLE_PTR16_SPRITE ||
+             schema->items[i].kind == TABLE_FAR_SPRITE)) {
+            fprintf(out, "(%u)", schema->items[i].param);
+        }
         if (schema->items[i].count != 1u) {
             fprintf(out, "[%lu]", (unsigned long)schema->items[i].count);
         }
@@ -1538,6 +1722,14 @@ static void analyze_system_region(ApexProject *project)
     apply_table_labels(&system_tables, project->rom.data, project->banks, project->bank_labels,
                        &project->system_labels, project->rom.data + project->paged_size,
                        &project->refs);
+    /* Same DMD/sprite table-target classification as the full analysis, so a
+       scoped re-analysis (e.g. after classifying a sprite table) also produces
+       the image data ranges.  Re-sort so collect_code_targets' data_range_at
+       binary search stays valid. */
+    inject_dmd_table_data_ranges(project);
+    inject_sprite_table_data_ranges(project);
+    inject_sprite_pointer_data_ranges(project);
+    sort_data_ranges(&project->data_ranges);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
@@ -1598,6 +1790,12 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     apply_table_labels(&bank_tables, project->rom.data, project->banks, project->bank_labels,
                        &project->system_labels, project->rom.data + project->paged_size,
                        &project->refs);
+    /* See analyze_system_region: classify DMD/sprite table targets here too so a
+       bank-scoped re-analysis produces the image data ranges. */
+    inject_dmd_table_data_ranges(project);
+    inject_sprite_table_data_ranges(project);
+    inject_sprite_pointer_data_ranges(project);
+    sort_data_ranges(&project->data_ranges);
 
     bank = project->rom.data + (size_t)bank_index * APEX_BANK_SIZE;
     used = last_non_ff(bank, APEX_BANK_SIZE);
@@ -1658,6 +1856,8 @@ static void analyze_full_project(ApexProject *project)
                        &project->system_labels, project->rom.data + project->paged_size,
                        &project->refs);
     inject_dmd_table_data_ranges(project);
+    inject_sprite_table_data_ranges(project);
+    inject_sprite_pointer_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
