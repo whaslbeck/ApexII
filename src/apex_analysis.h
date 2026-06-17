@@ -97,9 +97,10 @@ const char *make_bank_label(uint8_t bank, uint16_t addr);
 const char *make_string_label(const char *base, const uint8_t *data, size_t len);
 void apply_string_content_labels(LabelSet *labels, const uint8_t *data, size_t used,
                                  uint32_t base_addr);
+uint8_t apex_bank_id_base(size_t banks);
 int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id);
 int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank);
-uint8_t bank_id_for_index(const uint8_t *paged_rom, int bank_index);
+uint8_t bank_id_for_index(size_t banks, int bank_index);
 void validate_config_classification(const ConfigEntries *entries, const TableDefs *tables,
                                     const DataRanges *data_ranges);
 size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);

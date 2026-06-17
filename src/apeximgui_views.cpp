@@ -1175,7 +1175,7 @@ void render_bank_list(const ApexProject *p, const ApexRenderedDocument *d, UiSta
             }
         }
         for (size_t i = 0; i < p->banks; i++) {
-            uint8_t bid = bank_id_for_index(p->rom.data, (int)i);
+            uint8_t bid = bank_id_for_index(p->banks, (int)i);
             char lbl[64];
             snprintf(lbl, 64, "Bank 0x%02x", bid);
             ImGui::TableNextRow();

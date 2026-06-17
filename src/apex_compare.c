@@ -440,7 +440,7 @@ static void collect_strings(const struct ApexProject *p, SStrSet *set)
     size_t bi;
 
     for (bi = 0; bi < p->banks; bi++) {
-        uint8_t bank_id = p->rom.data[bi * APEX_BANK_SIZE];
+        uint8_t bank_id = bank_id_for_index(p->banks, (int)bi);
         collect_strings_from(p, &p->bank_labels[bi], bank_id, set);
     }
     collect_strings_from(p, &p->system_labels, 0xffu, set);

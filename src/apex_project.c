@@ -1744,7 +1744,7 @@ static void analyze_system_region(ApexProject *project)
     {
         size_t i;
         for (i = 0; i < project->banks; i++) {
-            uint8_t bank_id = project->rom.data[i * APEX_BANK_SIZE];
+            uint8_t bank_id = bank_id_for_index(project->banks, (int)i);
             prune_unreferenced_generated_labels(&project->bank_labels[i], bank_id, &project->refs);
         }
     }
@@ -1817,7 +1817,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
                 continue;
             }
             prune_unreferenced_generated_labels(&project->bank_labels[i],
-                                                project->rom.data[i * APEX_BANK_SIZE],
+                                                bank_id_for_index(project->banks, (int)i),
                                                 &project->refs);
         }
     }
@@ -2662,11 +2662,11 @@ void apex_scan_code_candidates(const ApexProject *p, ApexCodeCandidates *out)
     for (i = 0; i < 256; i++) valid_bank[i] = 0;
     valid_bank[0xffu] = 1;
     for (i = 0; i < p->banks; i++)
-        valid_bank[p->rom.data[i * APEX_BANK_SIZE]] = 1;
+        valid_bank[bank_id_for_index(p->banks, (int)i)] = 1;
 
     /* scan paged banks */
     for (i = 0; i < p->banks; i++) {
-        uint8_t  bid  = p->rom.data[i * APEX_BANK_SIZE];
+        uint8_t  bid  = bank_id_for_index(p->banks, (int)i);
         scan_bank(p, bid,
                   p->rom.data + i * APEX_BANK_SIZE,
                   APEX_BANK_SIZE,
@@ -2995,7 +2995,7 @@ void apex_scan_inline_candidates(const ApexProject *p, ApexInlineCandidates *out
     for (i = 0; i < 256; i++) valid_bank[i] = 0;
     valid_bank[0xFFu] = 1;
     for (i = 0; i < p->banks; i++)
-        valid_bank[p->rom.data[i * APEX_BANK_SIZE]] = 1;
+        valid_bank[bank_id_for_index(p->banks, (int)i)] = 1;
 
     /* Scan every known code label in every bank */
     /* Helper: process one LabelSet */
@@ -3011,7 +3011,7 @@ void apex_scan_inline_candidates(const ApexProject *p, ApexInlineCandidates *out
 
             if (pass == 0) {
                 ls        = &p->bank_labels[i];
-                bank_id   = p->rom.data[i * APEX_BANK_SIZE];
+                bank_id   = bank_id_for_index(p->banks, (int)i);
                 base_addr = APEX_PAGED_ORG;
                 bdata     = p->rom.data + i * APEX_BANK_SIZE;
                 bsize     = APEX_BANK_SIZE;

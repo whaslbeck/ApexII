@@ -729,7 +729,17 @@ static void parse_line(AsmState *st, char *line)
                 die("invalid .BANK '%s'", s);
             }
             st->bank = (int)value;
-            st->has_far_bank = 0;
+            /* A user label's far bank is the canonical (computed) bank id for
+               this page, mirroring the disassembler: base = 0x3e - paged_pages
+               (0x20 for 512 KB, 0x00 for 1 MB).  The BANK_ID byte is just the
+               emitted marker and no longer defines bank identity. */
+            if (st->paged_size > 0) {
+                size_t banks = st->paged_size / APEX_BANK_SIZE;
+                st->has_far_bank = 1;
+                st->far_bank = (uint8_t)((0x3eu - banks) + value);
+            } else {
+                st->has_far_bank = 0;
+            }
         }
     } else if (starts_with_word(s, ".ORG")) {
         s = trim(s + strlen(".ORG"));
@@ -742,8 +752,7 @@ static void parse_line(AsmState *st, char *line)
         if (!parse_u32(s, &value) || value > 0xffu) {
             die("invalid BANK_ID '%s'", s);
         }
-        st->has_far_bank = 1;
-        st->far_bank = (uint8_t)value;
+        /* BANK_ID only emits the marker byte; bank identity comes from .BANK. */
         emit_byte(st, (uint8_t)value);
     } else if (starts_with_word(s, "INLINE_BYTE")) {
         s = trim(s + strlen("INLINE_BYTE"));

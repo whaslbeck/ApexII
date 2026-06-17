@@ -322,7 +322,7 @@ static void collect_labels(const struct ApexProject *p, ApexFingerprintDB *db)
     /* paged banks */
     for (bi = 0; bi < p->banks; bi++) {
         const LabelSet *ls = &p->bank_labels[bi];
-        uint8_t bank_id = p->rom.data[bi * APEX_BANK_SIZE];
+        uint8_t bank_id = bank_id_for_index(p->banks, (int)bi);
 
         for (li = 0; li < ls->count; li++) {
             const Label *lb = &ls->items[li];
@@ -438,7 +438,7 @@ void apex_match_inject_entries(struct ApexProject       *dst,
        are game-specific and their addresses differ between ROM versions). */
     for (bi = 0; bi < src->banks; bi++) {
         const LabelSet *ls = &src->bank_labels[bi];
-        uint8_t bank_id = src->rom.data[bi * APEX_BANK_SIZE];
+        uint8_t bank_id = bank_id_for_index(src->banks, (int)bi);
 
         for (li = 0; li < ls->count; li++) {
             const Label *lb = &ls->items[li];

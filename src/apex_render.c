@@ -312,23 +312,33 @@ static size_t rendered_line_size(const ApexProject *project, const ApexRenderedL
         mnemonic_equals(line->text, line->length, "INLINE_STRING_PTR") ||
         mnemonic_equals(line->text, line->length, "INLINE_TABLE_PTR") ||
         mnemonic_equals(line->text, line->length, "INLINE_CODE_PTR") ||
+        mnemonic_equals(line->text, line->length, "INLINE_PTR_DMD_FULLFRAME") ||
+        mnemonic_equals(line->text, line->length, "INLINE_PTR_SPRITE") ||
         mnemonic_equals(line->text, line->length, "TABLE_PTR") ||
         mnemonic_equals(line->text, line->length, "TABLE_STRING_PTR") ||
-        mnemonic_equals(line->text, line->length, "TABLE_CODE_PTR")) {
+        mnemonic_equals(line->text, line->length, "TABLE_CODE_PTR") ||
+        mnemonic_equals(line->text, line->length, "TABLE_PTR_DMD_FULLFRAME") ||
+        mnemonic_equals(line->text, line->length, "TABLE_PTR_SPRITE")) {
         return 2u;
     }
     if (mnemonic_equals(line->text, line->length, "INLINE_FAR_PTR") ||
         mnemonic_equals(line->text, line->length, "INLINE_FAR_STRING") ||
         mnemonic_equals(line->text, line->length, "INLINE_FAR_TABLE") ||
         mnemonic_equals(line->text, line->length, "INLINE_FAR_CODE") ||
+        mnemonic_equals(line->text, line->length, "INLINE_FAR_DMD_FULLFRAME") ||
+        mnemonic_equals(line->text, line->length, "INLINE_FAR_SPRITE") ||
         mnemonic_equals(line->text, line->length, "FAR_PTR") ||
         mnemonic_equals(line->text, line->length, "FAR_STRING") ||
         mnemonic_equals(line->text, line->length, "FAR_TABLE") ||
         mnemonic_equals(line->text, line->length, "FAR_CODE") ||
+        mnemonic_equals(line->text, line->length, "FAR_DMD_FULLFRAME") ||
+        mnemonic_equals(line->text, line->length, "FAR_SPRITE") ||
         mnemonic_equals(line->text, line->length, "TABLE_FAR_PTR") ||
         mnemonic_equals(line->text, line->length, "TABLE_FAR_STRING") ||
         mnemonic_equals(line->text, line->length, "TABLE_FAR_TABLE") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_CODE")) {
+        mnemonic_equals(line->text, line->length, "TABLE_FAR_CODE") ||
+        mnemonic_equals(line->text, line->length, "TABLE_FAR_DMD_FULLFRAME") ||
+        mnemonic_equals(line->text, line->length, "TABLE_FAR_SPRITE")) {
         return 3u;
     }
     if (line->kind == APEX_RENDER_LINE_INSTRUCTION) {

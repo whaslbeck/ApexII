@@ -1159,7 +1159,7 @@ int rom_offset_to_cpu_address(const ApexProject *project, size_t offset,
         return 1;
     }
     int bank_idx = (int)(offset / 0x4000);
-    *bank = bank_id_for_index(project->rom.data, bank_idx);
+    *bank = bank_id_for_index(project->banks, bank_idx);
     *cpu_addr = 0x4000u + (uint32_t)(offset % 0x4000);
     return 1;
 }

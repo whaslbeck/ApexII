@@ -8,12 +8,85 @@ enum {
     WRITE_TYPE_ROWS = 2
 };
 
+/* Source reader shared by the byte-oriented and bit-stream decoders.  `pos` is
+   the running offset from the start of the encoded frame (offset 0 is the type
+   byte), so the final `pos` doubles as the consumed-byte count.  `mask` holds
+   the current bit position for the bit-stream encodings (0x04/0x05/0x0a/0x0b);
+   it is irrelevant to the byte encodings. */
+typedef struct {
+    const uint8_t *src;
+    size_t size;
+    size_t pos;
+    uint8_t mask;
+    int bad;
+} DmdReader;
+
 static uint8_t reverse_bits(uint8_t value)
 {
     value = (uint8_t)(((value & 0x55u) << 1) | ((value >> 1) & 0x55u));
     value = (uint8_t)(((value & 0x33u) << 2) | ((value >> 2) & 0x33u));
     value = (uint8_t)((value << 4) | (value >> 4));
     return value;
+}
+
+static uint8_t rd_byte(DmdReader *r)
+{
+    if (r->pos >= r->size) {
+        r->bad = 1;
+        return 0u;
+    }
+    return r->src[r->pos++];
+}
+
+/* Read a single bit (MSB first), advancing to the next source byte once all 8
+   bits are consumed.  Mirrors WPCEdit's readNextBit(). */
+static unsigned rd_bit(DmdReader *r)
+{
+    unsigned bit;
+
+    if (r->pos >= r->size) {
+        r->bad = 1;
+        return 0u;
+    }
+    bit = (unsigned)(r->src[r->pos] & r->mask);
+    r->mask = (uint8_t)(r->mask >> 1);
+    if (r->mask == 0u) {
+        r->mask = 0x80u;
+        r->pos++;
+    }
+    return bit;
+}
+
+/* Read one 8-bit value from the bit stream.  A leading 1 selects a dictionary
+   entry (count of following 1-bits, max 7, indexes RepeatBytes[]); a leading 0
+   is followed by 8 literal bits.  Mirrors WPCEdit's readNext8BitValue(). */
+static uint8_t rd_stream_value(DmdReader *r, const uint8_t *repeat_bytes)
+{
+    if (rd_bit(r)) {
+        int ones = 0;
+        int i;
+
+        for (i = 0; i < 7; i++) {
+            if (rd_bit(r)) {
+                ones++;
+            } else {
+                break;
+            }
+        }
+        return repeat_bytes[ones];
+    } else {
+        uint8_t value = 0u;
+        uint8_t mask = 0x80u;
+        int i;
+
+        for (i = 0; i < 8; i++) {
+            if (rd_bit(r)) {
+                value = (uint8_t)(value | mask);
+            }
+            mask = (uint8_t)(mask >> 1);
+        }
+        return value;
+    }
 }
 
 static void write_next_8bit_value(uint8_t *dest, size_t *write_counter, uint8_t value,
@@ -38,36 +111,52 @@ static void write_next_8bit_value(uint8_t *dest, size_t *write_counter, uint8_t 
     *write_counter = count + 1u;
 }
 
-static int decode_01or02(const uint8_t *src, size_t src_size, uint8_t *dest, size_t *consumed,
-                         uint8_t type)
+/* Repeat `value` `count` times, with WPCEdit's "0 means fill the rest of the
+   page" semantics (the JS `do { } while (--count && ...)` decrements 0 into a
+   negative, so only the page-full check stops it). */
+static void emit_repeat(uint8_t *dest, size_t *write_counter, uint8_t value, unsigned count,
+                        uint8_t type)
 {
-    size_t pos = 1u;
-    size_t write_counter = 0u;
-    uint8_t special_flag;
+    unsigned remaining = count ? count : 0xffffffffu;
 
-    if (src_size < 2u) {
-        return 0;
-    }
+    do {
+        write_next_8bit_value(dest, write_counter, value, type);
+    } while (--remaining && *write_counter < APEX_DMD_PAGE_BYTES);
+}
 
-    special_flag = src[pos++];
-    while (write_counter < APEX_DMD_PAGE_BYTES) {
-        uint8_t ch;
+/* 0x00: raw page copy, no encoding. */
+static void decode_00(DmdReader *r, uint8_t *dest)
+{
+    size_t i;
 
-        if (pos >= src_size) {
-            return 0;
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        dest[i] = rd_byte(r);
+        if (r->bad) {
+            return;
         }
-        ch = src[pos++];
-        if (ch == special_flag) {
-            uint8_t repeat_count;
-            uint8_t repeat_value;
-            unsigned remaining;
+    }
+}
 
-            if (pos + 1u >= src_size) {
-                return 0;
+/* 0x01/0x02: simple single-flag-byte repeats (columns / rows). */
+static void decode_01or02(DmdReader *r, uint8_t *dest, uint8_t type)
+{
+    uint8_t special = rd_byte(r);
+    size_t write_counter = 0u;
+
+    while (write_counter < APEX_DMD_PAGE_BYTES && !r->bad) {
+        uint8_t ch = rd_byte(r);
+
+        if (r->bad) {
+            return;
+        }
+        if (ch == special) {
+            uint8_t repeat_count = rd_byte(r);
+            uint8_t repeat_value = rd_byte(r);
+            unsigned remaining = repeat_count == 0u ? 256u : (unsigned)repeat_count;
+
+            if (r->bad) {
+                return;
             }
-            repeat_count = src[pos++];
-            repeat_value = src[pos++];
-            remaining = repeat_count == 0u ? 256u : (unsigned)repeat_count;
             while (remaining != 0u && write_counter < APEX_DMD_PAGE_BYTES) {
                 write_next_8bit_value(dest, &write_counter, repeat_value, type);
                 remaining--;
@@ -76,17 +165,180 @@ static int decode_01or02(const uint8_t *src, size_t src_size, uint8_t *dest, siz
             write_next_8bit_value(dest, &write_counter, ch, type);
         }
     }
+}
 
-    if (consumed) {
-        *consumed = pos;
+/* 0x04/0x05: complex repeats, 1 flag byte + 8-byte dictionary, bit stream. */
+static void decode_04or05(DmdReader *r, uint8_t *dest, uint8_t type)
+{
+    uint8_t special = rd_byte(r);
+    uint8_t repeat[8];
+    size_t write_counter = 0u;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        repeat[i] = rd_byte(r);
     }
-    return 1;
+    r->mask = 0x80u;
+
+    while (write_counter < APEX_DMD_PAGE_BYTES && !r->bad) {
+        uint8_t ch = rd_stream_value(r, repeat);
+
+        if (ch == special) {
+            uint8_t value1 = rd_stream_value(r, repeat);
+            uint8_t value2 = rd_stream_value(r, repeat);
+
+            emit_repeat(dest, &write_counter, value2, value1, type);
+        } else {
+            write_next_8bit_value(dest, &write_counter, ch, type);
+        }
+    }
+}
+
+/* 0x06/0x07: XOR-repeats.  Plane data gets 0x00 where the XOR run applies (the
+   XOR overlay is an animation delta we do not reconstruct); the source-byte
+   walk — and therefore the consumed length — matches the game. */
+static void decode_06or07(DmdReader *r, uint8_t *dest, uint8_t type)
+{
+    uint8_t special = rd_byte(r);
+    size_t write_counter = 0u;
+
+    while (write_counter < APEX_DMD_PAGE_BYTES && !r->bad) {
+        uint8_t ch = rd_byte(r);
+
+        if (r->bad) {
+            return;
+        }
+        if (ch == special) {
+            uint8_t value1 = rd_byte(r);
+            (void)rd_byte(r); /* XOR value: not applied to a standalone plane */
+
+            if (r->bad) {
+                return;
+            }
+            emit_repeat(dest, &write_counter, 0x00u, value1, type);
+        } else {
+            write_next_8bit_value(dest, &write_counter, ch, type);
+        }
+    }
+}
+
+/* 0x08/0x09: bulk data loads alternating with bulk skips, byte stream. */
+static void decode_08or09(DmdReader *r, uint8_t *dest, uint8_t type)
+{
+    size_t write_counter = 0u;
+    int looping = 1;
+    uint8_t count;
+
+    count = rd_byte(r); /* start flag: zero => begin with a skip phase */
+    if (r->bad) {
+        return;
+    }
+    if (count == 0u) {
+        uint8_t skips = rd_byte(r);
+
+        if (r->bad) {
+            return;
+        }
+        if (skips) {
+            emit_repeat(dest, &write_counter, 0x00u, skips, type);
+        }
+        if (write_counter >= APEX_DMD_PAGE_BYTES) {
+            looping = 0;
+        }
+    }
+
+    while (looping && !r->bad) {
+        count = rd_byte(r);
+        if (r->bad) {
+            return;
+        }
+        if (count) {
+            do {
+                uint8_t pattern = rd_byte(r);
+
+                if (r->bad) {
+                    return;
+                }
+                write_next_8bit_value(dest, &write_counter, pattern, type);
+            } while (--count && write_counter < APEX_DMD_PAGE_BYTES);
+        }
+        if (write_counter >= APEX_DMD_PAGE_BYTES) {
+            looping = 0;
+        }
+        if (looping) {
+            uint8_t skips = rd_byte(r);
+
+            if (r->bad) {
+                return;
+            }
+            if (skips) {
+                emit_repeat(dest, &write_counter, 0x00u, skips, type);
+            }
+            if (write_counter >= APEX_DMD_PAGE_BYTES) {
+                looping = 0;
+            }
+        }
+    }
+}
+
+/* 0x0a/0x0b: bulk data loads alternating with bulk skips, 8-byte dictionary,
+   bit stream. */
+static void decode_0aor0b(DmdReader *r, uint8_t *dest, uint8_t type)
+{
+    uint8_t repeat[8];
+    size_t write_counter = 0u;
+    int looping = 1;
+    uint8_t count;
+    int i;
+
+    for (i = 0; i < 8; i++) {
+        repeat[i] = rd_byte(r);
+    }
+    r->mask = 0x80u;
+
+    count = rd_stream_value(r, repeat); /* start flag */
+    if (count == 0u) {
+        uint8_t skips = rd_stream_value(r, repeat);
+
+        if (skips) {
+            emit_repeat(dest, &write_counter, 0x00u, skips, type);
+        }
+        if (write_counter >= APEX_DMD_PAGE_BYTES) {
+            looping = 0;
+        }
+    }
+
+    while (looping && !r->bad) {
+        count = rd_stream_value(r, repeat);
+        if (count) {
+            do {
+                uint8_t value = rd_stream_value(r, repeat);
+
+                write_next_8bit_value(dest, &write_counter, value, type);
+            } while (--count && write_counter < APEX_DMD_PAGE_BYTES);
+        }
+        if (write_counter >= APEX_DMD_PAGE_BYTES) {
+            looping = 0;
+        }
+        if (looping) {
+            uint8_t skips = rd_stream_value(r, repeat);
+
+            if (skips) {
+                emit_repeat(dest, &write_counter, 0x00u, skips, type);
+            }
+            if (write_counter >= APEX_DMD_PAGE_BYTES) {
+                looping = 0;
+            }
+        }
+    }
 }
 
 int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
                              size_t *consumed, uint8_t *type_out)
 {
+    DmdReader r;
     uint8_t type;
+    int bitstream = 0;
 
     if (!src || !dest || src_size == 0u) {
         return 0;
@@ -98,14 +350,65 @@ int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
         *type_out = type;
     }
 
+    r.src = src;
+    r.size = src_size;
+    r.pos = 1u; /* skip the type byte */
+    r.mask = 0x80u;
+    r.bad = 0;
+
     switch (type) {
+    case 0x00u:
+        decode_00(&r, dest);
+        break;
     case 0x01u:
-        return decode_01or02(src, src_size, dest, consumed, WRITE_TYPE_COLUMNS);
+        decode_01or02(&r, dest, WRITE_TYPE_COLUMNS);
+        break;
     case 0x02u:
-        return decode_01or02(src, src_size, dest, consumed, WRITE_TYPE_ROWS);
+        decode_01or02(&r, dest, WRITE_TYPE_ROWS);
+        break;
+    case 0x04u:
+        decode_04or05(&r, dest, WRITE_TYPE_COLUMNS);
+        bitstream = 1;
+        break;
+    case 0x05u:
+        decode_04or05(&r, dest, WRITE_TYPE_ROWS);
+        bitstream = 1;
+        break;
+    case 0x06u:
+        decode_06or07(&r, dest, WRITE_TYPE_COLUMNS);
+        break;
+    case 0x07u:
+        decode_06or07(&r, dest, WRITE_TYPE_ROWS);
+        break;
+    case 0x08u:
+        decode_08or09(&r, dest, WRITE_TYPE_COLUMNS);
+        break;
+    case 0x09u:
+        decode_08or09(&r, dest, WRITE_TYPE_ROWS);
+        break;
+    case 0x0au:
+        decode_0aor0b(&r, dest, WRITE_TYPE_COLUMNS);
+        bitstream = 1;
+        break;
+    case 0x0bu:
+        decode_0aor0b(&r, dest, WRITE_TYPE_ROWS);
+        bitstream = 1;
+        break;
     default:
+        /* 0x03 has no known decoder. */
         return 0;
     }
+
+    if (r.bad) {
+        return 0;
+    }
+
+    if (consumed) {
+        /* For a bit-stream frame that ends mid-byte, that partial byte still
+           belongs to this frame, so round the consumed count up to it. */
+        *consumed = (bitstream && r.mask != 0x80u) ? r.pos + 1u : r.pos;
+    }
+    return 1;
 }
 
 int apexdmd_write_plane_pbm(const char *path, const uint8_t *plane)

@@ -370,16 +370,31 @@ void apply_string_content_labels(LabelSet *labels, const uint8_t *data, size_t u
     }
 }
 
+/* The canonical bank id is derived arithmetically from the page index, not from
+   the bank-id byte stored at the start of each 16 KB page.  WPC maps the game
+   ROM at the top of the 6-bit bank space, so the first paged bank is 0x20 on a
+   512 KB ROM and 0x00 on a 1 MB ROM:
+
+       base = 0x40 - total_pages = 0x3e - banks   (banks = paged pages)
+
+   The stored bank-id byte is unreliable — some ROMs (e.g. AFM 1.13) carry a
+   wrong/duplicate value in the first page — so we never trust it for identity. */
+uint8_t apex_bank_id_base(size_t banks)
+{
+    return (uint8_t)(0x3eu - banks);
+}
+
 int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id)
 {
-    size_t i;
+    uint8_t base = apex_bank_id_base(banks);
+    size_t idx;
 
-    for (i = 0; i < banks; i++) {
-        if (paged_rom[i * APEX_BANK_SIZE] == bank_id) {
-            return (int)i;
-        }
+    (void)paged_rom;
+    if (banks == 0 || bank_id < base) {
+        return -1;
     }
-    return -1;
+    idx = (size_t)(bank_id - base);
+    return idx < banks ? (int)idx : -1;
 }
 
 int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank)
@@ -389,15 +404,18 @@ int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank)
     if (bank_index >= 0) {
         return bank_index;
     }
+    /* Phantom bank byte below the base: WPC leaves the unused upper bank-address
+       lines tied, so a value like 0x18 on a 512 KB ROM aliases the same page as
+       0x38.  A raw value that is itself a valid page index selects that page. */
     if (bank < banks) {
-        return bank;
+        return (int)bank;
     }
     return -1;
 }
 
-uint8_t bank_id_for_index(const uint8_t *paged_rom, int bank_index)
+uint8_t bank_id_for_index(size_t banks, int bank_index)
 {
-    return paged_rom[(size_t)bank_index * APEX_BANK_SIZE];
+    return (uint8_t)(apex_bank_id_base(banks) + (size_t)bank_index);
 }
 
 void validate_config_classification(const ConfigEntries *entries, const TableDefs *tables,
@@ -755,7 +773,7 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
         label = add_label(&bank_labels[bank_index], addr,
-                          make_bank_label(bank_id_for_index(paged_rom, bank_index), addr),
+                          make_bank_label(bank_id_for_index(banks, bank_index), addr),
                           is_code);
         explain_label(label, source);
         explain_label_kind(label, source);
@@ -860,7 +878,7 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
                     } else {
                         bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
                         if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-                            add_reference(refs, bank_id_for_index(paged_rom, bank_index), addr,
+                            add_reference(refs, bank_id_for_index(banks, bank_index), addr,
                                           current_bank, source_addr, "code", source);
                         }
                     }

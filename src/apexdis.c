@@ -747,7 +747,22 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
     }
 }
 
-static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols)
+static const char *symbol_name_for_value(const ConfigSymbols *symbols, uint32_t value)
+{
+    size_t i;
+
+    if (!symbols) {
+        return NULL;
+    }
+    for (i = 0; i < symbols->count; i++) {
+        if ((symbols->items[i].value & 0xffffu) == (value & 0xffffu)) {
+            return symbols->items[i].name;
+        }
+    }
+    return NULL;
+}
+
+static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols, const ConfigDocs *docs)
 {
     size_t i;
 
@@ -755,10 +770,49 @@ static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols)
         return;
     }
     for (i = 0; i < symbols->count; i++) {
+        /* RAM / ASIC equates are never emitted as ROM lines, so their [docs]
+           would otherwise be lost.  Attach the doc above the equate.  Skip
+           system-ROM-address symbols: those docs already render at the code or
+           data line and we must not duplicate them. */
+        if ((symbols->items[i].value & 0xffffu) < APEX_SYSTEM_ORG) {
+            emit_doc_comment(out, config_doc_at(docs, 0xffu, symbols->items[i].value));
+        }
         fprintf(out, "%s = 0x%04x\n", symbols->items[i].name,
                 (unsigned)symbols->items[i].value & 0xffffu);
     }
     fputc('\n', out);
+}
+
+/* Emit [docs] attached to RAM/ASIC addresses (0x0000-0x3fff) that have no
+   [symbols] equate — without this they would never appear in the output, since
+   such addresses are not part of the ROM and produce no disassembly line. */
+static void emit_nonrom_docs(FILE *out, const ConfigDocs *docs, const ConfigSymbols *symbols)
+{
+    size_t i;
+    int header = 0;
+
+    if (!docs) {
+        return;
+    }
+    for (i = 0; i < docs->count; i++) {
+        const ConfigDoc *d = &docs->items[i];
+
+        if (d->has_bank || d->addr >= APEX_PAGED_ORG) {
+            continue; /* only un-banked RAM/ASIC addresses */
+        }
+        if (symbol_name_for_value(symbols, d->addr)) {
+            continue; /* already emitted above its equate */
+        }
+        if (!header) {
+            fprintf(out, "; ---- RAM/ASIC documentation (no symbol) ----\n");
+            header = 1;
+        }
+        fprintf(out, "; 0x%04x:\n", (unsigned)d->addr & 0xffffu);
+        emit_doc_comment(out, d->text);
+    }
+    if (header) {
+        fputc('\n', out);
+    }
 }
 
 static void emit_type_equates(FILE *out, const ConfigTypes *types)
@@ -1009,7 +1063,7 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
         int bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
 
         if (bank_index >= 0) {
-            label_bank = bank_id_for_index(paged_rom, bank_index);
+            label_bank = bank_id_for_index(banks, bank_index);
             label = label_name_at(addr, bank_labels[bank_index].items, bank_labels[bank_index].count, 0);
         }
         if (!label) {
@@ -1042,7 +1096,7 @@ static uint8_t far_effective_bank(const uint8_t *paged_rom, size_t banks, uint8_
     if (idx < 0) {
         return bank;
     }
-    return bank_id_for_index(paged_rom, idx);
+    return bank_id_for_index(banks, idx);
 }
 
 /* Emit a standalone comment line flagging a phantom-bank remap, if any. */
@@ -1722,7 +1776,12 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
                                size_t rom_bank_base, int emit_explain, const ConfigTypes *types)
 {
     size_t used = last_non_ff(data, APEX_BANK_SIZE);
-    uint8_t bank_id = data[0];
+    /* The canonical (computed) bank id names labels and references; the raw byte
+       stored at the start of the page is emitted verbatim as BANK_ID so the
+       roundtrip reproduces it even when it disagrees with the computed id. */
+    size_t page_index = paged_rom ? (size_t)(data - paged_rom) / APEX_BANK_SIZE : 0;
+    uint8_t bank_id = bank_id_for_index(banks, (int)page_index);
+    uint8_t raw_bank_byte = data[0];
 
     emit_location_comment(out, "bank_start", bank_id, APEX_PAGED_ORG, rom_bank_base);
     if (!labels_at(APEX_PAGED_ORG, labels->items, labels->count, labels->sorted)) {
@@ -1732,7 +1791,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
     if (used == 0) {
         used = 1;
     }
-    fprintf(out, "    BANK_ID 0x%02x\n", bank_id);    if (used > 1) {
+    fprintf(out, "    BANK_ID 0x%02x\n", raw_bank_byte);    if (used > 1) {
         emit_db_with_labels(out, data + 1, used - 1, APEX_PAGED_ORG + 1, labels->items,
                             labels->count, labels->sorted, system_labels->items,
                             system_labels->count, NULL, 0, inline_sigs, paged_rom, banks,
@@ -1888,12 +1947,13 @@ static void emit_xref_index(FILE *out, const uint8_t *paged_rom, const LabelSet 
     size_t i;
     size_t j;
 
+    (void)paged_rom;
     if (!refs || refs->count == 0) {
         return;
     }
     fprintf(out, "\n; XREF INDEX\n");
     for (i = 0; i < banks; i++) {
-        uint8_t bank_id = paged_rom[i * APEX_BANK_SIZE];
+        uint8_t bank_id = bank_id_for_index(banks, (int)i);
 
         for (j = 0; j < bank_labels[i].count; j++) {
             emit_xref_for_label(out, bank_id, &bank_labels[i].items[j], refs);
@@ -2108,7 +2168,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                 int bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
 
                 if (bank_index >= 0 && target >= APEX_PAGED_ORG && target < 0x8000u) {
-                    add_reference(refs, bank_id_for_index(paged_rom, bank_index), target,
+                    add_reference(refs, bank_id_for_index(banks, bank_index), target,
                                   range->bank, range->addr, "data", source);
                 }
             }
@@ -2182,7 +2242,7 @@ static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom,
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
         label = add_label(&bank_labels[bank_index], addr,
-                          make_bank_label(bank_id_for_index(paged_rom, bank_index), addr),
+                          make_bank_label(bank_id_for_index(banks, bank_index), addr),
                           is_code);
         explain_label(label, table_far_ref_source(kind));
         explain_label_kind(label, table_far_ref_source(kind));
@@ -2271,7 +2331,7 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
                 } else {
                     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
                     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-                        target_bank = bank_id_for_index(paged_rom, bank_index);
+                        target_bank = bank_id_for_index(banks, bank_index);
                         add_table_row_reference(refs, target_bank, addr, table->bank, table->addr,
                                                 source, (int)row_index, row_cpu_addr);
                     }
@@ -2486,7 +2546,8 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
 
     emit_preamble(out, project);
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
-    emit_config_symbols(out, &project->symbols);
+    emit_config_symbols(out, &project->symbols, &project->docs);
+    emit_nonrom_docs(out, &project->docs, &project->symbols);
     emit_type_equates(out, &project->config_types);
     emit_vector_equates(out, project->vectors, sizeof(project->vectors) / sizeof(project->vectors[0]));
 
