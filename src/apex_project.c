@@ -1704,6 +1704,25 @@ static void analyze_system_region(ApexProject *project)
     DataRanges system_data_ranges = filter_data_ranges_for_system(&project->data_ranges);
     TableDefs system_tables = filter_tables_for_system(&project->tables);
 
+    /* Snapshot existing code entry points before the rebuild — see the matching
+       comment in analyze_bank_region.  A system-scoped re-analysis does not
+       rescan the paged banks, so code reached only via cross-bank references
+       into the system region would otherwise be lost. */
+    uint32_t *code_seed = NULL;
+    size_t    code_seed_count = 0;
+    {
+        const LabelSet *old = &project->system_labels;
+        size_t i;
+        if (old->count > 0) {
+            code_seed = xmalloc(old->count * sizeof(*code_seed));
+            for (i = 0; i < old->count; i++) {
+                if (old->items[i].is_code) {
+                    code_seed[code_seed_count++] = old->items[i].addr;
+                }
+            }
+        }
+    }
+
     free_label_set(&project->system_labels);
     remove_references_from_source_range(&project->refs, 0xffu, APEX_SYSTEM_ORG, 0xffffu);
 
@@ -1730,6 +1749,26 @@ static void analyze_system_region(ApexProject *project)
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
+    /* Replay snapshotted code entry points unless reclassified as data. */
+    {
+        size_t s;
+        LabelSet *ls = &project->system_labels;
+        for (s = 0; s < code_seed_count; s++) {
+            uint32_t addr = code_seed[s];
+
+            if (addr >= 0xfff2u || data_range_at(0xffu, addr, &project->data_ranges)) {
+                continue;
+            }
+            if (!label_name_at(addr, ls->items, ls->count, 0)) {
+                Label *t = add_label(ls, addr, make_generated_label(addr), 1);
+                explain_label(t, "code_flow");
+                explain_label_kind(t, "code_flow");
+            } else {
+                add_label(ls, addr, NULL, 1);
+            }
+        }
+    }
+    free(code_seed);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
@@ -1774,6 +1813,28 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
         return;
     }
 
+    /* Snapshot the code entry points discovered so far in this bank.  A
+       bank-scoped re-analysis rebuilds the label set from scratch but does not
+       rescan the other banks, so cross-bank entry points (far calls, far-code
+       tables and inline far-code refs that target this bank) would be lost.
+       Their union — regardless of how each was found — is exactly the set of
+       is_code labels currently in the bank, so we replay those addresses as
+       code seeds below and let the intra-bank flow scan rediscover the rest. */
+    uint32_t *code_seed = NULL;
+    size_t    code_seed_count = 0;
+    {
+        const LabelSet *old = &project->bank_labels[bank_index];
+        size_t i;
+        if (old->count > 0) {
+            code_seed = xmalloc(old->count * sizeof(*code_seed));
+            for (i = 0; i < old->count; i++) {
+                if (old->items[i].is_code) {
+                    code_seed[code_seed_count++] = old->items[i].addr;
+                }
+            }
+        }
+    }
+
     free_label_set(&project->bank_labels[bank_index]);
     remove_references_from_source_range(&project->refs, bank_id, APEX_PAGED_ORG, 0x7fffu);
 
@@ -1796,6 +1857,28 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
+
+    /* Replay the snapshotted code entry points (see above) as code seeds, unless
+       they have since been reclassified as data. */
+    {
+        size_t s;
+        LabelSet *ls = &project->bank_labels[bank_index];
+        for (s = 0; s < code_seed_count; s++) {
+            uint32_t addr = code_seed[s];
+
+            if (data_range_at(bank_id, addr, &project->data_ranges)) {
+                continue;
+            }
+            if (!label_name_at(addr, ls->items, ls->count, 0)) {
+                Label *t = add_label(ls, addr, make_bank_label(bank_id, addr), 1);
+                explain_label(t, "code_flow");
+                explain_label_kind(t, "code_flow");
+            } else {
+                add_label(ls, addr, NULL, 1);
+            }
+        }
+    }
+    free(code_seed);
 
     bank = project->rom.data + (size_t)bank_index * APEX_BANK_SIZE;
     used = last_non_ff(bank, APEX_BANK_SIZE);
