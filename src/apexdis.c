@@ -839,8 +839,9 @@ static void emit_type_equates(FILE *out, const ConfigTypes *types)
                 upper_val[k] = (char)toupper((unsigned char)type->values[j].name[k]);
             }
             upper_val[k] = '\0';
-            fprintf(out, "%s_%s = 0x%02x\n", upper_type, upper_val,
-                    (unsigned)type->values[j].value & 0xffu);
+            fprintf(out, type->kind == TABLE_WORD ? "%s_%s = 0x%04x\n" : "%s_%s = 0x%02x\n",
+                    upper_type, upper_val,
+                    (unsigned)type->values[j].value & (type->kind == TABLE_WORD ? 0xffffu : 0xffu));
             emitted = 1;
         }
     }

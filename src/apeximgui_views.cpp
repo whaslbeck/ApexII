@@ -2280,7 +2280,8 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
                 if (ImGui::IsItemHovered() && ct->value_count > 0) {
                     ImGui::BeginTooltip();
                     for (size_t vi = 0; vi < ct->value_count; vi++) {
-                        ImGui::Text("0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
+                        ImGui::Text(ct->kind == TABLE_WORD ? "0x%04x = %s" : "0x%02x = %s",
+                                    ct->values[vi].value, ct->values[vi].name);
                     }
                     ImGui::EndTooltip();
                 }
@@ -2795,15 +2796,16 @@ static std::string build_values_str(const ConfigType *ct, int skip,
 {
     std::string out;
     char tmp[64];
+    const char *vfmt = (ct->kind == TABLE_WORD) ? "0x%04x:%s" : "0x%02x:%s";
     for (size_t i = 0; i < ct->value_count; i++) {
         if ((int)i == skip) continue;
         if (!out.empty()) out += ", ";
-        snprintf(tmp, sizeof(tmp), "0x%02x:%s", ct->values[i].value, ct->values[i].name);
+        snprintf(tmp, sizeof(tmp), vfmt, ct->values[i].value, ct->values[i].name);
         out += tmp;
     }
     if (new_name && *new_name) {
         if (!out.empty()) out += ", ";
-        snprintf(tmp, sizeof(tmp), "0x%02x:%s", new_val, new_name);
+        snprintf(tmp, sizeof(tmp), vfmt, new_val, new_name);
         out += tmp;
     }
     return out;
@@ -3053,7 +3055,8 @@ void render_types_editor(ApexProject *p, UiState *s)
             /* existing enum values */
             for (size_t vi = 0; vi < ct->value_count; vi++) {
                 ImGui::PushID((int)vi);
-                ImGui::Text("  0x%02x = %s", ct->values[vi].value, ct->values[vi].name);
+                ImGui::Text(ct->kind == TABLE_WORD ? "  0x%04x = %s" : "  0x%02x = %s",
+                            ct->values[vi].value, ct->values[vi].name);
                 ImGui::SameLine();
                 ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.5f, 0.1f, 0.1f, 1.0f));
                 if (ImGui::SmallButton("x##delval")) {

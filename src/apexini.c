@@ -341,7 +341,8 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
                 qsort(t->values, t->value_count, sizeof(t->values[0]), cmp_type_value);
             fprintf(f, "%s:%s =\n", t->name, t->kind == TABLE_BYTE ? "byte" : "word");
             for (j = 0; j < t->value_count; j++) {
-                fprintf(f, "\t0x%02x:%s\n", t->values[j].value, t->values[j].name);
+                fprintf(f, t->kind == TABLE_WORD ? "\t0x%04x:%s\n" : "\t0x%02x:%s\n",
+                        t->values[j].value, t->values[j].name);
             }
         }
     }

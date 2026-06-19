@@ -2582,7 +2582,8 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         for (auto &t : ctype) {
             fprintf(o, "%s:%s =\n", t.name.c_str(), t.is_word ? "word" : "byte");
             for (size_t vi = 0; vi < t.values.size(); vi++) {
-                fprintf(o, "\t0x%02x:%s\n", t.values[vi].value, t.values[vi].name.c_str());
+                fprintf(o, t.is_word ? "\t0x%04x:%s\n" : "\t0x%02x:%s\n",
+                        t.values[vi].value, t.values[vi].name.c_str());
             }
         }
     }
@@ -2671,7 +2672,8 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
             const ConfigType *ct = &p->config_types.items[i];
             fprintf(o, "%s:%s =\n", ct->name, (ct->kind == TABLE_WORD) ? "word" : "byte");
             for (size_t j = 0; j < ct->value_count; j++) {
-                fprintf(o, "\t0x%02x:%s\n", ct->values[j].value, ct->values[j].name);
+                fprintf(o, (ct->kind == TABLE_WORD) ? "\t0x%04x:%s\n" : "\t0x%02x:%s\n",
+                        ct->values[j].value, ct->values[j].name);
             }
         }
     }
