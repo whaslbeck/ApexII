@@ -227,6 +227,9 @@ struct UiState {
     size_t hex_anchor_offset;   /* range start — set on plain left-click */
     bool hex_has_range;         /* true when a multi-byte range is selected */
     bool hex_active;
+    bool hex_is_edit_target;    /* hex view was the last view directly interacted with:
+                                   classify/label edits target the hex byte, not the
+                                   disassembly line start */
     bool hex_window_focused;
     int hex_request_follow;
     size_t hex_prev_selected_line;

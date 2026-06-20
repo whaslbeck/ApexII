@@ -992,7 +992,7 @@ void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
             return;
         }
@@ -1014,7 +1014,7 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         size_t base = s->hex_has_range
             ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
             : s->hex_selected_offset;
@@ -1037,7 +1037,7 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         size_t base = s->hex_has_range
             ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
             : s->hex_selected_offset;
@@ -1058,7 +1058,7 @@ void apply_string_lp_at_selection(ApexProject *p, const ApexRenderedDocument **d
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         size_t base = s->hex_has_range
             ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
             : s->hex_selected_offset;
@@ -1080,7 +1080,7 @@ void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, U
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
             return;
         }
@@ -1098,7 +1098,7 @@ void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 {
     uint8_t b;
     uint32_t a;
-    if (s->hex_active) {
+    if (s->hex_is_edit_target) {
         if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
             return;
         }

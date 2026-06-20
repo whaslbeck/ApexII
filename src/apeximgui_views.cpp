@@ -390,6 +390,34 @@ static bool line_excluded_ref(const ApexProject *p, const ApexRenderedLine *line
     return false;
 }
 
+/* Shared "Classify as ▸" submenu of pointer / sprite / DMD data kinds, used by
+   both the disassembly row context menu and the hex view context menu.  Each
+   item classifies the current selection (hex byte when the hex view is the edit
+   target, else the selected disassembly line) via apply_data_at_selection. */
+static void classify_kind_submenu(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    if (!ImGui::BeginMenu("Classify as")) {
+        return;
+    }
+    if (ImGui::MenuItem("sprite"))             apply_data_at_selection(p, dp, s, "sprite");
+    if (ImGui::MenuItem("dmd_fullframe"))      apply_data_at_selection(p, dp, s, "dmd_fullframe");
+    ImGui::Separator();
+    if (ImGui::MenuItem("ptr16_code"))         apply_data_at_selection(p, dp, s, "ptr16_code");
+    if (ImGui::MenuItem("ptr16_data"))         apply_data_at_selection(p, dp, s, "ptr16_data");
+    if (ImGui::MenuItem("ptr16_string"))       apply_data_at_selection(p, dp, s, "ptr16_string");
+    if (ImGui::MenuItem("ptr16_table"))        apply_data_at_selection(p, dp, s, "ptr16_table");
+    if (ImGui::MenuItem("ptr16_sprite"))       apply_data_at_selection(p, dp, s, "ptr16_sprite");
+    if (ImGui::MenuItem("ptr16_dmd_fullframe"))apply_data_at_selection(p, dp, s, "ptr16_dmd_fullframe");
+    ImGui::Separator();
+    if (ImGui::MenuItem("far_code"))           apply_data_at_selection(p, dp, s, "far_code");
+    if (ImGui::MenuItem("far_data"))           apply_data_at_selection(p, dp, s, "far_data");
+    if (ImGui::MenuItem("far_string"))         apply_data_at_selection(p, dp, s, "far_string");
+    if (ImGui::MenuItem("far_table"))          apply_data_at_selection(p, dp, s, "far_table");
+    if (ImGui::MenuItem("far_sprite"))         apply_data_at_selection(p, dp, s, "far_sprite");
+    if (ImGui::MenuItem("far_dmd_fullframe"))  apply_data_at_selection(p, dp, s, "far_dmd_fullframe");
+    ImGui::EndMenu();
+}
+
 void render_line_table(ApexProject *project, const ApexRenderedDocument **document_ptr,
                        UiState *state)
 {
@@ -926,6 +954,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         }
                         apply_table_at_selection(project, document_ptr, state, spec);
                     }
+                    classify_kind_submenu(project, document_ptr, state);
                     if (ImGui::MenuItem("Clear Classification", "Del")) {
                         clear_kind_at_selection(project, document_ptr, state);
                     }
@@ -1499,6 +1528,9 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 d->lines[s->selected_line].rom_addr < p->rom.size) {
             s->hex_selected_offset = d->lines[s->selected_line].rom_addr;
             s->hex_active = true;
+            /* The disassembly selection drove this change, so the hex cursor only
+               follows for display — the disassembly is the edit target. */
+            s->hex_is_edit_target = false;
             s->hex_request_follow = 1;
         }
         s->hex_prev_selected_line = s->selected_line;
@@ -1565,6 +1597,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (found != SIZE_MAX) {
                     s->hex_selected_offset = found;
                     s->hex_active          = true;
+                    s->hex_is_edit_target  = true;
                     s->hex_request_follow  = 1;
                     size_t li;
                     if (find_line_by_rom_offset(*dp, found, &li)) {
@@ -1607,6 +1640,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             s->hex_anchor_offset   = (size_t)next;
             s->hex_selected_offset = (size_t)next;
             s->hex_has_range       = false;
+            s->hex_is_edit_target  = true;
             s->hex_request_follow  = 1;
             size_t li;
             if (find_line_by_rom_offset(*dp, (size_t)next, &li)) {
@@ -1895,6 +1929,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         s->hex_has_range       = false;
                     }
                     s->hex_active = true;
+                    s->hex_is_edit_target = true;
                     size_t li;
                     if (find_line_by_rom_offset(d, o, &li)) {
                         select_line(s, li, 1);
@@ -1904,6 +1939,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (ImGui::IsItemHovered() && ImGui::IsMouseClicked(ImGuiMouseButton_Right)) {
                     s->hex_selected_offset = o;
                     s->hex_active = true;
+                    s->hex_is_edit_target = true;
                     size_t li;
                     if (find_line_by_rom_offset(d, o, &li)) {
                         select_line(s, li, 1);
@@ -1957,6 +1993,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         s->hex_has_range       = false;
                     }
                     s->hex_active = true;
+                    s->hex_is_edit_target = true;
                     size_t li;
                     if (find_line_by_rom_offset(d, o, &li)) {
                         select_line(s, li, 1);
@@ -2020,6 +2057,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             }
             apply_table_at_selection(p, dp, s, spec);
         }
+        classify_kind_submenu(p, dp, s);
         if (ImGui::MenuItem("Clear Classification", "Del")) { clear_kind_at_selection(p, dp, s); }
         ImGui::Separator();
         if (ImGui::MenuItem("Edit Label",   "L"))       { s->request_focus_label = 1; }
@@ -2355,7 +2393,15 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
 {
     uint8_t b;
     uint32_t a;
-    if (!selected_address(*dp, s, &b, &a)) {
+    /* When the hex view was the last view interacted with, the editor targets
+       the exact selected byte (matching the Classify As / Label actions below),
+       not the start of the corresponding disassembly line. */
+    if (s->hex_is_edit_target && s->hex_selected_offset < p->rom.size) {
+        if (!rom_offset_to_cpu_address(p, s->hex_selected_offset, &b, &a)) {
+            ImGui::TextUnformatted("No addressable byte selected.");
+            return;
+        }
+    } else if (!selected_address(*dp, s, &b, &a)) {
         ImGui::TextUnformatted("No addressable line selected.");
         return;
     }
@@ -4767,6 +4813,7 @@ static void sprite_navigate(ApexProject *p, const ApexRenderedDocument *d, UiSta
        disasm->hex re-sync that would otherwise snap it to the line start. */
     s->hex_selected_offset    = off;
     s->hex_active             = true;
+    s->hex_is_edit_target     = true;
     s->hex_request_follow     = 1;
     s->hex_prev_selected_line = s->selected_line;
     /* Make both views visible so the jump is observable. */

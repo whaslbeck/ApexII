@@ -253,6 +253,7 @@ static int label_is_pinned(const Label *label)
         return 0;
     }
     return strcmp(source, "config_entry") == 0 || strcmp(source, "config_data") == 0 ||
+           strcmp(source, "config_dmd_fullframe") == 0 || strcmp(source, "config_sprite") == 0 ||
            strcmp(source, "config_table") == 0 || strcmp(source, "config_label") == 0 ||
            strcmp(source, "config_label_entry") == 0 || strcmp(source, "vector_entry") == 0 ||
            strcmp(source, "vector_table") == 0;
