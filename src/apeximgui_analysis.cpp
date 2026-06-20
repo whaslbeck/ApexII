@@ -1900,6 +1900,52 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
     return 1;
 }
 
+/* Like decode_sprite_preview_at, but for a target that is not classified yet:
+   header-format images self-describe and decode directly; a no-header image
+   (first byte = width) needs the height, which is supplied by the caller from
+   the sprite table field.  Used by the table-row tooltip preview. */
+int decode_sprite_preview_with_height(const ApexProject *p, uint8_t b, uint32_t a,
+                                      unsigned hint_height, SpritePreviewInfo *pr)
+{
+    const uint8_t *src;
+    size_t len, ro;
+    uint8_t b0;
+
+    /* If it is already classified (or a header sprite), reuse the full decoder. */
+    if (decode_sprite_preview_at(p, b, a, pr)) {
+        return 1;
+    }
+    if (hint_height == 0u || !project_locate_rom_bytes(p, b, a, &src, &len, &ro)) {
+        return 0;
+    }
+    b0 = src[0];
+    /* A header byte means it is not a no-header image; nothing more to try. */
+    if (b0 == 0x00u || b0 == 0xFDu || b0 == 0xFEu || b0 == 0xFFu || b0 == 0u || b0 > 128u) {
+        return 0;
+    }
+    {
+        uint8_t width = 0;
+        size_t consumed = 0;
+        if (!apexsprite_decode_noheader(src, len, pr->pixels, (uint8_t)hint_height,
+                                        &width, &consumed)) {
+            return 0;
+        }
+        pr->two_plane    = false;
+        pr->valid        = true;
+        pr->bank         = b;
+        pr->cpu_addr     = a;
+        pr->rom_offset   = ro;
+        pr->header_type  = 0;
+        pr->enc_type     = 0;
+        pr->consumed     = consumed;
+        pr->vert_offset  = 0;
+        pr->horiz_offset = 0;
+        pr->width        = width;
+        pr->height       = (uint8_t)hint_height;
+    }
+    return 1;
+}
+
 SpritePreviewInfo find_sprite_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
 {
     SpritePreviewInfo pr = {};

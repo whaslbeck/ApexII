@@ -233,6 +233,8 @@ struct UiState {
     bool hex_window_focused;
     int hex_request_follow;
     size_t hex_prev_selected_line;
+    size_t hex_hover_off;       /* byte hovered last frame; drives the block highlight */
+    int    hex_hover_valid;
     char hex_search_input[64];
     int request_focus_hex_search;
 
@@ -476,6 +478,7 @@ DmdPreviewInfo find_dmd_preview(const ApexProject *project, const ApexRenderedDo
 // Sprite logic
 int address_is_sprite_start(const ApexProject *project, uint8_t bank, uint32_t addr);
 int decode_sprite_preview_at(const ApexProject *project, uint8_t bank, uint32_t addr, SpritePreviewInfo *preview);
+int decode_sprite_preview_with_height(const ApexProject *project, uint8_t bank, uint32_t addr, unsigned hint_height, SpritePreviewInfo *preview);
 SpritePreviewInfo find_sprite_preview(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 // Inline spec string

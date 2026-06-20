@@ -390,6 +390,184 @@ static bool line_excluded_ref(const ApexProject *p, const ApexRenderedLine *line
     return false;
 }
 
+/* Render a sprite or DMD preview relevant to `line`: the line's own address if
+   it is a sprite/DMD, otherwise a sprite/DMD target it references (including the
+   raw ptr16_sprite FDB-pointer fallback for not-yet-labeled targets).  Each
+   preview is prefixed with a separator.  Returns true if a preview was drawn.
+   Shared by the disassembly and hex view tooltips. */
+/* Height for a no-header sprite at a ptr16_sprite/far_sprite table row, taken
+   from the sprite field of the table that contains `addr`.  0 if none. */
+static unsigned sprite_table_height_at(const ApexProject *p, uint8_t bank, uint32_t addr)
+{
+    for (size_t i = 0; i < p->tables.count; i++) {
+        const TableDef *t = &p->tables.items[i];
+        if (t->bank != bank || t->schema.count == 0) {
+            continue;
+        }
+        size_t row_width = table_schema_width(&t->schema);
+        if (row_width == 0) {
+            continue;
+        }
+        uint32_t start = t->addr;
+        size_t rows = t->rows;
+        if (t->has_header) {
+            const uint8_t *hsrc;
+            size_t hrem;
+            if (!project_locate_rom_bytes(p, bank, t->addr, &hsrc, &hrem, NULL) || hrem < 3u) {
+                continue;
+            }
+            rows = ((size_t)hsrc[0] << 8) | hsrc[1];
+            start = t->addr + 3u;
+        }
+        if (addr < start || addr >= start + rows * row_width) {
+            continue;
+        }
+        for (size_t f = 0; f < t->schema.count; f++) {
+            if (t->schema.items[f].kind == TABLE_PTR16_SPRITE ||
+                t->schema.items[f].kind == TABLE_FAR_SPRITE) {
+                return t->schema.items[f].param;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Resolve a sprite/DMD table row's target straight from the pointer bytes and
+   the table field (no-header sprites take their height from the field), so the
+   preview works even when the target carries no label/classification yet.
+   Returns true if a preview was drawn. */
+static bool render_table_row_target_preview(const ApexProject *project,
+                                            const ApexRenderedLine *line)
+{
+    /* Table pointer rows render with kind INSTRUCTION (the TABLE_* pseudo-op),
+       so gate on the block kind plus the mnemonic, not the line kind. */
+    if (line->block_kind != APEX_RENDER_BLOCK_TABLE) {
+        return false;
+    }
+    const char *txt = line->text;
+    size_t tn = line->length;
+    while (tn && (*txt == ' ' || *txt == '\t')) { txt++; tn--; }
+    auto has = [&](const char *m) {
+        size_t ml = strlen(m);
+        return tn >= ml && memcmp(txt, m, ml) == 0;
+    };
+    int is_dmd = 0;
+    size_t ptr_len = 0;
+    if (has("TABLE_FAR_DMD_FULLFRAME"))      { is_dmd = 1; ptr_len = 3; }
+    else if (has("TABLE_PTR_DMD_FULLFRAME")) { is_dmd = 1; ptr_len = 2; }
+    else if (has("TABLE_FAR_SPRITE"))        { ptr_len = 3; }
+    else if (has("TABLE_PTR_SPRITE"))        { ptr_len = 2; }
+    else { return false; }
+
+    const uint8_t *src;
+    size_t rem;
+    if (!project_locate_rom_bytes(project, line->bank, line->cpu_addr, &src, &rem, NULL) ||
+        rem < ptr_len) {
+        return false;
+    }
+    uint16_t taddr = (uint16_t)(((uint16_t)src[0] << 8) | src[1]);
+    uint8_t tbank = (ptr_len == 3) ? src[2] : ((taddr >= 0x8000u) ? 0xFFu : line->bank);
+
+    if (is_dmd) {
+        DmdPreviewInfo pr = {};
+        if (decode_dmd_preview_at(project, tbank, taddr, &pr)) {
+            snprintf(pr.title, sizeof(pr.title), "DMD Target");
+            ImGui::Separator();
+            render_dmd_preview(pr, 4.0f);
+            return true;
+        }
+        return false;
+    }
+    unsigned h = sprite_table_height_at(project, line->bank, line->cpu_addr);
+    SpritePreviewInfo pr = {};
+    if (decode_sprite_preview_with_height(project, tbank, taddr, h, &pr)) {
+        snprintf(pr.title, sizeof(pr.title), "Sprite Target");
+        ImGui::Separator();
+        render_sprite_preview(pr, 4.0f);
+        return true;
+    }
+    return false;
+}
+
+static bool render_line_sprite_dmd_preview(const ApexProject *project,
+                                           const ApexRenderedDocument *document,
+                                           UiState *state, const ApexRenderedLine *line)
+{
+    if (!line || !line->has_location) {
+        return false;
+    }
+    /* Table rows: resolve straight from the pointer + field (robust even for
+       not-yet-classified targets, and supplies the no-header sprite height). */
+    if (render_table_row_target_preview(project, line)) {
+        return true;
+    }
+
+    DmdPreviewInfo dmd_pr = {};
+    bool found_dmd = false;
+    if (is_dmd_fullframe_addr(project, line->bank, line->cpu_addr) &&
+        decode_dmd_preview_at(project, line->bank, line->cpu_addr, &dmd_pr)) {
+        snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Preview");
+        found_dmd = true;
+    }
+    if (!found_dmd) {
+        auto ts = find_line_targets(document, state, line);
+        for (auto &t : ts) {
+            if (address_is_dmd_fullframe_start(project, t.bank, t.cpu_addr) &&
+                decode_dmd_preview_at(project, t.bank, t.cpu_addr, &dmd_pr)) {
+                snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Target");
+                found_dmd = true;
+                break;
+            }
+        }
+    }
+    if (found_dmd) {
+        ImGui::Separator();
+        render_dmd_preview(dmd_pr, 4.0f);
+        return true;
+    }
+
+    SpritePreviewInfo spr_pr = {};
+    bool found_spr = false;
+    if (is_sprite_addr(project, line->bank, line->cpu_addr) &&
+        decode_sprite_preview_at(project, line->bank, line->cpu_addr, &spr_pr)) {
+        snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Preview");
+        found_spr = true;
+    }
+    if (!found_spr) {
+        auto ts = find_line_targets(document, state, line);
+        for (auto &t : ts) {
+            if (address_is_sprite_start(project, t.bank, t.cpu_addr) &&
+                decode_sprite_preview_at(project, t.bank, t.cpu_addr, &spr_pr)) {
+                snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
+                found_spr = true;
+                break;
+            }
+        }
+    }
+    /* Fallback: for ptr16_sprite FDB rows whose target isn't labeled yet
+       (unclassified), read the 2-byte pointer from ROM directly. */
+    if (!found_spr && line->block_kind == APEX_RENDER_BLOCK_TABLE &&
+        line->kind == APEX_RENDER_LINE_DIRECTIVE) {
+        const uint8_t *fdb_src;
+        size_t fdb_rem;
+        if (project_locate_rom_bytes(project, line->bank, line->cpu_addr, &fdb_src,
+                                     &fdb_rem, NULL) && fdb_rem >= 2u) {
+            uint32_t tgt_addr = ((uint32_t)fdb_src[0] << 8) | fdb_src[1];
+            uint8_t tgt_bank = (tgt_addr >= 0x8000u) ? 0xFFu : line->bank;
+            if (decode_sprite_preview_at(project, tgt_bank, tgt_addr, &spr_pr)) {
+                snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
+                found_spr = true;
+            }
+        }
+    }
+    if (found_spr) {
+        ImGui::Separator();
+        render_sprite_preview(spr_pr, 4.0f);
+        return true;
+    }
+    return false;
+}
+
 /* Shared "Classify as ▸" submenu of pointer / sprite / DMD data kinds, used by
    both the disassembly row context menu and the hex view context menu.  Each
    item classifies the current selection (hex byte when the hex view is the edit
@@ -819,79 +997,16 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             ImGui::Text("Table row: %d", row_idx);
                         }
                     }
+                    /* Sprite/DMD preview FIRST so it stays visible even when the
+                       disassembly preview below it is long. */
+                    render_line_sprite_dmd_preview(project, document, state, line);
                     if (line->has_location &&
                         (line->block_kind == APEX_RENDER_BLOCK_DATA ||
                          line->block_kind == APEX_RENDER_BLOCK_SPRITE ||
                          line->block_kind == APEX_RENDER_BLOCK_TABLE ||
                          line->block_kind == APEX_RENDER_BLOCK_UNCLASSIFIED)) {
+                        ImGui::Separator();
                         render_disasm_preview(project, line->rom_addr, line->bank, line->cpu_addr);
-                    }
-                    if (line->has_location) {
-                        DmdPreviewInfo dmd_pr = {};
-                        bool found_dmd = false;
-                        if (is_dmd_fullframe_addr(project, line->bank, line->cpu_addr) &&
-                            decode_dmd_preview_at(project, line->bank, line->cpu_addr, &dmd_pr)) {
-                            snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Preview");
-                            found_dmd = true;
-                        }
-                        if (!found_dmd) {
-                            auto ts = find_line_targets(document, state, line);
-                            for (auto &t : ts) {
-                                if (address_is_dmd_fullframe_start(project, t.bank, t.cpu_addr) &&
-                                    decode_dmd_preview_at(project, t.bank, t.cpu_addr, &dmd_pr)) {
-                                    snprintf(dmd_pr.title, sizeof(dmd_pr.title), "DMD Target");
-                                    found_dmd = true;
-                                    break;
-                                }
-                            }
-                        }
-                        if (found_dmd) {
-                            ImGui::Separator();
-                            render_dmd_preview(dmd_pr, 4.0f);
-                        }
-                        if (!found_dmd) {
-                            SpritePreviewInfo spr_pr = {};
-                            bool found_spr = false;
-                            if (is_sprite_addr(project, line->bank, line->cpu_addr) &&
-                                decode_sprite_preview_at(project, line->bank, line->cpu_addr, &spr_pr)) {
-                                snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Preview");
-                                found_spr = true;
-                            }
-                            if (!found_spr) {
-                                auto ts = find_line_targets(document, state, line);
-                                for (auto &t : ts) {
-                                    if (address_is_sprite_start(project, t.bank, t.cpu_addr) &&
-                                        decode_sprite_preview_at(project, t.bank, t.cpu_addr, &spr_pr)) {
-                                        snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
-                                        found_spr = true;
-                                        break;
-                                    }
-                                }
-                            }
-                            /* Fallback: for ptr16_sprite FDB rows whose target isn't labeled
-                               yet (unclassified), read the 2-byte pointer from ROM directly. */
-                            if (!found_spr &&
-                                line->has_location &&
-                                line->block_kind == APEX_RENDER_BLOCK_TABLE &&
-                                line->kind == APEX_RENDER_LINE_DIRECTIVE) {
-                                const uint8_t *fdb_src; size_t fdb_rem;
-                                if (project_locate_rom_bytes(project, line->bank,
-                                                             line->cpu_addr, &fdb_src,
-                                                             &fdb_rem, NULL) && fdb_rem >= 2u) {
-                                    uint32_t tgt_addr = ((uint32_t)fdb_src[0] << 8) | fdb_src[1];
-                                    uint8_t tgt_bank = (tgt_addr >= 0x8000u) ? 0xFFu : line->bank;
-                                    if (decode_sprite_preview_at(project, tgt_bank,
-                                                                 tgt_addr, &spr_pr)) {
-                                        snprintf(spr_pr.title, sizeof(spr_pr.title), "Sprite Target");
-                                        found_spr = true;
-                                    }
-                                }
-                            }
-                            if (found_spr) {
-                                ImGui::Separator();
-                                render_sprite_preview(spr_pr, 4.0f);
-                            }
-                        }
                     }
                     ImGui::EndTooltip();
                 }
@@ -1512,6 +1627,60 @@ static size_t hex_search_backward(const uint8_t *rom, size_t rom_size,
     return SIZE_MAX;
 }
 
+/* Extent (rom offsets [lo,hi)) of the classification unit containing `off`, for
+   the hex view's hover highlight.  Code spans the whole contiguous code run
+   (entry through end of flow); data/table/sprite/DMD units are delimited by
+   their labels (one data range / one frame).  0xff-fill is not highlighted. */
+static bool hex_block_extent(const ApexProject *p, const ApexRenderedDocument *d,
+                             size_t off, size_t *lo, size_t *hi)
+{
+    size_t li;
+    if (!find_line_by_rom_offset(d, off, &li)) {
+        return false;
+    }
+    ApexRenderedBlockKind base = d->lines[li].block_kind;
+    if (base == APEX_RENDER_BLOCK_FREE || base == APEX_RENDER_BLOCK_UNKNOWN) {
+        return false;
+    }
+    bool code = (base == APEX_RENDER_BLOCK_CODE);
+
+    size_t start_off = d->lines[li].rom_addr;
+    for (size_t i = li;; i--) {
+        const ApexRenderedLine *l = &d->lines[i];
+        if (l->has_location) {
+            if (l->block_kind != base) {
+                break; /* crossed into the previous block */
+            }
+            start_off = l->rom_addr;
+            if (!code && l->kind == APEX_RENDER_LINE_LABEL) {
+                break; /* a label begins this data/table/sprite unit */
+            }
+        }
+        if (i == 0) {
+            break;
+        }
+    }
+
+    size_t end_off = p->rom.size;
+    for (size_t j = li + 1; j < d->line_count; j++) {
+        const ApexRenderedLine *l = &d->lines[j];
+        if (!l->has_location) {
+            continue;
+        }
+        if (l->block_kind != base ||
+            (!code && l->kind == APEX_RENDER_LINE_LABEL)) {
+            end_off = l->rom_addr;
+            break;
+        }
+    }
+    if (end_off <= start_off) {
+        end_off = start_off + 1u;
+    }
+    *lo = start_off;
+    *hi = end_off;
+    return true;
+}
+
 void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
     if (!p || !dp || !*dp || !p->rom.data || p->rom.size == 0) {
@@ -1670,6 +1839,17 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
     /* Must be obtained after BeginChild so it belongs to the child window's draw layer. */
     ImDrawList *dl = ImGui::GetWindowDrawList();
     bool open_ctx = false;
+
+    /* Classification block under the cursor — computed once per frame from last
+       frame's hover (one-frame lag is imperceptible) and drawn as a faint
+       background spanning the whole block so its extent is visible.  Must live
+       outside the clipper Step loop, which iterates several times per frame. */
+    size_t blk_lo = 0, blk_hi = 0;
+    bool blk_show = false;
+    if (s->hex_hover_valid && s->hex_hover_off < p->rom.size) {
+        blk_show = hex_block_extent(p, d, s->hex_hover_off, &blk_lo, &blk_hi);
+    }
+    s->hex_hover_valid = 0; /* set again below if a cell is hovered this frame */
 
     ImGuiListClipper clipper;
     clipper.Begin(total_rows);
@@ -1832,7 +2012,14 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
+                bool is_in_block = blk_show && o >= blk_lo && o < blk_hi;
                 ImGui::SameLine(hex_x0 + (float)col * char_w * 3.0f);
+                if (is_in_block && !is_cur && !is_in_range) {
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(pos,
+                        ImVec2(pos.x + char_w * 2.2f, pos.y + ImGui::GetTextLineHeight()),
+                        IM_COL32(140, 170, 240, 55));
+                }
                 if (is_cur) {
                     ImVec2 pos = ImGui::GetCursorScreenPos();
                     dl->AddRectFilled(pos,
@@ -1882,6 +2069,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 }
 
                 if (ImGui::IsItemHovered()) {
+                    s->hex_hover_off = o;       /* drives next frame's block highlight */
+                    s->hex_hover_valid = 1;
                     ImGui::BeginTooltip();
                     uint8_t bank = 0;
                     uint32_t cpu_addr = 0;
@@ -1897,7 +2086,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     }
                     if (has_cpu) {
                         size_t li;
-                        bool is_data = !find_line_by_rom_offset(d, o, &li) ||
+                        bool have_line = find_line_by_rom_offset(d, o, &li);
+                        /* Sprite/DMD preview first so it stays visible above a
+                           potentially long disassembly preview. */
+                        if (have_line) {
+                            render_line_sprite_dmd_preview(p, d, s, &d->lines[li]);
+                        }
+                        bool is_data = !have_line ||
                                        d->lines[li].block_kind == APEX_RENDER_BLOCK_DATA ||
                                        d->lines[li].block_kind == APEX_RENDER_BLOCK_TABLE ||
                                        d->lines[li].block_kind == APEX_RENDER_BLOCK_UNCLASSIFIED;
@@ -1962,7 +2157,14 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
+                bool is_in_block = blk_show && o >= blk_lo && o < blk_hi;
                 ImGui::SameLine(asc_x + (float)col * char_w);
+                if (is_in_block && !is_cur && !is_in_range) {
+                    ImVec2 pos = ImGui::GetCursorScreenPos();
+                    dl->AddRectFilled(pos,
+                        ImVec2(pos.x + char_w, pos.y + ImGui::GetTextLineHeight()),
+                        IM_COL32(140, 170, 240, 55));
+                }
                 if (is_cur) {
                     ImVec2 pos = ImGui::GetCursorScreenPos();
                     dl->AddRectFilled(pos,
@@ -1981,6 +2183,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 char ch[2] = {(v >= 32 && v <= 126) ? (char)v : '.', '\0'};
                 ImGui::TextUnformatted(ch);
                 ImGui::PopStyleColor();
+                if (ImGui::IsItemHovered()) {
+                    s->hex_hover_off = o;
+                    s->hex_hover_valid = 1;
+                }
 
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     bool shift = ImGui::GetIO().KeyShift;
