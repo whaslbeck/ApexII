@@ -254,6 +254,22 @@ B3c_A4001 = Classic WPC counted string pointer table.
 
 Values may be unquoted (everything after `=` up to the end-of-line comment) or quoted. Inside quotes: `\;`, `\#`, `\\`, `\"`, and `\n` are recognized.
 
+**RAM / ASIC addresses.** A doc on an address that is not part of the ROM (RAM and ASIC I/O, `0x0000`–`0x3fff`) would otherwise have no disassembly line to attach to. Such docs are emitted near the top of the output instead:
+
+- If a `[symbols]` equate names the address, the doc is emitted directly above that equate:
+
+  ```asm
+  ; doc Player 1 score, 4-byte packed BCD.
+  Score_P1 = 0x0150
+  ```
+
+- Otherwise it is listed in a dedicated `; ---- RAM/ASIC documentation (no symbol) ----` block:
+
+  ```asm
+  ; 0x00a3:
+  ; doc scratch flag used by the attract loop.
+  ```
+
 **Backwards compatibility:** The legacy section names `[routine_docs]` and `[table_docs]` are still accepted and merged into `[docs]` on load. New files and all write paths (GUI overlay, `apexini merge`) always use `[docs]`. To migrate existing files in-place:
 
 ```sh
