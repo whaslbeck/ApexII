@@ -281,6 +281,8 @@ types_rebuilt="$OUT/types.rebuilt"
 if cmp -s "$system_banked_inline_rom" "$types_rebuilt" &&
     grep -q '^MODE_PARAM_TEST_MODE = 0x42$' "$types_asm" &&
     grep -q '^MODE_PARAM_NO_MODE = 0xff$' "$types_asm" &&
+    grep -q '^LEVEL_LOW = 0x0003$' "$types_asm" &&
+    grep -q '^LEVEL_HIGH = 0x0103$' "$types_asm" &&
     grep -q '^        INLINE_BYTE 0x42 ; for JSR Helper mode_param=test_mode$' "$types_asm"; then
     printf 'PASS types.ini\n'
 else
@@ -288,6 +290,27 @@ else
     if ! cmp -s "$system_banked_inline_rom" "$types_rebuilt"; then
         report_mismatch "$system_banked_inline_rom" "$types_rebuilt"
     fi
+    exit 1
+fi
+
+# ---- RAM/ASIC docs render at their symbol equate or in a no-symbol block ----
+ram_docs_ini="$OUT/ram_docs.ini"
+ram_docs_asm="$OUT/ram_docs.disasm"
+cat >"$ram_docs_ini" <<'EOF'
+[symbols]
+Score_P1 = 0x0150
+[docs]
+0x0150 = Player 1 score, 4-byte packed BCD.
+0x00a3 = scratch flag, no symbol.
+EOF
+"$ROOT/build/apexdis" "$system_banked_inline_rom" "$ram_docs_asm" "$ram_docs_ini"
+if grep -q '^; doc Player 1 score, 4-byte packed BCD\.$' "$ram_docs_asm" &&
+    grep -q '^Score_P1 = 0x0150$' "$ram_docs_asm" &&
+    grep -q '^; 0x00a3:$' "$ram_docs_asm" &&
+    grep -q '^; doc scratch flag, no symbol\.$' "$ram_docs_asm"; then
+    printf 'PASS ram_docs.ini\n'
+else
+    printf 'FAIL ram_docs.ini\n' >&2
     exit 1
 fi
 
@@ -314,10 +337,14 @@ fi
 local_reanalysis_far_rom="$OUT/local_reanalysis_far.rom"
 "$ROOT/build/apexasm" "$local_reanalysis_far_rom" "$ROOT/tests/local_reanalysis_far.asm"
 
+scoped_dmd_rom="$OUT/scoped_dmd.rom"
+"$ROOT/build/apexasm" "$scoped_dmd_rom" "$ROOT/tests/scoped_dmd.asm"
+
 if "$ROOT/build/project_api_test" "$system_banked_inline_rom" \
     "$ROOT/tests/system_banked_inline.ini" \
     "$banked_inline_rom" "$ROOT/tests/banked_inline.ini" \
-    "$local_reanalysis_far_rom" "$ROOT/tests/local_reanalysis_far.ini"; then
+    "$local_reanalysis_far_rom" "$ROOT/tests/local_reanalysis_far.ini" \
+    "$scoped_dmd_rom" "$ROOT/tests/scoped_dmd.ini"; then
     printf 'PASS project_api_test\n'
 else
     printf 'FAIL project_api_test\n' >&2
@@ -512,6 +539,13 @@ else
     exit 1
 fi
 
+if "$ROOT/build/apexsprite_test"; then
+    printf 'PASS apexsprite_test\n'
+else
+    printf 'FAIL apexsprite_test\n' >&2
+    exit 1
+fi
+
 dmd_fullframe_rom="$OUT/dmd_fullframe.rom"
 dmd_fullframe_asm="$OUT/dmd_fullframe.disasm"
 dmd_fullframe_rebuilt="$OUT/dmd_fullframe.rebuilt"
@@ -547,22 +581,24 @@ printf '\001\252\252\000\000\252\000\000' | \
     dd of="$apexdmd_table_rom" bs=1 seek=1 conv=notrunc status=none
 printf '\002\252\252\000\377\252\000\377' | \
     dd of="$apexdmd_table_rom" bs=1 seek=514 conv=notrunc status=none
-printf '\100\001\001\102\002\001' | \
+# Far-pointer bank byte is the computed bank id for the single paged bank of a
+# 48 KB ROM (banks=1 -> base = 0x3e - 1 = 0x3d).
+printf '\100\001\075\102\002\075' | \
     dd of="$apexdmd_table_rom" bs=1 seek=16384 conv=notrunc status=none
 cat >"$apexdmd_table_ini" <<'EOF'
 [tables]
 Bff_A8000 = rows[2](far_data)
 EOF
 rm -rf "$apexdmd_table_out"
-apexdmd_table_line0=$(printf '0\tB01_A4001\t0x01\t8\trow000_B01_A4001.pbm\tpair000_001_B01_A4001_B01_A4202.pgm')
-apexdmd_table_line1=$(printf '1\tB01_A4202\t0x02\t8\trow001_B01_A4202.pbm\t-')
+apexdmd_table_line0=$(printf '0\tB3d_A4001\t0x01\t8\trow000_B3d_A4001.pbm\tpair000_001_B3d_A4001_B3d_A4202.pgm')
+apexdmd_table_line1=$(printf '1\tB3d_A4202\t0x02\t8\trow001_B3d_A4202.pbm\t-')
 apexdmd_table_stat1=$(printf '# adjacent_same_bank\t1')
 apexdmd_table_stat2=$(printf '# adjacent_same_type\t0')
 if "$ROOT/build/apexdmd" --table "$apexdmd_table_rom" "$apexdmd_table_ini" Bff_A8000 \
     "$apexdmd_table_out" &&
-    [ -f "$apexdmd_table_out/row000_B01_A4001.pbm" ] &&
-    [ -f "$apexdmd_table_out/row001_B01_A4202.pbm" ] &&
-    [ -f "$apexdmd_table_out/pair000_001_B01_A4001_B01_A4202.pgm" ] &&
+    [ -f "$apexdmd_table_out/row000_B3d_A4001.pbm" ] &&
+    [ -f "$apexdmd_table_out/row001_B3d_A4202.pbm" ] &&
+    [ -f "$apexdmd_table_out/pair000_001_B3d_A4001_B3d_A4202.pgm" ] &&
     grep -Fqx "$apexdmd_table_line0" "$apexdmd_table_summary" &&
     grep -Fqx "$apexdmd_table_line1" "$apexdmd_table_summary" &&
     grep -Fqx "$apexdmd_table_stat1" "$apexdmd_table_summary" &&
@@ -602,5 +638,78 @@ if head -1 "$cmp_out" | grep -Eq '0 moved, 0 changed, 0 removed, 0 added'; then
 else
     printf 'FAIL apexcompare_self\n' >&2
     cat "$cmp_out" >&2
+    exit 1
+fi
+
+# ---- inline flow_stop (tail-call helper stops code decoding) --------------
+fs_rom="$OUT/inline_flow_stop.rom"
+fs_asm="$OUT/inline_flow_stop.disasm"
+fs_rom2="$OUT/inline_flow_stop.rebuilt"
+"$ROOT/build/apexasm" "$fs_rom" "$ROOT/tests/inline_flow_stop.asm"
+"$ROOT/build/apexdis" "$fs_rom" "$fs_asm" "$ROOT/tests/inline_flow_stop.ini"
+"$ROOT/build/apexasm" "$fs_rom2" "$fs_asm"
+# flow_stop must end the routine after the inline byte: the COMA (0x43) at 0x8004
+# becomes data, and "flow_stop" survives a config round-trip via apexini.
+"$ROOT/build/apexini" normalize "$ROOT/tests/inline_flow_stop.ini" "$OUT/inline_flow_stop.norm.ini"
+if cmp -s "$fs_rom" "$fs_rom2" &&
+   grep -Eq '^    \.DB 0x43' "$fs_asm" &&
+   ! grep -Eq '^    COMA' "$fs_asm" &&
+   grep -Eq 'byte, flow_stop' "$OUT/inline_flow_stop.norm.ini"; then
+    printf 'PASS inline_flow_stop\n'
+else
+    printf 'FAIL inline_flow_stop\n' >&2
+    report_mismatch "$fs_rom" "$fs_rom2" 2>/dev/null || true
+    exit 1
+fi
+
+# ---- sprite pointer table auto-classifies its image targets (with no-header
+#      height carried on the ptr16_sprite(H) field) ------------------------
+spt_rom="$OUT/sprite_table.rom"
+spt_asm="$OUT/sprite_table.disasm"
+spt_rom2="$OUT/sprite_table.rebuilt"
+spt_norm="$OUT/sprite_table.norm.ini"
+"$ROOT/build/apexasm" "$spt_rom" "$ROOT/tests/sprite_table.asm"
+"$ROOT/build/apexdis" "$spt_rom" "$spt_asm" "$ROOT/tests/sprite_table.ini"
+"$ROOT/build/apexasm" "$spt_rom2" "$spt_asm"
+"$ROOT/build/apexini" normalize "$ROOT/tests/sprite_table.ini" "$spt_norm" >/dev/null 2>&1
+if cmp -s "$spt_rom" "$spt_rom2" &&
+   grep -Eq 'data type=sprite_noheader\[3\]' "$spt_asm" &&
+   grep -Eq '; sprite hdr=0x00 enc=mono' "$spt_asm" &&
+   grep -Eq 'rows\[2\]\(ptr16_sprite\(3\)\)' "$spt_norm"; then
+    printf 'PASS sprite_table\n'
+else
+    printf 'FAIL sprite_table\n' >&2
+    report_mismatch "$spt_rom" "$spt_rom2" 2>/dev/null || true
+    exit 1
+fi
+
+# The image classification must also happen through an incremental (scoped)
+# re-analysis, not only the full analysis.
+if "$ROOT/build/sprite_scope_test" "$spt_rom"; then
+    printf 'PASS sprite_scope_test\n'
+else
+    printf 'FAIL sprite_scope_test\n' >&2
+    exit 1
+fi
+
+# A sprite data range that fails to decode (here: a 0xFF-fill region whose
+# "width" byte is 0xFF > 128) must emit a diagnostic instead of silently
+# mis-aligning, and still round-trip byte-identically.
+spt_inv_ini="$OUT/sprite_invalid.ini"
+spt_inv_asm="$OUT/sprite_invalid.disasm"
+spt_inv_rom2="$OUT/sprite_invalid.rebuilt"
+cat >"$spt_inv_ini" <<'EOF'
+[labels]
+Bff_A8000 = TablePtr
+[data]
+Bff_A8040 = sprite
+EOF
+"$ROOT/build/apexdis" "$spt_rom" "$spt_inv_asm" "$spt_inv_ini"
+"$ROOT/build/apexasm" "$spt_inv_rom2" "$spt_inv_asm"
+if grep -Eq '^; WARNING sprite_invalid bank=0xff cpu=0x8040' "$spt_inv_asm" &&
+   cmp -s "$spt_rom" "$spt_inv_rom2"; then
+    printf 'PASS sprite_invalid\n'
+else
+    printf 'FAIL sprite_invalid\n' >&2
     exit 1
 fi

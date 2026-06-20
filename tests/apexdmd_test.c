@@ -109,6 +109,69 @@ static void test_repeat_zero_means_256(void)
     }
 }
 
+/* 0x00: raw page copy, written in row order (sequential). */
+static void test_decode_raw_00(void)
+{
+    uint8_t src[1u + APEX_DMD_PAGE_BYTES];
+    uint8_t plane[APEX_DMD_PAGE_BYTES];
+    size_t consumed = 0u;
+    uint8_t type = 0xffu;
+    size_t i;
+
+    src[0] = 0x00u;
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        src[1u + i] = (uint8_t)(i * 7u + 3u);
+    }
+    expect(apexdmd_decode_fullframe(src, sizeof(src), plane, &consumed, &type),
+           "raw(0x00) decode failed");
+    expect(type == 0x00u, "raw(0x00) type mismatch");
+    expect(consumed == sizeof(src), "raw(0x00) consumed mismatch");
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        expect(plane[i] == (uint8_t)(i * 7u + 3u), "raw(0x00) payload mismatch");
+    }
+}
+
+/* 0x05: complex bit-stream repeats, rows order.  Build an all-literal stream
+   (every value encoded as a 0 extension bit followed by 8 literal MSB-first
+   bits) so the decoded page is a known constant and the stream ends exactly on
+   a byte boundary. */
+static void test_decode_stream_05(void)
+{
+    uint8_t src[10u + (APEX_DMD_PAGE_BYTES * 9u + 7u) / 8u];
+    uint8_t plane[APEX_DMD_PAGE_BYTES];
+    size_t consumed = 0u;
+    uint8_t type = 0xffu;
+    size_t bitpos;
+    size_t i;
+    const uint8_t literal = 0x55u;
+
+    memset(src, 0, sizeof(src));
+    src[0] = 0x05u;                 /* type: rows */
+    src[1] = 0xaau;                 /* special flag (never produced) */
+    /* src[2..9] = dictionary, unused by an all-literal stream */
+
+    bitpos = 10u * 8u;
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        int bit;
+        /* 0 extension bit => literal follows */
+        bitpos++;
+        for (bit = 7; bit >= 0; bit--) {
+            if ((literal >> bit) & 1u) {
+                src[bitpos / 8u] |= (uint8_t)(0x80u >> (bitpos % 8u));
+            }
+            bitpos++;
+        }
+    }
+
+    expect(apexdmd_decode_fullframe(src, sizeof(src), plane, &consumed, &type),
+           "stream(0x05) decode failed");
+    expect(type == 0x05u, "stream(0x05) type mismatch");
+    expect(consumed == sizeof(src), "stream(0x05) consumed mismatch");
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        expect(plane[i] == literal, "stream(0x05) payload mismatch");
+    }
+}
+
 static void test_pbm_write(void)
 {
     static const char *path = "out/apexdmd_test.pbm";
@@ -164,6 +227,8 @@ int main(void)
     test_decode_rows();
     test_decode_columns();
     test_repeat_zero_means_256();
+    test_decode_raw_00();
+    test_decode_stream_05();
     test_pbm_write();
     test_pgm_pair_write();
     return 0;

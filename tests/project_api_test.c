@@ -48,8 +48,9 @@ int main(int argc, char **argv)
     char overlay_buf[512];
     size_t overlay_len;
 
-    if (argc != 3 && argc != 5 && argc != 7) {
-        fprintf(stderr, "usage: %s ROM CONFIG [BANK_ROM BANK_CONFIG] [PRUNE_ROM PRUNE_CONFIG]\n",
+    if (argc != 3 && argc != 5 && argc != 7 && argc != 9) {
+        fprintf(stderr, "usage: %s ROM CONFIG [BANK_ROM BANK_CONFIG] [PRUNE_ROM PRUNE_CONFIG]"
+                        " [SCOPED_DMD_ROM SCOPED_DMD_CONFIG]\n",
                 argv[0]);
         return 2;
     }
@@ -363,6 +364,155 @@ int main(int argc, char **argv)
             return 1;
         }
         apex_project_free(project);
+    }
+
+    /* A manual label at an auto-generated address must take over the placeholder
+       rather than add a second label there.  B21_A4001 is a generated far-code
+       target in local_reanalysis_far; use a fresh project so the prune test
+       above is unaffected. */
+    if (argc == 7) {
+        int bidx;
+        LabelSet *ls;
+        size_t cnt = 0;
+
+        project = apex_project_open(argv[5], argv[6]);
+        if (!project || apex_project_analyze(project) != 0) {
+            fprintf(stderr, "takeover: analyze failed\n");
+            return 1;
+        }
+        bidx = bank_index_for_id(project->rom.data, project->banks, 0x21u);
+        if (bidx < 0) {
+            fprintf(stderr, "takeover: bank 0x21 not found\n");
+            apex_project_free(project);
+            return 1;
+        }
+        if (apex_project_set_label(project, 1, 0x21u, 0x4001u, "ManualTakeover") != 0) {
+            fprintf(stderr, "takeover: set_label failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        ls = &project->bank_labels[bidx];
+        for (i = 0; i < ls->count; i++) {
+            if (ls->items[i].addr == 0x4001u) {
+                cnt++;
+                if (strcmp(ls->items[i].name, "ManualTakeover") != 0) {
+                    fprintf(stderr, "takeover: stale label '%s' left at address\n",
+                            ls->items[i].name);
+                    apex_project_free(project);
+                    return 1;
+                }
+            }
+        }
+        if (cnt != 1) {
+            fprintf(stderr, "takeover: expected 1 label at B21_A4001, found %zu\n", cnt);
+            apex_project_free(project);
+            return 1;
+        }
+        doc1 = apex_project_render(project, 0, 0);
+        if (!doc1 || contains(doc1->text, "B21_A4001:") ||
+            !contains(doc1->text, "ManualTakeover")) {
+            fprintf(stderr, "takeover: render still shows the generated label\n");
+            apex_project_free(project);
+            return 1;
+        }
+        apex_project_free(project);
+
+        /* Cross-bank code must survive a bank-scoped re-analysis.  In
+           local_reanalysis_far, B21_A4001 (Target) is reached ONLY through an
+           inline far-code call from bank 0x20, so classifying an unrelated new
+           code address in bank 0x21 (which triggers a bank-only re-analysis)
+           must not drop it. */
+        {
+            ApexProject *pr = apex_project_open(argv[5], argv[6]);
+            int found_before = 0, found_after = 0;
+            int bidx2;
+            LabelSet *ls2;
+            size_t k;
+
+            if (!pr || apex_project_analyze(pr) != 0) {
+                fprintf(stderr, "xbank: analyze failed\n");
+                return 1;
+            }
+            bidx2 = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
+            ls2 = &pr->bank_labels[bidx2];
+            for (k = 0; k < ls2->count; k++) {
+                if (ls2->items[k].addr == 0x4001u && ls2->items[k].is_code) {
+                    found_before = 1;
+                }
+            }
+            if (!found_before) {
+                fprintf(stderr, "xbank: Target not code in full analysis\n");
+                apex_project_free(pr);
+                return 1;
+            }
+            if (apex_project_set_kind(pr, 1, 0x21u, 0x4002u, APEX_KIND_CODE, NULL) != 0 ||
+                apex_project_analyze(pr) != 0) {
+                fprintf(stderr, "xbank: scoped re-analysis failed\n");
+                apex_project_free(pr);
+                return 1;
+            }
+            bidx2 = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
+            ls2 = &pr->bank_labels[bidx2];
+            for (k = 0; k < ls2->count; k++) {
+                if (ls2->items[k].addr == 0x4001u && ls2->items[k].is_code) {
+                    found_after = 1;
+                }
+            }
+            if (!found_after) {
+                fprintf(stderr, "xbank: cross-bank code dropped by scoped re-analysis\n");
+                apex_project_free(pr);
+                return 1;
+            }
+            apex_project_free(pr);
+        }
+    }
+
+    /* Injected sprite/DMD data labels must survive a bank-scoped re-analysis of
+       an UNRELATED bank.  In scoped_dmd, a far-DMD table in bank 0x20 injects a
+       DATA_DMD_FULLFRAME (with no inbound reference) in bank 0x21; classifying
+       something in bank 0x22 triggers a bank-only re-analysis whose prune pass
+       must not drop the (pinned) DMD label in bank 0x21. */
+    if (argc == 9) {
+        ApexProject *pr = apex_project_open(argv[7], argv[8]);
+        int bidx;
+        LabelSet *ls;
+        size_t k;
+        int dmd_before = 0, spr_before = 0, dmd_after = 0, spr_after = 0;
+
+        if (!pr || apex_project_analyze(pr) != 0) {
+            fprintf(stderr, "scoped_dmd: analyze failed\n");
+            return 1;
+        }
+        bidx = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
+        ls = &pr->bank_labels[bidx];
+        for (k = 0; k < ls->count; k++) {
+            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data) dmd_before = 1;
+            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data) spr_before = 1;
+        }
+        if (!dmd_before || !spr_before) {
+            fprintf(stderr, "scoped_dmd: dmd/sprite label missing in full analysis\n");
+            apex_project_free(pr);
+            return 1;
+        }
+        /* classify an unrelated byte in bank 0x22 -> bank-scoped re-analysis */
+        if (apex_project_set_kind(pr, 1, 0x22u, 0x4001u, APEX_KIND_DATA, "bytes[2]") != 0 ||
+            apex_project_analyze(pr) != 0) {
+            fprintf(stderr, "scoped_dmd: scoped re-analysis failed\n");
+            apex_project_free(pr);
+            return 1;
+        }
+        bidx = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
+        ls = &pr->bank_labels[bidx];
+        for (k = 0; k < ls->count; k++) {
+            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data) dmd_after = 1;
+            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data) spr_after = 1;
+        }
+        if (!dmd_after || !spr_after) {
+            fprintf(stderr, "scoped_dmd: dmd/sprite label dropped by scoped re-analysis\n");
+            apex_project_free(pr);
+            return 1;
+        }
+        apex_project_free(pr);
     }
 
     return 0;
