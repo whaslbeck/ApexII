@@ -330,6 +330,7 @@ struct UiState {
     int sprite_filter_min_w = 1, sprite_filter_max_w = 128;
     int sprite_filter_min_h = 1, sprite_filter_max_h = 32;
     int sprite_nh_height = 12; /* height for sprite_noheader classify button */
+    int sprite_gallery_zoom = 1; /* Sprite Gallery pixel zoom: 1x / 2x / 4x */
 
     struct VsiTableEntry {
         int table_idx;      /* index in master table */

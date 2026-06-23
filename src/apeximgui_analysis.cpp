@@ -873,6 +873,30 @@ void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delt
     select_line(s, n, 1);
 }
 
+/* First located line of a distinct classification region — the anchor the N/P
+   buttons stop at.  A boundary is any change in classification (block kind:
+   code / data / table / sprite / unclassified / free) or the start of a new
+   bank, so every region (incl. data sitting between a sprite and a table, and
+   the first byte of each bank after an end-of-bank fill) is reachable. */
+static bool nav_is_boundary(const ApexRenderedDocument *d, size_t i)
+{
+    const ApexRenderedLine *l = &d->lines[i];
+    if (!l->has_location) {
+        return false; /* anchors are real addresses so the hex view can follow */
+    }
+    for (size_t j = i; j > 0; j--) {
+        const ApexRenderedLine *pv = &d->lines[j - 1];
+        if (!pv->has_location) {
+            continue;
+        }
+        if (pv->bank != l->bank) {
+            return true; /* first located line of a new bank */
+        }
+        return pv->block_kind != l->block_kind; /* classification changed */
+    }
+    return true; /* very first located line = start of the first bank */
+}
+
 void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
 {
     if (!d || d->line_count == 0) {
@@ -880,14 +904,14 @@ void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
     }
     if (f) {
         for (size_t i = s->selected_line + 1; i < d->line_count; i++) {
-            if (d->lines[i].transition_kind != APEX_RENDER_TRANSITION_NONE) {
+            if (nav_is_boundary(d, i)) {
                 select_line(s, i, 1);
                 return;
             }
         }
     } else {
         for (size_t i = s->selected_line + 1; i > 0; i--) {
-            if (d->lines[i-1].transition_kind != APEX_RENDER_TRANSITION_NONE) {
+            if (nav_is_boundary(d, i - 1)) {
                 select_line(s, i - 1, 1);
                 return;
             }

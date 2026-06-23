@@ -181,16 +181,23 @@ static int find_table_row_index(const ApexRenderedDocument *d, size_t line_idx)
 
 static bool is_dmd_fullframe_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
 {
+    /* The byte belongs to a DMD frame only if the data range that *owns* it (the
+       one with the greatest start address <= addr in this bank) is a DMD frame.
+       A nearer ptr16_sprite / bytes[] / etc. range that the user classified
+       after the frame takes precedence, so it is not mis-reported as DMD. */
+    const DataRange *owner = NULL;
     size_t i;
     for (i = 0; i < p->data_ranges.count; i++) {
         const DataRange *dr = &p->data_ranges.items[i];
-        if (dr->kind == DATA_DMD_FULLFRAME &&
-            dr->bank == bank &&
-            addr >= dr->addr &&
-            addr < dr->addr + APEX_DMD_PAGE_BYTES)
-            return true;
+        if (dr->bank != bank || dr->addr > addr) {
+            continue;
+        }
+        if (!owner || dr->addr > owner->addr) {
+            owner = dr;
+        }
     }
-    return false;
+    return owner && owner->kind == DATA_DMD_FULLFRAME &&
+           addr < owner->addr + APEX_DMD_PAGE_BYTES;
 }
 
 static bool is_sprite_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
@@ -439,25 +446,42 @@ static unsigned sprite_table_height_at(const ApexProject *p, uint8_t bank, uint3
 static bool render_table_row_target_preview(const ApexProject *project,
                                             const ApexRenderedLine *line)
 {
-    /* Table pointer rows render with kind INSTRUCTION (the TABLE_* pseudo-op),
-       so gate on the block kind plus the mnemonic, not the line kind. */
-    if (line->block_kind != APEX_RENDER_BLOCK_TABLE) {
+    int is_dmd = -1;        /* -1 until a sprite/DMD pointer row or range is identified */
+    size_t ptr_len = 0;
+    unsigned height = 0;
+
+    /* (a) Table pointer rows render with kind INSTRUCTION (the TABLE_* pseudo-op),
+       so identify them by block kind + mnemonic. */
+    if (line->block_kind == APEX_RENDER_BLOCK_TABLE) {
+        const char *txt = line->text;
+        size_t tn = line->length;
+        while (tn && (*txt == ' ' || *txt == '\t')) { txt++; tn--; }
+        auto has = [&](const char *m) {
+            size_t ml = strlen(m);
+            return tn >= ml && memcmp(txt, m, ml) == 0;
+        };
+        if (has("TABLE_FAR_DMD_FULLFRAME"))      { is_dmd = 1; ptr_len = 3; }
+        else if (has("TABLE_PTR_DMD_FULLFRAME")) { is_dmd = 1; ptr_len = 2; }
+        else if (has("TABLE_FAR_SPRITE"))        { is_dmd = 0; ptr_len = 3; }
+        else if (has("TABLE_PTR_SPRITE"))        { is_dmd = 0; ptr_len = 2; }
+        if (is_dmd == 0) {
+            height = sprite_table_height_at(project, line->bank, line->cpu_addr);
+        }
+    }
+
+    /* (b) Standalone pointer data ranges (e.g. a byte-pair the user marked as
+       ptr16_sprite): identify by the classification of the range starting here. */
+    if (is_dmd < 0) {
+        const DataRange *dr = data_range_at(line->bank, line->cpu_addr, &project->data_ranges);
+        if (dr) {
+            if (dr->kind == DATA_PTR16_SPRITE)        { is_dmd = 0; ptr_len = 2; height = dr->length; }
+            else if (dr->kind == DATA_FAR_SPRITE)     { is_dmd = 0; ptr_len = 3; height = dr->length; }
+            else if (dr->kind == DATA_FAR_DMD_FULLFRAME) { is_dmd = 1; ptr_len = 3; }
+        }
+    }
+    if (is_dmd < 0) {
         return false;
     }
-    const char *txt = line->text;
-    size_t tn = line->length;
-    while (tn && (*txt == ' ' || *txt == '\t')) { txt++; tn--; }
-    auto has = [&](const char *m) {
-        size_t ml = strlen(m);
-        return tn >= ml && memcmp(txt, m, ml) == 0;
-    };
-    int is_dmd = 0;
-    size_t ptr_len = 0;
-    if (has("TABLE_FAR_DMD_FULLFRAME"))      { is_dmd = 1; ptr_len = 3; }
-    else if (has("TABLE_PTR_DMD_FULLFRAME")) { is_dmd = 1; ptr_len = 2; }
-    else if (has("TABLE_FAR_SPRITE"))        { ptr_len = 3; }
-    else if (has("TABLE_PTR_SPRITE"))        { ptr_len = 2; }
-    else { return false; }
 
     const uint8_t *src;
     size_t rem;
@@ -478,9 +502,8 @@ static bool render_table_row_target_preview(const ApexProject *project,
         }
         return false;
     }
-    unsigned h = sprite_table_height_at(project, line->bank, line->cpu_addr);
     SpritePreviewInfo pr = {};
-    if (decode_sprite_preview_with_height(project, tbank, taddr, h, &pr)) {
+    if (decode_sprite_preview_with_height(project, tbank, taddr, height, &pr)) {
         snprintf(pr.title, sizeof(pr.title), "Sprite Target");
         ImGui::Separator();
         render_sprite_preview(pr, 4.0f);
@@ -1893,18 +1916,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                         lk = 8; /* .DW — cyan */
                     else if (rem >= 4 && memcmp(p2, "FAR_", 4) == 0)
                         lk = 9; /* FAR pointer — red */
-                    else {
-                        size_t ri;
-                        for (ri = 0; ri < p->data_ranges.count; ri++) {
-                            const DataRange *dr = &p->data_ranges.items[ri];
-                            if (dr->kind == DATA_DMD_FULLFRAME &&
-                                dr->bank == l->bank &&
-                                l->cpu_addr >= dr->addr &&
-                                l->cpu_addr < dr->addr + APEX_DMD_PAGE_BYTES) {
-                                lk = 10; /* DMD fullframe — magenta */
-                                break;
-                            }
-                        }
+                    else if (is_dmd_fullframe_addr(p, l->bank, l->cpu_addr)) {
+                        lk = 10; /* DMD fullframe — magenta */
                     }
                 }
                 if (l->rom_addr <= vis_start) {
@@ -4382,17 +4395,8 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
                         lk = 8;
                     else if (rem >= 4 && memcmp(tp, "FAR_", 4) == 0)
                         lk = 9;
-                    else {
-                        for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
-                            const DataRange *dr = &p->data_ranges.items[ri];
-                            if (dr->kind == DATA_DMD_FULLFRAME &&
-                                dr->bank == l->bank &&
-                                l->cpu_addr >= dr->addr &&
-                                l->cpu_addr < dr->addr + APEX_DMD_PAGE_BYTES) {
-                                lk = 10;
-                                break;
-                            }
-                        }
+                    else if (is_dmd_fullframe_addr(p, l->bank, l->cpu_addr)) {
+                        lk = 10;
                     }
                 }
                 if (l->rom_addr <= fill) {
@@ -5368,36 +5372,35 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
    while preserving aspect ratio.  Reserves exactly the box so gallery table rows
    stay uniform height (required by ImGuiListClipper).  Only lit pixels are
    drawn over a dark background to keep the rect count down. */
-static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, float box_h)
+static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, float box_h, int zoom)
 {
     ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(box_w, box_h));
+    ImGui::Dummy(ImVec2(box_w, box_h)); /* fixed-size cell keeps clipper rows uniform */
     if (!pr.valid || pr.width == 0 || pr.height == 0) {
         return;
     }
-    float scale = box_h / (float)pr.height;
-    if ((float)pr.width * scale > box_w) {
-        scale = box_w / (float)pr.width;
-    }
-    float img_w = (float)pr.width * scale;
-    float img_h = (float)pr.height * scale;
+    /* Render at original size times the zoom factor (top-left aligned), clipped
+       to the box, so sprites of different proportions are shown undistorted
+       rather than stretched to the row height. */
+    float z = zoom < 1 ? 1.0f : (float)zoom;
+    float img_w = (float)pr.width  * z < box_w ? (float)pr.width  * z : box_w;
+    float img_h = (float)pr.height * z < box_h ? (float)pr.height * z : box_h;
     ImDrawList *draw = ImGui::GetWindowDrawList();
     draw->AddRectFilled(origin, ImVec2(origin.x + img_w, origin.y + img_h),
                         IM_COL32(6, 18, 28, 255));
     uint8_t row_bytes = (uint8_t)((pr.width + 7u) / 8u);
-    float psz = scale > 1.0f ? scale : 1.0f;
-    for (uint8_t row = 0; row < pr.height; row++) {
+    for (uint8_t row = 0; row < pr.height && (float)row * z < box_h; row++) {
         for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
-            /* OR both planes for a clear silhouette at thumbnail scale. */
+            /* OR both planes for a clear silhouette. */
             uint8_t bits = pr.pixels[row * row_bytes + col_byte] |
                            (pr.two_plane ? pr.pixels1[row * row_bytes + col_byte] : 0u);
             if (!bits) continue;
             for (size_t bit = 0; bit < 8u; bit++) {
                 int px = (int)(col_byte * 8u + bit);
-                if (px >= (int)pr.width) break;
+                if (px >= (int)pr.width || (float)px * z >= box_w) break;
                 if (!((bits >> bit) & 1u)) continue;
-                ImVec2 p0(origin.x + px * scale, origin.y + row * scale);
-                draw->AddRectFilled(p0, ImVec2(p0.x + psz, p0.y + psz),
+                ImVec2 p0(origin.x + (float)px * z, origin.y + (float)row * z);
+                draw->AddRectFilled(p0, ImVec2(p0.x + z, p0.y + z),
                                     IM_COL32(120, 220, 255, 255));
             }
         }
@@ -5449,8 +5452,18 @@ void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **d
         return;
     }
 
-    static const float kImgW = 140.0f;
-    static const float kImgH = 28.0f;
+    if (s->sprite_gallery_zoom < 1) s->sprite_gallery_zoom = 1;
+    ImGui::TextUnformatted("Zoom:");
+    ImGui::SameLine();
+    ImGui::RadioButton("1x", &s->sprite_gallery_zoom, 1); ImGui::SameLine();
+    ImGui::RadioButton("2x", &s->sprite_gallery_zoom, 2); ImGui::SameLine();
+    ImGui::RadioButton("4x", &s->sprite_gallery_zoom, 4);
+
+    /* Rows sized to the DMD/sprite maximum (32px) times the zoom; sprites render
+       at original size * zoom inside, top-left aligned. */
+    const int   zoom = s->sprite_gallery_zoom;
+    const float kImgW = 132.0f * (float)zoom;
+    const float kImgH = 32.0f * (float)zoom;
 
     bool     do_classify = false;
     uint8_t  cls_bank = 0;
@@ -5486,7 +5499,7 @@ void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **d
                 ImGui::PushID(row);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
-                draw_sprite_thumbnail(pr, kImgW, kImgH);
+                draw_sprite_thumbnail(pr, kImgW, kImgH, zoom);
                 ImGui::TableSetColumnIndex(1);
                 if (ImGui::Selectable(addrstr, sel,
                         ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
