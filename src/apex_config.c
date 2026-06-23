@@ -5,6 +5,15 @@
 #include <stdlib.h>
 #include <string.h>
 
+/* Config parser buffer limits.  CONFIG_MAX_TYPE_VALUES bounds the combined text
+   of one [types] enum's value list (e.g. "0x0001:name, 0x0002:name, ...") that
+   is accumulated from its (multi-line) definition before being parsed; at an
+   average ~20 chars per "value:name" entry that is room for ~3000 enum values.
+   CONFIG_MAX_LINE bounds a single physical config line, which matters for the
+   one-line [types] form.  Enlarge both together if even bigger enums appear. */
+#define CONFIG_MAX_LINE        65536u
+#define CONFIG_MAX_TYPE_VALUES 65536u
+
 static int parse_table_field(char *value, TableField *field, const ConfigTypes *types);
 
 static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t item_addr,
@@ -1106,7 +1115,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *ref_exclusions)
 {
     FILE *f;
-    char line[8192];
+    /* Max length of a single config line (e.g. a one-line [types] enum list). */
+    char line[CONFIG_MAX_LINE];
     int in_options = 0;
     int in_inline = 0;
     int in_labels = 0;
@@ -1118,10 +1128,12 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_data = 0;
     int in_types = 0;
     int in_exclude_refs = 0;
-    /* pending multi-line [types] entry */
+    /* pending multi-line [types] entry: all enum values of one type are
+       accumulated here before being parsed, so this bounds the total size of a
+       single type's enum list (see CONFIG_MAX_TYPE_VALUES). */
     char pt_name[256];
     TableFieldKind pt_kind;
-    char pt_vals[8192];
+    char pt_vals[CONFIG_MAX_TYPE_VALUES];
     pt_name[0] = '\0';
     pt_kind = TABLE_BYTE;
     pt_vals[0] = '\0';

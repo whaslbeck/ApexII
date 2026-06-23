@@ -313,6 +313,8 @@ If the value does not match any declared enum name, it is emitted as a hex liter
 
 Named types may also appear in `[schemas]` and `[tables]` row definitions. Only `byte` and `word` base kinds are supported.
 
+**Size limit:** the combined text of a single type's enum value list (all `value:name` pairs, however they are split across continuation lines) is parsed through a fixed buffer of 65536 bytes — roughly 3000 enum values at typical name lengths. A single physical config line is likewise limited to 65536 bytes. Definitions beyond these limits are truncated; raise `CONFIG_MAX_TYPE_VALUES` / `CONFIG_MAX_LINE` in `src/apex_config.c` (and rebuild) if you need more.
+
 ## Field Kind Reference
 
 Used in `[inline]`, `[schemas]`, and `[tables]` row definitions.
