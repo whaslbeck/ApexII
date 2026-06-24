@@ -1044,6 +1044,21 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 uint32_t pop_excl_addr = 0;
                 const bool pop_has_excl =
                     pop_has_loc && line_excluded_ref(project, line, &pop_excl_bank, &pop_excl_addr);
+                /* A literal candidate is a code instruction with an immediate operand
+                   that resolves to an address (has_addr_ref, not a branch/call target). */
+                bool pop_lit_cand = false;
+                bool pop_is_lit   = false;
+                if (pop_has_loc && line->kind == APEX_RENDER_LINE_INSTRUCTION &&
+                    line->block_kind == APEX_RENDER_BLOCK_CODE &&
+                    line->rom_addr < project->rom.size) {
+                    const uint8_t *rb = project->rom.data + line->rom_addr;
+                    size_t         rl = project->rom.size  - line->rom_addr;
+                    char dummy[1];
+                    Cpu6809InstrInfo li = cpu6809_disassemble_info(rb, rl, line->cpu_addr,
+                                                                   dummy, sizeof(dummy));
+                    pop_lit_cand = (li.has_addr_ref && !li.has_target);
+                    pop_is_lit   = apex_project_is_literal(project, pop_bank, pop_cpu_addr) != 0;
+                }
 
                 if (ImGui::BeginPopup("row_context_menu")) {
                     if (has_pointer && ImGui::MenuItem("Jump to target", "F / Enter")) {
@@ -1162,6 +1177,30 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                     state->overlay_dirty = true;
                                     set_status(state, "ref excluded");
                                 }
+                            }
+                        }
+                    }
+                    if (pop_lit_cand) {
+                        ImGui::Separator();
+                        if (pop_is_lit) {
+                            if (ImGui::MenuItem("Clear literal (resolve operand)")) {
+                                apex_project_remove_literal(project, 1, pop_bank, pop_cpu_addr);
+                                const ApexRenderedDocument *nd =
+                                    apex_project_render(project, 1, 0);
+                                if (nd) { *document_ptr = nd; }
+                                state->labels_valid = false;
+                                state->overlay_dirty = true;
+                                set_status(state, "literal cleared");
+                            }
+                        } else {
+                            if (ImGui::MenuItem("Mark immediate as literal")) {
+                                apex_project_add_literal(project, 1, pop_bank, pop_cpu_addr);
+                                const ApexRenderedDocument *nd =
+                                    apex_project_render(project, 1, 0);
+                                if (nd) { *document_ptr = nd; }
+                                state->labels_valid = false;
+                                state->overlay_dirty = true;
+                                set_status(state, "immediate marked as literal");
                             }
                         }
                     }

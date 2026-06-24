@@ -42,11 +42,14 @@ typedef struct {
     size_t extra_label_count;
     const ConfigSymbols *symbols;
     int sorted;
-    /* All paged-bank label sets, used as a fallback to resolve a paged-window
-       operand (0x4000-0x7fff) when the current bank has no label there — e.g. a
-       cross-bank JSR from the system bank after a bank switch. */
+    /* All paged-bank label sets, used ONLY for system-bank code (current_bank ==
+       0xff) as a fallback to resolve a paged-window operand (0x4000-0x7fff) the
+       system bank can't resolve — e.g. a cross-bank JSR after a bank switch.
+       For paged-bank code the operand refers to that same bank, so cross-bank
+       resolution is suppressed to avoid pulling in an unrelated bank's label. */
     const LabelSet *bank_labels;
     size_t banks;
+    uint8_t current_bank; /* bank being disassembled; 0xff = system */
 } LabelLookup;
 
 typedef struct {
@@ -138,7 +141,8 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs, const ConfigEntries *ref_exclusions);
+                          ReferenceSet *refs, const ConfigEntries *ref_exclusions,
+                          const ConfigEntries *literals);
 const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count);
 size_t valid_string_len(const uint8_t *data, size_t len);
 

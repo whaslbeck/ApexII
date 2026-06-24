@@ -415,6 +415,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotLabel> labels;
     std::vector<SnapshotEntry> entries;
     std::vector<SnapshotEntry> ref_exclusions;
+    std::vector<SnapshotEntry> literals;
     std::vector<SnapshotData> data;
     std::vector<SnapshotTable> tables;
     std::vector<SnapshotDoc> docs;

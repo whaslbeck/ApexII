@@ -45,6 +45,7 @@ typedef struct {
     ConfigOptions    opts;
     ConfigTypes      types;
     ConfigEntries    ref_exclusions;
+    ConfigEntries    literals;
 } Cfg;
 
 static int cfg_load(Cfg *c, const char *path)
@@ -56,7 +57,7 @@ static int cfg_load(Cfg *c, const char *path)
     if (!failed) {
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
                     &c->schemas, &c->docs, &c->syms, &c->data,
-                    &c->opts, &c->types, &c->ref_exclusions);
+                    &c->opts, &c->types, &c->ref_exclusions, &c->literals);
     }
     s_catching = 0;
     return failed;
@@ -96,6 +97,7 @@ static void cfg_free(Cfg *c)
 
     free(c->data.items);
     free(c->ref_exclusions.items);
+    free(c->literals.items);
     free_config_types(&c->types);
     memset(c, 0, sizeof(*c));
 }
@@ -329,6 +331,9 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
     if (c->ref_exclusions.count)
         qsort(c->ref_exclusions.items, c->ref_exclusions.count,
               sizeof(c->ref_exclusions.items[0]), cmp_entry);
+    if (c->literals.count)
+        qsort(c->literals.items, c->literals.count,
+              sizeof(c->literals.items[0]), cmp_entry);
 
     if (c->opts.labels_are_entries)
         fputs("[options]\nlabels_are_entries = true\n", f);
@@ -437,6 +442,16 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
             fputs(" = exclude\n", f);
         }
     }
+
+    if (c->literals.count) {
+        fputs("\n[literals]\n", f);
+        for (i = 0; i < c->literals.count; i++) {
+            addr_fn(f, c->literals.items[i].has_bank,
+                    c->literals.items[i].bank,
+                    c->literals.items[i].addr);
+            fputs(" = literal\n", f);
+        }
+    }
 }
 
 static void write_cfg(FILE *f, Cfg *c)
@@ -462,9 +477,10 @@ static int cmd_check(int argc, char **argv)
             fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
             any_err = 1;
         } else {
-            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu\n",
+            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu  literals=%zu\n",
                    argv[i], c.labels.count, c.entries.count, c.sigs.count,
-                   c.data.count, c.tables.count, c.types.count, c.ref_exclusions.count);
+                   c.data.count, c.tables.count, c.types.count, c.ref_exclusions.count,
+                   c.literals.count);
         }
         cfg_free(&c);
     }
@@ -769,6 +785,8 @@ static int cmd_normalize(int argc, char **argv)
         if (!c.docs.items[i].has_bank) { c.docs.items[i].has_bank = 1; c.docs.items[i].bank = 0xff; }
     for (i = 0; i < c.ref_exclusions.count; i++)
         if (!c.ref_exclusions.items[i].has_bank) { c.ref_exclusions.items[i].has_bank = 1; c.ref_exclusions.items[i].bank = 0xff; }
+    for (i = 0; i < c.literals.count; i++)
+        if (!c.literals.items[i].has_bank) { c.literals.items[i].has_bank = 1; c.literals.items[i].bank = 0xff; }
 
     outpath = (argc >= 2) ? argv[1] : argv[0];
     out = fopen(outpath, "w");
@@ -1310,6 +1328,12 @@ static int cmd_check_bounds(int argc, char **argv)
     for (i = 0; i < p->ref_exclusions.count; i++) {
         const ConfigEntry *e = &p->ref_exclusions.items[i];
         check_one_addr(p, e->has_bank, e->bank, e->addr, "exclude_refs", &issues);
+    }
+
+    /* Literals */
+    for (i = 0; i < p->literals.count; i++) {
+        const ConfigEntry *e = &p->literals.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "literals", &issues);
     }
 
     if (issues == 0)

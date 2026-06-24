@@ -2358,6 +2358,11 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                                     p->ref_exclusions.items[i].bank,
                                     p->ref_exclusions.items[i].addr});
     }
+    for (size_t i = 0; i < p->literals.count; i++) {
+        s.literals.push_back({p->literals.items[i].has_bank,
+                              p->literals.items[i].bank,
+                              p->literals.items[i].addr});
+    }
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
         SnapshotType st;
@@ -2392,9 +2397,10 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     options.labels_are_entries = 0;
     ConfigTypes types = {};
     ConfigEntries ref_exclusions = {};
+    ConfigEntries literals = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
                 &docs, &symbols, &data_ranges, &options, &types,
-                &ref_exclusions);
+                &ref_exclusions, &literals);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
                             labels.items[i].bank,
@@ -2433,6 +2439,11 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
                                     ref_exclusions.items[i].bank,
                                     ref_exclusions.items[i].addr});
     }
+    for (size_t i = 0; i < literals.count; i++) {
+        s.literals.push_back({literals.items[i].has_bank,
+                              literals.items[i].bank,
+                              literals.items[i].addr});
+    }
     for (size_t i = 0; i < types.count; i++) {
         const ConfigType *ct = &types.items[i];
         SnapshotType stype;
@@ -2444,6 +2455,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
         s.types.push_back(std::move(stype));
     }
     free(ref_exclusions.items);
+    free(literals.items);
     free_config_types(&types);
     return s;
 }
@@ -2454,6 +2466,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotLabel> cl;
     std::vector<SnapshotEntry> ce;
     std::vector<SnapshotEntry> cexcl;
+    std::vector<SnapshotEntry> clits;
     std::vector<SnapshotData> cd;
     std::vector<SnapshotTable> ct;
     std::vector<SnapshotDoc> cdocs;
@@ -2577,6 +2590,39 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new literals; deletions require full snapshot */
+    for (auto &o : s->literals) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->literals.count; j++) {
+            if (p->literals.items[j].has_bank == o.has_bank &&
+                p->literals.items[j].bank == o.bank &&
+                p->literals.items[j].addr == o.addr) {
+                still_there = true;
+                break;
+            }
+        }
+        if (!still_there) {
+            *st = "deletion needs full snapshot";
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < p->literals.count; i++) {
+        bool found = false;
+        for (auto &o : s->literals) {
+            if (o.has_bank == p->literals.items[i].has_bank &&
+                o.bank == p->literals.items[i].bank &&
+                o.addr == p->literals.items[i].addr) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            clits.push_back({p->literals.items[i].has_bank,
+                             p->literals.items[i].bank,
+                             p->literals.items[i].addr});
+        }
+    }
+
     /* collect new or changed types */
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
@@ -2678,6 +2724,13 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         for (auto &i : cexcl) {
             write_config_address(o, i.has_bank, i.bank, i.addr);
             fputs(" = 1\n", o);
+        }
+    }
+    if (!clits.empty()) {
+        fputs("\n[literals]\n", o);
+        for (auto &i : clits) {
+            write_config_address(o, i.has_bank, i.bank, i.addr);
+            fputs(" = literal\n", o);
         }
     }
     if (!ci.empty()) {
@@ -2786,6 +2839,15 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
                                  p->ref_exclusions.items[i].bank,
                                  p->ref_exclusions.items[i].addr);
             fputs(" = 1\n", o);
+        }
+    }
+    if (p->literals.count > 0) {
+        fputs("\n[literals]\n", o);
+        for (size_t i = 0; i < p->literals.count; i++) {
+            write_config_address(o, p->literals.items[i].has_bank,
+                                 p->literals.items[i].bank,
+                                 p->literals.items[i].addr);
+            fputs(" = literal\n", o);
         }
     }
     if (p->inline_sigs.count > 0) {

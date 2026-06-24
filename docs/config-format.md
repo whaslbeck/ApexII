@@ -92,6 +92,21 @@ The value on the right-hand side is ignored; `1` is conventional. Bank-qualified
 
 This section has no effect on references that arise from actual branch or jump instructions — those are always recorded regardless.
 
+### `[literals]`
+
+Marks an individual instruction whose immediate operand is a fixed value, not an address. The disassembler normally resolves an immediate that matches a label's address to that label (e.g. `LDX #ScoreTable`). When the value is genuinely a constant — a count, a mask, a magic number — listing the **instruction's** address here forces the operand to render as a raw value (`LDX #0x5123`) and suppresses the speculative code cross-reference it would otherwise generate.
+
+```ini
+[literals]
+B20_A4001 = literal
+Bff_A8123 = literal
+0x8990    = literal
+```
+
+The key is the address of the instruction itself (not the operand value), so the same constant can still resolve to a label elsewhere. The value on the right-hand side is ignored; `literal` is conventional. Bank-qualified and bare-address forms are both accepted.
+
+Unlike [`[exclude_refs]`](#exclude_refs) — which is keyed by the *target* address and suppresses every reference to it — `[literals]` is keyed by the *instruction* and only affects that one operand. In the GUI, right-click a code instruction with an immediate operand and choose **Mark immediate as literal** (or **Clear literal**).
+
 ### `[inline]`
 
 Declares routines that consume a fixed-layout payload of bytes immediately after the `JSR` or `JMP` instruction that calls them. The disassembler skips over those bytes and emits typed `INLINE_*` pseudo-ops instead of disassembling them as code.

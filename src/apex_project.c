@@ -16,7 +16,8 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                const InlineSignatures *inline_sigs,
                                LabelSet *bank_labels, LabelSet *system_labels,
                                const DataRanges *data_ranges, ReferenceSet *refs,
-                               const ConfigEntries *ref_exclusions);
+                               const ConfigEntries *ref_exclusions,
+                               const ConfigEntries *literals);
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
                               size_t banks, LabelSet *bank_labels,
                               const ConfigOptions *options);
@@ -1176,6 +1177,7 @@ typedef struct {
     DataRanges       data_ranges;
     ConfigTypes      config_types;
     ConfigEntries    ref_exclusions;
+    ConfigEntries    literals;
     ConfigOptions    options;
     char             action[24];
 } ApexConfigSnapshot;
@@ -1411,6 +1413,7 @@ static void snapshot_capture(const ApexProject *p, const char *action, ApexConfi
     out->symbols        = copy_config_symbols(&p->symbols);
     out->data_ranges    = copy_data_ranges(&p->data_ranges);
     out->ref_exclusions = copy_config_entries(&p->ref_exclusions);
+    out->literals       = copy_config_entries(&p->literals);
     out->options        = p->options;
     snprintf(out->action, sizeof(out->action), "%s", action ? action : "edit");
 }
@@ -1427,6 +1430,7 @@ static void snapshot_free(ApexConfigSnapshot *s)
     free(s->data_ranges.items);
     free_config_types(&s->config_types);
     free_config_entries(&s->ref_exclusions);
+    free_config_entries(&s->literals);
     memset(s, 0, sizeof(*s));
 }
 
@@ -1445,6 +1449,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     memset(&p->data_ranges, 0, sizeof(p->data_ranges));
     free_config_types(&p->config_types);
     free_config_entries(&p->ref_exclusions);
+    free_config_entries(&p->literals);
 
     p->inline_sigs    = s->inline_sigs;
     p->config_labels  = s->config_labels;
@@ -1456,6 +1461,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     p->data_ranges    = s->data_ranges;
     p->config_types   = s->config_types;
     p->ref_exclusions = s->ref_exclusions;
+    p->literals       = s->literals;
     p->options        = s->options;
     memset(s, 0, sizeof(*s));
 }
@@ -1619,7 +1625,7 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
                 &project->config_entries, &project->tables, &project->schemas,
                 &project->docs, &project->symbols,
                 &project->data_ranges, &project->options, &project->config_types,
-                &project->ref_exclusions);
+                &project->ref_exclusions, &project->literals);
     validate_config_classification(&project->config_entries, &project->tables,
                                    &project->data_ranges);
 
@@ -1662,6 +1668,7 @@ void apex_project_free(ApexProject *project)
     free_config_labels(&project->config_labels);
     free_config_entries(&project->config_entries);
     free_config_entries(&project->ref_exclusions);
+    free_config_entries(&project->literals);
     free_table_defs(&project->tables);
     free_schema_defs(&project->schemas);
     free_config_docs(&project->docs);
@@ -1773,7 +1780,7 @@ static void analyze_system_region(ApexProject *project)
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
                          &project->system_labels, &project->data_ranges, 0xffu, &project->refs,
-                         &project->ref_exclusions);
+                         &project->ref_exclusions, &project->literals);
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);
@@ -1886,7 +1893,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
         collect_code_targets(bank, used, APEX_PAGED_ORG, &project->bank_labels[bank_index],
                              &project->inline_sigs, project->rom.data, project->banks,
                              project->bank_labels, &project->system_labels, &project->data_ranges,
-                             bank_id, &project->refs, &project->ref_exclusions);
+                             bank_id, &project->refs, &project->ref_exclusions, &project->literals);
     }
     apply_string_content_labels(&project->bank_labels[bank_index], bank, used, APEX_PAGED_ORG);
     sort_label_set(&project->bank_labels[bank_index]);
@@ -1945,10 +1952,12 @@ static void analyze_full_project(ApexProject *project)
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
-                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions);
+                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions,
+                         &project->literals);
     collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
                               project->bank_labels, &project->system_labels,
-                              &project->data_ranges, &project->refs, &project->ref_exclusions);
+                              &project->data_ranges, &project->refs, &project->ref_exclusions,
+                              &project->literals);
     {
         size_t prev_count, prev_code;
         do {
@@ -1962,7 +1971,7 @@ static void analyze_full_project(ApexProject *project)
                                  APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                                  project->rom.data, banks, project->bank_labels,
                                  &project->system_labels, &project->data_ranges, 0xff,
-                                 &project->refs, &project->ref_exclusions);
+                                 &project->refs, &project->ref_exclusions, &project->literals);
             {
                 size_t j2, curr_code = 0;
                 for (j2 = 0; j2 < project->system_labels.count; j2++) {
@@ -2495,6 +2504,50 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
+                             uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "mark literal");
+    config_set_entry(&project->literals, has_bank, bank, addr);
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank,
+                                uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "clear literal");
+    if (config_clear_entry(&project->literals, has_bank, bank, addr) != 0) {
+        return 1;
+    }
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr)
+{
+    size_t i;
+
+    if (!project) {
+        return 0;
+    }
+    for (i = 0; i < project->literals.count; i++) {
+        const ConfigEntry *e = &project->literals.items[i];
+        if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
+            return 1;
+        }
+    }
     return 0;
 }
 

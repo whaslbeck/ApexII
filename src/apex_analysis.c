@@ -636,8 +636,13 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
        resolve (e.g. a JSR in the system bank, after switching banks, into
        0x4000-0x7fff).  If exactly one paged bank has a label at this address it
        is the only candidate, so use it; if several do it is ambiguous (we don't
-       track the live bank register) and we leave the raw address. */
-    if (lookup->bank_labels && lookup->banks > 0 &&
+       track the live bank register) and we leave the raw address.
+
+       Restricted to system-bank code: code in a paged bank addresses its OWN
+       bank through the 0x4000-0x7fff window, so a paged-window operand there
+       must resolve only against the current bank (already tried above) and
+       never borrow another bank's label. */
+    if (lookup->current_bank == 0xffu && lookup->bank_labels && lookup->banks > 0 &&
         addr >= APEX_PAGED_ORG && addr < 0x8000u) {
         const char *found = NULL;
         size_t i;
@@ -938,7 +943,8 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs, const ConfigEntries *ref_exclusions)
+                          ReferenceSet *refs, const ConfigEntries *ref_exclusions,
+                          const ConfigEntries *literals)
 {
     size_t i = 0;
 
@@ -1027,7 +1033,8 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                                   source);
                 }
             }
-            if (info.has_addr_ref && !info.has_target) {
+            if (info.has_addr_ref && !info.has_target &&
+                !addr_ref_excluded(literals, current_bank, instr_addr)) {
                 if (info.addr_ref >= base_addr && info.addr_ref < base_addr + used) {
                     if (!addr_ref_excluded(ref_exclusions, current_bank, info.addr_ref)) {
                         add_reference(refs, current_bank, info.addr_ref, current_bank, instr_addr,

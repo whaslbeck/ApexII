@@ -1580,6 +1580,25 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
     }
 }
 
+/* True if an instruction at (current_bank, addr) is marked as a literal in the
+   [literals] config section — its immediate operand is a fixed value, not an
+   address, and must render raw instead of resolving to a label. */
+static int literal_instr_at(const ConfigEntries *literals, uint8_t bank, uint32_t addr)
+{
+    size_t i;
+
+    if (!literals) {
+        return 0;
+    }
+    for (i = 0; i < literals->count; i++) {
+        if (literals->items[i].addr == addr &&
+            (!literals->items[i].has_bank || literals->items[i].bank == bank)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
                                 const Label *labels, size_t label_count, int sorted,
                                 const Label *extra_labels, size_t extra_label_count,
@@ -1590,7 +1609,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
                                 uint8_t current_bank,
-                                size_t rom_base, int emit_explain, const ConfigTypes *types)
+                                size_t rom_base, int emit_explain, const ConfigTypes *types,
+                                const ConfigEntries *literals)
 {
     size_t pos = 0;
     int decoding_code = 0;
@@ -1605,6 +1625,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
     lookup.sorted = sorted;
     lookup.bank_labels = bank_labels;
     lookup.banks = banks;
+    lookup.current_bank = current_bank;
 
     while (pos < len) {
         size_t col = 0;
@@ -1689,9 +1710,15 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         }
         if (decoding_code) {
             char inst[256];
+            uint32_t instr_addr = base_addr + (uint32_t)pos;
+            /* For a literal-marked instruction, decode without the label callback so
+               an immediate operand renders as a raw value rather than a label. */
             Cpu6809InstrInfo info =
-                cpu6809_disassemble_info_ex(data + pos, len - pos, base_addr + (uint32_t)pos, inst,
-                                            sizeof(inst), lookup_label_for_cpu, &lookup);
+                literal_instr_at(literals, current_bank, instr_addr)
+                    ? cpu6809_disassemble_info(data + pos, len - pos, instr_addr, inst,
+                                               sizeof(inst))
+                    : cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
+                                                  sizeof(inst), lookup_label_for_cpu, &lookup);
             if (info.size > 0) {
                 const InlineSignature *inline_sig = NULL;
 
@@ -1777,7 +1804,8 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
                                const TableDefs *tables, const ConfigDocs *docs,
                                const ConfigSymbols *symbols,
                                const DataRanges *data_ranges, const ReferenceSet *refs,
-                               size_t rom_bank_base, int emit_explain, const ConfigTypes *types)
+                               size_t rom_bank_base, int emit_explain, const ConfigTypes *types,
+                               const ConfigEntries *literals)
 {
     size_t used = last_non_ff(data, APEX_BANK_SIZE);
     /* The canonical (computed) bank id names labels and references; the raw byte
@@ -1800,7 +1828,7 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
                             labels->count, labels->sorted, system_labels->items,
                             system_labels->count, NULL, 0, inline_sigs, paged_rom, banks,
                             bank_labels, tables, docs, symbols, data_ranges,
-                            refs, bank_id, rom_bank_base + 1u, emit_explain, types);
+                            refs, bank_id, rom_bank_base + 1u, emit_explain, types, literals);
     }
     if (used < APEX_BANK_SIZE) {
         emit_location_comment(out, "free", bank_id,
@@ -1879,7 +1907,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
             prev_count = labels->count;
             prev_code  = total_code_bank_labels(labels, 1);
             collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom,
-                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL);
+                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL, NULL);
         } while (labels->count != prev_count || total_code_bank_labels(labels, 1) != prev_code);
     }
 }
@@ -1891,7 +1919,8 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
                                 const ConfigDocs *docs,
                                 const ConfigSymbols *symbols, const DataRanges *data_ranges,
                                 const ReferenceSet *refs,
-                                size_t rom_system_base, int emit_explain, const ConfigTypes *types)
+                                size_t rom_system_base, int emit_explain, const ConfigTypes *types,
+                                const ConfigEntries *literals)
 {
     size_t used = last_non_ff(data, APEX_SYSTEM_SIZE);
 
@@ -1905,7 +1934,7 @@ static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo 
                             labels->sorted, NULL, 0, vectors, vector_count, inline_sigs,
                             paged_rom, banks, bank_labels, tables, docs,
                             symbols, data_ranges, refs, 0xff, rom_system_base, emit_explain,
-                            types);
+                            types, literals);
     }
     if (used < APEX_SYSTEM_SIZE) {
         emit_location_comment(out, "free", 0xffu,
@@ -1983,7 +2012,8 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                const InlineSignatures *inline_sigs,
                                LabelSet *bank_labels, LabelSet *system_labels,
                                const DataRanges *data_ranges, ReferenceSet *refs,
-                               const ConfigEntries *ref_exclusions)
+                               const ConfigEntries *ref_exclusions,
+                               const ConfigEntries *literals)
 {
     size_t prev_count, prev_code;
 
@@ -1998,7 +2028,7 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
             if (used > 1) {
                 collect_code_targets(bank, used, APEX_PAGED_ORG, &bank_labels[i], inline_sigs,
                                      paged_rom, banks, bank_labels, system_labels, data_ranges,
-                                     bank[0], refs, ref_exclusions);
+                                     bank[0], refs, ref_exclusions, literals);
             }
         }
     } while (total_bank_labels(bank_labels, banks) != prev_count ||
@@ -2563,7 +2593,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                           project->banks, project->bank_labels, &project->tables,
                           &project->docs, &project->symbols,
                           &project->data_ranges, &project->refs, i * APEX_BANK_SIZE,
-                          emit_explain, &project->config_types);
+                          emit_explain, &project->config_types, &project->literals);
         fputc('\n', out);
     }
 
@@ -2575,7 +2605,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                        project->banks, project->bank_labels, &project->tables,
                        &project->docs, &project->symbols,
                        &project->data_ranges, &project->refs, project->paged_size, emit_explain,
-                       &project->config_types);
+                       &project->config_types, &project->literals);
     if (emit_xrefs) {
         emit_xref_index(out, project->rom.data, project->bank_labels, project->banks,
                         &project->system_labels, &project->refs);

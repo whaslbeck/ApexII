@@ -1112,7 +1112,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
-                 ConfigEntries *ref_exclusions)
+                 ConfigEntries *ref_exclusions, ConfigEntries *literals)
 {
     FILE *f;
     /* Max length of a single config line (e.g. a one-line [types] enum list). */
@@ -1128,6 +1128,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_data = 0;
     int in_types = 0;
     int in_exclude_refs = 0;
+    int in_literals = 0;
     /* pending multi-line [types] entry: all enum values of one type are
        accumulated here before being parsed, so this bounds the total size of a
        single type's enum list (see CONFIG_MAX_TYPE_VALUES). */
@@ -1191,6 +1192,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_data = strcmp(s + 1, "data") == 0;
             in_types = strcmp(s + 1, "types") == 0;
             in_exclude_refs = strcmp(s + 1, "exclude_refs") == 0;
+            in_literals = strcmp(s + 1, "literals") == 0;
             continue;
         }
         eq = strchr(s, '=');
@@ -1204,7 +1206,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *include_path = resolve_include_path(path, value);
 
             load_config(include_path, sigs, labels, entries, tables, schemas, docs,
-                        symbols, data_ranges, options, types, ref_exclusions);
+                        symbols, data_ranges, options, types, ref_exclusions, literals);
             free(value);
             free(include_path);
             continue;
@@ -1416,6 +1418,24 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             }
             if (ref_exclusions) {
                 add_config_entry(ref_exclusions, has_bank, bank, addr);
+            }
+            free(value);
+        } else if (in_literals) {
+            /* [literals]: instruction address whose immediate operand is a fixed
+               value, not an address — render it raw and record no addr_ref. */
+            uint32_t addr;
+            uint8_t bank = 0;
+            int has_bank = 0;
+            char *key = s;
+            char *value = dup_config_value(eq + 1);
+
+            if (parse_bank_label_ref(key, &bank, &addr)) {
+                has_bank = 1;
+            } else if (!parse_u32(key, &addr)) {
+                die("invalid literals config '%s = %s'", key, value);
+            }
+            if (literals) {
+                add_config_entry(literals, has_bank, bank, addr);
             }
             free(value);
         } else if (in_types) {

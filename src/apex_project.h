@@ -43,6 +43,7 @@ typedef struct ApexProject {
     ConfigOptions options;
     ConfigTypes config_types;
     ConfigEntries ref_exclusions;
+    ConfigEntries literals; /* instruction addrs whose immediate is a literal, not an address */
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -91,6 +92,11 @@ int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t b
                                    uint32_t addr);
 int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
                                       uint32_t addr);
+int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
+                             uint32_t addr);
+int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank,
+                                uint32_t addr);
+int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr);
 int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
 int apex_project_clear_symbol(ApexProject *project, const char *name);
 
