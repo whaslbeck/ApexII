@@ -10,6 +10,8 @@ typedef const char *(*Cpu6809LabelFn)(void *ctx, uint32_t addr);
 
 #define CPU6809_FLOW_STOP 0x01u
 #define CPU6809_TARGET_CODE 0x02u
+#define CPU6809_CALL 0x04u   /* subroutine call (JSR/BSR/LBSR): pushes a return
+                                address, so an inline payload may follow it */
 
 typedef struct {
     size_t size;

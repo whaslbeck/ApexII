@@ -726,7 +726,10 @@ unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatu
 {
     const InlineSignature *sig;
 
-    if (!info->has_target) {
+    /* Inline payloads only follow a subroutine call (JSR/BSR/LBSR), which pushes
+       the return address the callee reads them through.  A branch/jump to an
+       inline-consuming routine must NOT be treated as having a payload. */
+    if (!info->has_target || !(info->flags & CPU6809_CALL)) {
         return 0;
     }
     sig = inline_signature_for(sigs, current_bank, info->target);
@@ -1037,12 +1040,11 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                     }
                 }
             }
-            {
+            if (info.has_target && (info.flags & CPU6809_CALL)) {
                 const InlineSignature *sig =
                     inline_signature_for(inline_sigs, current_bank, info.target);
 
-                if (info.has_target && sig &&
-                    pos + info.size + sig->length <= used &&
+                if (sig && pos + info.size + sig->length <= used &&
                     paged_rom && bank_labels) {
                     size_t inline_pos = pos + info.size;
 
@@ -1054,7 +1056,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             pos += info.size;
             pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used);
-            if (info.has_target) {
+            if (info.has_target && (info.flags & CPU6809_CALL)) {
                 const InlineSignature *fs =
                     inline_signature_for(inline_sigs, current_bank, info.target);
                 if (fs && fs->flow_stop) {

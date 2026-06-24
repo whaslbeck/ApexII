@@ -1717,7 +1717,10 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                         fprintf(out, "    %s\n", inst);
                     }
                     pos += info.size;
-                    if (info.has_target) {
+                    /* Inline payloads only follow a subroutine call (JSR/BSR/
+                       LBSR); a branch/jump to an inline-consuming routine has no
+                       return address pushed and must not render inline bytes. */
+                    if (info.has_target && (info.flags & CPU6809_CALL)) {
                         inline_sig = inline_signature_for(inline_sigs, current_bank, info.target);
                     }
                     if (inline_sig) {
