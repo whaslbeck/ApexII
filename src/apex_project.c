@@ -2126,6 +2126,24 @@ int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
     return 0;
 }
 
+/* A far-pointer data range points into another bank, so classifying or clearing
+   it must re-analyze the whole project (not just the pointer's own bank) for the
+   target data to appear/disappear. */
+static int datakind_is_far(DataKind k)
+{
+    switch (k) {
+    case DATA_FAR_STRING:
+    case DATA_FAR_DATA:
+    case DATA_FAR_TABLE:
+    case DATA_FAR_CODE:
+    case DATA_FAR_DMD_FULLFRAME:
+    case DATA_FAR_SPRITE:
+        return 1;
+    default:
+        return 0;
+    }
+}
+
 int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
                           ApexConfigKind kind, const char *spec)
 {
@@ -2171,7 +2189,13 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
         return 1;
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
-    if (project_addr_is_system(has_bank, bank, addr)) {
+    /* A far-pointer classification (far_string, far_code, counted(far_data), …)
+       points into a *different* bank than the one it sits in, so a bank-scoped
+       re-analysis of the pointer's own bank never discovers the target. Force a
+       full re-analysis so the pointed-to data in the other bank is classified. */
+    if (effective_spec && strstr(effective_spec, "far_")) {
+        mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    } else if (project_addr_is_system(has_bank, bank, addr)) {
         mark_analysis_scope(project, APEX_ANALYZE_SCOPE_SYSTEM_ONLY);
     } else if (project_addr_is_bank_local(has_bank, bank, addr)) {
         mark_bank_analysis_scope(project, bank);
@@ -2187,11 +2211,17 @@ int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, ui
         return 1;
     }
     project_record_edit(project, "clear kind");
+    /* Detect a far-pointer classification before removing it: the target data in
+       another bank must be reclassified, which a bank-scoped re-analysis misses. */
+    const DataRange *dr = data_range_at(bank, addr, &project->data_ranges);
+    int was_far = dr && datakind_is_far(dr->kind);
     config_clear_entry(&project->config_entries, has_bank, bank, addr);
     config_clear_data(&project->data_ranges, bank, addr);
     config_clear_table(&project->tables, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
-    if (project_addr_is_system(has_bank, bank, addr)) {
+    if (was_far) {
+        mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    } else if (project_addr_is_system(has_bank, bank, addr)) {
         mark_analysis_scope(project, APEX_ANALYZE_SCOPE_SYSTEM_ONLY);
     } else if (project_addr_is_bank_local(has_bank, bank, addr)) {
         mark_bank_analysis_scope(project, bank);
@@ -2254,7 +2284,11 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
         return 1;
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
-    if (project_addr_is_system(1, bank, addr)) {
+    /* A far pointer in the table schema points into another bank — see the note
+       in apex_project_set_kind — so a bank-scoped re-analysis would miss it. */
+    if (strstr(spec, "far_")) {
+        mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    } else if (project_addr_is_system(1, bank, addr)) {
         mark_analysis_scope(project, APEX_ANALYZE_SCOPE_SYSTEM_ONLY);
     } else if (project_addr_is_bank_local(1, bank, addr)) {
         mark_bank_analysis_scope(project, bank);
