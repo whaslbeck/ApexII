@@ -915,6 +915,7 @@ int main(int argc, char **argv)
                 krow("D",    "Mark as data");
                 krow("S",    "Mark as string");
                 krow("T",    "Mark as table (uses current schema)");
+                krow("1",    "Repeat last classification");
                 krow("Del",  "Clear classification");
                 ImGui::EndTable();
             }
@@ -1088,6 +1089,10 @@ int main(int argc, char **argv)
             }
             if (ImGui::IsKeyPressed(ImGuiKey_P)) {
                 jump_primary_transition(document, &state, 0);
+            }
+            if (ImGui::IsKeyPressed(ImGuiKey_1) ||
+                ImGui::IsKeyPressed(ImGuiKey_Keypad1)) {
+                repeat_last_classify(project, &document, &state);
             }
             if (ImGui::IsKeyPressed(ImGuiKey_C)) {
                 if (io.KeyCtrl) {

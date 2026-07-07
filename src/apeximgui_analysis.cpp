@@ -1014,6 +1014,7 @@ ApexRenderedBlockKind get_offset_kind(const ApexProject *project,
 
 void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_CODE;
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1036,6 +1037,8 @@ void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
                              const char *sp)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_DATA;
+    snprintf(s->last_classify_spec, sizeof(s->last_classify_spec), "%s", sp ? sp : "");
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1059,6 +1062,7 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 
 void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_STRING;
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1080,6 +1084,7 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
 
 void apply_string_lp_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_STRING_LP;
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1102,6 +1107,8 @@ void apply_string_lp_at_selection(ApexProject *p, const ApexRenderedDocument **d
 void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
                               const char *sp)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_TABLE;
+    snprintf(s->last_classify_spec, sizeof(s->last_classify_spec), "%s", sp ? sp : "");
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1120,6 +1127,7 @@ void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, U
 
 void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
+    s->last_classify_op = APEX_LAST_CLASSIFY_CLEAR;
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1133,6 +1141,28 @@ void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     }
     if (apex_project_clear_kind(p, 1, b, a) == 0) {
         rerender_and_reselect(p, dp, s, b, a);
+    }
+}
+
+/* Replay the most recent classification action at the current selection.  Bound
+   to the "1" hotkey so classifying a run of individual entries (e.g. a block of
+   far_code pointers) becomes: classify once, then n,1,n,1,…  The apply_* helpers
+   re-record the same op, so repeating stays idempotent. */
+void repeat_last_classify(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    /* Copy the spec into a local first: the apply_* helpers re-record into
+       s->last_classify_spec via snprintf("%s", sp), so passing the member
+       buffer directly would alias snprintf's source and destination (UB). */
+    char spec[sizeof(s->last_classify_spec)];
+    snprintf(spec, sizeof(spec), "%s", s->last_classify_spec);
+    switch (s->last_classify_op) {
+    case APEX_LAST_CLASSIFY_DATA:      apply_data_at_selection(p, dp, s, spec); break;
+    case APEX_LAST_CLASSIFY_STRING:    apply_string_at_selection(p, dp, s); break;
+    case APEX_LAST_CLASSIFY_STRING_LP: apply_string_lp_at_selection(p, dp, s); break;
+    case APEX_LAST_CLASSIFY_TABLE:     apply_table_at_selection(p, dp, s, spec); break;
+    case APEX_LAST_CLASSIFY_CODE:      apply_code_at_selection(p, dp, s); break;
+    case APEX_LAST_CLASSIFY_CLEAR:     clear_kind_at_selection(p, dp, s); break;
+    default:                           set_status(s, "no previous classification to repeat"); break;
     }
 }
 

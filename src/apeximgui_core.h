@@ -181,6 +181,17 @@ struct RefEntry {
     uint32_t row_cpu_addr;
 };
 
+/* Which classification action the "repeat last classification" hotkey replays. */
+enum ApexLastClassifyOp {
+    APEX_LAST_CLASSIFY_NONE = 0,
+    APEX_LAST_CLASSIFY_DATA,       /* apply_data_at_selection(last_classify_spec) */
+    APEX_LAST_CLASSIFY_STRING,     /* apply_string_at_selection */
+    APEX_LAST_CLASSIFY_STRING_LP,  /* apply_string_lp_at_selection */
+    APEX_LAST_CLASSIFY_TABLE,      /* apply_table_at_selection(last_classify_spec) */
+    APEX_LAST_CLASSIFY_CODE,       /* apply_code_at_selection */
+    APEX_LAST_CLASSIFY_CLEAR,      /* clear_kind_at_selection */
+};
+
 struct UiState {
     size_t selected_line;
     size_t selection_end;
@@ -237,6 +248,11 @@ struct UiState {
     int    hex_hover_valid;
     char hex_search_input[64];
     int request_focus_hex_search;
+
+    /* Last classification action, replayed by the "repeat" hotkey (1) so a run of
+       individual classifications reduces to n,1,n,1,…  See repeat_last_classify(). */
+    int  last_classify_op = APEX_LAST_CLASSIFY_NONE;  /* ApexLastClassifyOp */
+    char last_classify_spec[64] = {0};                /* spec for DATA/TABLE ops */
 
     bool show_flow_arrows = true;
     bool show_navigator;
@@ -533,6 +549,7 @@ void apply_string_at_selection(ApexProject *project, const ApexRenderedDocument 
 void apply_string_lp_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_table_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void clear_kind_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void repeat_last_classify(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *document, uint8_t bank, size_t *line_index);
 int find_line_by_rom_offset(const ApexRenderedDocument *document, size_t rom_offset, size_t *line_index);
 int rom_offset_to_cpu_address(const ApexProject *project, size_t offset, uint8_t *bank, uint32_t *cpu_addr);
