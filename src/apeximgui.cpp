@@ -16,6 +16,49 @@ static const OriginalSnapshot *g_crash_snapshot = NULL;
 static char g_crash_overlay_path[512] = "";
 static char g_crash_base_config[1024] = "";
 
+/* User-adjustable global font zoom (View menu + Ctrl +/-/0), applied via
+   style.FontScaleMain and persisted in imgui.ini through a settings handler.
+   Independent of automatic HiDPI scaling (io.ConfigDpiScaleFonts → FontScaleDpi),
+   which composes on top: text size = base * FontScaleMain * FontScaleDpi. */
+static const float FONT_SCALE_MIN  = 0.5f;
+static const float FONT_SCALE_MAX  = 3.0f;
+static const float FONT_SCALE_STEP = 0.1f;
+static float g_ui_font_scale = 1.0f;
+
+static float clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+static void set_ui_font_scale(float v)
+{
+    g_ui_font_scale = clampf(v, FONT_SCALE_MIN, FONT_SCALE_MAX);
+    ImGui::MarkIniSettingsDirty(); /* schedule a persist of the new value */
+}
+
+/* Persist g_ui_font_scale in imgui.ini alongside window/dock layout. Registered
+   before the first NewFrame so the stored value is loaded at startup. */
+static void register_view_settings_handler(void)
+{
+    ImGuiSettingsHandler h;
+    h.TypeName = "ApexII";
+    h.TypeHash = ImHashStr("ApexII");
+    h.ReadOpenFn = [](ImGuiContext *, ImGuiSettingsHandler *, const char *name) -> void * {
+        return strcmp(name, "View") == 0 ? (void *)1 : NULL;
+    };
+    h.ReadLineFn = [](ImGuiContext *, ImGuiSettingsHandler *, void *, const char *line) {
+        float v;
+        if (sscanf(line, "FontScale=%f", &v) == 1) {
+            g_ui_font_scale = clampf(v, FONT_SCALE_MIN, FONT_SCALE_MAX);
+        }
+    };
+    h.WriteAllFn = [](ImGuiContext *, ImGuiSettingsHandler *handler, ImGuiTextBuffer *buf) {
+        buf->appendf("[%s][View]\n", handler->TypeName);
+        buf->appendf("FontScale=%.3f\n\n", g_ui_font_scale);
+    };
+    ImGui::AddSettingsHandler(&h);
+}
+
 static void handle_fatal_signal(int sig)
 {
     if (g_crash_project && g_crash_snapshot && g_crash_overlay_path[0]) {
@@ -67,6 +110,7 @@ static bool startup_pick_file(SDL_Window *win, bool ini_mode,
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        ImGui::GetStyle().FontScaleMain = g_ui_font_scale; /* honor persisted font zoom */
 
         ImGuiIO &fio = ImGui::GetIO();
         ImVec2 dlg_min(std::min(700.0f, fio.DisplaySize.x * 0.85f),
@@ -150,6 +194,11 @@ int main(int argc, char **argv)
     ImGui::CreateContext();
     ImGuiIO &io = ImGui::GetIO();
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard | ImGuiConfigFlags_DockingEnable;
+    /* Auto-scale fonts to the monitor's DPI (dynamic fonts, no atlas rebuild).
+       The user's manual zoom (g_ui_font_scale) composes on top of this. */
+    io.ConfigDpiScaleFonts = true;
+    /* Must be registered before the first NewFrame loads imgui.ini. */
+    register_view_settings_handler();
     ImGui::StyleColorsDark();
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init("#version 150");
@@ -325,6 +374,7 @@ int main(int argc, char **argv)
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
         ImGui::NewFrame();
+        ImGui::GetStyle().FontScaleMain = g_ui_font_scale; /* apply user font zoom */
         sync_editor_state(project, document, &state);
 
         if (ImGui::BeginMainMenuBar()) {
@@ -424,6 +474,17 @@ int main(int argc, char **argv)
                 if (ImGui::MenuItem("Reset Layout")) {
                     state.request_layout_reset = true;
                 }
+                ImGui::Separator();
+                ImGui::TextDisabled("Font");
+                ImGui::SetNextItemWidth(180.0f);
+                float fs = g_ui_font_scale;
+                if (ImGui::SliderFloat("##fontscale", &fs, FONT_SCALE_MIN, FONT_SCALE_MAX,
+                                       "Zoom %.2fx")) {
+                    set_ui_font_scale(fs);
+                }
+                if (ImGui::MenuItem("Zoom In",    "Ctrl++")) set_ui_font_scale(g_ui_font_scale + FONT_SCALE_STEP);
+                if (ImGui::MenuItem("Zoom Out",   "Ctrl+-")) set_ui_font_scale(g_ui_font_scale - FONT_SCALE_STEP);
+                if (ImGui::MenuItem("Reset Zoom", "Ctrl+0")) set_ui_font_scale(1.0f);
                 ImGui::EndMenu();
             }
             if (ImGui::BeginMenu("Help")) {
@@ -944,6 +1005,8 @@ int main(int argc, char **argv)
                 krow("Ctrl+Y",   "Redo");
                 krow("F5",       "Re-analyze");
                 krow("Shift+F5", "Force full re-analyze");
+                krow("Ctrl +/-", "Font zoom in / out");
+                krow("Ctrl+0",   "Reset font zoom");
                 ImGui::EndTable();
             }
 
@@ -1025,17 +1088,21 @@ int main(int argc, char **argv)
                 }
                 apply_table_at_selection(project, &document, &state, spec);
             }
-            if (ImGui::IsKeyPressed(ImGuiKey_Equal) ||
-                ImGui::IsKeyPressed(ImGuiKey_KeypadAdd)) {
-                state.dmd_scrub_offset += io.KeyShift ? 32 : 1;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_Minus) ||
-                ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract)) {
-                state.dmd_scrub_offset -= io.KeyShift ? 32 : 1;
-            }
-            if (ImGui::IsKeyPressed(ImGuiKey_0) ||
-                ImGui::IsKeyPressed(ImGuiKey_Keypad0)) {
-                state.dmd_scrub_offset = 0;
+            /* Ctrl +/-/0 = font zoom; the same keys without Ctrl drive DMD scrub. */
+            bool key_plus  = ImGui::IsKeyPressed(ImGuiKey_Equal) ||
+                             ImGui::IsKeyPressed(ImGuiKey_KeypadAdd);
+            bool key_minus = ImGui::IsKeyPressed(ImGuiKey_Minus) ||
+                             ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract);
+            bool key_zero  = ImGui::IsKeyPressed(ImGuiKey_0) ||
+                             ImGui::IsKeyPressed(ImGuiKey_Keypad0);
+            if (io.KeyCtrl) {
+                if (key_plus)  set_ui_font_scale(g_ui_font_scale + FONT_SCALE_STEP);
+                if (key_minus) set_ui_font_scale(g_ui_font_scale - FONT_SCALE_STEP);
+                if (key_zero)  set_ui_font_scale(1.0f);
+            } else {
+                if (key_plus)  state.dmd_scrub_offset += io.KeyShift ? 32 : 1;
+                if (key_minus) state.dmd_scrub_offset -= io.KeyShift ? 32 : 1;
+                if (key_zero)  state.dmd_scrub_offset = 0;
             }
             if (ImGui::IsKeyPressed(ImGuiKey_M)) {
                 uint8_t b;
