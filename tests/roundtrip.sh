@@ -293,6 +293,106 @@ else
     exit 1
 fi
 
+# ---- Large [types] enum is not truncated (was capped at an 8 KB buffer) ----
+big_types_ini="$OUT/big_types.ini"
+big_types_asm="$OUT/big_types.disasm"
+{
+    printf '[types]\nbigt:word =\n'
+    i=0
+    while [ "$i" -lt 700 ]; do
+        printf '\t0x%04x:val_%d\n' "$i" "$i"
+        i=$((i + 1))
+    done
+} >"$big_types_ini"
+"$ROOT/build/apexdis" "$system_banked_inline_rom" "$big_types_asm" "$big_types_ini"
+if grep -q '^BIGT_VAL_0 = 0x0000$' "$big_types_asm" &&
+    grep -q '^BIGT_VAL_699 = 0x02bb$' "$big_types_asm"; then
+    printf 'PASS big_types.ini\n'
+else
+    printf 'FAIL big_types.ini\n' >&2
+    exit 1
+fi
+
+# ---- inline payloads apply to calls, not branches ----
+inline_branch_rom="$OUT/inline_branch.rom"
+inline_branch_asm="$OUT/inline_branch.disasm"
+inline_branch_rebuilt="$OUT/inline_branch.rebuilt"
+"$ROOT/build/apexasm" "$inline_branch_rom" "$ROOT/tests/inline_branch.asm"
+"$ROOT/build/apexdis" "$inline_branch_rom" "$inline_branch_asm" "$ROOT/tests/inline_branch.ini"
+"$ROOT/build/apexasm" "$inline_branch_rebuilt" "$inline_branch_asm"
+# JSR to Helper consumes the inline byte; the BCC to the same Helper must not,
+# so the NOP after the branch decodes as code (no INLINE_BYTE after BCC).
+if cmp -s "$inline_branch_rom" "$inline_branch_rebuilt" &&
+    grep -q '^        INLINE_BYTE 0x42 ; for JSR Helper$' "$inline_branch_asm" &&
+    grep -q '^    NOP$' "$inline_branch_asm" &&
+    ! grep -q 'for BCC' "$inline_branch_asm"; then
+    printf 'PASS inline_branch.asm\n'
+else
+    printf 'FAIL inline_branch.asm\n' >&2
+    if ! cmp -s "$inline_branch_rom" "$inline_branch_rebuilt"; then
+        report_mismatch "$inline_branch_rom" "$inline_branch_rebuilt"
+    fi
+    exit 1
+fi
+
+# ---- paged-bank operand resolves only against its own bank ----
+xbank_imm_rom="$OUT/cross_bank_imm.rom"
+xbank_imm_asm="$OUT/cross_bank_imm.disasm"
+"$ROOT/build/apexasm" "$xbank_imm_rom" "$ROOT/tests/cross_bank_imm.asm"
+"$ROOT/build/apexdis" "$xbank_imm_rom" "$xbank_imm_asm" "$ROOT/tests/cross_bank_imm.ini"
+# The LDX #0x5123 in bank 0x20 must stay a literal, not borrow bank 0x21's label.
+if grep -q '^    LDX #0x5123$' "$xbank_imm_asm" &&
+    ! grep -q 'LDX #TargetInBankB' "$xbank_imm_asm"; then
+    printf 'PASS cross_bank_imm.asm\n'
+else
+    printf 'FAIL cross_bank_imm.asm\n' >&2
+    exit 1
+fi
+
+# ---- [literals]: a marked immediate renders raw instead of resolving to a label ----
+# Reuse the cross-bank ROM. Place a same-bank label at 0x5123 so LDX #0x5123 would
+# normally resolve to it, then verify [literals] suppresses that resolution.
+lit_off_ini="$OUT/literal_off.ini"
+lit_on_ini="$OUT/literal_on.ini"
+lit_off_asm="$OUT/literal_off.disasm"
+lit_on_asm="$OUT/literal_on.disasm"
+cat >"$lit_off_ini" <<'EOF'
+[labels]
+B20_A4001 = Entry
+B20_A5123 = SameBankTgt
+[entries]
+B20_A4001 = code
+EOF
+cat >"$lit_on_ini" <<'EOF'
+[labels]
+B20_A4001 = Entry
+B20_A5123 = SameBankTgt
+[entries]
+B20_A4001 = code
+[literals]
+B20_A4001 = literal
+EOF
+"$ROOT/build/apexdis" "$xbank_imm_rom" "$lit_off_asm" "$lit_off_ini"
+"$ROOT/build/apexdis" "$xbank_imm_rom" "$lit_on_asm" "$lit_on_ini"
+if grep -q '^    LDX #SameBankTgt$' "$lit_off_asm" &&
+    grep -q '^    LDX #0x5123$' "$lit_on_asm" &&
+    ! grep -q 'LDX #SameBankTgt' "$lit_on_asm"; then
+    printf 'PASS literals operand suppression\n'
+else
+    printf 'FAIL literals operand suppression\n' >&2
+    exit 1
+fi
+# apexini must parse, count and round-trip [literals].
+lit_norm_ini="$OUT/literal_norm.ini"
+"$ROOT/build/apexini" merge "$lit_norm_ini" "$lit_on_ini" >/dev/null
+if grep -q '^\[literals\]$' "$lit_norm_ini" &&
+    grep -q '^B20_A4001 = literal$' "$lit_norm_ini"; then
+    printf 'PASS literals config roundtrip\n'
+else
+    printf 'FAIL literals config roundtrip\n' >&2
+    exit 1
+fi
+
 # ---- RAM/ASIC docs render at their symbol equate or in a no-symbol block ----
 ram_docs_ini="$OUT/ram_docs.ini"
 ram_docs_asm="$OUT/ram_docs.disasm"
