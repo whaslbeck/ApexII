@@ -339,13 +339,49 @@ static void add_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, u
     labels->count++;
 }
 
-static void add_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
+static const struct { const char *name; FarImmType type; } k_far_imm_types[] = {
+    { "far_data",          FAR_IMM_DATA },
+    { "far_code",          FAR_IMM_CODE },
+    { "far_table",         FAR_IMM_TABLE },
+    { "far_string",        FAR_IMM_STRING },
+    { "far_sprite",        FAR_IMM_SPRITE },
+    { "far_dmd_fullframe", FAR_IMM_DMD_FULLFRAME },
+};
+
+int far_imm_type_from_str(const char *s, FarImmType *out)
+{
+    size_t i;
+    for (i = 0; i < sizeof(k_far_imm_types) / sizeof(k_far_imm_types[0]); i++) {
+        if (strcmp(s, k_far_imm_types[i].name) == 0) {
+            *out = k_far_imm_types[i].type;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+const char *far_imm_type_name(FarImmType type)
+{
+    size_t i;
+    for (i = 0; i < sizeof(k_far_imm_types) / sizeof(k_far_imm_types[0]); i++) {
+        if (k_far_imm_types[i].type == type) {
+            return k_far_imm_types[i].name;
+        }
+    }
+    return "far_data";
+}
+
+static void add_config_entry_full(ConfigEntries *entries, int has_bank, uint8_t bank,
+                                  uint32_t addr, uint8_t value, uint8_t value2, uint32_t aux_addr)
 {
     size_t i;
 
     for (i = 0; i < entries->count; i++) {
         if (config_addr_matches(entries->items[i].has_bank, entries->items[i].bank,
                                 entries->items[i].addr, has_bank, bank, addr)) {
+            entries->items[i].value = value; /* update aux fields (e.g. far_imm) */
+            entries->items[i].value2 = value2;
+            entries->items[i].aux_addr = aux_addr;
             return;
         }
     }
@@ -362,7 +398,21 @@ static void add_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank,
     entries->items[entries->count].has_bank = has_bank;
     entries->items[entries->count].bank = bank;
     entries->items[entries->count].addr = addr;
+    entries->items[entries->count].value = value;
+    entries->items[entries->count].value2 = value2;
+    entries->items[entries->count].aux_addr = aux_addr;
     entries->count++;
+}
+
+static void add_config_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank,
+                                 uint32_t addr, uint8_t value)
+{
+    add_config_entry_full(entries, has_bank, bank, addr, value, 0, 0);
+}
+
+static void add_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
+{
+    add_config_entry_full(entries, has_bank, bank, addr, 0, 0, 0);
 }
 
 static int remove_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
@@ -1113,7 +1163,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
                  ConfigEntries *ref_exclusions, ConfigEntries *literals,
-                 ConfigEntries *ack_warnings)
+                 ConfigEntries *ack_warnings, ConfigEntries *far_imms)
 {
     FILE *f;
     /* Max length of a single config line (e.g. a one-line [types] enum list). */
@@ -1131,6 +1181,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_exclude_refs = 0;
     int in_literals = 0;
     int in_ack_warnings = 0;
+    int in_far_imm = 0;
     /* pending multi-line [types] entry: all enum values of one type are
        accumulated here before being parsed, so this bounds the total size of a
        single type's enum list (see CONFIG_MAX_TYPE_VALUES). */
@@ -1196,6 +1247,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_exclude_refs = strcmp(s + 1, "exclude_refs") == 0;
             in_literals = strcmp(s + 1, "literals") == 0;
             in_ack_warnings = strcmp(s + 1, "ack_warnings") == 0;
+            in_far_imm = strcmp(s + 1, "far_imm") == 0;
             continue;
         }
         eq = strchr(s, '=');
@@ -1210,7 +1262,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
 
             load_config(include_path, sigs, labels, entries, tables, schemas, docs,
                         symbols, data_ranges, options, types, ref_exclusions, literals,
-                        ack_warnings);
+                        ack_warnings, far_imms);
             free(value);
             free(include_path);
             continue;
@@ -1459,6 +1511,49 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_config_entry(ack_warnings, has_bank, bank, addr);
             }
             free(value);
+        } else if (in_far_imm) {
+            /* [far_imm]: the immediate operand of the instruction at <key> is an
+               address in another bank (a far pointer whose address and bank are
+               loaded by separate instructions).  Value grammar:
+                   [<type>] <target_bank> [<bank_load_instr>]
+               e.g. "far_code 0x38 B20_A4015". */
+            uint32_t addr;
+            uint8_t bank = 0;
+            int has_bank = 0;
+            uint32_t target_bank = 0;
+            uint32_t bank_load = 0;
+            FarImmType type = FAR_IMM_DATA;
+            char *key = s;
+            char *value = dup_config_value(eq + 1);
+            char *tok;
+
+            if (parse_bank_label_ref(key, &bank, &addr)) {
+                has_bank = 1;
+            } else if (!parse_u32(key, &addr)) {
+                die("invalid far_imm config '%s'", key);
+            }
+            tok = strtok(value, " \t");
+            if (tok && far_imm_type_from_str(tok, &type)) {
+                tok = strtok(NULL, " \t"); /* type consumed; bank is next */
+            }
+            if (!tok || !parse_u32(tok, &target_bank) || target_bank > 0xffu) {
+                die("invalid far_imm target bank for '%s'", key);
+            }
+            tok = strtok(NULL, " \t");
+            if (tok) {
+                uint8_t bl_bank;
+                uint32_t bl_addr;
+                if (parse_bank_label_ref(tok, &bl_bank, &bl_addr)) {
+                    bank_load = bl_addr;
+                } else if (!parse_u32(tok, &bank_load)) {
+                    die("invalid far_imm bank-load instruction for '%s'", key);
+                }
+            }
+            if (far_imms) {
+                add_config_entry_full(far_imms, has_bank, bank, addr, (uint8_t)target_bank,
+                                      (uint8_t)type, bank_load);
+            }
+            free(value);
         } else if (in_types) {
             char *key = s;
             char *colon = strchr(key, ':');
@@ -1510,6 +1605,20 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
 int config_set_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
 {
     add_config_entry(entries, has_bank, bank, addr);
+    return 0;
+}
+
+int config_set_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                         uint8_t value)
+{
+    add_config_entry_val(entries, has_bank, bank, addr, value);
+    return 0;
+}
+
+int config_set_far_imm(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                       uint8_t target_bank, uint8_t type, uint32_t bank_load_addr)
+{
+    add_config_entry_full(entries, has_bank, bank, addr, target_bank, type, bank_load_addr);
     return 0;
 }
 

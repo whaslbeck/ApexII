@@ -213,6 +213,27 @@ else
     exit 1
 fi
 
+# [far_imm]: a split far pointer (LDX #addr + LDB #bank) with the paired form
+# "far_code 0x38 B20_A4004".  The address load resolves to B38_A5123 (seeded as
+# code in bank 0x38) and the bank load renders #bank(B38_A5123); both reference
+# the same label and reassemble byte-identically.
+far_imm_rom="$OUT/far_imm.rom"
+far_imm_asm="$OUT/far_imm.disasm"
+far_imm_rebuilt="$OUT/far_imm.rebuilt"
+"$ROOT/build/apexasm" "$far_imm_rom" "$ROOT/tests/far_imm.asm"
+"$ROOT/build/apexdis" "$far_imm_rom" "$far_imm_asm" "$ROOT/tests/far_imm.ini"
+"$ROOT/build/apexasm" "$far_imm_rebuilt" "$far_imm_asm"
+if cmp -s "$far_imm_rom" "$far_imm_rebuilt" &&
+    grep -q '^    LDX #B38_A5123' "$far_imm_asm" &&
+    grep -q '^    LDB #bank(B38_A5123)' "$far_imm_asm" &&
+    grep -q '^B38_A5123:' "$far_imm_asm" &&
+    "$ROOT/build/apexini" check "$ROOT/tests/far_imm.ini" | grep -q 'far_imm=1'; then
+    printf 'PASS far_imm.asm\n'
+else
+    printf 'FAIL far_imm.asm\n' >&2
+    exit 1
+fi
+
 banked_inline_rom="$OUT/banked_inline.rom"
 banked_inline_asm="$OUT/banked_inline.disasm"
 banked_inline_explain="$OUT/banked_inline.explain.disasm"

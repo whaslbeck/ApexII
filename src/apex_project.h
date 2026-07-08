@@ -45,6 +45,7 @@ typedef struct ApexProject {
     ConfigEntries ref_exclusions;
     ConfigEntries literals; /* instruction addrs whose immediate is a literal, not an address */
     ConfigEntries ack_warnings; /* addrs whose disassembly warning was reviewed/accepted */
+    ConfigEntries far_imms;     /* LDX-style instrs: .value = bank the immediate targets */
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -106,6 +107,14 @@ int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t a
 int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr);
+int apex_project_set_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
+                             uint8_t target_bank, uint8_t type, uint32_t bank_load_addr);
+int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
+/* Returns 1 and sets *out_target_bank if the instruction at (bank,addr) is a far
+   immediate, else 0.  out_type / out_bank_load may be NULL. */
+int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32_t addr,
+                                uint8_t *out_target_bank, uint8_t *out_type,
+                                uint32_t *out_bank_load);
 int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
 int apex_project_clear_symbol(ApexProject *project, const char *name);
 

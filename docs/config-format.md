@@ -1,6 +1,6 @@
 # ApexII Config File Format
 
-Config files are INI-like text files passed to `apexdis` and `apeximgui`. They annotate a ROM with labels, entry points, table layouts, inline signatures, data ranges, and documentation.
+Config files are INI-like text files passed to `apexdis` and `apeximgui`. They annotate a ROM with labels, entry points, table layouts, inline signatures, data ranges, and documentation, plus analysis hints — literal immediates, split far-pointer resolution, suppressed references, and acknowledged warnings.
 
 ## General Syntax
 
@@ -106,6 +106,41 @@ Bff_A8123 = literal
 The key is the address of the instruction itself (not the operand value), so the same constant can still resolve to a label elsewhere. The value on the right-hand side is ignored; `literal` is conventional. Bank-qualified and bare-address forms are both accepted.
 
 Unlike [`[exclude_refs]`](#exclude_refs) — which is keyed by the *target* address and suppresses every reference to it — `[literals]` is keyed by the *instruction* and only affects that one operand. In the GUI, right-click a code instruction with an immediate operand and choose **Mark immediate as literal** (or **Clear literal**).
+
+### `[ack_warnings]`
+
+Marks a disassembly warning as reviewed and accepted. The disassembler emits `; WARNING …` notes for suspect situations (invalid inline far-code targets, truncated inline data, classification conflicts, sprite decode failures). Once you have inspected one and decided it is expected, list its address here to acknowledge it.
+
+```ini
+[ack_warnings]
+B38_A4ea3 = ack
+0x999b    = ack
+```
+
+The key is the address the warning is reported at (its `cpu=` field). An acknowledged warning is rendered as `; WARNING_ACK …` instead of `; WARNING …`: it no longer counts as an active warning, loses any conflict highlight, and is not printed to the console. The right-hand value is ignored; `ack` is conventional.
+
+In the GUI the **Warnings** panel lists every warning; click **Ack** on a row to accept it (it turns green and disappears from the disassembly) or **Un-ack** to restore it.
+
+### `[far_imm]`
+
+Resolves a split far-pointer load symbolically. WPC code often loads a far pointer with two separate instructions — the 16-bit address in one (`LDX #0x5123`) and the bank in another (`LDB #0x38`) — so neither operand alone carries both halves, and the address would otherwise render as a raw number (a paged immediate only resolves within its own bank). Listing the **address-loading instruction** here resolves its operand to a label in the target bank:
+
+```ini
+[far_imm]
+B20_A4010 = 0x38                        ; bank only (target treated as data)
+B20_A4010 = far_code 0x38               ; with a target type
+B20_A4010 = far_code 0x38 B20_A4015     ; + the paired bank-load instruction
+```
+
+The key is the address-loading instruction. The value is `[<type>] <target_bank> [<bank_load_instr>]`:
+
+- `<target_bank>` — the bank the immediate addresses (`0x00`–`0xff`, or `0xff`/system).
+- `<type>` (optional, default `far_data`) — how the far target is seeded: `far_code` (disassembled as a routine), `far_data`, `far_table`, `far_string`, `far_sprite`, `far_dmd_fullframe`.
+- `<bank_load_instr>` (optional) — the address of the instruction that loads the *bank* byte (`LDA`/`LDB #imm8`). When given, that instruction renders as `#bank(<far label>)`, tying both instructions to the same label so a rename updates both.
+
+The address load then renders `LDX #B38_A5123` and the bank load `LDB #bank(B38_A5123)`; a label of the chosen type is seeded at the far target (named, navigable, cross-referenced), and both reassemble to the original bytes.
+
+In the GUI, right-click the address-loading instruction and choose **Resolve immediate as far pointer**: pick the target type, confirm the bank (pre-filled from the following `LDA`/`LDB #imm8`, which is also captured as the paired bank load), and apply. **Clear far pointer** reverts it.
 
 ### `[inline]`
 
@@ -220,11 +255,14 @@ Classifies ranges as data, preventing the disassembler from treating them as cod
 [data]
 Bff_A8002 = bytes[3]
 B3b_A415c = string
+B3b_A4200 = string[8]
+B20_A4400 = sprite
 B20_A400b = far_code
 B20_A4010 = far_string
 B20_A4013 = far_data
 B20_A4016 = far_table
 B20_A4019 = dmd_fullframe
+B20_A401c = ptr16_string
 ```
 
 A bank-qualified address key is required (system addresses must use the `Bff_` prefix or the numeric form `0x8xxx`).
@@ -235,11 +273,20 @@ Supported data kinds:
 |---|---|
 | `bytes[N]` | Raw bytes, length N |
 | `string` | Null-terminated ASCII string |
+| `string[N]` | Fixed-length ASCII string, exactly N bytes (no terminator) |
 | `dmd_fullframe` | DMD full-frame bitmap |
+| `sprite` | Sprite image (self-describing header) |
+| `sprite_noheader[N]` | Headerless sprite, height N pixels (width byte read from ROM) |
+| `ptr16_string` | 16-bit (same-bank) pointer to a string |
+| `ptr16_data` | 16-bit pointer to data |
+| `ptr16_code` | 16-bit pointer to code |
+| `ptr16_table` | 16-bit pointer to a table |
+| `ptr16_sprite` | 16-bit pointer to a sprite |
 | `far_string` | 3-byte far pointer to a string |
 | `far_data` | 3-byte far pointer to data |
 | `far_table` | 3-byte far pointer to a table |
 | `far_code` | 3-byte far pointer to code |
+| `far_sprite` | 3-byte far pointer to a sprite |
 | `far_dmd_fullframe` | 3-byte far pointer to a DMD frame |
 
 ### `[symbols]`
@@ -344,11 +391,13 @@ Used in `[inline]`, `[schemas]`, and `[tables]` row definitions.
 | `ptr16_data` | 2 | 16-bit pointer to data |
 | `ptr16_code` | 2 | 16-bit pointer to code |
 | `ptr16_table` | 2 | 16-bit pointer to a table |
+| `ptr16_sprite` | 2 | 16-bit pointer to a sprite |
 | `ptr16_dmd_fullframe` | 2 | 16-bit pointer to a DMD frame |
 | `far_string` | 3 | Far pointer (`addr_hi, addr_lo, bank`) to a string |
 | `far_data` | 3 | Far pointer to data |
 | `far_table` | 3 | Far pointer to a table |
 | `far_code` | 3 | Far pointer to code |
+| `far_sprite` | 3 | Far pointer to a sprite |
 | `far_dmd_fullframe` | 3 | Far pointer to a DMD frame |
 | `TypeName` | 1 or 2 | Named type from `[types]`; inherits its base kind |
 
@@ -365,8 +414,20 @@ The config loader aborts with an error for:
 - An `[entries]` address that also appears in `[tables]` at the same location.
 - Invalid syntax in any section.
 
-Truncated or structurally invalid inline payloads (payload extends beyond the known ROM content) are reported to `stderr` and emitted as a warning comment in the disassembly:
+## Warnings
+
+Beyond hard errors, the disassembler flags suspect-but-recoverable situations with a `; WARNING <type> …` comment on its own line (and, for the CLI, a matching `stderr` line). Each carries the `bank=`/`cpu=`/`rom=` location it applies to:
 
 ```asm
-; WARNING: inline payload truncated for JSR Panic (expected 3 bytes, got 1)
+; WARNING inline_far_code_invalid bank=0x38 cpu=0x4ea3 rom=0x060ea3 target=0x4001 target_bank=0x18 for JSR FarCall
 ```
+
+| Type | Meaning |
+|---|---|
+| `inline_truncated` | An `[inline]` payload extends past the end of known ROM content. |
+| `inline_far_code_invalid` | An inline far-code pointer targets a bank that is not a real ROM bank. |
+| `classification_conflict` | An address is reachable as both code and data. |
+| `sprite_invalid` | A range classified as `sprite` failed to decode. |
+| `sprite_noheader_invalid` | A `sprite_noheader` range failed to decode. |
+
+Acknowledge a warning you have reviewed with [`[ack_warnings]`](#ack_warnings): it is then emitted as `; WARNING_ACK …` and no longer counts as active or prints to the console.

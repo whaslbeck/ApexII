@@ -17,7 +17,7 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                LabelSet *bank_labels, LabelSet *system_labels,
                                const DataRanges *data_ranges, ReferenceSet *refs,
                                const ConfigEntries *ref_exclusions,
-                               const ConfigEntries *literals);
+                               const ConfigEntries *literals, const ConfigEntries *far_imms);
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
                               size_t banks, LabelSet *bank_labels,
                               const ConfigOptions *options);
@@ -292,6 +292,46 @@ static void inject_sprite_pointer_data_ranges(ApexProject *project)
             uint16_t a = (uint16_t)(((uint16_t)data[0] << 8) | data[1]);
             uint8_t fb = data[2];
             inject_one_sprite(project, fb, a, (unsigned)dr.length);
+        }
+    }
+}
+
+/* For a [far_imm] whose target is a string/sprite/DMD frame, decode the
+   address-loading instruction to find the target address and seed the matching
+   data range in the target bank so it renders as that type (code/data targets
+   need no range — they become code/data labels during collect_code_targets). */
+static void inject_far_imm_data_ranges(ApexProject *project)
+{
+    size_t i;
+
+    for (i = 0; i < project->far_imms.count; i++) {
+        const ConfigEntry *e = &project->far_imms.items[i];
+        const uint8_t *rb;
+        size_t rl;
+        char inst[8];
+        Cpu6809InstrInfo li;
+        uint8_t lb, tbank;
+        uint16_t taddr;
+        DataKind kind;
+
+        switch ((FarImmType)e->value2) {
+        case FAR_IMM_STRING:        kind = DATA_STRING; break;
+        case FAR_IMM_SPRITE:        kind = DATA_SPRITE; break;
+        case FAR_IMM_DMD_FULLFRAME: kind = DATA_DMD_FULLFRAME; break;
+        default:                    continue;
+        }
+        lb = e->has_bank ? e->bank : 0xffu;
+        if (!sprite_locate(project, lb, (uint16_t)e->addr, &rb, &rl)) {
+            continue;
+        }
+        li = cpu6809_disassemble_info(rb, rl, e->addr, inst, sizeof(inst));
+        if (li.size == 0 || !li.has_addr_ref) {
+            continue;
+        }
+        taddr = (uint16_t)li.addr_ref;
+        tbank = e->value;
+        if (!data_range_at(tbank, taddr, &project->data_ranges)) {
+            add_data_range(&project->data_ranges, tbank, taddr, kind, 0);
         }
     }
 }
@@ -1176,6 +1216,7 @@ typedef struct {
     ConfigEntries    ref_exclusions;
     ConfigEntries    literals;
     ConfigEntries    ack_warnings;
+    ConfigEntries    far_imms;
     ConfigOptions    options;
     char             action[24];
 } ApexConfigSnapshot;
@@ -1413,6 +1454,7 @@ static void snapshot_capture(const ApexProject *p, const char *action, ApexConfi
     out->ref_exclusions = copy_config_entries(&p->ref_exclusions);
     out->literals       = copy_config_entries(&p->literals);
     out->ack_warnings   = copy_config_entries(&p->ack_warnings);
+    out->far_imms       = copy_config_entries(&p->far_imms);
     out->options        = p->options;
     snprintf(out->action, sizeof(out->action), "%s", action ? action : "edit");
 }
@@ -1431,6 +1473,7 @@ static void snapshot_free(ApexConfigSnapshot *s)
     free_config_entries(&s->ref_exclusions);
     free_config_entries(&s->literals);
     free_config_entries(&s->ack_warnings);
+    free_config_entries(&s->far_imms);
     memset(s, 0, sizeof(*s));
 }
 
@@ -1451,6 +1494,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     free_config_entries(&p->ref_exclusions);
     free_config_entries(&p->literals);
     free_config_entries(&p->ack_warnings);
+    free_config_entries(&p->far_imms);
 
     p->inline_sigs    = s->inline_sigs;
     p->config_labels  = s->config_labels;
@@ -1464,6 +1508,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     p->ref_exclusions = s->ref_exclusions;
     p->literals       = s->literals;
     p->ack_warnings   = s->ack_warnings;
+    p->far_imms       = s->far_imms;
     p->options        = s->options;
     memset(s, 0, sizeof(*s));
 }
@@ -1627,7 +1672,8 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
                 &project->config_entries, &project->tables, &project->schemas,
                 &project->docs, &project->symbols,
                 &project->data_ranges, &project->options, &project->config_types,
-                &project->ref_exclusions, &project->literals, &project->ack_warnings);
+                &project->ref_exclusions, &project->literals, &project->ack_warnings,
+                &project->far_imms);
     validate_config_classification(&project->config_entries, &project->tables,
                                    &project->data_ranges);
 
@@ -1672,6 +1718,7 @@ void apex_project_free(ApexProject *project)
     free_config_entries(&project->ref_exclusions);
     free_config_entries(&project->literals);
     free_config_entries(&project->ack_warnings);
+    free_config_entries(&project->far_imms);
     free_table_defs(&project->tables);
     free_schema_defs(&project->schemas);
     free_config_docs(&project->docs);
@@ -1758,6 +1805,7 @@ static void analyze_system_region(ApexProject *project)
     inject_dmd_table_data_ranges(project);
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
+    inject_far_imm_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
     /* Replay snapshotted code entry points unless reclassified as data. */
     {
@@ -1783,7 +1831,7 @@ static void analyze_system_region(ApexProject *project)
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, project->banks, project->bank_labels,
                          &project->system_labels, &project->data_ranges, 0xffu, &project->refs,
-                         &project->ref_exclusions, &project->literals);
+                         &project->ref_exclusions, &project->literals, &project->far_imms);
     apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
                                 last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
                                 APEX_SYSTEM_ORG);
@@ -1866,6 +1914,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     inject_dmd_table_data_ranges(project);
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
+    inject_far_imm_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
 
     /* Replay the snapshotted code entry points (see above) as code seeds, unless
@@ -1896,7 +1945,8 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
         collect_code_targets(bank, used, APEX_PAGED_ORG, &project->bank_labels[bank_index],
                              &project->inline_sigs, project->rom.data, project->banks,
                              project->bank_labels, &project->system_labels, &project->data_ranges,
-                             bank_id, &project->refs, &project->ref_exclusions, &project->literals);
+                             bank_id, &project->refs, &project->ref_exclusions,
+                             &project->literals, &project->far_imms);
     }
     apply_string_content_labels(&project->bank_labels[bank_index], bank, used, APEX_PAGED_ORG);
     sort_label_set(&project->bank_labels[bank_index]);
@@ -1951,16 +2001,17 @@ static void analyze_full_project(ApexProject *project)
     inject_dmd_table_data_ranges(project);
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
+    inject_far_imm_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
     collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                          APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
                          &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions,
-                         &project->literals);
+                         &project->literals, &project->far_imms);
     collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
                               project->bank_labels, &project->system_labels,
                               &project->data_ranges, &project->refs, &project->ref_exclusions,
-                              &project->literals);
+                              &project->literals, &project->far_imms);
     {
         size_t prev_count, prev_code;
         do {
@@ -1974,7 +2025,8 @@ static void analyze_full_project(ApexProject *project)
                                  APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                                  project->rom.data, banks, project->bank_labels,
                                  &project->system_labels, &project->data_ranges, 0xff,
-                                 &project->refs, &project->ref_exclusions, &project->literals);
+                                 &project->refs, &project->ref_exclusions, &project->literals,
+                                 &project->far_imms);
             {
                 size_t j2, curr_code = 0;
                 for (j2 = 0; j2 < project->system_labels.count; j2++) {
@@ -2624,6 +2676,58 @@ int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr)
     for (i = 0; i < project->ack_warnings.count; i++) {
         const ConfigEntry *e = &project->ack_warnings.items[i];
         if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* A far-immediate hint makes an LDX-style operand resolve to a label in another
+   bank, which seeds that label + an incoming ref there, so a full re-analysis is
+   required (mirrors the literals annotation). */
+int apex_project_set_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
+                             uint8_t target_bank, uint8_t type, uint32_t bank_load_addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "set far immediate");
+    config_set_far_imm(&project->far_imms, has_bank, bank, addr, target_bank, type,
+                       bank_load_addr);
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "clear far immediate");
+    if (config_clear_entry(&project->far_imms, has_bank, bank, addr) != 0) {
+        return 1;
+    }
+    project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
+    return 0;
+}
+
+int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32_t addr,
+                                uint8_t *out_target_bank, uint8_t *out_type,
+                                uint32_t *out_bank_load)
+{
+    size_t i;
+
+    if (!project) {
+        return 0;
+    }
+    for (i = 0; i < project->far_imms.count; i++) {
+        const ConfigEntry *e = &project->far_imms.items[i];
+        if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
+            if (out_target_bank) *out_target_bank = e->value;
+            if (out_type)        *out_type = e->value2;
+            if (out_bank_load)   *out_bank_load = e->aux_addr;
             return 1;
         }
     }

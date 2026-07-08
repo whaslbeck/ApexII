@@ -356,6 +356,37 @@ static int parse_value_or_symbol(const AsmState *st, const char *text, uint32_t 
     if (parse_u32(text, value)) {
         return 1;
     }
+    /* bank(LABEL): the bank byte of a far label (address in LDX, bank here). */
+    if (strncmp(text, "bank(", 5) == 0) {
+        const char *inner = text + 5;
+        const char *close = strrchr(inner, ')');
+        char name[128];
+        size_t n;
+        if (!close || close[1] != '\0') {
+            return 0;
+        }
+        n = (size_t)(close - inner);
+        if (n == 0 || n >= sizeof(name)) {
+            return 0;
+        }
+        memcpy(name, inner, n);
+        name[n] = '\0';
+        {
+            char *nm = trim(name);
+            uint32_t sa, sb;
+            if (strlen(nm) == 9 && nm[0] == 'B' && nm[3] == '_' && nm[4] == 'A') {
+                char bt[5] = { '0', 'x', nm[1], nm[2], '\0' };
+                if (parse_u32(bt, value)) {
+                    return 1;
+                }
+            }
+            if (lookup_symbol_far_bank(st, nm, &sa, &sb)) {
+                *value = sb;
+                return 1;
+            }
+        }
+        return 0;
+    }
     if (snprintf(expr, sizeof(expr), "%s", text) < (int)sizeof(expr)) {
         op = find_unquoted_char(expr, '+');
         if (!op) {

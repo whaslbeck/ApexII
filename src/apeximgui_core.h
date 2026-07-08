@@ -398,6 +398,12 @@ struct SnapshotEntry {
     int has_bank;
     uint8_t bank;
     uint32_t addr;
+    uint8_t value;      /* aux byte (far_imm target bank); 0 for valueless sections */
+    uint8_t value2;     /* far_imm: FarImmType */
+    uint32_t aux_addr;  /* far_imm: paired bank-load instruction address */
+    SnapshotEntry() : has_bank(0), bank(0), addr(0), value(0), value2(0), aux_addr(0) {}
+    SnapshotEntry(int hb, uint8_t b, uint32_t a, uint8_t v = 0, uint8_t v2 = 0, uint32_t ax = 0)
+        : has_bank(hb), bank(b), addr(a), value(v), value2(v2), aux_addr(ax) {}
 };
 
 struct SnapshotData {
@@ -448,6 +454,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotEntry> ref_exclusions;
     std::vector<SnapshotEntry> literals;
     std::vector<SnapshotEntry> ack_warnings;
+    std::vector<SnapshotEntry> far_imms;
     std::vector<SnapshotData> data;
     std::vector<SnapshotTable> tables;
     std::vector<SnapshotDoc> docs;

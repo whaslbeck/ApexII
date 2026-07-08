@@ -105,10 +105,23 @@ typedef struct {
     size_t cap;
 } ConfigLabels;
 
+/* Target kind of a [far_imm] far pointer (how the pointed-to bytes are seeded). */
+typedef enum {
+    FAR_IMM_DATA = 0,   /* plain data label (default) */
+    FAR_IMM_CODE,       /* code entry — disassembled as a routine */
+    FAR_IMM_TABLE,      /* data label (user classifies the table) */
+    FAR_IMM_STRING,     /* null-terminated string */
+    FAR_IMM_SPRITE,     /* sprite image */
+    FAR_IMM_DMD_FULLFRAME
+} FarImmType;
+
 typedef struct {
     int has_bank;
     uint8_t bank;
     uint32_t addr;
+    uint8_t value;   /* auxiliary byte; used by [far_imm] as the target bank, else 0 */
+    uint8_t value2;  /* [far_imm]: FarImmType of the target */
+    uint32_t aux_addr; /* [far_imm]: cpu addr of the paired bank-load instr, 0 = none */
 } ConfigEntry;
 
 typedef struct {
@@ -200,7 +213,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
                  ConfigEntries *ref_exclusions, ConfigEntries *literals,
-                 ConfigEntries *ack_warnings);
+                 ConfigEntries *ack_warnings, ConfigEntries *far_imms);
 void free_config_types(ConfigTypes *types);
 const ConfigType *find_config_type(const ConfigTypes *types, const char *name);
 const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value);
@@ -208,6 +221,12 @@ void config_set_type(ConfigTypes *types, const char *name, TableFieldKind kind,
                      const char *values_str);
 int config_remove_type(ConfigTypes *types, const char *name);
 int config_set_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr);
+int config_set_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                         uint8_t value);
+int config_set_far_imm(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                       uint8_t target_bank, uint8_t type, uint32_t bank_load_addr);
+int far_imm_type_from_str(const char *s, FarImmType *out);
+const char *far_imm_type_name(FarImmType type);
 int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr);
 int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
                            const char *spec, const ConfigTypes *types);

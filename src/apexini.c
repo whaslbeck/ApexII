@@ -47,6 +47,7 @@ typedef struct {
     ConfigEntries    ref_exclusions;
     ConfigEntries    literals;
     ConfigEntries    ack_warnings;
+    ConfigEntries    far_imm;
 } Cfg;
 
 static int cfg_load(Cfg *c, const char *path)
@@ -59,7 +60,7 @@ static int cfg_load(Cfg *c, const char *path)
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
                     &c->schemas, &c->docs, &c->syms, &c->data,
                     &c->opts, &c->types, &c->ref_exclusions, &c->literals,
-                    &c->ack_warnings);
+                    &c->ack_warnings, &c->far_imm);
     }
     s_catching = 0;
     return failed;
@@ -101,6 +102,7 @@ static void cfg_free(Cfg *c)
     free(c->ref_exclusions.items);
     free(c->literals.items);
     free(c->ack_warnings.items);
+    free(c->far_imm.items);
     free_config_types(&c->types);
     memset(c, 0, sizeof(*c));
 }
@@ -339,6 +341,9 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
     if (c->ack_warnings.count)
         qsort(c->ack_warnings.items, c->ack_warnings.count,
               sizeof(c->ack_warnings.items[0]), cmp_entry);
+    if (c->far_imm.count)
+        qsort(c->far_imm.items, c->far_imm.count,
+              sizeof(c->far_imm.items[0]), cmp_entry);
 
     if (c->opts.labels_are_entries)
         fputs("[options]\nlabels_are_entries = true\n", f);
@@ -467,6 +472,20 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
             fputs(" = ack\n", f);
         }
     }
+
+    if (c->far_imm.count) {
+        fputs("\n[far_imm]\n", f);
+        for (i = 0; i < c->far_imm.count; i++) {
+            const ConfigEntry *e = &c->far_imm.items[i];
+            addr_fn(f, e->has_bank, e->bank, e->addr);
+            fprintf(f, " = %s 0x%02x", far_imm_type_name((FarImmType)e->value2), e->value);
+            if (e->aux_addr) {
+                fprintf(f, " B%02x_A%04x", (unsigned)(e->has_bank ? e->bank : 0xffu),
+                        (unsigned)e->aux_addr);
+            }
+            fputc('\n', f);
+        }
+    }
 }
 
 static void write_cfg(FILE *f, Cfg *c)
@@ -492,10 +511,10 @@ static int cmd_check(int argc, char **argv)
             fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
             any_err = 1;
         } else {
-            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu  literals=%zu  ack_warnings=%zu\n",
+            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu  literals=%zu  ack_warnings=%zu  far_imm=%zu\n",
                    argv[i], c.labels.count, c.entries.count, c.sigs.count,
                    c.data.count, c.tables.count, c.types.count, c.ref_exclusions.count,
-                   c.literals.count, c.ack_warnings.count);
+                   c.literals.count, c.ack_warnings.count, c.far_imm.count);
         }
         cfg_free(&c);
     }
@@ -803,6 +822,8 @@ static int cmd_normalize(int argc, char **argv)
         if (!c.literals.items[i].has_bank) { c.literals.items[i].has_bank = 1; c.literals.items[i].bank = 0xff; }
     for (i = 0; i < c.ack_warnings.count; i++)
         if (!c.ack_warnings.items[i].has_bank) { c.ack_warnings.items[i].has_bank = 1; c.ack_warnings.items[i].bank = 0xff; }
+    for (i = 0; i < c.far_imm.count; i++)
+        if (!c.far_imm.items[i].has_bank) { c.far_imm.items[i].has_bank = 1; c.far_imm.items[i].bank = 0xff; }
 
     outpath = (argc >= 2) ? argv[1] : argv[0];
     out = fopen(outpath, "w");
@@ -1356,6 +1377,12 @@ static int cmd_check_bounds(int argc, char **argv)
     for (i = 0; i < p->ack_warnings.count; i++) {
         const ConfigEntry *e = &p->ack_warnings.items[i];
         check_one_addr(p, e->has_bank, e->bank, e->addr, "ack_warnings", &issues);
+    }
+
+    /* Far immediates */
+    for (i = 0; i < p->far_imms.count; i++) {
+        const ConfigEntry *e = &p->far_imms.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "far_imm", &issues);
     }
 
     if (issues == 0)

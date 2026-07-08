@@ -2375,6 +2375,14 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                                   p->ack_warnings.items[i].bank,
                                   p->ack_warnings.items[i].addr});
     }
+    for (size_t i = 0; i < p->far_imms.count; i++) {
+        s.far_imms.push_back({p->far_imms.items[i].has_bank,
+                              p->far_imms.items[i].bank,
+                              p->far_imms.items[i].addr,
+                              p->far_imms.items[i].value,
+                              p->far_imms.items[i].value2,
+                              p->far_imms.items[i].aux_addr});
+    }
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
         SnapshotType st;
@@ -2411,9 +2419,10 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigEntries ref_exclusions = {};
     ConfigEntries literals = {};
     ConfigEntries ack_warnings = {};
+    ConfigEntries far_imms = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
                 &docs, &symbols, &data_ranges, &options, &types,
-                &ref_exclusions, &literals, &ack_warnings);
+                &ref_exclusions, &literals, &ack_warnings, &far_imms);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
                             labels.items[i].bank,
@@ -2462,6 +2471,14 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
                                   ack_warnings.items[i].bank,
                                   ack_warnings.items[i].addr});
     }
+    for (size_t i = 0; i < far_imms.count; i++) {
+        s.far_imms.push_back({far_imms.items[i].has_bank,
+                              far_imms.items[i].bank,
+                              far_imms.items[i].addr,
+                              far_imms.items[i].value,
+                              far_imms.items[i].value2,
+                              far_imms.items[i].aux_addr});
+    }
     for (size_t i = 0; i < types.count; i++) {
         const ConfigType *ct = &types.items[i];
         SnapshotType stype;
@@ -2475,6 +2492,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     free(ref_exclusions.items);
     free(literals.items);
     free(ack_warnings.items);
+    free(far_imms.items);
     free_config_types(&types);
     return s;
 }
@@ -2487,6 +2505,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotEntry> cexcl;
     std::vector<SnapshotEntry> clits;
     std::vector<SnapshotEntry> cacks;
+    std::vector<SnapshotEntry> cfar;
     std::vector<SnapshotData> cd;
     std::vector<SnapshotTable> ct;
     std::vector<SnapshotDoc> cdocs;
@@ -2676,6 +2695,49 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new/changed far immediates; a removed one (or a changed target
+       bank counts as removed+added) falls back to a full snapshot on deletion */
+    for (auto &o : s->far_imms) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->far_imms.count; j++) {
+            if (p->far_imms.items[j].has_bank == o.has_bank &&
+                p->far_imms.items[j].bank == o.bank &&
+                p->far_imms.items[j].addr == o.addr &&
+                p->far_imms.items[j].value == o.value &&
+                p->far_imms.items[j].value2 == o.value2 &&
+                p->far_imms.items[j].aux_addr == o.aux_addr) {
+                still_there = true;
+                break;
+            }
+        }
+        if (!still_there) {
+            *st = "deletion needs full snapshot";
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < p->far_imms.count; i++) {
+        bool found = false;
+        for (auto &o : s->far_imms) {
+            if (o.has_bank == p->far_imms.items[i].has_bank &&
+                o.bank == p->far_imms.items[i].bank &&
+                o.addr == p->far_imms.items[i].addr &&
+                o.value == p->far_imms.items[i].value &&
+                o.value2 == p->far_imms.items[i].value2 &&
+                o.aux_addr == p->far_imms.items[i].aux_addr) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cfar.push_back({p->far_imms.items[i].has_bank,
+                            p->far_imms.items[i].bank,
+                            p->far_imms.items[i].addr,
+                            p->far_imms.items[i].value,
+                            p->far_imms.items[i].value2,
+                            p->far_imms.items[i].aux_addr});
+        }
+    }
+
     /* collect new or changed types */
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
@@ -2791,6 +2853,17 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         for (auto &i : cacks) {
             write_config_address(o, i.has_bank, i.bank, i.addr);
             fputs(" = ack\n", o);
+        }
+    }
+    if (!cfar.empty()) {
+        fputs("\n[far_imm]\n", o);
+        for (auto &i : cfar) {
+            write_config_address(o, i.has_bank, i.bank, i.addr);
+            fprintf(o, " = %s 0x%02x", far_imm_type_name((FarImmType)i.value2), i.value);
+            if (i.aux_addr)
+                fprintf(o, " B%02x_A%04x", (unsigned)(i.has_bank ? i.bank : 0xffu),
+                        (unsigned)i.aux_addr);
+            fputc('\n', o);
         }
     }
     if (!ci.empty()) {
@@ -2917,6 +2990,18 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
                                  p->ack_warnings.items[i].bank,
                                  p->ack_warnings.items[i].addr);
             fputs(" = ack\n", o);
+        }
+    }
+    if (p->far_imms.count > 0) {
+        fputs("\n[far_imm]\n", o);
+        for (size_t i = 0; i < p->far_imms.count; i++) {
+            const ConfigEntry *e = &p->far_imms.items[i];
+            write_config_address(o, e->has_bank, e->bank, e->addr);
+            fprintf(o, " = %s 0x%02x", far_imm_type_name((FarImmType)e->value2), e->value);
+            if (e->aux_addr)
+                fprintf(o, " B%02x_A%04x", (unsigned)(e->has_bank ? e->bank : 0xffu),
+                        (unsigned)e->aux_addr);
+            fputc('\n', o);
         }
     }
     if (p->inline_sigs.count > 0) {

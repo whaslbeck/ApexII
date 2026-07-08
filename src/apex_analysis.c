@@ -928,6 +928,28 @@ static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t a
     return 0;
 }
 
+/* If the instruction at (bank, addr) is a [far_imm], returns 1 and sets
+   *out_target to the bank its immediate operand addresses and *out_type to the
+   target's FarImmType. */
+static int far_imm_target_bank(const ConfigEntries *far_imms, uint8_t bank, uint32_t addr,
+                               uint8_t *out_target, uint8_t *out_type)
+{
+    size_t i;
+
+    if (!far_imms) {
+        return 0;
+    }
+    for (i = 0; i < far_imms->count; i++) {
+        if (far_imms->items[i].addr == addr &&
+            (!far_imms->items[i].has_bank || far_imms->items[i].bank == bank)) {
+            *out_target = far_imms->items[i].value;
+            *out_type   = far_imms->items[i].value2;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 /* Work-list convergence loop: scans from every code label until flow stops (JMP/BRA/RTS/RTI),
    adding new branch/call targets to the label set for the next pass.  Continues until no
    unscanned code labels remain.  Known limitation: indirect jumps (JMP ,X / JMP [addr]) have
@@ -938,7 +960,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
                           ReferenceSet *refs, const ConfigEntries *ref_exclusions,
-                          const ConfigEntries *literals)
+                          const ConfigEntries *literals, const ConfigEntries *far_imms)
 {
     size_t i = 0;
 
@@ -1029,7 +1051,32 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             if (info.has_addr_ref && !info.has_target &&
                 !addr_ref_excluded(literals, current_bank, instr_addr)) {
-                if (info.addr_ref >= base_addr && info.addr_ref < base_addr + used) {
+                uint8_t tb, ttype;
+                if (far_imm_target_bank(far_imms, current_bank, instr_addr, &tb, &ttype)) {
+                    /* Far immediate: the operand addresses bank tb, not the current
+                       bank.  Seed a label there so it resolves symbolically (as code
+                       for far_code, else a data label), and record the incoming
+                       reference against that bank. */
+                    int tcode = (ttype == FAR_IMM_CODE);
+                    if (tb == 0xffu && in_system_addr(info.addr_ref)) {
+                        if (system_labels) {
+                            add_label(system_labels, info.addr_ref,
+                                      make_generated_label(info.addr_ref), tcode);
+                        }
+                        add_reference(refs, 0xffu, info.addr_ref, current_bank, instr_addr,
+                                      "code", source);
+                    } else if (tb != 0xffu && info.addr_ref >= APEX_PAGED_ORG &&
+                               info.addr_ref < 0x8000u && bank_labels) {
+                        int bi = bank_index_for_id(paged_rom, banks, tb);
+                        if (bi >= 0) {
+                            add_label(&bank_labels[bi], info.addr_ref,
+                                      make_bank_label(bank_id_for_index(banks, bi),
+                                                      (uint16_t)info.addr_ref), tcode);
+                            add_reference(refs, tb, info.addr_ref, current_bank, instr_addr,
+                                          "code", source);
+                        }
+                    }
+                } else if (info.addr_ref >= base_addr && info.addr_ref < base_addr + used) {
                     if (!addr_ref_excluded(ref_exclusions, current_bank, info.addr_ref)) {
                         add_reference(refs, current_bank, info.addr_ref, current_bank, instr_addr,
                                       "code", source);

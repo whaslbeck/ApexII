@@ -142,7 +142,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
                           const DataRanges *data_ranges, uint8_t current_bank,
                           ReferenceSet *refs, const ConfigEntries *ref_exclusions,
-                          const ConfigEntries *literals);
+                          const ConfigEntries *literals, const ConfigEntries *far_imms);
 const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count);
 size_t valid_string_len(const uint8_t *data, size_t len);
 

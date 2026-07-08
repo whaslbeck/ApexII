@@ -22,6 +22,27 @@ int apex_warn_to_stderr = 1;
    note that no longer reads as a warning) and is not printed to stderr. */
 static const ConfigEntries *g_render_acks = NULL;
 
+/* Far-immediate hints for the current write pass (set in write_asm_stream): the
+   LDX-style instruction at (bank, addr) loads an address in .value's bank, so its
+   immediate operand is resolved against that bank instead of the current one. */
+static const ConfigEntries *g_render_far_imms = NULL;
+
+static int far_imm_render_bank(uint8_t bank, uint32_t addr, uint8_t *out_target)
+{
+    size_t i;
+    if (!g_render_far_imms) {
+        return 0;
+    }
+    for (i = 0; i < g_render_far_imms->count; i++) {
+        const ConfigEntry *e = &g_render_far_imms->items[i];
+        if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
+            *out_target = e->value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int warning_is_acked(uint8_t bank, uint32_t cpu_addr)
 {
     size_t i;
@@ -41,6 +62,55 @@ static int warning_is_acked(uint8_t bank, uint32_t cpu_addr)
 static const char *warning_keyword(uint8_t bank, uint32_t cpu_addr)
 {
     return warning_is_acked(bank, cpu_addr) ? "WARNING_ACK" : "WARNING";
+}
+
+/* If the instruction at (bank, addr) is the paired bank-load of a [far_imm],
+   returns 1 and sets *ldx_addr to the address-loading instruction and
+   *target_bank to the far target's bank. */
+static int far_imm_bank_load(uint8_t bank, uint32_t addr, uint32_t *ldx_addr,
+                             uint8_t *target_bank)
+{
+    size_t i;
+    if (!g_render_far_imms) {
+        return 0;
+    }
+    for (i = 0; i < g_render_far_imms->count; i++) {
+        const ConfigEntry *e = &g_render_far_imms->items[i];
+        if (e->aux_addr == addr && e->aux_addr != 0 &&
+            (!e->has_bank || e->bank == bank)) {
+            *ldx_addr = e->addr;
+            *target_bank = e->value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Name of the far label at (target_bank, addr) for a #bank(...) operand — a real
+   label if one exists there, else the generated Bbb_Aaaaa form. */
+static const char *far_load_label_name(uint8_t target_bank, uint16_t addr,
+                                       const LabelSet *bank_labels, size_t banks,
+                                       const uint8_t *paged_rom,
+                                       const Label *extra_labels, size_t extra_count,
+                                       char *buf, size_t bufsz)
+{
+    const char *n = NULL;
+    if (target_bank == 0xffu) {
+        n = label_name_at(addr, extra_labels, extra_count, 0);
+        if (n) return n;
+        snprintf(buf, bufsz, "Bff_A%04x", (unsigned)addr);
+        return buf;
+    }
+    {
+        int bi = bank_index_for_id(paged_rom, banks, target_bank);
+        if (bi >= 0) {
+            n = label_name_at(addr, bank_labels[bi].items, bank_labels[bi].count,
+                              bank_labels[bi].sorted);
+        }
+    }
+    if (n) return n;
+    snprintf(buf, bufsz, "B%02x_A%04x", (unsigned)target_bank, (unsigned)addr);
+    return buf;
 }
 
 typedef enum {
@@ -1687,16 +1757,63 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         if (decoding_code) {
             char inst[256];
             uint32_t instr_addr = base_addr + (uint32_t)pos;
-            /* For a literal-marked instruction, decode without the label callback so
-               an immediate operand renders as a raw value rather than a label. */
-            Cpu6809InstrInfo info =
-                literal_instr_at(literals, current_bank, instr_addr)
-                    ? cpu6809_disassemble_info(data + pos, len - pos, instr_addr, inst,
-                                               sizeof(inst))
-                    : cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
-                                                  sizeof(inst), lookup_label_for_cpu, &lookup);
+            uint8_t far_tb;
+            Cpu6809InstrInfo info;
+            if (literal_instr_at(literals, current_bank, instr_addr)) {
+                /* Literal-marked: decode without the label callback so an immediate
+                   operand renders as a raw value rather than a label. */
+                info = cpu6809_disassemble_info(data + pos, len - pos, instr_addr, inst,
+                                                sizeof(inst));
+            } else if (far_imm_render_bank(current_bank, instr_addr, &far_tb)) {
+                /* Far immediate: resolve the operand against its target bank by
+                   pointing the lookup at that bank's label set (a system target is
+                   already covered by extra_labels). */
+                LabelLookup saved = lookup;
+                if (far_tb != 0xffu && bank_labels) {
+                    int bi = bank_index_for_id(paged_rom, banks, far_tb);
+                    if (bi >= 0) {
+                        lookup.labels = bank_labels[bi].items;
+                        lookup.label_count = bank_labels[bi].count;
+                        lookup.sorted = bank_labels[bi].sorted;
+                    }
+                }
+                lookup.current_bank = far_tb;
+                info = cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
+                                                   sizeof(inst), lookup_label_for_cpu, &lookup);
+                lookup = saved;
+            } else {
+                info = cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
+                                                   sizeof(inst), lookup_label_for_cpu, &lookup);
+            }
             if (info.size > 0) {
                 const InlineSignature *inline_sig = NULL;
+
+                /* Paired bank-load of a far pointer: render its immediate as
+                   #bank(<far label>) instead of the raw byte. */
+                {
+                    uint32_t bl_ldx;
+                    uint8_t  bl_bank;
+                    if (far_imm_bank_load(current_bank, instr_addr, &bl_ldx, &bl_bank) &&
+                        bl_ldx >= base_addr && (size_t)(bl_ldx - base_addr) < len) {
+                        char ldxinst[8];
+                        Cpu6809InstrInfo lx = cpu6809_disassemble_info(
+                            data + (bl_ldx - base_addr), len - (size_t)(bl_ldx - base_addr),
+                            bl_ldx, ldxinst, sizeof(ldxinst));
+                        if (lx.size > 0 && lx.has_addr_ref) {
+                            char lbl[40], mnem[16];
+                            const char *lname = far_load_label_name(
+                                bl_bank, (uint16_t)lx.addr_ref, bank_labels, banks, paged_rom,
+                                extra_labels, extra_label_count, lbl, sizeof(lbl));
+                            size_t m = 0;
+                            while (inst[m] && inst[m] != ' ' && m + 1 < sizeof(mnem)) {
+                                mnem[m] = inst[m];
+                                m++;
+                            }
+                            mnem[m] = '\0';
+                            snprintf(inst, sizeof(inst), "%s #bank(%s)", mnem, lname);
+                        }
+                    }
+                }
 
                 if (label_between(base_addr + (uint32_t)pos,
                                   base_addr + (uint32_t)(pos + info.size), labels,
@@ -1883,7 +2000,8 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
             prev_count = labels->count;
             prev_code  = total_code_bank_labels(labels, 1);
             collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom,
-                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL, NULL);
+                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL, NULL,
+                                 NULL);
         } while (labels->count != prev_count || total_code_bank_labels(labels, 1) != prev_code);
     }
 }
@@ -1989,7 +2107,7 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
                                LabelSet *bank_labels, LabelSet *system_labels,
                                const DataRanges *data_ranges, ReferenceSet *refs,
                                const ConfigEntries *ref_exclusions,
-                               const ConfigEntries *literals)
+                               const ConfigEntries *literals, const ConfigEntries *far_imms)
 {
     size_t prev_count, prev_code;
 
@@ -2004,7 +2122,7 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
             if (used > 1) {
                 collect_code_targets(bank, used, APEX_PAGED_ORG, &bank_labels[i], inline_sigs,
                                      paged_rom, banks, bank_labels, system_labels, data_ranges,
-                                     bank[0], refs, ref_exclusions, literals);
+                                     bank[0], refs, ref_exclusions, literals, far_imms);
             }
         }
     } while (total_bank_labels(bank_labels, banks) != prev_count ||
@@ -2554,6 +2672,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
     size_t i;
 
     g_render_acks = &project->ack_warnings;
+    g_render_far_imms = &project->far_imms;
     emit_preamble(out, project);
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols, &project->docs);
@@ -2587,6 +2706,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
                         &project->system_labels, &project->refs);
     }
     g_render_acks = NULL;
+    g_render_far_imms = NULL;
     return 0;
 }
 

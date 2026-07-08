@@ -1060,16 +1060,50 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                    that resolves to an address (has_addr_ref, not a branch/call target). */
                 bool pop_lit_cand = false;
                 bool pop_is_lit   = false;
+                bool pop_is_far   = false;
+                int  pop_far_detected = -1;   /* bank guessed from a following LDA/LDB #imm8 */
+                uint32_t pop_far_load_addr = 0; /* cpu addr of that bank-load instruction */
                 if (pop_has_loc && line->kind == APEX_RENDER_LINE_INSTRUCTION &&
-                    line->block_kind == APEX_RENDER_BLOCK_CODE &&
                     line->rom_addr < project->rom.size) {
                     const uint8_t *rb = project->rom.data + line->rom_addr;
                     size_t         rl = project->rom.size  - line->rom_addr;
-                    char dummy[1];
+                    char inst[64];
                     Cpu6809InstrInfo li = cpu6809_disassemble_info(rb, rl, line->cpu_addr,
-                                                                   dummy, sizeof(dummy));
-                    pop_lit_cand = (li.has_addr_ref && !li.has_target);
+                                                                   inst, sizeof(inst));
+                    /* Confirm the line really renders this instruction and is not a
+                       data pseudo-op (.DB/STRING/FAR_/…) whose bytes merely decode as
+                       one: its text must begin with the decoded mnemonic.  This is
+                       more reliable than block_kind, which can be UNKNOWN for code. */
+                    const char *lt = line->text;
+                    size_t      ll = line->length;
+                    while (ll && (*lt == ' ' || *lt == '\t')) { lt++; ll--; }
+                    size_t mlen = 0;
+                    while (inst[mlen] && inst[mlen] != ' ') mlen++;
+                    bool real_instr = li.size > 0 && mlen > 0 && ll >= mlen &&
+                                      memcmp(lt, inst, mlen) == 0 &&
+                                      (ll == mlen || lt[mlen] == ' ' || lt[mlen] == '\t');
+                    pop_lit_cand = real_instr && (li.has_addr_ref && !li.has_target);
                     pop_is_lit   = apex_project_is_literal(project, pop_bank, pop_cpu_addr) != 0;
+                    pop_is_far   = apex_project_far_imm_target(project, pop_bank, pop_cpu_addr,
+                                                               NULL, NULL, NULL) != 0;
+                    /* Guess the target bank: scan a few instructions ahead for an
+                       LDA/LDB #imm8 (opcodes 0x86 / 0xC6) that loads the bank. */
+                    if (pop_lit_cand && !pop_is_far) {
+                        size_t off = li.size;
+                        for (int step = 0; step < 4 && off < rl; step++) {
+                            uint8_t opc = rb[off];
+                            if ((opc == 0x86u || opc == 0xc6u) && off + 1u < rl) {
+                                pop_far_detected  = rb[off + 1u];
+                                pop_far_load_addr = line->cpu_addr + (uint32_t)off;
+                                break;
+                            }
+                            Cpu6809InstrInfo nx = cpu6809_disassemble_info(
+                                rb + off, rl - off, line->cpu_addr + (uint32_t)off,
+                                inst, sizeof(inst));
+                            if (nx.size == 0) break;
+                            off += nx.size;
+                        }
+                    }
                 }
 
                 if (ImGui::BeginPopup("row_context_menu")) {
@@ -1210,6 +1244,58 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                 state->labels_valid = false;
                                 state->overlay_dirty = true;
                                 set_status(state, "immediate marked as literal");
+                            }
+                        }
+                    }
+                    /* Far immediate: resolve the operand as an address in another
+                       bank (split far pointer: LDX #addr here, LDB #bank nearby). */
+                    if (pop_lit_cand) {
+                        if (pop_is_far) {
+                            if (ImGui::MenuItem("Clear far pointer (resolve locally)")) {
+                                apex_project_clear_far_imm(project, 1, pop_bank, pop_cpu_addr);
+                                const ApexRenderedDocument *nd =
+                                    apex_project_render(project, 1, 0);
+                                if (nd) { *document_ptr = nd; }
+                                state->labels_valid = false;
+                                state->overlay_dirty = true;
+                                set_status(state, "far pointer cleared");
+                            }
+                        } else {
+                            static char fbuf[8];
+                            static int  ftype = 1; /* default far_code */
+                            static const char *kFarTypes[] = {
+                                "far_data", "far_code", "far_table",
+                                "far_string", "far_sprite", "far_dmd_fullframe" };
+                            if (ImGui::IsWindowAppearing()) {
+                                if (pop_far_detected >= 0)
+                                    snprintf(fbuf, sizeof(fbuf), "%02x", (unsigned)pop_far_detected);
+                                else
+                                    fbuf[0] = '\0';
+                            }
+                            ImGui::SetNextItemWidth(150.0f);
+                            ImGui::Combo("target type##farimm", &ftype, kFarTypes,
+                                         IM_ARRAYSIZE(kFarTypes));
+                            ImGui::SetNextItemWidth(60.0f);
+                            ImGui::InputText("target bank (hex)##farimm", fbuf, sizeof(fbuf),
+                                             ImGuiInputTextFlags_CharsHexadecimal);
+                            if (pop_far_load_addr)
+                                ImGui::TextDisabled("bank load: B%02x_A%04x", pop_bank,
+                                                    pop_far_load_addr);
+                            if (ImGui::MenuItem("Resolve immediate as far pointer")) {
+                                unsigned tb = 0;
+                                if (sscanf(fbuf, "%x", &tb) == 1 && tb <= 0xffu) {
+                                    apex_project_set_far_imm(project, 1, pop_bank, pop_cpu_addr,
+                                                             (uint8_t)tb, (uint8_t)ftype,
+                                                             pop_far_load_addr);
+                                    const ApexRenderedDocument *nd =
+                                        apex_project_render(project, 1, 0);
+                                    if (nd) { *document_ptr = nd; }
+                                    state->labels_valid = false;
+                                    state->overlay_dirty = true;
+                                    set_status(state, "far pointer resolved");
+                                } else {
+                                    set_status(state, "far pointer: enter a bank 00-ff");
+                                }
                             }
                         }
                     }
