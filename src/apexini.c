@@ -46,6 +46,7 @@ typedef struct {
     ConfigTypes      types;
     ConfigEntries    ref_exclusions;
     ConfigEntries    literals;
+    ConfigEntries    ack_warnings;
 } Cfg;
 
 static int cfg_load(Cfg *c, const char *path)
@@ -57,7 +58,8 @@ static int cfg_load(Cfg *c, const char *path)
     if (!failed) {
         load_config(path, &c->sigs, &c->labels, &c->entries, &c->tables,
                     &c->schemas, &c->docs, &c->syms, &c->data,
-                    &c->opts, &c->types, &c->ref_exclusions, &c->literals);
+                    &c->opts, &c->types, &c->ref_exclusions, &c->literals,
+                    &c->ack_warnings);
     }
     s_catching = 0;
     return failed;
@@ -98,6 +100,7 @@ static void cfg_free(Cfg *c)
     free(c->data.items);
     free(c->ref_exclusions.items);
     free(c->literals.items);
+    free(c->ack_warnings.items);
     free_config_types(&c->types);
     memset(c, 0, sizeof(*c));
 }
@@ -202,7 +205,6 @@ static void w_data_val(FILE *f, const DataRange *r)
     switch (r->kind) {
     case DATA_BYTES:             fprintf(f, "bytes[%lu]", (unsigned long)r->length); break;
     case DATA_STRING:            fputs("string",              f); break;
-    case DATA_STRING_LP:         fputs("string_lp",           f); break;
     case DATA_STRING_FIXED:      fprintf(f, "string[%lu]", (unsigned long)r->length); break;
     case DATA_DMD_FULLFRAME:     fputs("dmd_fullframe",       f); break;
     case DATA_PTR16_STRING:      fputs("ptr16_string",        f); break;
@@ -334,6 +336,9 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
     if (c->literals.count)
         qsort(c->literals.items, c->literals.count,
               sizeof(c->literals.items[0]), cmp_entry);
+    if (c->ack_warnings.count)
+        qsort(c->ack_warnings.items, c->ack_warnings.count,
+              sizeof(c->ack_warnings.items[0]), cmp_entry);
 
     if (c->opts.labels_are_entries)
         fputs("[options]\nlabels_are_entries = true\n", f);
@@ -452,6 +457,16 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
             fputs(" = literal\n", f);
         }
     }
+
+    if (c->ack_warnings.count) {
+        fputs("\n[ack_warnings]\n", f);
+        for (i = 0; i < c->ack_warnings.count; i++) {
+            addr_fn(f, c->ack_warnings.items[i].has_bank,
+                    c->ack_warnings.items[i].bank,
+                    c->ack_warnings.items[i].addr);
+            fputs(" = ack\n", f);
+        }
+    }
 }
 
 static void write_cfg(FILE *f, Cfg *c)
@@ -477,10 +492,10 @@ static int cmd_check(int argc, char **argv)
             fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
             any_err = 1;
         } else {
-            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu  literals=%zu\n",
+            printf("%s: OK  labels=%zu  entries=%zu  inline=%zu  data=%zu  tables=%zu  types=%zu  exclude_refs=%zu  literals=%zu  ack_warnings=%zu\n",
                    argv[i], c.labels.count, c.entries.count, c.sigs.count,
                    c.data.count, c.tables.count, c.types.count, c.ref_exclusions.count,
-                   c.literals.count);
+                   c.literals.count, c.ack_warnings.count);
         }
         cfg_free(&c);
     }
@@ -602,7 +617,6 @@ static int cmd_overlaps(int argc, char **argv)
             snprintf(e->spec, sizeof(e->spec), "bytes[%lu]",
                      (unsigned long)c.data.items[i].length); break;
         case DATA_STRING:            strcpy(e->spec, "string");              break;
-        case DATA_STRING_LP:         strcpy(e->spec, "string_lp");           break;
         case DATA_STRING_FIXED:
             snprintf(e->spec, sizeof(e->spec), "string[%lu]",
                      (unsigned long)c.data.items[i].length);
@@ -787,6 +801,8 @@ static int cmd_normalize(int argc, char **argv)
         if (!c.ref_exclusions.items[i].has_bank) { c.ref_exclusions.items[i].has_bank = 1; c.ref_exclusions.items[i].bank = 0xff; }
     for (i = 0; i < c.literals.count; i++)
         if (!c.literals.items[i].has_bank) { c.literals.items[i].has_bank = 1; c.literals.items[i].bank = 0xff; }
+    for (i = 0; i < c.ack_warnings.count; i++)
+        if (!c.ack_warnings.items[i].has_bank) { c.ack_warnings.items[i].has_bank = 1; c.ack_warnings.items[i].bank = 0xff; }
 
     outpath = (argc >= 2) ? argv[1] : argv[0];
     out = fopen(outpath, "w");
@@ -1334,6 +1350,12 @@ static int cmd_check_bounds(int argc, char **argv)
     for (i = 0; i < p->literals.count; i++) {
         const ConfigEntry *e = &p->literals.items[i];
         check_one_addr(p, e->has_bank, e->bank, e->addr, "literals", &issues);
+    }
+
+    /* Acked warnings */
+    for (i = 0; i < p->ack_warnings.count; i++) {
+        const ConfigEntry *e = &p->ack_warnings.items[i];
+        check_one_addr(p, e->has_bank, e->bank, e->addr, "ack_warnings", &issues);
     }
 
     if (issues == 0)

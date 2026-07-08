@@ -298,7 +298,6 @@ static std::string data_range_spec_string(const DataRange *r)
     }
     switch (r->kind) {
     case DATA_STRING:          return "string";
-    case DATA_STRING_LP:       return "string_lp";
     case DATA_STRING_FIXED:    return "string[" + std::to_string(r->length) + "]";
     case DATA_PTR16_STRING:    return "ptr16_string";
     case DATA_PTR16_DATA:      return "ptr16_data";
@@ -989,6 +988,7 @@ void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiSt
     s->labels_valid = false;
     s->code_candidates_stale   = true;
     s->inline_candidates_stale = true;
+    s->warnings_stale          = true;
     if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
@@ -1082,28 +1082,6 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
     }
 }
 
-void apply_string_lp_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
-    s->last_classify_op = APEX_LAST_CLASSIFY_STRING_LP;
-    uint8_t b;
-    uint32_t a;
-    if (s->hex_is_edit_target) {
-        size_t base = s->hex_has_range
-            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
-            : s->hex_selected_offset;
-        if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
-            return;
-        }
-    } else {
-        if (!selected_address(*dp, s, &b, &a)) {
-            return;
-        }
-    }
-    if (apex_project_set_kind(p, 1, b, a, APEX_KIND_DATA, "string_lp") == 0) {
-        rerender_and_reselect(p, dp, s, b, a);
-    }
-}
-
 void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
                               const char *sp)
 {
@@ -1158,7 +1136,6 @@ void repeat_last_classify(ApexProject *p, const ApexRenderedDocument **dp, UiSta
     switch (s->last_classify_op) {
     case APEX_LAST_CLASSIFY_DATA:      apply_data_at_selection(p, dp, s, spec); break;
     case APEX_LAST_CLASSIFY_STRING:    apply_string_at_selection(p, dp, s); break;
-    case APEX_LAST_CLASSIFY_STRING_LP: apply_string_lp_at_selection(p, dp, s); break;
     case APEX_LAST_CLASSIFY_TABLE:     apply_table_at_selection(p, dp, s, spec); break;
     case APEX_LAST_CLASSIFY_CODE:      apply_code_at_selection(p, dp, s); break;
     case APEX_LAST_CLASSIFY_CLEAR:     clear_kind_at_selection(p, dp, s); break;
@@ -2393,6 +2370,11 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                               p->literals.items[i].bank,
                               p->literals.items[i].addr});
     }
+    for (size_t i = 0; i < p->ack_warnings.count; i++) {
+        s.ack_warnings.push_back({p->ack_warnings.items[i].has_bank,
+                                  p->ack_warnings.items[i].bank,
+                                  p->ack_warnings.items[i].addr});
+    }
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
         SnapshotType st;
@@ -2428,9 +2410,10 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigTypes types = {};
     ConfigEntries ref_exclusions = {};
     ConfigEntries literals = {};
+    ConfigEntries ack_warnings = {};
     load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
                 &docs, &symbols, &data_ranges, &options, &types,
-                &ref_exclusions, &literals);
+                &ref_exclusions, &literals, &ack_warnings);
     for (size_t i = 0; i < labels.count; i++) {
         s.labels.push_back({labels.items[i].has_bank,
                             labels.items[i].bank,
@@ -2474,6 +2457,11 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
                               literals.items[i].bank,
                               literals.items[i].addr});
     }
+    for (size_t i = 0; i < ack_warnings.count; i++) {
+        s.ack_warnings.push_back({ack_warnings.items[i].has_bank,
+                                  ack_warnings.items[i].bank,
+                                  ack_warnings.items[i].addr});
+    }
     for (size_t i = 0; i < types.count; i++) {
         const ConfigType *ct = &types.items[i];
         SnapshotType stype;
@@ -2486,6 +2474,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     }
     free(ref_exclusions.items);
     free(literals.items);
+    free(ack_warnings.items);
     free_config_types(&types);
     return s;
 }
@@ -2497,6 +2486,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotEntry> ce;
     std::vector<SnapshotEntry> cexcl;
     std::vector<SnapshotEntry> clits;
+    std::vector<SnapshotEntry> cacks;
     std::vector<SnapshotData> cd;
     std::vector<SnapshotTable> ct;
     std::vector<SnapshotDoc> cdocs;
@@ -2653,6 +2643,39 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
 
+    /* collect new acked warnings; deletions (un-acks) require full snapshot */
+    for (auto &o : s->ack_warnings) {
+        bool still_there = false;
+        for (size_t j = 0; j < p->ack_warnings.count; j++) {
+            if (p->ack_warnings.items[j].has_bank == o.has_bank &&
+                p->ack_warnings.items[j].bank == o.bank &&
+                p->ack_warnings.items[j].addr == o.addr) {
+                still_there = true;
+                break;
+            }
+        }
+        if (!still_there) {
+            *st = "deletion needs full snapshot";
+            return 0;
+        }
+    }
+    for (size_t i = 0; i < p->ack_warnings.count; i++) {
+        bool found = false;
+        for (auto &o : s->ack_warnings) {
+            if (o.has_bank == p->ack_warnings.items[i].has_bank &&
+                o.bank == p->ack_warnings.items[i].bank &&
+                o.addr == p->ack_warnings.items[i].addr) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            cacks.push_back({p->ack_warnings.items[i].has_bank,
+                             p->ack_warnings.items[i].bank,
+                             p->ack_warnings.items[i].addr});
+        }
+    }
+
     /* collect new or changed types */
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
@@ -2761,6 +2784,13 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         for (auto &i : clits) {
             write_config_address(o, i.has_bank, i.bank, i.addr);
             fputs(" = literal\n", o);
+        }
+    }
+    if (!cacks.empty()) {
+        fputs("\n[ack_warnings]\n", o);
+        for (auto &i : cacks) {
+            write_config_address(o, i.has_bank, i.bank, i.addr);
+            fputs(" = ack\n", o);
         }
     }
     if (!ci.empty()) {
@@ -2878,6 +2908,15 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
                                  p->literals.items[i].bank,
                                  p->literals.items[i].addr);
             fputs(" = literal\n", o);
+        }
+    }
+    if (p->ack_warnings.count > 0) {
+        fputs("\n[ack_warnings]\n", o);
+        for (size_t i = 0; i < p->ack_warnings.count; i++) {
+            write_config_address(o, p->ack_warnings.items[i].has_bank,
+                                 p->ack_warnings.items[i].bank,
+                                 p->ack_warnings.items[i].addr);
+            fputs(" = ack\n", o);
         }
     }
     if (p->inline_sigs.count > 0) {

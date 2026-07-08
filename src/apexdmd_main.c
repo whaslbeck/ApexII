@@ -142,7 +142,7 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
         ConfigTypes types = {0};
 
         load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &docs,
-                    &symbols, &data_ranges, &options, &types, NULL, NULL);
+                    &symbols, &data_ranges, &options, &types, NULL, NULL, NULL);
         free_config_types(&types);
     }
     table = find_table(&tables, table_bank, table_addr);

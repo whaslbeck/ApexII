@@ -1112,7 +1112,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
-                 ConfigEntries *ref_exclusions, ConfigEntries *literals)
+                 ConfigEntries *ref_exclusions, ConfigEntries *literals,
+                 ConfigEntries *ack_warnings)
 {
     FILE *f;
     /* Max length of a single config line (e.g. a one-line [types] enum list). */
@@ -1129,6 +1130,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_types = 0;
     int in_exclude_refs = 0;
     int in_literals = 0;
+    int in_ack_warnings = 0;
     /* pending multi-line [types] entry: all enum values of one type are
        accumulated here before being parsed, so this bounds the total size of a
        single type's enum list (see CONFIG_MAX_TYPE_VALUES). */
@@ -1193,6 +1195,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_types = strcmp(s + 1, "types") == 0;
             in_exclude_refs = strcmp(s + 1, "exclude_refs") == 0;
             in_literals = strcmp(s + 1, "literals") == 0;
+            in_ack_warnings = strcmp(s + 1, "ack_warnings") == 0;
             continue;
         }
         eq = strchr(s, '=');
@@ -1206,7 +1209,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *include_path = resolve_include_path(path, value);
 
             load_config(include_path, sigs, labels, entries, tables, schemas, docs,
-                        symbols, data_ranges, options, types, ref_exclusions, literals);
+                        symbols, data_ranges, options, types, ref_exclusions, literals,
+                        ack_warnings);
             free(value);
             free(include_path);
             continue;
@@ -1326,8 +1330,6 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_BYTES, length);
             } else if (strcmp(value, "string") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_STRING, 0);
-            } else if (strcmp(value, "string_lp") == 0) {
-                add_data_range(data_ranges, bank, addr, DATA_STRING_LP, 0);
             } else if (parse_count_format(value, "string", &length)) {
                 add_data_range(data_ranges, bank, addr, DATA_STRING_FIXED, length);
             } else if (strcmp(value, "dmd_fullframe") == 0) {
@@ -1438,6 +1440,25 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_config_entry(literals, has_bank, bank, addr);
             }
             free(value);
+        } else if (in_ack_warnings) {
+            /* [ack_warnings]: instruction/data address whose disassembly warning
+               the user has reviewed and accepted — rendered as an acknowledged
+               note instead of an active warning. */
+            uint32_t addr;
+            uint8_t bank = 0;
+            int has_bank = 0;
+            char *key = s;
+            char *value = dup_config_value(eq + 1);
+
+            if (parse_bank_label_ref(key, &bank, &addr)) {
+                has_bank = 1;
+            } else if (!parse_u32(key, &addr)) {
+                die("invalid ack_warnings config '%s = %s'", key, value);
+            }
+            if (ack_warnings) {
+                add_config_entry(ack_warnings, has_bank, bank, addr);
+            }
+            free(value);
         } else if (in_types) {
             char *key = s;
             char *colon = strchr(key, ':');
@@ -1540,8 +1561,6 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
         add_data_range(ranges, bank, addr, DATA_STRING_FIXED, length);
     } else if (strcmp(value, "string") == 0) {
         add_data_range(ranges, bank, addr, DATA_STRING, 0);
-    } else if (strcmp(value, "string_lp") == 0) {
-        add_data_range(ranges, bank, addr, DATA_STRING_LP, 0);
     } else if (strcmp(value, "dmd_fullframe") == 0) {
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
     } else if (strcmp(value, "ptr16_string") == 0) {

@@ -6,7 +6,7 @@ START:
     NOP
 
 .ORG 0x8002
-    STRING "\nA\aB"
+    STRING "\nA\tB\aC"
 
 .ORG 0xfff2
     .DW START

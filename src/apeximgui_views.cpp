@@ -619,6 +619,16 @@ static void classify_kind_submenu(ApexProject *p, const ApexRenderedDocument **d
     ImGui::EndMenu();
 }
 
+/* An acknowledged warning renders as a "; WARNING_ACK ..." comment; the
+   disassembly view hides those lines so acked warnings disappear from the code
+   (they remain listed, green, in the Warnings panel). */
+static bool is_acked_warning_line(const ApexRenderedLine *l)
+{
+    static const char ACK[] = "; WARNING_ACK ";
+    const size_t ALEN = sizeof(ACK) - 1;
+    return l->length >= ALEN && memcmp(l->text, ACK, ALEN) == 0;
+}
+
 void render_line_table(ApexProject *project, const ApexRenderedDocument **document_ptr,
                        UiState *state)
 {
@@ -629,6 +639,8 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
     std::vector<size_t> visible;
     visible.reserve(document->line_count);
     for (size_t i = 0; i < document->line_count; i++) {
+        if (is_acked_warning_line(&document->lines[i]))
+            continue;
         if (line_matches_filter(&document->lines[i], state->filter_input)) {
             if (state->selected_line == i)
                 selected_visible_row = (int)visible.size();
@@ -1088,9 +1100,6 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     }
                     if (ImGui::MenuItem("Mark as String", "S")) {
                         apply_string_at_selection(project, document_ptr, state);
-                    }
-                    if (ImGui::MenuItem("Mark as String LP")) {
-                        apply_string_lp_at_selection(project, document_ptr, state);
                     }
                     if (ImGui::MenuItem("Mark as Table", "T")) {
                         char spec[320] = "counted(ptr16_data)";
@@ -1646,44 +1655,64 @@ static int parse_hex_search_bytes(const char *input, uint8_t *out, int max_len)
     return count;
 }
 
-/* Search forward from cur_off+1; wraps around to 0 if not found before end.
-   Returns SIZE_MAX if the needle is not present anywhere. Sets *wrapped=true on wrap. */
-static size_t hex_search_forward(const uint8_t *rom, size_t rom_size,
+/* ROM-offset window [*lo, *hi) of the bank containing `off`: the 16 KB paged
+   bank, or the trailing system bank.  Used to scope the byte search. */
+static void hex_bank_range(const ApexProject *p, size_t off, size_t *lo, size_t *hi)
+{
+    if (off >= p->paged_size) {
+        *lo = p->paged_size;
+        *hi = p->rom.size;
+    } else {
+        size_t bidx = off / (size_t)APEX_BANK_SIZE;
+        *lo = bidx * (size_t)APEX_BANK_SIZE;
+        *hi = *lo + (size_t)APEX_BANK_SIZE;
+        if (*hi > p->rom.size) *hi = p->rom.size;
+    }
+}
+
+/* Search forward from cur_off+1 within the window [lo, hi); wraps to lo if not
+   found before hi. Returns SIZE_MAX if the needle is not present in the window.
+   Sets *wrapped=true on wrap. A match must lie wholly inside [lo, hi). */
+static size_t hex_search_forward(const uint8_t *rom, size_t lo, size_t hi,
                                  size_t cur_off, const uint8_t *needle, size_t nlen,
                                  bool *wrapped)
 {
     *wrapped = false;
-    if (nlen == 0 || nlen > rom_size) return SIZE_MAX;
-    size_t limit = rom_size - nlen;
-    /* primary pass: cur_off+1 .. end */
-    for (size_t i = cur_off + 1; i <= limit; i++) {
+    if (nlen == 0 || hi < lo || nlen > hi - lo) return SIZE_MAX;
+    size_t limit = hi - nlen; /* last valid start position, inclusive */
+    /* primary pass: max(cur_off+1, lo) .. limit */
+    size_t start = cur_off + 1 < lo ? lo : cur_off + 1;
+    for (size_t i = start; i <= limit; i++) {
         if (memcmp(rom + i, needle, nlen) == 0) return i;
     }
-    /* wrap: 0 .. cur_off */
-    size_t wrap_end = cur_off < limit ? cur_off : limit;
-    for (size_t i = 0; i <= wrap_end; i++) {
-        if (memcmp(rom + i, needle, nlen) == 0) { *wrapped = true; return i; }
+    /* wrap: lo .. min(cur_off, limit) */
+    if (cur_off >= lo) {
+        size_t wrap_end = cur_off < limit ? cur_off : limit;
+        for (size_t i = lo; i <= wrap_end; i++) {
+            if (memcmp(rom + i, needle, nlen) == 0) { *wrapped = true; return i; }
+        }
     }
     return SIZE_MAX;
 }
 
-/* Search backward from cur_off-1; wraps around to end if not found. */
-static size_t hex_search_backward(const uint8_t *rom, size_t rom_size,
+/* Search backward from cur_off-1 within the window [lo, hi); wraps to hi. */
+static size_t hex_search_backward(const uint8_t *rom, size_t lo, size_t hi,
                                   size_t cur_off, const uint8_t *needle, size_t nlen,
                                   bool *wrapped)
 {
     *wrapped = false;
-    if (nlen == 0 || nlen > rom_size) return SIZE_MAX;
-    size_t limit = rom_size - nlen;
-    /* primary pass: cur_off-1 .. 0 */
-    if (cur_off > 0) {
+    if (nlen == 0 || hi < lo || nlen > hi - lo) return SIZE_MAX;
+    size_t limit = hi - nlen; /* last valid start position, inclusive */
+    /* primary pass: min(cur_off-1, limit) .. lo */
+    if (cur_off > lo) {
         size_t start = (cur_off - 1) < limit ? (cur_off - 1) : limit;
-        for (size_t i = start + 1; i-- > 0; ) {
+        for (size_t i = start + 1; i-- > lo; ) {
             if (memcmp(rom + i, needle, nlen) == 0) return i;
         }
     }
-    /* wrap: end .. cur_off */
-    for (size_t i = limit + 1; i-- > cur_off; ) {
+    /* wrap: limit .. max(cur_off, lo) */
+    size_t wrap_lo = cur_off > lo ? cur_off : lo;
+    for (size_t i = limit + 1; i-- > wrap_lo; ) {
         if (memcmp(rom + i, needle, nlen) == 0) { *wrapped = true; return i; }
     }
     return SIZE_MAX;
@@ -1807,7 +1836,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             s->request_focus_hex_search = 0;
         }
         float btn_w = ImGui::CalcTextSize("Next").x + ImGui::GetStyle().FramePadding.x * 2.0f;
-        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x - (btn_w + ImGui::GetStyle().ItemSpacing.x) * 2.0f - 2.0f);
+        float bank_w = ImGui::CalcTextSize("Bank only").x + ImGui::GetFrameHeight() +
+                       ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x -
+                                (btn_w + ImGui::GetStyle().ItemSpacing.x) * 2.0f - bank_w - 2.0f);
         bool enter_next = ImGui::InputText("##hexsearch", s->hex_search_input,
                                            sizeof(s->hex_search_input),
                                            ImGuiInputTextFlags_EnterReturnsTrue);
@@ -1815,6 +1847,11 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         bool do_next = enter_next || ImGui::Button("Next##hexsrch");
         ImGui::SameLine();
         bool do_prev = ImGui::Button("Prev##hexsrch");
+        ImGui::SameLine();
+        ImGui::Checkbox("Bank only", &s->hex_search_bank_only);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Restrict the search to the bank the cursor is in");
+        }
 
         if ((do_next || do_prev) && s->hex_search_input[0]) {
             uint8_t needle[32];
@@ -1822,9 +1859,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             if (nlen > 0) {
                 bool wrapped = false;
                 size_t cur = s->hex_active ? s->hex_selected_offset : 0;
+                size_t lo = 0, hi = p->rom.size;
+                if (s->hex_search_bank_only) {
+                    hex_bank_range(p, cur, &lo, &hi);
+                }
                 size_t found = do_next
-                    ? hex_search_forward (p->rom.data, p->rom.size, cur, needle, (size_t)nlen, &wrapped)
-                    : hex_search_backward(p->rom.data, p->rom.size, cur, needle, (size_t)nlen, &wrapped);
+                    ? hex_search_forward (p->rom.data, lo, hi, cur, needle, (size_t)nlen, &wrapped)
+                    : hex_search_backward(p->rom.data, lo, hi, cur, needle, (size_t)nlen, &wrapped);
                 if (found != SIZE_MAX) {
                     s->hex_selected_offset = found;
                     s->hex_active          = true;
@@ -1837,7 +1878,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     }
                     set_status(s, wrapped ? "search: found (wrapped)" : "search: found");
                 } else {
-                    set_status(s, "search: not found");
+                    set_status(s, s->hex_search_bank_only ? "search: not found in bank"
+                                                          : "search: not found");
                 }
             } else {
                 set_status(s, "search: invalid hex");
@@ -1945,11 +1987,9 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                     while (rem > 0 && (*p2 == ' ' || *p2 == '\t')) { p2++; rem--; }
                     if ((rem >= 12 && memcmp(p2, "STRING_FIXED", 12) == 0 &&
                          (rem == 12 || p2[12] == ' ' || p2[12] == '\t')) ||
-                        (rem >= 9 && memcmp(p2, "STRING_LP", 9) == 0 &&
-                         (rem == 9 || p2[9] == ' ' || p2[9] == '\t')) ||
                         (rem >= 6 && memcmp(p2, "STRING", 6) == 0 &&
                          (rem == 6 || p2[6] == ' ' || p2[6] == '\t')))
-                        lk = 7; /* STRING / STRING_LP / STRING_FIXED — purple */
+                        lk = 7; /* STRING / STRING_FIXED — purple */
                     else if (rem >= 3 && memcmp(p2, ".DW", 3) == 0 &&
                              (rem == 3 || p2[3] == ' ' || p2[3] == '\t'))
                         lk = 8; /* .DW — cyan */
@@ -2300,7 +2340,6 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             }
         }
         if (ImGui::MenuItem("Mark as String", "S")) { apply_string_at_selection(p, dp, s); }
-        if (ImGui::MenuItem("Mark as String LP"))   { apply_string_lp_at_selection(p, dp, s); }
         if (ImGui::MenuItem("Mark as Table",  "T")) {
             char spec[320] = "counted(ptr16_data)";
             if (s->edit_schema_count > 0) {
@@ -2697,8 +2736,6 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::Button("Code##cls"))   { apply_code_at_selection(p, dp, s); }
     ImGui::SameLine();
     if (ImGui::Button("String##cls"))   { apply_string_at_selection(p, dp, s); }
-    ImGui::SameLine();
-    if (ImGui::Button("String LP##cls")) { apply_string_lp_at_selection(p, dp, s); }
     ImGui::SameLine();
     if (ImGui::Button("Clear##cls"))    { clear_kind_at_selection(p, dp, s); }
     /* row: raw byte/word + bytes[N] */
@@ -3665,7 +3702,7 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument **document_p
 }
 
 /* Classify a rendered directive line as a string and return its type name, or
-   NULL if it is not a STRING/STRING_LP/STRING_FIXED directive. */
+   NULL if it is not a STRING/STRING_FIXED directive. */
 static const char *string_directive_type(const ApexRenderedLine *l)
 {
     /* STRING* directives render as indented lines, which classify_line() tags as
@@ -3680,7 +3717,6 @@ static const char *string_directive_type(const ApexRenderedLine *l)
     const char *p = l->text + i;
     size_t rem = l->length - i;
     #define STR_STARTS(kw) (rem >= sizeof(kw) - 1 && memcmp(p, kw, sizeof(kw) - 1) == 0)
-    if (STR_STARTS("STRING_LP"))    return "string_lp";
     if (STR_STARTS("STRING_FIXED")) return "string_fixed";
     if (STR_STARTS("STRING"))       return "string";
     #undef STR_STARTS
@@ -4126,6 +4162,172 @@ void render_code_candidates(ApexProject *project,
     ImGui::EndTable();
 }
 
+/* Scrape "; WARNING[_ACK] <type> bank=0x.. cpu=0x.. rom=0x.. <detail>" comment
+   lines from the rendered document into state->warnings for the Warnings panel.
+   "; WARNING_ACK" lines are acknowledged warnings (shown green, un-ackable). */
+static void rebuild_warnings(const ApexRenderedDocument *d, UiState *s)
+{
+    s->warnings.clear();
+    s->warnings_stale = false;
+    if (!d) return;
+    static const char PREFIX[]     = "; WARNING ";
+    static const char PREFIX_ACK[] = "; WARNING_ACK ";
+    const size_t PLEN     = sizeof(PREFIX) - 1;
+    const size_t PLEN_ACK = sizeof(PREFIX_ACK) - 1;
+    for (size_t i = 0; i < d->line_count; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        /* "; WARNING " and "; WARNING_ACK " diverge at the space/underscore, so
+           they are mutually exclusive; test the acked form first. */
+        bool acked = (l->length >= PLEN_ACK && memcmp(l->text, PREFIX_ACK, PLEN_ACK) == 0);
+        if (!acked && (l->length < PLEN || memcmp(l->text, PREFIX, PLEN) != 0)) continue;
+        size_t plen = acked ? PLEN_ACK : PLEN;
+
+        std::string line(l->text, l->length); /* null-terminated working copy */
+        const char *p = line.c_str() + plen;
+
+        WarningEntry w;
+        w.line_index = i;
+        w.has_location = false;
+        w.acked = acked;
+        w.bank = 0;
+        w.cpu_addr = 0;
+
+        const char *sp = strchr(p, ' ');
+        w.type.assign(p, sp ? (size_t)(sp - p) : strlen(p));
+
+        unsigned bank = 0, cpu = 0;
+        const char *bptr = strstr(p, "bank=0x");
+        const char *cptr = strstr(p, "cpu=0x");
+        if (bptr && cptr && sscanf(bptr, "bank=0x%x", &bank) == 1 &&
+            sscanf(cptr, "cpu=0x%x", &cpu) == 1) {
+            w.bank = (uint8_t)bank;
+            w.cpu_addr = (uint32_t)cpu;
+            w.has_location = true;
+        }
+
+        /* detail = text after the last location field (rom=, else cpu=), else
+           after the type token */
+        const char *anchor = strstr(p, "rom=0x");
+        if (!anchor) anchor = cptr;
+        const char *detail = NULL;
+        if (anchor && (detail = strchr(anchor, ' ')) != NULL) {
+            while (*detail == ' ') detail++;
+        } else if (sp) {
+            detail = sp;
+            while (*detail == ' ') detail++;
+        }
+        if (detail && *detail) w.detail.assign(detail);
+
+        s->warnings.push_back(std::move(w));
+    }
+}
+
+void render_warnings_view(ApexProject *project,
+                          const ApexRenderedDocument **document_ptr,
+                          UiState *state)
+{
+    (void)project;
+    const ApexRenderedDocument *document = *document_ptr;
+
+    if (state->warnings_stale) rebuild_warnings(document, state);
+
+    size_t acked_count = 0;
+    for (auto &w : state->warnings) if (w.acked) acked_count++;
+    size_t active_count = state->warnings.size() - acked_count;
+
+    ImGui::Text("%zu active", active_count);
+    ImGui::SameLine();
+    ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.45f, 1.0f), "%zu acked", acked_count);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Refresh")) rebuild_warnings(document, state);
+    ImGui::SameLine();
+    ImGui::TextDisabled("| click a row to jump");
+
+    if (state->warnings.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("No warnings.");
+        return;
+    }
+    ImGui::Separator();
+
+    if (!ImGui::BeginTable("warn_tbl", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV, ImVec2(0, 0)))
+        return;
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 190.0f);
+    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("##ack", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+    ImGui::TableHeadersRow();
+
+    /* Deferred ack toggle: applied after the loop so we never rerender (which
+       rebuilds state->warnings) while iterating it. */
+    int      do_toggle = 0;   /* +1 = ack, -1 = un-ack */
+    uint8_t  tog_bank = 0;
+    uint32_t tog_addr = 0;
+    const ImVec4 kAckGreen(0.40f, 0.85f, 0.45f, 1.0f);
+
+    for (size_t i = 0; i < state->warnings.size(); i++) {
+        const WarningEntry &w = state->warnings[i];
+        ImGui::PushID((int)i);
+        ImGui::TableNextRow();
+
+        ImGui::TableSetColumnIndex(0);
+        if (w.acked) ImGui::PushStyleColor(ImGuiCol_Text, kAckGreen);
+        /* AllowOverlap so the Ack button (submitted later, in the last column)
+           receives clicks instead of this row-spanning Selectable swallowing them. */
+        bool clicked = ImGui::Selectable(w.type.c_str(), false,
+                                         ImGuiSelectableFlags_SpanAllColumns |
+                                         ImGuiSelectableFlags_AllowOverlap);
+        if (w.acked) ImGui::PopStyleColor();
+
+        ImGui::TableSetColumnIndex(1);
+        if (w.has_location) {
+            char addr[32];
+            snprintf(addr, sizeof(addr), "B%02x_A%04x", w.bank, w.cpu_addr);
+            if (w.acked) ImGui::TextColored(kAckGreen, "%s", addr);
+            else         ImGui::TextUnformatted(addr);
+        } else {
+            ImGui::TextDisabled("-");
+        }
+
+        ImGui::TableSetColumnIndex(2);
+        if (w.acked) ImGui::TextColored(kAckGreen, "%s", w.detail.c_str());
+        else         ImGui::TextUnformatted(w.detail.c_str());
+
+        ImGui::TableSetColumnIndex(3);
+        if (w.has_location) {
+            if (ImGui::SmallButton(w.acked ? "Un-ack" : "Ack")) {
+                do_toggle = w.acked ? -1 : 1;
+                tog_bank  = w.bank;
+                tog_addr  = w.cpu_addr;
+            }
+        }
+
+        if (clicked) {
+            size_t li;
+            if (w.has_location &&
+                apex_render_find_line_by_address(document, w.bank, w.cpu_addr, &li)) {
+                select_line(state, li, 1);
+            } else {
+                select_line(state, w.line_index, 1);
+            }
+        }
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
+
+    if (do_toggle > 0) {
+        apex_project_add_ack(project, 1, tog_bank, tog_addr);
+        state->overlay_dirty = true;
+        rerender_and_reselect(project, document_ptr, state, tog_bank, tog_addr);
+    } else if (do_toggle < 0) {
+        apex_project_remove_ack(project, 1, tog_bank, tog_addr);
+        state->overlay_dirty = true;
+        rerender_and_reselect(project, document_ptr, state, tog_bank, tog_addr);
+    }
+}
+
 void render_inline_candidates(ApexProject *project,
                               const ApexRenderedDocument **document_ptr,
                               UiState *state)
@@ -4424,8 +4626,6 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
                     while (rem > 0 && (*tp == ' ' || *tp == '\t')) { tp++; rem--; }
                     if ((rem >= 12 && memcmp(tp, "STRING_FIXED", 12) == 0 &&
                          (rem == 12 || tp[12] == ' ' || tp[12] == '\t')) ||
-                        (rem >= 9 && memcmp(tp, "STRING_LP", 9) == 0 &&
-                         (rem == 9 || tp[9] == ' ' || tp[9] == '\t')) ||
                         (rem >= 6 && memcmp(tp, "STRING", 6) == 0 &&
                          (rem == 6 || tp[6] == ' ' || tp[6] == '\t')))
                         lk = 7;

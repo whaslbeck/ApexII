@@ -439,9 +439,6 @@ static void write_data_range_value(FILE *out, const DataRange *range)
     case DATA_STRING:
         fputs("string", out);
         break;
-    case DATA_STRING_LP:
-        fputs("string_lp", out);
-        break;
     case DATA_STRING_FIXED:
         fprintf(out, "string[%lu]", (unsigned long)range->length);
         break;
@@ -1178,6 +1175,7 @@ typedef struct {
     ConfigTypes      config_types;
     ConfigEntries    ref_exclusions;
     ConfigEntries    literals;
+    ConfigEntries    ack_warnings;
     ConfigOptions    options;
     char             action[24];
 } ApexConfigSnapshot;
@@ -1414,6 +1412,7 @@ static void snapshot_capture(const ApexProject *p, const char *action, ApexConfi
     out->data_ranges    = copy_data_ranges(&p->data_ranges);
     out->ref_exclusions = copy_config_entries(&p->ref_exclusions);
     out->literals       = copy_config_entries(&p->literals);
+    out->ack_warnings   = copy_config_entries(&p->ack_warnings);
     out->options        = p->options;
     snprintf(out->action, sizeof(out->action), "%s", action ? action : "edit");
 }
@@ -1431,6 +1430,7 @@ static void snapshot_free(ApexConfigSnapshot *s)
     free_config_types(&s->config_types);
     free_config_entries(&s->ref_exclusions);
     free_config_entries(&s->literals);
+    free_config_entries(&s->ack_warnings);
     memset(s, 0, sizeof(*s));
 }
 
@@ -1450,6 +1450,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     free_config_types(&p->config_types);
     free_config_entries(&p->ref_exclusions);
     free_config_entries(&p->literals);
+    free_config_entries(&p->ack_warnings);
 
     p->inline_sigs    = s->inline_sigs;
     p->config_labels  = s->config_labels;
@@ -1462,6 +1463,7 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     p->config_types   = s->config_types;
     p->ref_exclusions = s->ref_exclusions;
     p->literals       = s->literals;
+    p->ack_warnings   = s->ack_warnings;
     p->options        = s->options;
     memset(s, 0, sizeof(*s));
 }
@@ -1625,7 +1627,7 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
                 &project->config_entries, &project->tables, &project->schemas,
                 &project->docs, &project->symbols,
                 &project->data_ranges, &project->options, &project->config_types,
-                &project->ref_exclusions, &project->literals);
+                &project->ref_exclusions, &project->literals, &project->ack_warnings);
     validate_config_classification(&project->config_entries, &project->tables,
                                    &project->data_ranges);
 
@@ -1669,6 +1671,7 @@ void apex_project_free(ApexProject *project)
     free_config_entries(&project->config_entries);
     free_config_entries(&project->ref_exclusions);
     free_config_entries(&project->literals);
+    free_config_entries(&project->ack_warnings);
     free_table_defs(&project->tables);
     free_schema_defs(&project->schemas);
     free_config_docs(&project->docs);
@@ -2578,6 +2581,48 @@ int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t a
     }
     for (i = 0; i < project->literals.count; i++) {
         const ConfigEntry *e = &project->literals.items[i];
+        if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* Acking a warning only changes how it renders (WARNING -> WARNING_ACK); no
+   re-analysis is needed, so mark render-dirty only. */
+int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "ack warning");
+    config_set_entry(&project->ack_warnings, has_bank, bank, addr);
+    project->dirty_flags |= APEX_DIRTY_RENDER;
+    return 0;
+}
+
+int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
+{
+    if (!project) {
+        return 1;
+    }
+    project_record_edit(project, "un-ack warning");
+    if (config_clear_entry(&project->ack_warnings, has_bank, bank, addr) != 0) {
+        return 1;
+    }
+    project->dirty_flags |= APEX_DIRTY_RENDER;
+    return 0;
+}
+
+int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr)
+{
+    size_t i;
+
+    if (!project) {
+        return 0;
+    }
+    for (i = 0; i < project->ack_warnings.count; i++) {
+        const ConfigEntry *e = &project->ack_warnings.items[i];
         if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
             return 1;
         }

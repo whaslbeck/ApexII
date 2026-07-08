@@ -6,7 +6,7 @@ START:
     NOP
 
 .ORG 0x8002
-    STRING_FIXED "WORLD"
+    STRING_FIXED "WOR\tD"
 
 .ORG 0xfffe
     .DW START

@@ -398,20 +398,14 @@ int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id)
     return idx < banks ? (int)idx : -1;
 }
 
+/* A far reference resolves strictly by its stored bank id; a byte that names no
+   real ROM bank (e.g. a below-base value like 0x18 on a 512 KB ROM) is left
+   unresolved (-1) rather than aliased to some other page.  Such bytes seen in
+   the wild appear to target hardware/debug ROMs absent from a production dump,
+   so mapping them into a real bank only produced misleading code/labels. */
 int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank)
 {
-    int bank_index = bank_index_for_id(paged_rom, banks, bank);
-
-    if (bank_index >= 0) {
-        return bank_index;
-    }
-    /* Phantom bank byte below the base: WPC leaves the unused upper bank-address
-       lines tied, so a value like 0x18 on a 512 KB ROM aliases the same page as
-       0x38.  A raw value that is itself a valid page index selects that page. */
-    if (bank < banks) {
-        return (int)bank;
-    }
-    return -1;
+    return bank_index_for_id(paged_rom, banks, bank);
 }
 
 uint8_t bank_id_for_index(size_t banks, int bank_index)
@@ -1108,10 +1102,10 @@ size_t valid_string_len(const uint8_t *data, size_t len)
         if (data[i] == 0x00) {
             return i + 1u;
         }
-        /* 0x0a (newline) and 0x07 (BELL) are legitimate string content (e.g.
-           multi-line DMD text); they are escaped as \n / \a on emit and decoded
-           back by the assembler. */
-        if (data[i] == 0x0au || data[i] == 0x07u) {
+        /* 0x0a (newline), 0x09 (tab) and 0x07 (BELL) are legitimate string
+           content (e.g. multi-line/aligned DMD text); they are escaped as
+           \n / \t / \a on emit and decoded back by the assembler. */
+        if (data[i] == 0x0au || data[i] == 0x09u || data[i] == 0x07u) {
             continue;
         }
         if (data[i] < 0x20u || data[i] > 0x7fu) {

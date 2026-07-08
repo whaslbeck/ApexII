@@ -181,12 +181,23 @@ struct RefEntry {
     uint32_t row_cpu_addr;
 };
 
+/* One "; WARNING ..." line scraped from the rendered document for the Warnings
+   panel.  has_location is false for warnings whose bank/cpu could not be parsed. */
+struct WarningEntry {
+    size_t line_index;   /* index of the warning comment line in the document */
+    std::string type;    /* e.g. "inline_far_code_invalid" */
+    std::string detail;  /* message text after the bank/cpu/rom fields */
+    bool has_location;
+    bool acked;          /* scraped from a "; WARNING_ACK" line */
+    uint8_t bank;
+    uint32_t cpu_addr;
+};
+
 /* Which classification action the "repeat last classification" hotkey replays. */
 enum ApexLastClassifyOp {
     APEX_LAST_CLASSIFY_NONE = 0,
     APEX_LAST_CLASSIFY_DATA,       /* apply_data_at_selection(last_classify_spec) */
     APEX_LAST_CLASSIFY_STRING,     /* apply_string_at_selection */
-    APEX_LAST_CLASSIFY_STRING_LP,  /* apply_string_lp_at_selection */
     APEX_LAST_CLASSIFY_TABLE,      /* apply_table_at_selection(last_classify_spec) */
     APEX_LAST_CLASSIFY_CODE,       /* apply_code_at_selection */
     APEX_LAST_CLASSIFY_CLEAR,      /* clear_kind_at_selection */
@@ -248,6 +259,7 @@ struct UiState {
     int    hex_hover_valid;
     char hex_search_input[64];
     int request_focus_hex_search;
+    bool hex_search_bank_only;  /* restrict byte search to the cursor's current bank */
 
     /* Last classification action, replayed by the "repeat" hotkey (1) so a run of
        individual classifications reduces to n,1,n,1,…  See repeat_last_classify(). */
@@ -321,6 +333,9 @@ struct UiState {
     bool show_inline_candidates;
     ApexInlineCandidates inline_candidates;
     bool inline_candidates_stale;
+    bool show_warnings;
+    std::vector<WarningEntry> warnings;
+    bool warnings_stale;
 
     bool refs_pinned;
     uint8_t refs_pinned_bank;
@@ -432,6 +447,7 @@ struct OriginalSnapshot {
     std::vector<SnapshotEntry> entries;
     std::vector<SnapshotEntry> ref_exclusions;
     std::vector<SnapshotEntry> literals;
+    std::vector<SnapshotEntry> ack_warnings;
     std::vector<SnapshotData> data;
     std::vector<SnapshotTable> tables;
     std::vector<SnapshotDoc> docs;
@@ -546,7 +562,6 @@ void rerender_and_reselect(ApexProject *project, const ApexRenderedDocument **do
 void apply_code_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_data_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void apply_string_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
-void apply_string_lp_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_table_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void clear_kind_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void repeat_last_classify(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
@@ -628,6 +643,7 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_code_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_inline_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_warnings_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // DMD and Sprite list windows

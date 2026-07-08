@@ -295,9 +295,6 @@ static size_t rendered_line_size(const ApexProject *project, const ApexRenderedL
     if (mnemonic_equals(line->text, line->length, "STRING")) {
         return parse_string_asm_length(line->text, line->length);
     }
-    if (mnemonic_equals(line->text, line->length, "STRING_LP")) {
-        return parse_string_asm_length(line->text, line->length);
-    }
     if (mnemonic_equals(line->text, line->length, "STRING_FIXED")) {
         size_t n = parse_string_asm_length(line->text, line->length);
         return n > 0u ? n - 1u : 0u;  /* no null/length byte */

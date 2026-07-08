@@ -149,7 +149,6 @@ typedef struct {
 typedef enum {
     DATA_BYTES,
     DATA_STRING,
-    DATA_STRING_LP,     /* length-prefixed: byte 0 = N, followed by N bytes, no null */
     DATA_STRING_FIXED,  /* fixed-length string: N bytes of ASCII, length in DataRange.length */
     DATA_DMD_FULLFRAME,
     DATA_PTR16_STRING,
@@ -200,7 +199,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
                  ConfigDocs *docs, ConfigSymbols *symbols,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
-                 ConfigEntries *ref_exclusions, ConfigEntries *literals);
+                 ConfigEntries *ref_exclusions, ConfigEntries *literals,
+                 ConfigEntries *ack_warnings);
 void free_config_types(ConfigTypes *types);
 const ConfigType *find_config_type(const ConfigTypes *types, const char *name);
 const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value);

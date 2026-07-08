@@ -44,6 +44,7 @@ typedef struct ApexProject {
     ConfigTypes config_types;
     ConfigEntries ref_exclusions;
     ConfigEntries literals; /* instruction addrs whose immediate is a literal, not an address */
+    ConfigEntries ack_warnings; /* addrs whose disassembly warning was reviewed/accepted */
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -78,6 +79,11 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
 int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr);
 const struct ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_xrefs,
                                                        int emit_explain);
+/* When nonzero (default) disassembly warnings are also printed to stderr; the GUI
+   sets it to 0 and surfaces them in its Warnings panel instead. The warnings are
+   always written into the output as "; WARNING ..." comment lines regardless. */
+extern int apex_warn_to_stderr;
+
 int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
                                   int emit_explain);
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
@@ -97,6 +103,9 @@ int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
 int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank,
                                 uint32_t addr);
 int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr);
+int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
+int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
+int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr);
 int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
 int apex_project_clear_symbol(ApexProject *project, const char *name);
 

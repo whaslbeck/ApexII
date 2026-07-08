@@ -121,27 +121,15 @@ string_fixed_asm="$OUT/string_fixed.disasm"
 "$ROOT/build/apexasm" "$string_fixed_rom" "$ROOT/tests/string_fixed.asm"
 "$ROOT/build/apexdis" "$string_fixed_rom" "$string_fixed_asm" "$ROOT/tests/string_fixed.ini"
 if grep -q '^; data type=string_fixed' "$string_fixed_asm" &&
-    grep -q '^    STRING_FIXED "WORLD"' "$string_fixed_asm"; then
+    grep -qF '    STRING_FIXED "WOR\tD"' "$string_fixed_asm"; then
     printf 'PASS string_fixed.asm\n'
 else
     printf 'FAIL string_fixed.asm\n' >&2
     exit 1
 fi
 
-string_lp_rom="$OUT/string_lp.rom"
-string_lp_asm="$OUT/string_lp.disasm"
-"$ROOT/build/apexasm" "$string_lp_rom" "$ROOT/tests/string_lp.asm"
-"$ROOT/build/apexdis" "$string_lp_rom" "$string_lp_asm" "$ROOT/tests/string_lp.ini"
-if grep -q '^; data type=string_lp' "$string_lp_asm" &&
-    grep -q '^    STRING_LP "HELLO"' "$string_lp_asm"; then
-    printf 'PASS string_lp.asm\n'
-else
-    printf 'FAIL string_lp.asm\n' >&2
-    exit 1
-fi
-
-# A string may contain control bytes 0x0a (newline) and 0x07 (BELL): they must
-# be emitted with \n / \a escapes and survive a full
+# A string may contain control bytes 0x0a (newline), 0x09 (tab) and 0x07 (BELL):
+# they must be emitted with \n / \t / \a escapes and survive a full
 # assemble→disassemble→assemble byte roundtrip.
 string_nl_rom="$OUT/string_newline.rom"
 string_nl_asm="$OUT/string_newline.disasm"
@@ -149,7 +137,7 @@ string_nl_rom2="$OUT/string_newline.rebuilt"
 "$ROOT/build/apexasm" "$string_nl_rom" "$ROOT/tests/string_newline.asm"
 "$ROOT/build/apexdis" "$string_nl_rom" "$string_nl_asm" "$ROOT/tests/string_newline.ini"
 "$ROOT/build/apexasm" "$string_nl_rom2" "$string_nl_asm"
-if grep -qF '    STRING "\nA\aB"' "$string_nl_asm" &&
+if grep -qF '    STRING "\nA\tB\aC"' "$string_nl_asm" &&
     cmp -s "$string_nl_rom" "$string_nl_rom2"; then
     printf 'PASS string_newline.asm\n'
 else
@@ -206,6 +194,22 @@ if grep -q '^; WARNING inline_far_code_invalid bank=0x20 cpu=0x4004 rom=0x000004
     printf 'PASS inline_invalid_far.asm\n'
 else
     printf 'FAIL inline_invalid_far.asm\n' >&2
+    exit 1
+fi
+
+# Acking a warning ([ack_warnings]) turns it into "; WARNING_ACK ...", removes
+# the active "; WARNING" and suppresses the stderr line; apexini preserves it.
+ack_asm="$OUT/ack_warning.disasm"
+ack_err="$OUT/ack_warning.stderr"
+"$ROOT/build/apexdis" "$inline_invalid_rom" "$ack_asm" \
+    "$ROOT/tests/ack_warning.ini" 2>"$ack_err"
+if grep -q '^; WARNING_ACK inline_far_code_invalid bank=0x20 cpu=0x4004' "$ack_asm" &&
+    ! grep -qE '^; WARNING ' "$ack_asm" &&
+    ! grep -q '^warning:' "$ack_err" &&
+    "$ROOT/build/apexini" check "$ROOT/tests/ack_warning.ini" | grep -q 'ack_warnings=1'; then
+    printf 'PASS ack_warning.ini\n'
+else
+    printf 'FAIL ack_warning.ini\n' >&2
     exit 1
 fi
 
@@ -460,13 +464,13 @@ far_tables_rebuilt="$OUT/far_tables.rebuilt"
 if cmp -s "$far_tables_rom" "$far_tables_rebuilt" &&
     grep -q '^; table rows=1 row_width=3 row_format=far_string' "$far_tables_asm" &&
     grep -q '^; table rows=1 row_width=6 row_format=byte, word, far_data' "$far_tables_asm" &&
-    grep -q '^    TABLE_FAR_STRING B21_A4001_STRING_HI, 0x01' "$far_tables_asm" &&
+    grep -q '^    TABLE_FAR_STRING B21_A4001_STRING_HI$' "$far_tables_asm" &&
     grep -q '^    .DB 0x55' "$far_tables_asm" &&
     grep -q '^    .DB 0x55 ; 0x4007 |U|' "$far_tables_asm" &&
     grep -q '^    .DW 0x1234' "$far_tables_asm" &&
-    grep -q '^    TABLE_FAR_PTR B21_A4004, 0x01' "$far_tables_asm" &&
+    grep -q '^    TABLE_FAR_PTR B21_A4004$' "$far_tables_asm" &&
     grep -q '^; data type=far_code' "$far_tables_asm" &&
-    grep -q '^    FAR_CODE B21_A4006, 0x01' "$far_tables_asm" &&
+    grep -q '^    FAR_CODE B21_A4006$' "$far_tables_asm" &&
     grep -q '^B21_A4001_STRING_HI:' "$far_tables_asm" &&
     grep -q '^    STRING "HI"' "$far_tables_asm" &&
     grep -q '^    .DB 0xaa, 0xbb ; 0x4004 |..|' "$far_tables_asm" &&
@@ -485,7 +489,7 @@ if cmp -s "$far_tables_rom" "$far_tables_rebuilt" &&
     grep -q '^; doc Inline param doc with ; semicolon, # hash, and \\ slash' "$far_tables_asm" &&
     grep -q '^    JSR InlineComplex' "$far_tables_asm" &&
     grep -q '^        INLINE_PTR B21_A4004 ; for JSR InlineComplex' "$far_tables_asm" &&
-    grep -q '^        INLINE_FAR_PTR B21_A4004, 0x01 ; for JSR InlineComplex' "$far_tables_asm" &&
+    grep -q '^        INLINE_FAR_PTR B21_A4004 ; for JSR InlineComplex' "$far_tables_asm" &&
     grep -q '^        INLINE_CODE_PTR B21_A4006 ; for JSR InlineComplex' "$far_tables_asm" &&
     grep -q '^        INLINE_WORD 0x1234 ; for JSR InlineComplex' "$far_tables_asm" &&
     grep -q '^; inline params=ptr16_data, far_data, ptr16_code, word, byte\[2\]' "$far_tables_asm" &&
@@ -619,7 +623,10 @@ if cmp -s "$ROOT/roms/addam_h4.rom" "$config_rebuilt" &&
     grep -q '^B3b_A5588:' "$config_asm" &&
     grep -q '^ThingAwardFarEntry:' "$config_asm" &&
     grep -q 'INLINE_FAR_CODE ThingAwardFarEntry ; for JSR FarCall' "$config_asm" &&
-    grep -q 'INLINE_FAR_CODE .*0x18 ; for JSR FarCall' "$config_asm" &&
+    # A far byte naming no real bank (0x18) is left as an honest raw-bank label,
+    # not aliased to some other page (phantom mapping removed).
+    grep -q '^        INLINE_FAR_CODE B18_A4001 ; for JSR FarCall$' "$config_asm" &&
+    ! grep -q 'INLINE_FAR_CODE .*, 0x18 ; for JSR FarCall' "$config_asm" &&
     ! grep -q 'JSR 0x8c97' "$config_asm" &&
     ! grep -q 'JSR 0x8990' "$config_asm"; then
     printf 'PASS addam_inline.ini\n'

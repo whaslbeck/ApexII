@@ -13,6 +13,36 @@
 #include <string.h>
 #include <time.h>
 
+/* See apex_project.h — the GUI clears this to keep warnings out of the console. */
+int apex_warn_to_stderr = 1;
+
+/* Acked-warning set for the current write pass: set at the top of
+   apex_project_write_asm_stream and cleared at the end.  A warning whose
+   (bank, cpu) is in this set is emitted as "; WARNING_ACK ..." (an acknowledged
+   note that no longer reads as a warning) and is not printed to stderr. */
+static const ConfigEntries *g_render_acks = NULL;
+
+static int warning_is_acked(uint8_t bank, uint32_t cpu_addr)
+{
+    size_t i;
+    if (!g_render_acks) {
+        return 0;
+    }
+    for (i = 0; i < g_render_acks->count; i++) {
+        const ConfigEntry *e = &g_render_acks->items[i];
+        if (e->addr == cpu_addr && (!e->has_bank || e->bank == bank)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* "WARNING" for an active warning, "WARNING_ACK" for an acknowledged one. */
+static const char *warning_keyword(uint8_t bank, uint32_t cpu_addr)
+{
+    return warning_is_acked(bank, cpu_addr) ? "WARNING_ACK" : "WARNING";
+}
+
 typedef enum {
     BLOCK_UNKNOWN,
     BLOCK_CODE,
@@ -262,9 +292,6 @@ static const char *data_kind_name(DataKind kind)
 {
     if (kind == DATA_STRING) {
         return "string";
-    }
-    if (kind == DATA_STRING_LP) {
-        return "string_lp";
     }
     if (kind == DATA_STRING_FIXED) {
         return "string_fixed";
@@ -628,13 +655,17 @@ static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, si
         snprintf(extra, sizeof(extra), " referenced_by=%s", srcs);
     }
 
-    fprintf(stderr,
-            "warning: classification conflict at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
-            "code_from=%s data_from=%s%s\n",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
+    int acked = warning_is_acked(bank, cpu_addr);
+    if (apex_warn_to_stderr && !acked) {
+        fprintf(stderr,
+                "warning: classification conflict at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
+                "code_from=%s data_from=%s%s\n",
+                bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
+    }
     fprintf(out,
-            "; WARNING classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
+            "; %s classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
             "code_from=%s data_from=%s%s\n",
+            acked ? "WARNING_ACK" : "WARNING",
             bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
 }
 
@@ -854,14 +885,18 @@ static void emit_inline_truncated_warning(FILE *out, uint8_t bank, uint32_t cpu_
                                           size_t rom_addr, const char *inst, unsigned expected,
                                           size_t available)
 {
-    fprintf(stderr,
-            "warning: inline data truncated after %s at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
-            "expected %u byte(s), available %lu\n",
-            inst, bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, expected,
-            (unsigned long)available);
+    int acked = warning_is_acked(bank, cpu_addr);
+    if (apex_warn_to_stderr && !acked) {
+        fprintf(stderr,
+                "warning: inline data truncated after %s at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
+                "expected %u byte(s), available %lu\n",
+                inst, bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, expected,
+                (unsigned long)available);
+    }
     fprintf(out,
-            "; WARNING inline_truncated bank=0x%02x cpu=0x%04x rom=0x%06lx expected=%u "
+            "; %s inline_truncated bank=0x%02x cpu=0x%04x rom=0x%06lx expected=%u "
             "available=%lu for %s\n",
+            acked ? "WARNING_ACK" : "WARNING",
             bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, expected,
             (unsigned long)available, inst);
 }
@@ -870,14 +905,18 @@ static void emit_inline_far_warning(FILE *out, uint8_t current_bank, uint32_t cp
                                     size_t rom_addr, const char *inst, uint16_t target,
                                     uint8_t target_bank)
 {
-    fprintf(stderr,
-            "warning: invalid inline far-code target after %s at bank=0x%02x cpu=0x%04x "
-            "rom=0x%06lx: target=0x%04x bank=0x%02x\n",
-            inst, current_bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, target,
-            target_bank);
+    int acked = warning_is_acked(current_bank, cpu_addr);
+    if (apex_warn_to_stderr && !acked) {
+        fprintf(stderr,
+                "warning: invalid inline far-code target after %s at bank=0x%02x cpu=0x%04x "
+                "rom=0x%06lx: target=0x%04x bank=0x%02x\n",
+                inst, current_bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, target,
+                target_bank);
+    }
     fprintf(out,
-            "; WARNING inline_far_code_invalid bank=0x%02x cpu=0x%04x rom=0x%06lx "
+            "; %s inline_far_code_invalid bank=0x%02x cpu=0x%04x rom=0x%06lx "
             "target=0x%04x target_bank=0x%02x for %s\n",
+            acked ? "WARNING_ACK" : "WARNING",
             current_bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, target,
             target_bank, inst);
 }
@@ -889,38 +928,11 @@ static void emit_string(FILE *out, const uint8_t *data, size_t len)
     fprintf(out, "    STRING \"");
     for (i = 0; i + 1u < len; i++) {
         if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == '\t') { fputs("\\t", out); continue; }
         if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') {
             fputc('\\', out);
         }
-        fputc(data[i], out);
-    }
-    fprintf(out, "\"\n");
-}
-
-/* Returns 1 + N (length byte + N chars) if data[0..N] is a valid LP string, else 0. */
-static size_t valid_string_lp_len(const uint8_t *data, size_t len)
-{
-    size_t n, i;
-    if (len == 0) return 0;
-    n = data[0];
-    if (n == 0 || 1u + n > len) return 0;
-    for (i = 1u; i <= n; i++) {
-        if (data[i] == 0x0au || data[i] == 0x07u) continue;  /* \n / \a, see emit_string */
-        if (data[i] < 0x20u || data[i] > 0x7fu) return 0;
-    }
-    return 1u + n;
-}
-
-/* Emits STRING_LP "…" (data[0] is the length byte, data[1..len-1] are the chars). */
-static void emit_string_lp(FILE *out, const uint8_t *data, size_t len)
-{
-    size_t i;
-    fprintf(out, "    STRING_LP \"");
-    for (i = 1u; i < len; i++) {
-        if (data[i] == '\n') { fputs("\\n", out); continue; }
-        if (data[i] == 0x07) { fputs("\\a", out); continue; }
-        if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
         fputc(data[i], out);
     }
     fprintf(out, "\"\n");
@@ -933,6 +945,7 @@ static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
     fprintf(out, "    STRING_FIXED \"");
     for (i = 0; i < len; i++) {
         if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == '\t') { fputs("\\t", out); continue; }
         if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
         fputc(data[i], out);
@@ -1080,34 +1093,6 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
         fprintf(out, "    %s %s", pseudo, label);
     } else {
         fprintf(out, "    %s %s, 0x%02x", pseudo, label, bank);
-    }
-}
-
-/* The effective bank a far reference resolves to.  A "phantom" bank byte that
-   names no real ROM bank is read by WPC through tied-high upper address lines as
-   an existing bank (e.g. 0x18 -> 0x38 on a 512 KB ROM); this returns that bank,
-   or the original byte when no remap happens. */
-static uint8_t far_effective_bank(const uint8_t *paged_rom, size_t banks, uint8_t bank)
-{
-    int idx;
-    if (bank == 0xffu || !paged_rom) {
-        return bank;
-    }
-    idx = bank_index_for_far_ref(paged_rom, banks, bank);
-    if (idx < 0) {
-        return bank;
-    }
-    return bank_id_for_index(banks, idx);
-}
-
-/* Emit a standalone comment line flagging a phantom-bank remap, if any. */
-static void emit_phantom_bank_comment(FILE *out, const char *indent,
-                                      const uint8_t *paged_rom, size_t banks, uint8_t bank)
-{
-    uint8_t eff = far_effective_bank(paged_rom, banks, bank);
-    if (eff != bank) {
-        fprintf(out, "%s; phantom bank 0x%02x -> 0x%02x (unmapped ROM addr line reads high)\n",
-                indent, (unsigned)bank, (unsigned)eff);
     }
 }
 
@@ -1313,7 +1298,6 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                     uint16_t addr = read_be16(data + *pos);
                     uint8_t bank = data[*pos + 2u];
 
-                    emit_phantom_bank_comment(out, "    ", paged_rom, banks, bank);
                     emit_far_code_ref(out, table_far_pseudo(kind), addr, bank, labels, label_count,
                                       extra_labels, extra_label_count, paged_rom, banks,
                                       bank_labels);
@@ -1374,16 +1358,6 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         *pos += string_len;
         return 1;
     }
-    if (range->kind == DATA_STRING_LP) {
-        size_t string_len = valid_string_lp_len(data + *pos, len - *pos);
-
-        if (string_len == 0) {
-            return 0;
-        }
-        emit_string_lp(out, data + *pos, string_len);
-        *pos += string_len;
-        return 1;
-    }
     if (range->kind == DATA_STRING_FIXED) {
         size_t n = range->length;
         size_t i;
@@ -1392,7 +1366,9 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             return 0;
         }
         for (i = 0; i < n; i++) {
-            if (data[*pos + i] < 0x20u || data[*pos + i] > 0x7fu) {
+            uint8_t c = data[*pos + i];
+            if (c == 0x09u) continue; /* tab, escaped as \t on emit */
+            if (c < 0x20u || c > 0x7fu) {
                 return 0;
             }
         }
@@ -1423,7 +1399,6 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (*pos + 3u > len) {
             return 0;
         }
-        emit_phantom_bank_comment(out, "    ", paged_rom, banks, data[*pos + 2u]);
         emit_far_code_ref(out, data_far_pseudo(range->kind), read_be16(data + *pos),
                           data[*pos + 2u], labels, label_count, extra_labels, extra_label_count,
                           paged_rom, banks, bank_labels);
@@ -1457,9 +1432,10 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (!apexsprite_decode(data + *pos, len - *pos, tmp,
                                NULL, NULL, NULL, NULL, NULL, NULL, &consumed) ||
             consumed == 0u) {
-            fprintf(out, "; WARNING sprite_invalid bank=0x%02x cpu=0x%04x"
+            uint32_t wcpu = (base_addr + (uint32_t)*pos) & 0xffffu;
+            fprintf(out, "; %s sprite_invalid bank=0x%02x cpu=0x%04x"
                          " (decode failed; emitting 1 byte as data)\n",
-                    range->bank, (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu);
+                    warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu);
             consumed = 1u;
         }
         emit_data_bytes(out, data, len, base_addr, pos, consumed);
@@ -1472,9 +1448,10 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         if (!apexsprite_decode_noheader(data + *pos, len - *pos, tmp,
                                         (uint8_t)range->length, NULL, &consumed) ||
             consumed == 0u) {
-            fprintf(out, "; WARNING sprite_noheader_invalid bank=0x%02x cpu=0x%04x height=%lu"
+            uint32_t wcpu = (base_addr + (uint32_t)*pos) & 0xffffu;
+            fprintf(out, "; %s sprite_noheader_invalid bank=0x%02x cpu=0x%04x height=%lu"
                          " (decode failed; emitting 1 byte as data)\n",
-                    range->bank, (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu,
+                    warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu,
                     (unsigned long)range->length);
             consumed = 1u;
         }
@@ -1541,7 +1518,6 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                     emit_inline_far_warning(out, current_bank, base_addr + (uint32_t)*pos,
                                             rom_base + *pos, inst, target, bank);
                 }
-                emit_phantom_bank_comment(out, "        ", paged_rom, banks, bank);
                 fputs("    ", out);
                 emit_far_code_ref(out, inline_far_pseudo(kind), target, bank, labels, label_count,
                                   extra_labels, extra_label_count, paged_rom, banks, bank_labels);
@@ -2165,8 +2141,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
         explain_label(label, config_data_source(range->kind));
         explain_label_kind(label, config_data_source(range->kind));
         mark_label_data(label);
-        if (range->kind == DATA_STRING || range->kind == DATA_STRING_LP ||
-            range->kind == DATA_STRING_FIXED) {
+        if (range->kind == DATA_STRING || range->kind == DATA_STRING_FIXED) {
             label->is_string = 1;
         } else if (data_kind_is_far(range->kind) && range->addr + 2u <= 0xffffu) {
             const uint8_t *data;
@@ -2578,6 +2553,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
 {
     size_t i;
 
+    g_render_acks = &project->ack_warnings;
     emit_preamble(out, project);
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols, &project->docs);
@@ -2610,6 +2586,7 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
         emit_xref_index(out, project->rom.data, project->bank_labels, project->banks,
                         &project->system_labels, &project->refs);
     }
+    g_render_acks = NULL;
     return 0;
 }
 
