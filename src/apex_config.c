@@ -958,6 +958,41 @@ static int parse_count_format(char *value, const char *prefix, size_t *count)
     return 1;
 }
 
+/* Canonical `[data]` spec string for a data range (the single source of truth
+   shared by every writer: apexini, apex_project overlay, and the GUI).  Writes
+   into buf and returns it. */
+const char *data_range_spec(const DataRange *r, char *buf, size_t bufsz)
+{
+    const char *name;
+    switch (r->kind) {
+    case DATA_BYTES:
+        snprintf(buf, bufsz, "bytes[%lu]", (unsigned long)r->length);      return buf;
+    case DATA_STRING_FIXED:
+        snprintf(buf, bufsz, "string[%lu]", (unsigned long)r->length);     return buf;
+    case DATA_BCD:
+        snprintf(buf, bufsz, "bcd[%lu]", (unsigned long)r->length);        return buf;
+    case DATA_SPRITE_NOHEADER:
+        snprintf(buf, bufsz, "sprite_noheader[%lu]", (unsigned long)r->length); return buf;
+    case DATA_STRING:            name = "string";           break;
+    case DATA_DMD_FULLFRAME:     name = "dmd_fullframe";     break;
+    case DATA_PTR16_STRING:      name = "ptr16_string";     break;
+    case DATA_PTR16_DATA:        name = "ptr16_data";       break;
+    case DATA_PTR16_CODE:        name = "ptr16_code";       break;
+    case DATA_PTR16_TABLE:       name = "ptr16_table";      break;
+    case DATA_PTR16_SPRITE:      name = "ptr16_sprite";     break;
+    case DATA_FAR_STRING:        name = "far_string";       break;
+    case DATA_FAR_DATA:          name = "far_data";         break;
+    case DATA_FAR_TABLE:         name = "far_table";        break;
+    case DATA_FAR_CODE:          name = "far_code";         break;
+    case DATA_FAR_DMD_FULLFRAME: name = "far_dmd_fullframe"; break;
+    case DATA_FAR_SPRITE:        name = "far_sprite";       break;
+    case DATA_SPRITE:            name = "sprite";           break;
+    default:                     name = "bytes[1]";         break;
+    }
+    snprintf(buf, bufsz, "%s", name);
+    return buf;
+}
+
 static char *resolve_include_path(const char *from_path, const char *include_path)
 {
     const char *slash;
@@ -1384,6 +1419,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 add_data_range(data_ranges, bank, addr, DATA_STRING, 0);
             } else if (parse_count_format(value, "string", &length)) {
                 add_data_range(data_ranges, bank, addr, DATA_STRING_FIXED, length);
+            } else if (parse_count_format(value, "bcd", &length)) {
+                add_data_range(data_ranges, bank, addr, DATA_BCD, length);
             } else if (strcmp(value, "dmd_fullframe") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
             } else if (strcmp(value, "ptr16_string") == 0) {
@@ -1666,6 +1703,8 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
     value = dup_string(spec);
     if (parse_count_format(value, "bytes", &length)) {
         add_data_range(ranges, bank, addr, DATA_BYTES, length);
+    } else if (parse_count_format(value, "bcd", &length)) {
+        add_data_range(ranges, bank, addr, DATA_BCD, length);
     } else if (parse_count_format(value, "string", &length)) {
         add_data_range(ranges, bank, addr, DATA_STRING_FIXED, length);
     } else if (strcmp(value, "string") == 0) {

@@ -403,6 +403,13 @@ static int parse_value_or_symbol(const AsmState *st, const char *text, uint32_t 
             }
         }
     }
+    /* A defined symbol wins even when its name coincidentally matches the
+       generated Bxx_Ayyyy form (e.g. a user label "Bcd_Add16" would otherwise
+       be misread as bank 0xcd, address 0xdd16).  Only fall back to decoding the
+       generated form when no such symbol is defined (forward/cross-bank refs). */
+    if (lookup_symbol(st, text, value)) {
+        return 1;
+    }
     if (strlen(text) == 9 && text[0] == 'B' && text[3] == '_' && text[4] == 'A') {
         uint32_t bank;
         char addr_text[7];
@@ -422,7 +429,7 @@ static int parse_value_or_symbol(const AsmState *st, const char *text, uint32_t 
         (void)bank;
         return 1;
     }
-    return lookup_symbol(st, text, value);
+    return 0;
 }
 
 static int parse_generated_bank_label(const char *text, uint32_t *addr, uint32_t *bank)
@@ -578,6 +585,29 @@ static void parse_string_fixed(AsmState *st, char *args)
         emit_byte(st, ch);
     }
     die("unterminated STRING_FIXED");
+}
+
+/* BCD <digits> — 2N decimal digits packed into N bytes (each nibble one digit). */
+static void parse_bcd(AsmState *st, char *args)
+{
+    char  *p = trim(args);
+    size_t n = 0, i;
+    for (i = 0; p[i]; i++) {
+        if (p[i] == ' ' || p[i] == '\t') break;
+        if (p[i] < '0' || p[i] > '9') {
+            die("invalid BCD digit '%c'", p[i]);
+        }
+        n++;
+    }
+    if (*trim(p + n) != '\0') {
+        die("unexpected trailing text after BCD");
+    }
+    if (n == 0 || (n & 1u)) {
+        die("BCD needs an even, non-zero number of digits");
+    }
+    for (i = 0; i < n; i += 2) {
+        emit_byte(st, (uint8_t)(((p[i] - '0') << 4) | (p[i + 1] - '0')));
+    }
 }
 
 static void parse_inline_far_code(AsmState *st, char *args)
@@ -813,6 +843,8 @@ static void parse_line(AsmState *st, char *line)
         parse_string_fixed(st, trim(s + strlen("STRING_FIXED")));
     } else if (starts_with_word(s, "STRING")) {
         parse_string(st, trim(s + strlen("STRING")));
+    } else if (starts_with_word(s, "BCD")) {
+        parse_bcd(st, trim(s + strlen("BCD")));
     } else if (starts_with_word(s, ".DB")) {
         parse_db(st, trim(s + strlen(".DB")));
     } else if (starts_with_word(s, ".DW")) {

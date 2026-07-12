@@ -1,0 +1,13 @@
+{
+  "_fileformat": 0.8,
+  "_metadata": { "version": 1.0, "roms": ["sample"], "platform": "williams-wpc" },
+  "adjustments": {
+    "A.1 Standard": {
+      "01": { "label": "Balls Per Game", "short_label": "BallsPerGame", "encoding": "int", "start": "0x1a00" },
+      "02": { "label": "Free Play", "encoding": "bool", "start": 6657 }
+    }
+  },
+  "high_scores": [
+    { "score": { "label": "Grand Champion Score", "short_label": "GC_Score", "encoding": "bcd", "start": "0x1b10" } }
+  ]
+}

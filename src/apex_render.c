@@ -299,6 +299,15 @@ static size_t rendered_line_size(const ApexProject *project, const ApexRenderedL
         size_t n = parse_string_asm_length(line->text, line->length);
         return n > 0u ? n - 1u : 0u;  /* no null/length byte */
     }
+    if (mnemonic_equals(line->text, line->length, "BCD")) {
+        /* BCD <2N digits> → N bytes */
+        size_t i = 0, digits = 0;
+        while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
+        i += 3; /* "BCD" */
+        while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
+        while (i < line->length && line->text[i] >= '0' && line->text[i] <= '9') { digits++; i++; }
+        return digits / 2u;
+    }
     if (mnemonic_equals(line->text, line->length, "INLINE_BYTE")) {
         return 1u;
     }

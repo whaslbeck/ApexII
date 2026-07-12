@@ -193,6 +193,17 @@ struct WarningEntry {
     uint32_t cpu_addr;
 };
 
+/* One candidate RAM location read from an nvram-maps JSON, shown in the import
+   preview window (name, address, doc, whether it collides with existing state). */
+struct NvramImportRow {
+    std::string name;
+    uint32_t    addr;
+    std::string doc;
+    bool        selected;
+    bool        overwrites;   /* would replace an existing symbol/doc */
+    std::string conflict;     /* human description of the collision, if any */
+};
+
 /* Which classification action the "repeat last classification" hotkey replays. */
 enum ApexLastClassifyOp {
     APEX_LAST_CLASSIFY_NONE = 0,
@@ -336,6 +347,9 @@ struct UiState {
     bool show_warnings;
     std::vector<WarningEntry> warnings;
     bool warnings_stale;
+    bool show_nvram_import;
+    std::vector<NvramImportRow> nvram_import_rows;
+    char nvram_source_path[512];  /* last imported nvram JSON — reused as export template */
 
     bool refs_pinned;
     uint8_t refs_pinned_bank;
@@ -651,6 +665,16 @@ void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **do
 void render_code_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_inline_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_warnings_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_nvram_import_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* Populate state->nvram_import_rows from parsed nvram locations, flagging
+   collisions against the project's current symbols/docs. Returns 0 on success. */
+int nvram_prepare_import(ApexProject *project, UiState *state, const char *json_path,
+                        std::string *err);
+/* Write the project's RAM symbols/docs to an nvram-maps JSON file. When
+   template_path is non-empty and readable, merge into it losslessly (only
+   names/docs updated); otherwise write a fresh minimal map. */
+int nvram_export(const ApexProject *project, const char *json_path,
+                 const char *template_path, std::string *err);
 void render_rom_map(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // DMD and Sprite list windows

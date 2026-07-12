@@ -80,6 +80,21 @@ static void handle_fatal_signal(int sig)
     raise(sig);
 }
 
+/* Directory of a file path, for seeding a file dialog's starting folder.
+   ImGuiFileDialog's `path` must be a directory; passing a file (e.g. the config
+   .ini) makes its directory iterator fail repeatedly ("Not a directory").
+   Returns "." when the path has no directory component or is empty. */
+static std::string dir_of(const char *p)
+{
+    if (!p || !p[0]) return ".";
+    const char *fwd = strrchr(p, '/');
+    const char *bwd = strrchr(p, '\\');
+    const char *s = (fwd && bwd) ? (fwd > bwd ? fwd : bwd) : (fwd ? fwd : bwd);
+    if (!s) return ".";
+    if (s == p) return "/";              /* path like "/file" */
+    return std::string(p, (size_t)(s - p));
+}
+
 /* Helper: render one frame for the startup file picker loop */
 static void startup_frame_render(SDL_Window *win)
 {
@@ -154,6 +169,8 @@ int main(int argc, char **argv)
     bool want_quit = false;
     bool want_consolidate = false;
     bool want_save_ini_as = false;
+    bool want_nvram_import = false;
+    bool want_nvram_export = false;
     char rom_path[1024] = "";
     char config_path[1024] = "";
 
@@ -307,6 +324,8 @@ int main(int argc, char **argv)
     state.inline_candidates_stale = false;
     state.show_warnings           = false;
     state.warnings_stale          = true;
+    state.show_nvram_import       = false;
+    state.nvram_source_path[0]    = '\0';
     state.show_rom_map           = false;
     state.show_dmd_list         = false;
     state.show_sprite_list      = false;
@@ -417,6 +436,14 @@ int main(int argc, char **argv)
                 if (ImGui::MenuItem("Save INI As...")) {
                     want_save_ini_as = true;
                 }
+                ImGui::Separator();
+                if (ImGui::MenuItem("Import RAM Map (JSON)...")) {
+                    want_nvram_import = true;
+                }
+                if (ImGui::MenuItem("Export RAM Map (JSON)...")) {
+                    want_nvram_export = true;
+                }
+                ImGui::Separator();
                 if (ImGui::MenuItem("Re-analyze", "F5")) {
                     uint8_t cur_b = 0xffu; uint32_t cur_a = 0u;
                     selected_address(document, &state, &cur_b, &cur_a);
@@ -1277,7 +1304,7 @@ int main(int argc, char **argv)
         /* --- Save INI As dialog --- */
         if (want_save_ini_as) {
             IGFD::FileDialogConfig cfg;
-            cfg.path     = state.base_config_path[0] ? state.base_config_path : ".";
+            cfg.path     = dir_of(state.base_config_path);
             cfg.fileName = "config.ini";
             cfg.flags    = ImGuiFileDialogFlags_ConfirmOverwrite;
             ImGuiFileDialog::Instance()->OpenDialog("SaveIniAs", "Save INI As", ".ini", cfg);
@@ -1292,6 +1319,60 @@ int main(int argc, char **argv)
                     set_status(&state, ("saved: " + p).c_str());
                 else
                     set_status(&state, ("save failed: " + st).c_str());
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+
+        /* --- RAM map import (nvram-maps JSON) --- */
+        if (want_nvram_import) {
+            IGFD::FileDialogConfig cfg;
+            cfg.path = dir_of(state.base_config_path);
+            ImGuiFileDialog::Instance()->OpenDialog("NvramImport", "Import RAM Map (JSON)",
+                                                    ".json", cfg);
+            want_nvram_import = false;
+        }
+        if (ImGuiFileDialog::Instance()->Display("NvramImport",
+                ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+                std::string st;
+                if (nvram_prepare_import(project, &state, p.c_str(), &st) != 0)
+                    set_status(&state, ("RAM import failed: " + st).c_str());
+                else
+                    snprintf(state.nvram_source_path, sizeof(state.nvram_source_path),
+                             "%s", p.c_str()); /* reuse as export template */
+            }
+            ImGuiFileDialog::Instance()->Close();
+        }
+        if (state.show_nvram_import) {
+            ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_FirstUseEver);
+            if (ImGui::Begin("Import RAM Map", &state.show_nvram_import)) {
+                render_nvram_import_window(project, &document, &state);
+            }
+            ImGui::End();
+            if (!state.show_nvram_import) state.nvram_import_rows.clear();
+        }
+
+        /* --- RAM map export --- */
+        if (want_nvram_export) {
+            IGFD::FileDialogConfig cfg;
+            cfg.path     = dir_of(state.base_config_path);
+            cfg.fileName = "ram_map.json";
+            cfg.flags    = ImGuiFileDialogFlags_ConfirmOverwrite;
+            ImGuiFileDialog::Instance()->OpenDialog("NvramExport", "Export RAM Map (JSON)",
+                                                    ".json", cfg);
+            want_nvram_export = false;
+        }
+        if (ImGuiFileDialog::Instance()->Display("NvramExport",
+                ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
+            if (ImGuiFileDialog::Instance()->IsOk()) {
+                std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
+                std::string st;
+                if (nvram_export(project, p.c_str(), state.nvram_source_path, &st) == 0)
+                    set_status(&state, ("RAM map exported: " + p +
+                                        (state.nvram_source_path[0] ? " (merged)" : "")).c_str());
+                else
+                    set_status(&state, ("RAM export failed: " + st).c_str());
             }
             ImGuiFileDialog::Instance()->Close();
         }

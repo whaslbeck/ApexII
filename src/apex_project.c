@@ -472,59 +472,8 @@ static void write_inline_signature_value(FILE *out, const InlineSignature *sig)
 
 static void write_data_range_value(FILE *out, const DataRange *range)
 {
-    switch (range->kind) {
-    case DATA_BYTES:
-        fprintf(out, "bytes[%lu]", (unsigned long)range->length);
-        break;
-    case DATA_STRING:
-        fputs("string", out);
-        break;
-    case DATA_STRING_FIXED:
-        fprintf(out, "string[%lu]", (unsigned long)range->length);
-        break;
-    case DATA_DMD_FULLFRAME:
-        fputs("dmd_fullframe", out);
-        break;
-    case DATA_PTR16_STRING:
-        fputs("ptr16_string", out);
-        break;
-    case DATA_PTR16_DATA:
-        fputs("ptr16_data", out);
-        break;
-    case DATA_PTR16_CODE:
-        fputs("ptr16_code", out);
-        break;
-    case DATA_PTR16_TABLE:
-        fputs("ptr16_table", out);
-        break;
-    case DATA_FAR_STRING:
-        fputs("far_string", out);
-        break;
-    case DATA_FAR_DATA:
-        fputs("far_data", out);
-        break;
-    case DATA_FAR_TABLE:
-        fputs("far_table", out);
-        break;
-    case DATA_FAR_CODE:
-        fputs("far_code", out);
-        break;
-    case DATA_FAR_DMD_FULLFRAME:
-        fputs("far_dmd_fullframe", out);
-        break;
-    case DATA_SPRITE:
-        fputs("sprite", out);
-        break;
-    case DATA_SPRITE_NOHEADER:
-        fprintf(out, "sprite_noheader[%lu]", (unsigned long)range->length);
-        break;
-    case DATA_PTR16_SPRITE:
-        fputs("ptr16_sprite", out);
-        break;
-    case DATA_FAR_SPRITE:
-        fputs("far_sprite", out);
-        break;
-    }
+    char buf[48];
+    fputs(data_range_spec(range, buf, sizeof(buf)), out);
 }
 
 static void write_table_def_value(FILE *out, const TableDef *table)

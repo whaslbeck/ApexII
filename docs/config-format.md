@@ -274,6 +274,7 @@ Supported data kinds:
 | `bytes[N]` | Raw bytes, length N |
 | `string` | Null-terminated ASCII string |
 | `string[N]` | Fixed-length ASCII string, exactly N bytes (no terminator) |
+| `bcd[N]` | Binary-coded decimal, N bytes = 2N decimal digits (e.g. scores). Renders as `BCD 0001234500`. |
 | `dmd_fullframe` | DMD full-frame bitmap |
 | `sprite` | Sprite image (self-describing header) |
 | `sprite_noheader[N]` | Headerless sprite, height N pixels (width byte read from ROM) |
@@ -429,5 +430,6 @@ Beyond hard errors, the disassembler flags suspect-but-recoverable situations wi
 | `classification_conflict` | An address is reachable as both code and data. |
 | `sprite_invalid` | A range classified as `sprite` failed to decode. |
 | `sprite_noheader_invalid` | A `sprite_noheader` range failed to decode. |
+| `label_name_collision` | A `[labels]` name matches the generated `Bxx_Ayyyy` form but decodes to a different address (e.g. `Bcd_Add16` → `0xdd16`). A defined symbol still wins in the assembler, but rename it to avoid ambiguity. |
 
 Acknowledge a warning you have reviewed with [`[ack_warnings]`](#ack_warnings): it is then emitted as `; WARNING_ACK …` and no longer counts as active or prints to the console.

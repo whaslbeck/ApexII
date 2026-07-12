@@ -7,6 +7,7 @@
 #include "apex_config.h"
 #include "apex_project.h"
 #include "apex_render.h"
+#include "apex_nvram.h"
 
 #include <ctype.h>
 #include <setjmp.h>
@@ -204,26 +205,8 @@ static void w_schema(FILE *f, const TableSchema *s)
 
 static void w_data_val(FILE *f, const DataRange *r)
 {
-    switch (r->kind) {
-    case DATA_BYTES:             fprintf(f, "bytes[%lu]", (unsigned long)r->length); break;
-    case DATA_STRING:            fputs("string",              f); break;
-    case DATA_STRING_FIXED:      fprintf(f, "string[%lu]", (unsigned long)r->length); break;
-    case DATA_DMD_FULLFRAME:     fputs("dmd_fullframe",       f); break;
-    case DATA_PTR16_STRING:      fputs("ptr16_string",        f); break;
-    case DATA_PTR16_DATA:        fputs("ptr16_data",          f); break;
-    case DATA_PTR16_CODE:        fputs("ptr16_code",          f); break;
-    case DATA_PTR16_TABLE:       fputs("ptr16_table",         f); break;
-    case DATA_FAR_STRING:        fputs("far_string",          f); break;
-    case DATA_FAR_DATA:          fputs("far_data",            f); break;
-    case DATA_FAR_TABLE:         fputs("far_table",           f); break;
-    case DATA_FAR_CODE:          fputs("far_code",            f); break;
-    case DATA_FAR_DMD_FULLFRAME: fputs("far_dmd_fullframe",   f); break;
-    case DATA_SPRITE:            fputs("sprite",              f); break;
-    case DATA_PTR16_SPRITE:      fputs("ptr16_sprite",        f); break;
-    case DATA_FAR_SPRITE:        fputs("far_sprite",          f); break;
-    case DATA_SPRITE_NOHEADER:
-        fprintf(f, "sprite_noheader[%lu]", (unsigned long)r->length); break;
-    }
+    char buf[48];
+    fputs(data_range_spec(r, buf, sizeof(buf)), f);
 }
 
 static void w_table_val(FILE *f, const TableDef *t)
@@ -542,27 +525,33 @@ static int cmp_ovl(const void *a, const void *b)
     return r ? r : strcmp(oa->section, ob->section);
 }
 
-static uint32_t data_end(const DataRange *r)
+/* Statically-known byte length of a data range, or 0 when the end can only be
+   determined by reading the ROM (null-terminated string, sprite). */
+static size_t data_range_len(const DataRange *r)
 {
-    size_t len;
-
     switch (r->kind) {
-    case DATA_BYTES:           len = r->length; break;
-    case DATA_DMD_FULLFRAME:   len = 512u;      break;
+    case DATA_BYTES:
+    case DATA_STRING_FIXED:
+    case DATA_BCD:               return r->length;
+    case DATA_DMD_FULLFRAME:     return 512u;
     case DATA_PTR16_STRING:
     case DATA_PTR16_DATA:
     case DATA_PTR16_CODE:
-    case DATA_PTR16_TABLE:     len = 2u;        break;
+    case DATA_PTR16_TABLE:
+    case DATA_PTR16_SPRITE:      return 2u;
     case DATA_FAR_STRING:
     case DATA_FAR_DATA:
     case DATA_FAR_TABLE:
     case DATA_FAR_CODE:
     case DATA_FAR_DMD_FULLFRAME:
-    case DATA_FAR_SPRITE:        len = 3u;           break;
-    case DATA_PTR16_SPRITE:      len = 2u;           break;
-    case DATA_SPRITE_NOHEADER:   len = 0u; break; /* width is in ROM, end not statically known */
-    default:                   len = 0u;              break;
+    case DATA_FAR_SPRITE:        return 3u;
+    default:                     return 0u; /* string, sprite, sprite_noheader */
     }
+}
+
+static uint32_t data_end(const DataRange *r)
+{
+    size_t len = data_range_len(r);
     return len ? r->addr + (uint32_t)len : 0u;
 }
 
@@ -631,33 +620,7 @@ static int cmd_overlaps(int argc, char **argv)
         e->addr     = c.data.items[i].addr;
         e->end      = data_end(&c.data.items[i]);
         strcpy(e->section, "data");
-        switch (c.data.items[i].kind) {
-        case DATA_BYTES:
-            snprintf(e->spec, sizeof(e->spec), "bytes[%lu]",
-                     (unsigned long)c.data.items[i].length); break;
-        case DATA_STRING:            strcpy(e->spec, "string");              break;
-        case DATA_STRING_FIXED:
-            snprintf(e->spec, sizeof(e->spec), "string[%lu]",
-                     (unsigned long)c.data.items[i].length);
-            break;
-        case DATA_DMD_FULLFRAME:     strcpy(e->spec, "dmd_fullframe");       break;
-        case DATA_PTR16_STRING:      strcpy(e->spec, "ptr16_string");        break;
-        case DATA_PTR16_DATA:        strcpy(e->spec, "ptr16_data");          break;
-        case DATA_PTR16_CODE:        strcpy(e->spec, "ptr16_code");          break;
-        case DATA_PTR16_TABLE:       strcpy(e->spec, "ptr16_table");         break;
-        case DATA_FAR_STRING:        strcpy(e->spec, "far_string");          break;
-        case DATA_FAR_DATA:          strcpy(e->spec, "far_data");            break;
-        case DATA_FAR_TABLE:         strcpy(e->spec, "far_table");           break;
-        case DATA_FAR_CODE:          strcpy(e->spec, "far_code");            break;
-        case DATA_FAR_DMD_FULLFRAME: strcpy(e->spec, "far_dmd_fullframe");   break;
-        case DATA_SPRITE:            strcpy(e->spec, "sprite");              break;
-        case DATA_PTR16_SPRITE:      strcpy(e->spec, "ptr16_sprite");        break;
-        case DATA_FAR_SPRITE:        strcpy(e->spec, "far_sprite");          break;
-        case DATA_SPRITE_NOHEADER:
-            snprintf(e->spec, sizeof(e->spec), "sprite_noheader[%lu]",
-                     (unsigned long)c.data.items[i].length);
-            break;
-        }
+        data_range_spec(&c.data.items[i], e->spec, sizeof(e->spec));
     }
     for (i = 0; i < c.tables.count; i++) {
         OvlEntry *e = ovl_push(&ovl, &count, &cap);
@@ -1329,23 +1292,7 @@ static int cmd_check_bounds(int argc, char **argv)
     for (i = 0; i < p->data_ranges.count; i++) {
         const DataRange *d = &p->data_ranges.items[i];
         if (check_one_addr(p, 1, d->bank, d->addr, "data", &issues)) {
-            size_t len = 0;
-            switch (d->kind) {
-            case DATA_BYTES:             len = d->length; break;
-            case DATA_DMD_FULLFRAME:     len = 512u;      break;
-            case DATA_PTR16_STRING:
-            case DATA_PTR16_DATA:
-            case DATA_PTR16_CODE:
-            case DATA_PTR16_TABLE:
-            case DATA_PTR16_SPRITE:      len = 2u;        break;
-            case DATA_FAR_STRING:
-            case DATA_FAR_DATA:
-            case DATA_FAR_TABLE:
-            case DATA_FAR_CODE:
-            case DATA_FAR_DMD_FULLFRAME:
-            case DATA_FAR_SPRITE:        len = 3u;        break;
-            default:                     len = 0u;        break;
-            }
+            size_t len = data_range_len(d);
             if (len) check_range_end(1, d->bank, d->addr, len, "data", &issues);
         }
     }
@@ -1469,6 +1416,185 @@ static int cmd_migrate(int argc, char **argv)
 
 /* ── main ───────────────────────────────────────────────────────────────── */
 
+static const char *doc_text_at(const Cfg *c, uint32_t addr)
+{
+    size_t i;
+    for (i = 0; i < c->docs.count; i++) {
+        if (c->docs.items[i].addr == addr) {
+            return c->docs.items[i].text;
+        }
+    }
+    return NULL;
+}
+
+static int symbol_at(const Cfg *c, uint32_t addr)
+{
+    size_t i;
+    for (i = 0; i < c->syms.count; i++) {
+        if (c->syms.items[i].value == addr) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+/* apexini nvram-export <in.ini> <out.json> — write RAM symbols/docs as an
+   NVRAM-maps JSON file. */
+/* Grow the RAM-location array if full (checked realloc; exits on OOM, matching
+   ovl_push).  Returns the possibly-relocated array. */
+static ApexNvramLoc *nvram_loc_reserve(ApexNvramLoc *arr, size_t n, size_t *cap)
+{
+    if (n == *cap) {
+        size_t nc = *cap ? *cap * 2 : 32;
+        ApexNvramLoc *na = realloc(arr, nc * sizeof(*na));
+        if (!na) { fputs("out of memory\n", stderr); exit(1); }
+        arr = na;
+        *cap = nc;
+    }
+    return arr;
+}
+
+static int cmd_nvram_export(int argc, char **argv)
+{
+    Cfg c;
+    ApexNvramLoc *arr = NULL;
+    size_t n = 0, cap = 0, i;
+    FILE *f;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: apexini nvram-export <in.ini> <out.json> [template.json]\n");
+        return 2;
+    }
+    memset(&c, 0, sizeof(c));
+    if (cfg_load(&c, argv[0])) {
+        fprintf(stderr, "%s: error: %s\n", argv[0], s_err);
+        return 1;
+    }
+    /* named RAM locations (symbols in the RAM range) + their docs */
+    for (i = 0; i < c.syms.count; i++) {
+        if (c.syms.items[i].value >= APEX_RAM_LIMIT) continue;
+        arr = nvram_loc_reserve(arr, n, &cap);
+        arr[n].name = (char *)c.syms.items[i].name;
+        arr[n].addr = c.syms.items[i].value;
+        arr[n].doc  = (char *)doc_text_at(&c, c.syms.items[i].value);
+        n++;
+    }
+    /* documented RAM locations without a symbol name → generated name */
+    for (i = 0; i < c.docs.count; i++) {
+        uint32_t a = c.docs.items[i].addr;
+        if (a >= APEX_RAM_LIMIT || symbol_at(&c, a)) continue;
+        arr = nvram_loc_reserve(arr, n, &cap);
+        {
+            char *nm = malloc(16);
+            snprintf(nm, 16, "RAM_%04x", a & 0xffffu);
+            arr[n].name = nm; /* leaked at process exit; fine for a CLI one-shot */
+        }
+        arr[n].addr = a;
+        arr[n].doc  = c.docs.items[i].text;
+        n++;
+    }
+    /* Read the template fully into memory BEFORE opening the output for write,
+       so `nvram-export game.ini game.json game.json` (in-place update) does not
+       truncate the template before we read it. */
+    char  *tt = NULL;
+    size_t tgot = 0;
+    if (argc >= 3) {
+        FILE *tf = fopen(argv[2], "rb");
+        if (!tf) { fprintf(stderr, "cannot read template %s\n", argv[2]); free(arr); cfg_free(&c); return 1; }
+        fseek(tf, 0, SEEK_END); long tsz = ftell(tf); fseek(tf, 0, SEEK_SET);
+        tt = malloc((size_t)(tsz < 0 ? 0 : tsz) + 1u);
+        if (!tt) { fprintf(stderr, "out of memory\n"); fclose(tf); free(arr); cfg_free(&c); return 1; }
+        tgot = tsz > 0 ? fread(tt, 1, (size_t)tsz, tf) : 0;
+        fclose(tf);
+        tt[tgot] = '\0';
+    }
+    f = fopen(argv[1], "w");
+    if (!f) { fprintf(stderr, "cannot write %s\n", argv[1]); free(tt); free(arr); cfg_free(&c); return 1; }
+    if (tt) {
+        char terr[128] = {0};
+        int rc = apex_nvram_export_merged(f, tt, tgot, arr, n, terr, sizeof(terr));
+        free(tt);
+        if (rc != 0) { fprintf(stderr, "%s: %s\n", argv[2], terr); fclose(f); free(arr); cfg_free(&c); return 1; }
+        printf("exported %zu RAM location(s) into %s (template %s)\n", n, argv[1], argv[2]);
+    } else {
+        apex_nvram_write_json(f, arr, n, NULL);
+        printf("exported %zu RAM location(s) to %s\n", n, argv[1]);
+    }
+    fclose(f);
+    free(arr);
+    cfg_free(&c);
+    return 0;
+}
+
+static void write_ini_doc_value(FILE *f, const char *s)
+{
+    fputc('"', f);
+    for (; s && *s; s++) {
+        char c = *s;
+        if (c == '"' || c == '\\' || c == ';' || c == '#') fputc('\\', f);
+        if (c == '\n') { fputs("\\n", f); continue; }
+        fputc(c, f);
+    }
+    fputc('"', f);
+}
+
+/* apexini nvram-import <in.json> <out.ini> [base] — read an NVRAM-maps JSON
+   file and write a config with [symbols] and [docs] for each RAM location. */
+static int cmd_nvram_import(int argc, char **argv)
+{
+    ApexNvramLocs locs;
+    char err[128] = {0};
+    char *text = NULL;
+    long sz;
+    uint32_t base = 0;
+    FILE *in, *out;
+    size_t i, got;
+
+    if (argc < 2) {
+        fprintf(stderr, "usage: apexini nvram-import <in.json> <out.ini> [base_addr]\n");
+        return 2;
+    }
+    if (argc >= 3) {
+        base = (uint32_t)strtoul(argv[2], NULL, 0);
+    }
+    in = fopen(argv[0], "rb");
+    if (!in) { fprintf(stderr, "cannot read %s\n", argv[0]); return 1; }
+    fseek(in, 0, SEEK_END);
+    sz = ftell(in);
+    fseek(in, 0, SEEK_SET);
+    if (sz < 0) { fclose(in); fprintf(stderr, "cannot size %s\n", argv[0]); return 1; }
+    text = malloc((size_t)sz + 1u);
+    if (!text) { fclose(in); fprintf(stderr, "out of memory\n"); return 1; }
+    got = fread(text, 1, (size_t)sz, in);
+    fclose(in);
+    text[got] = '\0';
+    if (apex_nvram_parse_json(text, got, base, &locs, err, sizeof(err)) != 0) {
+        fprintf(stderr, "%s: %s\n", argv[0], err);
+        free(text);
+        return 1;
+    }
+    free(text);
+    out = fopen(argv[1], "w");
+    if (!out) { fprintf(stderr, "cannot write %s\n", argv[1]); apex_nvram_locs_free(&locs); return 1; }
+    fputs("; RAM map imported from an NVRAM-maps JSON file by apexini nvram-import\n\n", out);
+    fputs("[symbols]\n", out);
+    for (i = 0; i < locs.count; i++) {
+        fprintf(out, "%s = 0x%04x\n", locs.items[i].name, locs.items[i].addr & 0xffffu);
+    }
+    fputs("\n[docs]\n", out);
+    for (i = 0; i < locs.count; i++) {
+        if (locs.items[i].doc && locs.items[i].doc[0]) {
+            fprintf(out, "0x%04x = ", locs.items[i].addr & 0xffffu);
+            write_ini_doc_value(out, locs.items[i].doc);
+            fputc('\n', out);
+        }
+    }
+    fclose(out);
+    printf("imported %zu RAM location(s) to %s\n", locs.count, argv[1]);
+    apex_nvram_locs_free(&locs);
+    return 0;
+}
+
 static void print_help(FILE *out)
 {
     fputs(
@@ -1490,6 +1616,10 @@ static void print_help(FILE *out)
 "  coverage <rom> <file.ini>       Report ROM classification coverage (code/data/unknown/...).\n"
 "  orphan-labels <rom> <file.ini>  List [labels] whose address is absent from the disassembly.\n"
 "  check-bounds <rom> <file.ini>   Verify data/table ranges stay within bank/ROM bounds.\n"
+"  nvram-export <in.ini> <out.json> [template.json]  Export RAM [symbols]/[docs] as PinMAME\n"
+"                                  nvram-maps JSON; with a template, only names/docs are\n"
+"                                  updated and every other field is preserved (zero loss).\n"
+"  nvram-import <in.json> <out.ini> [base]  Import an nvram-maps JSON into [symbols]/[docs].\n"
 "  help                            Show this help.\n"
 "\n"
 "Addresses: Bxx_Ayyyy (xx = bank in hex, yyyy = CPU address) or 0xyyyy for the system bank.\n",
@@ -1529,6 +1659,10 @@ int main(int argc, char **argv)
         return cmd_orphan_labels(argc - 2, argv + 2);
     if (strcmp(argv[1], "check-bounds") == 0)
         return cmd_check_bounds(argc - 2, argv + 2);
+    if (strcmp(argv[1], "nvram-export") == 0)
+        return cmd_nvram_export(argc - 2, argv + 2);
+    if (strcmp(argv[1], "nvram-import") == 0)
+        return cmd_nvram_import(argc - 2, argv + 2);
 
     fprintf(stderr, "apexini: unknown command '%s'\n\n", argv[1]);
     print_help(stderr);

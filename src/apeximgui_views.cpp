@@ -1,5 +1,6 @@
 #include "apeximgui_core.h"
 #include "apex_rominfo.h"
+#include "apex_nvram.h"
 #include "ImGuiFileDialog.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -602,6 +603,14 @@ static void classify_kind_submenu(ApexProject *p, const ApexRenderedDocument **d
     }
     if (ImGui::MenuItem("sprite"))             apply_data_at_selection(p, dp, s, "sprite");
     if (ImGui::MenuItem("dmd_fullframe"))      apply_data_at_selection(p, dp, s, "dmd_fullframe");
+    {
+        /* bcd needs a length; use the Edit panel's current N so the label shows it. */
+        int n = s->edit_data_length > 0 ? s->edit_data_length : 1;
+        char label[24], spec[24];
+        snprintf(label, sizeof(label), "bcd[%d]", n);
+        snprintf(spec, sizeof(spec), "bcd[%d]", n);
+        if (ImGui::MenuItem(label)) apply_data_at_selection(p, dp, s, spec);
+    }
     ImGui::Separator();
     if (ImGui::MenuItem("ptr16_code"))         apply_data_at_selection(p, dp, s, "ptr16_code");
     if (ImGui::MenuItem("ptr16_data"))         apply_data_at_selection(p, dp, s, "ptr16_data");
@@ -2404,9 +2413,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             size_t rlo = std::min(s->hex_anchor_offset, s->hex_selected_offset);
             size_t rhi = std::max(s->hex_anchor_offset, s->hex_selected_offset);
             size_t rn  = rhi - rlo + 1;
-            char blabel[48], slabel[48];
+            char blabel[48], slabel[48], clabel[48];
             snprintf(blabel, sizeof(blabel), "Assign bytes[%zu]", rn);
             snprintf(slabel, sizeof(slabel), "Assign string[%zu]", rn);
+            snprintf(clabel, sizeof(clabel), "Assign bcd[%zu]", rn);
             if (ImGui::MenuItem(blabel)) {
                 char spec[32];
                 snprintf(spec, sizeof(spec), "bytes[%zu]", rn);
@@ -2415,6 +2425,11 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             if (ImGui::MenuItem(slabel)) {
                 char spec[32];
                 snprintf(spec, sizeof(spec), "string[%zu]", rn);
+                apply_data_at_selection(p, dp, s, spec);
+            }
+            if (ImGui::MenuItem(clabel)) {
+                char spec[32];
+                snprintf(spec, sizeof(spec), "bcd[%zu]", rn);
                 apply_data_at_selection(p, dp, s, spec);
             }
         } else {
@@ -2842,6 +2857,13 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
         snprintf(spec, sizeof(spec), "bytes[%d]", s->edit_data_length);
         apply_data_at_selection(p, dp, s, spec);
     }
+    ImGui::SameLine();
+    if (ImGui::Button("bcd[N]##data")) {
+        char spec[32];
+        snprintf(spec, sizeof(spec), "bcd[%d]", s->edit_data_length);
+        apply_data_at_selection(p, dp, s, spec);
+    }
+    if (ImGui::IsItemHovered()) ImGui::SetTooltip("N-byte binary-coded decimal");
     ImGui::SameLine();
     if (ImGui::Button("sprite##raw")) { apply_data_at_selection(p, dp, s, "sprite"); }
     ImGui::SameLine();
@@ -4414,6 +4436,228 @@ void render_warnings_view(ApexProject *project,
     }
 }
 
+/* ---- RAM-map import / export (PinMAME nvram-maps JSON) ---- */
+
+static const ConfigSymbol *nvram_symbol_at(const ApexProject *p, uint32_t addr)
+{
+    for (size_t i = 0; i < p->symbols.count; i++)
+        if (p->symbols.items[i].value == addr) return &p->symbols.items[i];
+    return nullptr;
+}
+
+static const ConfigSymbol *nvram_symbol_named(const ApexProject *p, const char *name)
+{
+    for (size_t i = 0; i < p->symbols.count; i++)
+        if (p->symbols.items[i].name && strcmp(p->symbols.items[i].name, name) == 0)
+            return &p->symbols.items[i];
+    return nullptr;
+}
+
+static const ConfigDoc *nvram_doc_at(const ApexProject *p, uint32_t addr)
+{
+    for (size_t i = 0; i < p->docs.count; i++)
+        if (p->docs.items[i].addr == addr) return &p->docs.items[i];
+    return nullptr;
+}
+
+int nvram_prepare_import(ApexProject *project, UiState *state, const char *json_path,
+                        std::string *err)
+{
+    FILE *f = fopen(json_path, "rb");
+    if (!f) { if (err) *err = std::string("cannot read ") + json_path; return 1; }
+    fseek(f, 0, SEEK_END);
+    long sz = ftell(f);
+    fseek(f, 0, SEEK_SET);
+    if (sz < 0) { fclose(f); if (err) *err = "cannot size file"; return 1; }
+    std::string text((size_t)sz, '\0');
+    size_t got = fread(&text[0], 1, (size_t)sz, f);
+    fclose(f);
+    text.resize(got);
+
+    ApexNvramLocs locs;
+    char emsg[128] = {0};
+    if (apex_nvram_parse_json(text.data(), text.size(), 0, &locs, emsg, sizeof(emsg)) != 0) {
+        if (err) *err = emsg;
+        return 1;
+    }
+    state->nvram_import_rows.clear();
+    for (size_t i = 0; i < locs.count; i++) {
+        NvramImportRow r;
+        r.name = locs.items[i].name ? locs.items[i].name : "";
+        r.addr = locs.items[i].addr;
+        r.doc  = locs.items[i].doc ? locs.items[i].doc : "";
+        r.selected = true;
+        r.overwrites = false;
+        const ConfigSymbol *sa = nvram_symbol_at(project, r.addr);
+        const ConfigSymbol *sn = nvram_symbol_named(project, r.name.c_str());
+        const ConfigDoc *da = nvram_doc_at(project, r.addr);
+        if (sa && sa->name && r.name != sa->name) {
+            r.overwrites = true;
+            r.conflict = std::string("addr has symbol ") + sa->name;
+        } else if (sn && sn->value != r.addr) {
+            r.overwrites = true;
+            char b[48]; snprintf(b, sizeof(b), "name used at 0x%04x", sn->value & 0xffffu);
+            r.conflict = b;
+        } else if (da && da->text && r.doc != da->text) {
+            r.overwrites = true;
+            r.conflict = "addr has a different doc";
+        }
+        state->nvram_import_rows.push_back(std::move(r));
+    }
+    apex_nvram_locs_free(&locs);
+    state->show_nvram_import = true;
+    return 0;
+}
+
+void render_nvram_import_window(ApexProject *project,
+                                const ApexRenderedDocument **document_ptr, UiState *state)
+{
+    auto &rows = state->nvram_import_rows;
+    size_t sel = 0, conflicts = 0;
+    for (auto &r : rows) { if (r.selected) sel++; if (r.overwrites) conflicts++; }
+
+    ImGui::Text("%zu location%s", rows.size(), rows.size() == 1 ? "" : "s");
+    ImGui::SameLine();
+    if (conflicts) ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
+                                      "| %zu would overwrite existing entries", conflicts);
+    if (ImGui::SmallButton("Select all"))  for (auto &r : rows) r.selected = true;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Select none")) for (auto &r : rows) r.selected = false;
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Only non-conflicting"))
+        for (auto &r : rows) r.selected = !r.overwrites;
+    ImGui::Separator();
+
+    if (ImGui::BeginTable("nvimp", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - 4.0f))) {
+        ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, 24.0f);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Doc / conflict", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < rows.size(); i++) {
+            NvramImportRow &r = rows[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            if (r.overwrites) {
+                ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.85f, 0.45f, 0.05f, 0.20f));
+                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+            }
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Checkbox("##s", &r.selected);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("0x%04x", r.addr & 0xffffu);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(r.name.c_str());
+            ImGui::TableSetColumnIndex(3);
+            ImGui::TextUnformatted(r.doc.c_str());
+            if (r.overwrites) {
+                ImGui::SameLine();
+                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "  [!] %s",
+                                   r.conflict.c_str());
+            }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    if (ImGui::Button("Import selected")) {
+        int applied = 0;
+        for (auto &r : rows) {
+            if (!r.selected) continue;
+            apex_project_set_symbol(project, r.name.c_str(), r.addr);
+            if (!r.doc.empty())
+                apex_project_set_doc(project, 0, 0, r.addr, r.doc.c_str());
+            applied++;
+        }
+        if (applied) {
+            state->overlay_dirty = true;
+            state->labels_valid = false;
+            rerender_and_reselect(project, document_ptr, state, 0xffu, 0u);
+        }
+        set_status(state, (std::to_string(applied) + " location(s) imported").c_str());
+        state->show_nvram_import = false;
+        rows.clear();
+    }
+    ImGui::SameLine();
+    ImGui::Text("(%zu selected)", sel);
+    ImGui::SameLine();
+    if (ImGui::Button("Cancel")) {
+        state->show_nvram_import = false;
+        rows.clear();
+    }
+}
+
+int nvram_export(const ApexProject *project, const char *json_path,
+                 const char *template_path, std::string *err)
+{
+    std::vector<ApexNvramLoc> arr;
+    std::vector<std::string> gen_names; /* backing store for generated names */
+    for (size_t i = 0; i < project->symbols.count; i++) {
+        if (project->symbols.items[i].value >= APEX_RAM_LIMIT) continue;
+        ApexNvramLoc l;
+        l.name = (char *)project->symbols.items[i].name;
+        l.addr = project->symbols.items[i].value;
+        const ConfigDoc *d = nvram_doc_at(project, l.addr);
+        l.doc = d ? d->text : (char *)"";
+        arr.push_back(l);
+    }
+    for (size_t i = 0; i < project->docs.count; i++) {
+        uint32_t a = project->docs.items[i].addr;
+        if (a >= APEX_RAM_LIMIT || nvram_symbol_at(project, a)) continue;
+        char b[16]; snprintf(b, sizeof(b), "RAM_%04x", a & 0xffffu);
+        gen_names.push_back(b);
+    }
+    /* second pass now that gen_names won't reallocate */
+    size_t gi = 0;
+    for (size_t i = 0; i < project->docs.count; i++) {
+        uint32_t a = project->docs.items[i].addr;
+        if (a >= APEX_RAM_LIMIT || nvram_symbol_at(project, a)) continue;
+        ApexNvramLoc l;
+        l.name = (char *)gen_names[gi++].c_str();
+        l.addr = a;
+        l.doc  = project->docs.items[i].text;
+        arr.push_back(l);
+    }
+    if (arr.empty()) { if (err) *err = "no RAM symbols/docs to export"; return 1; }
+
+    /* Optional zero-loss merge into the originally-imported map.  If a template
+       was requested but is no longer readable, fail rather than silently writing
+       a fresh (lossy) map — otherwise the caller would wrongly report a merge. */
+    std::string tmpl;
+    bool want_merge = template_path && template_path[0];
+    if (want_merge) {
+        FILE *tf = fopen(template_path, "rb");
+        if (!tf) {
+            if (err) *err = std::string("template not readable: ") + template_path;
+            return 1;
+        }
+        fseek(tf, 0, SEEK_END); long ts = ftell(tf); fseek(tf, 0, SEEK_SET);
+        if (ts > 0) { tmpl.resize((size_t)ts); tmpl.resize(fread(&tmpl[0], 1, (size_t)ts, tf)); }
+        fclose(tf);
+    }
+
+    FILE *f = fopen(json_path, "w");
+    if (!f) { if (err) *err = std::string("cannot write ") + json_path; return 1; }
+    int rc = 0;
+    if (want_merge) {
+        char terr[128] = {0};
+        rc = apex_nvram_export_merged(f, tmpl.data(), tmpl.size(), arr.data(), arr.size(),
+                                      terr, sizeof(terr));
+        if (rc != 0 && err) *err = terr;
+    } else {
+        const char *rom = project->rom_path
+            ? (strrchr(project->rom_path, '/') ? strrchr(project->rom_path, '/') + 1
+                                               : project->rom_path)
+            : nullptr;
+        apex_nvram_write_json(f, arr.data(), arr.size(), rom);
+    }
+    fclose(f);
+    return rc;
+}
+
 void render_inline_candidates(ApexProject *project,
                               const ApexRenderedDocument **document_ptr,
                               UiState *state)
@@ -5425,14 +5669,18 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
                             classified_count, vsi_count, cand_count);
     }
 
-    /* Filter controls */
-    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("W min", &s->sprite_filter_min_w);
+    /* Filter controls. InputInt's width is the whole widget (field + the two
+       step buttons), so size it to fit a 3-digit field plus both buttons; derive
+       it from font metrics so it stays correct under font zoom. */
+    const float sp_field_w = ImGui::CalcTextSize("000").x + ImGui::GetStyle().FramePadding.x * 2.0f +
+                             (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x) * 2.0f;
+    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("W min", &s->sprite_filter_min_w);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("W max", &s->sprite_filter_max_w);
+    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("W max", &s->sprite_filter_max_w);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("H min", &s->sprite_filter_min_h);
+    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("H min", &s->sprite_filter_min_h);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f); ImGui::InputInt("H max", &s->sprite_filter_max_h);
+    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("H max", &s->sprite_filter_max_h);
     s->sprite_filter_min_w = std::max(1, std::min(s->sprite_filter_min_w, 128));
     s->sprite_filter_max_w = std::max(s->sprite_filter_min_w, std::min(s->sprite_filter_max_w, 128));
     s->sprite_filter_min_h = std::max(1, std::min(s->sprite_filter_min_h, 32));

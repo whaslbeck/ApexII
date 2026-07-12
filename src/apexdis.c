@@ -366,6 +366,9 @@ static const char *data_kind_name(DataKind kind)
     if (kind == DATA_STRING_FIXED) {
         return "string_fixed";
     }
+    if (kind == DATA_BCD) {
+        return "bcd";
+    }
     if (kind == DATA_DMD_FULLFRAME) {
         return "dmd_fullframe";
     }
@@ -739,6 +742,61 @@ static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, si
             bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
 }
 
+/* If `name` matches the generated Bxx_Ayyyy form (with valid hex) but its encoded
+   address differs from `addr`, it "shadows" another address: a defined symbol now
+   wins in the assembler, but the name is ambiguous/confusing.  Returns the decoded
+   16-bit address in *decoded and 1 when such a collision is present. */
+static int name_shadows_addr(const char *name, uint32_t addr, unsigned *decoded)
+{
+    int i;
+    unsigned d = 0;
+    if (!name || strlen(name) != 9 || name[0] != 'B' || name[3] != '_' || name[4] != 'A') {
+        return 0;
+    }
+    for (i = 1; i <= 8; i++) {
+        if (i == 3 || i == 4) continue; /* '_' and 'A' */
+        if (!isxdigit((unsigned char)name[i])) return 0;
+    }
+    for (i = 5; i <= 8; i++) {
+        char c = name[i];
+        d = (d << 4) | (unsigned)(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
+    }
+    if (decoded) *decoded = d;
+    return d != (addr & 0xffffu);
+}
+
+static void emit_label_shadow_warning(FILE *out, uint8_t bank, uint32_t cpu_addr,
+                                      size_t rom_addr, const char *name, unsigned decoded)
+{
+    int acked = warning_is_acked(bank, cpu_addr);
+    if (apex_warn_to_stderr && !acked) {
+        fprintf(stderr,
+                "warning: label '%s' at bank=0x%02x cpu=0x%04x rom=0x%06lx matches the "
+                "generated Bxx_Ayyyy form and decodes to 0x%04x — rename to avoid ambiguity\n",
+                name, bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, decoded);
+    }
+    fprintf(out,
+            "; %s label_name_collision bank=0x%02x cpu=0x%04x rom=0x%06lx name=%s decodes=0x%04x\n",
+            acked ? "WARNING_ACK" : "WARNING",
+            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, name, decoded);
+}
+
+/* True if some label at `addr` carries a real (non-generated) name. */
+static int addr_has_named_label(const Label *labels, size_t label_count, int sorted, uint32_t addr)
+{
+    size_t i = sorted ? label_lower_bound(labels, label_count, addr) : 0;
+    for (; i < label_count; i++) {
+        if (labels[i].addr != addr) {
+            if (sorted) break;
+            continue;
+        }
+        if (!generated_any_label_name(labels[i].name)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
                            int labels_sorted,
                            uint8_t bank, uint32_t base_addr, size_t rom_base,
@@ -754,11 +812,19 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
     int emitted_label = 0;
     int emitted_conflict = 0;
     const InlineSignature *inline_sig = inline_signature_for(inline_sigs, bank, addr);
+    /* A generated Bxx_Ayyyy placeholder that shares an address with a real
+       (config) label is redundant — references resolve to the real name — so it
+       is not emitted at the definition.  This happens when a far reference seeds
+       the placeholder before the paged config labels are applied. */
+    int have_named = addr_has_named_label(labels, label_count, labels_sorted, addr);
 
     i = labels_sorted ? label_lower_bound(labels, label_count, addr) : 0;
     for (; i < label_count; i++) {
         if (labels[i].addr != addr) {
             if (labels_sorted) break;
+            continue;
+        }
+        if (have_named && generated_any_label_name(labels[i].name)) {
             continue;
         }
         if (!emitted_block && table) {
@@ -821,6 +887,14 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                                       rom_base + (size_t)(addr - base_addr),
                                       labels[i].explain, labels[i].kind_explain, refs);
                 emitted_conflict = 1;
+            }
+            {
+                unsigned decoded;
+                if (name_shadows_addr(labels[i].name, addr, &decoded)) {
+                    emit_label_shadow_warning(out, bank, addr,
+                                              rom_base + (size_t)(addr - base_addr),
+                                              labels[i].name, decoded);
+                }
             }
             fprintf(out, "%s:\n", labels[i].name);
             emitted_label = 1;
@@ -1021,6 +1095,17 @@ static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
         fputc(data[i], out);
     }
     fprintf(out, "\"\n");
+}
+
+/* Emits BCD <digits> — N bytes as 2N decimal digits (each nibble 0-9). */
+static void emit_bcd(FILE *out, const uint8_t *data, size_t len)
+{
+    size_t i;
+    fprintf(out, "    BCD ");
+    for (i = 0; i < len; i++) {
+        fprintf(out, "%02x", data[i]); /* nibbles are 0-9, so hex == decimal digits */
+    }
+    fputc('\n', out);
 }
 
 static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t len,
@@ -1443,6 +1528,23 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             }
         }
         emit_string_fixed(out, data + *pos, n);
+        *pos += n;
+        return 1;
+    }
+    if (range->kind == DATA_BCD) {
+        size_t n = range->length;
+        size_t i;
+
+        if (n == 0 || *pos + n > len) {
+            return 0;
+        }
+        for (i = 0; i < n; i++) {
+            uint8_t c = data[*pos + i];
+            if ((c >> 4) > 9u || (c & 0x0fu) > 9u) {
+                return 0; /* not valid BCD → fall back to .DB */
+            }
+        }
+        emit_bcd(out, data + *pos, n);
         *pos += n;
         return 1;
     }

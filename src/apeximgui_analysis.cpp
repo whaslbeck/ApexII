@@ -293,28 +293,8 @@ static std::string table_schema_to_string(const TableSchema *s)
 
 static std::string data_range_spec_string(const DataRange *r)
 {
-    if (r->kind == DATA_BYTES) {
-        return "bytes[" + std::to_string(r->length) + "]";
-    }
-    switch (r->kind) {
-    case DATA_STRING:          return "string";
-    case DATA_STRING_FIXED:    return "string[" + std::to_string(r->length) + "]";
-    case DATA_PTR16_STRING:    return "ptr16_string";
-    case DATA_PTR16_DATA:      return "ptr16_data";
-    case DATA_PTR16_CODE:      return "ptr16_code";
-    case DATA_PTR16_TABLE:     return "ptr16_table";
-    case DATA_FAR_STRING:      return "far_string";
-    case DATA_FAR_DATA:        return "far_data";
-    case DATA_FAR_TABLE:       return "far_table";
-    case DATA_FAR_CODE:        return "far_code";
-    case DATA_DMD_FULLFRAME:   return "dmd_fullframe";
-    case DATA_FAR_DMD_FULLFRAME: return "far_dmd_fullframe";
-    case DATA_SPRITE:          return "sprite";
-    case DATA_SPRITE_NOHEADER: return "sprite_noheader[" + std::to_string(r->length) + "]";
-    case DATA_PTR16_SPRITE:    return "ptr16_sprite";
-    case DATA_FAR_SPRITE:      return "far_sprite";
-    default:                   return "bytes[1]";
-    }
+    char buf[48];
+    return data_range_spec(r, buf, sizeof(buf));
 }
 
 std::string table_def_spec_string(const TableDef *t)

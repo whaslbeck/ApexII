@@ -234,6 +234,93 @@ else
     exit 1
 fi
 
+# Label name that collides with the generated Bxx_Ayyyy form ("Bcd_Add16" =>
+# B'cd'_A'dd16'): the assembler must resolve the DEFINED symbol (0xa651), not
+# decode the pattern (0xdd16). Assemble -> disassemble -> assemble byte-identical.
+lpc_rom="$OUT/label_pattern_collision.rom"
+lpc_asm="$OUT/label_pattern_collision.disasm"
+lpc_rebuilt="$OUT/label_pattern_collision.rebuilt"
+lpc_err="$OUT/label_pattern_collision.stderr"
+"$ROOT/build/apexasm" "$lpc_rom" "$ROOT/tests/label_pattern_collision.asm"
+"$ROOT/build/apexdis" "$lpc_rom" "$lpc_asm" "$ROOT/tests/label_pattern_collision.ini" 2>"$lpc_err"
+"$ROOT/build/apexasm" "$lpc_rebuilt" "$lpc_asm"
+if cmp -s "$lpc_rom" "$lpc_rebuilt" &&
+    grep -q '^    JSR Bcd_Add16' "$lpc_asm" &&
+    grep -q '^Bcd_Add16:' "$lpc_asm" &&
+    grep -q '^; WARNING label_name_collision .* name=Bcd_Add16 decodes=0xdd16' "$lpc_asm" &&
+    grep -q "label 'Bcd_Add16'" "$lpc_err"; then
+    printf 'PASS label_pattern_collision.asm\n'
+else
+    printf 'FAIL label_pattern_collision.asm\n' >&2
+    exit 1
+fi
+
+# bcd[N] data type: a BCD range renders as "BCD <digits>" and reassembles.
+bcd_rom="$OUT/bcd.rom"
+bcd_asm="$OUT/bcd.disasm"
+bcd_rebuilt="$OUT/bcd.rebuilt"
+"$ROOT/build/apexasm" "$bcd_rom" "$ROOT/tests/bcd.asm"
+"$ROOT/build/apexdis" "$bcd_rom" "$bcd_asm" "$ROOT/tests/bcd.ini"
+"$ROOT/build/apexasm" "$bcd_rebuilt" "$bcd_asm"
+if cmp -s "$bcd_rom" "$bcd_rebuilt" &&
+    grep -q '^    BCD 0001234500$' "$bcd_asm"; then
+    printf 'PASS bcd.asm\n'
+else
+    printf 'FAIL bcd.asm\n' >&2
+    exit 1
+fi
+
+# nvram-maps JSON import/export: import a JSON RAM map into [symbols]/[docs],
+# verify the ini parses, then export it back and confirm the locations survive.
+nv_ini="$OUT/nvram_sample.ini"
+nv_json="$OUT/nvram_sample.out.json"
+nv_merged="$OUT/nvram_sample.merged.json"
+"$ROOT/build/apexini" nvram-import "$ROOT/tests/nvram_sample.json" "$nv_ini" >/dev/null
+"$ROOT/build/apexini" nvram-export "$nv_ini" "$nv_json" >/dev/null
+# zero-loss merge: re-export against the original as template — the bcd encoding
+# and the nested "high_scores" array must survive, with the apex name applied.
+"$ROOT/build/apexini" nvram-export "$nv_ini" "$nv_merged" "$ROOT/tests/nvram_sample.json" >/dev/null
+# in-place update: output == template must preserve fields, not truncate the file.
+nv_inplace="$OUT/nvram_inplace.json"
+cp "$ROOT/tests/nvram_sample.json" "$nv_inplace"
+"$ROOT/build/apexini" nvram-export "$nv_ini" "$nv_inplace" "$nv_inplace" >/dev/null
+if grep -q '^BallsPerGame = 0x1a00$' "$nv_ini" &&
+    grep -q '^Free_Play = 0x1a01$' "$nv_ini" &&
+    grep -q '^GC_Score = 0x1b10$' "$nv_ini" &&
+    grep -q '^0x1a00 = "Balls Per Game"$' "$nv_ini" &&
+    "$ROOT/build/apexini" check "$nv_ini" >/dev/null &&
+    grep -q '"BallsPerGame"' "$nv_json" &&
+    grep -q '"start": "0x1b10"' "$nv_json" &&
+    grep -q '"encoding": "bcd"' "$nv_merged" &&
+    grep -q '"high_scores"' "$nv_merged" &&
+    grep -q '"short_label": "GC_Score"' "$nv_merged" &&
+    grep -q '"encoding": "bcd"' "$nv_inplace" &&
+    grep -q '"BallsPerGame"' "$nv_inplace"; then
+    printf 'PASS nvram_maps.json\n'
+else
+    printf 'FAIL nvram_maps.json\n' >&2
+    exit 1
+fi
+
+# nvram JSON hardening: deeply-nested input is rejected (not a stack-overflow
+# crash), and non-integer numbers survive a zero-loss round-trip verbatim.
+nv_deep="$OUT/nvram_deep.json"
+python3 -c "open('$nv_deep','w').write('{\"_x\":' + '['*4000 + ']'*4000 + '}')"
+deep_rc=0
+"$ROOT/build/apexini" nvram-import "$nv_deep" "$OUT/nvram_deep.ini" >"$OUT/nvram_deep.err" 2>&1 || deep_rc=$?
+nv_prec="$OUT/nvram_prec.json"
+printf '{ "_metadata": { "version": 1.0 },\n  "a": { "01": { "start": "0x100", "label": "x", "scale": 0.123456789 } } }\n' > "$nv_prec"
+"$ROOT/build/apexini" nvram-import "$nv_prec" "$OUT/nvram_prec.ini" >/dev/null
+"$ROOT/build/apexini" nvram-export "$OUT/nvram_prec.ini" "$OUT/nvram_prec.out.json" "$nv_prec" >/dev/null
+if [ "$deep_rc" -ne 139 ] &&
+    grep -q 'nesting too deep' "$OUT/nvram_deep.err" &&
+    grep -q '"scale": 0.123456789' "$OUT/nvram_prec.out.json"; then
+    printf 'PASS nvram_hardening\n'
+else
+    printf 'FAIL nvram_hardening (deep_rc=%s)\n' "$deep_rc" >&2
+    exit 1
+fi
+
 banked_inline_rom="$OUT/banked_inline.rom"
 banked_inline_asm="$OUT/banked_inline.disasm"
 banked_inline_explain="$OUT/banked_inline.explain.disasm"
