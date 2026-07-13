@@ -969,6 +969,7 @@ void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiSt
     s->code_candidates_stale   = true;
     s->inline_candidates_stale = true;
     s->warnings_stale          = true;
+    s->flow_breaks_stale       = true;
     if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
@@ -1503,11 +1504,31 @@ static void off_to_bank_addr_internal(const ApexProject *p, uint32_t off, int to
     }
 }
 
-void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+/* Collect table-search suggestions into s->table_candidates WITHOUT applying
+   them; the user reviews and accepts (like the sprite/VSI flow).  A DMD candidate
+   is a run of consecutive rows that each hold a valid far pointer to a decodable
+   DMD full-frame — the run length is the discriminator that separates a real
+   table from the many isolated byte sequences that happen to decode. */
+void scan_table_candidates(ApexProject *p, UiState *s)
 {
+    s->table_candidates.clear();
+    s->table_scan_done = true;
+    if (!p->rom.data || p->rom.size < 9u) return;
+
+    auto push_cand = [&](uint8_t bank, uint16_t addr, const char *spec, int rows,
+                         const char *kind) {
+        UiState::TableCandidate c;
+        c.bank = bank;
+        c.cpu_addr = addr;
+        c.spec = spec;
+        c.rows = rows;
+        c.kind = kind;
+        c.already = table_def_at(bank, addr, &p->tables) != nullptr;
+        s->table_candidates.push_back(std::move(c));
+    };
+
     int total_banks = (int)(p->rom.size / 0x4000);
     std::vector<uint32_t> found_text_table_offsets;
-    int count = 0;
 
     // Step 1: Text Tables
     for (uint32_t i = 0; i <= p->rom.size - 3; i++) {
@@ -1519,11 +1540,8 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
                 addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000)
                                                        : 0xC000 + (i % 0x4000);
             }
-            if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE,
-                                      "counted(ptr16_string)") == 0) {
-                found_text_table_offsets.push_back(i);
-                count++;
-            }
+            found_text_table_offsets.push_back(i);
+            push_cand(bank_id, addr, "counted(ptr16_string)", 0, "text");
         }
     }
 
@@ -1567,11 +1585,8 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
                 addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000)
                                                        : 0xC000 + (i % 0x4000);
             }
-            if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE,
-                                      "rows[3](far_data)") == 0) {
-                count++;
-                i += 8;
-            }
+            push_cand(bank_id, addr, "rows[3](far_data)", 3, "far_ptr");
+            i += 8;
         }
     }
 
@@ -1580,7 +1595,10 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
     //   (b) rows[N](far_dmd_fullframe): a headerless run of far_dmd pointers (the
     //       common case).  Requiring several consecutive decodable targets keeps
     //       random byte sequences from matching.
-    static const int kMinDmdRun = 3;
+    /* A short run of coincidentally-decodable far pointers is common noise; a
+       real DMD table is a long contiguous run.  Require several rows so the
+       candidate list stays short and reviewable (the user still confirms). */
+    static const int kMinDmdRun = 5;
     if (p->rom.size >= 6) {
         for (uint32_t i = 0; i + 3u <= p->rom.size; ) {
             // (a) counted header: [count_hi count_lo width=3]
@@ -1596,10 +1614,8 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
                 if (all_dmd) {
                     uint8_t bank_id; uint16_t addr;
                     off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
-                    if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE,
-                                              "counted(far_dmd_fullframe)") == 0) {
-                        count++;
-                    }
+                    push_cand(bank_id, addr, "counted(far_dmd_fullframe)",
+                              (int)hdr_count, "far_dmd");
                     i += 3u + (uint32_t)hdr_count * 3u;
                     continue;
                 }
@@ -1616,9 +1632,7 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
                 off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
                 char spec[40];
                 snprintf(spec, sizeof(spec), "rows[%d](far_dmd_fullframe)", n);
-                if (apex_project_set_kind(p, 0, bank_id, addr, APEX_KIND_TABLE, spec) == 0) {
-                    count++;
-                }
+                push_cand(bank_id, addr, spec, n, "far_dmd");
                 i = k;
             } else {
                 i++;
@@ -1626,14 +1640,17 @@ void auto_search_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState
         }
     }
 
-    if (count > 0) {
-        rerender_and_reselect(p, dp, s, 0, 0);
-        char msg[64];
-        snprintf(msg, 64, "Found %d tables", count);
-        set_status(s, msg);
-    } else {
-        set_status(s, "No new tables found");
-    }
+    /* Newest/most-specific first: DMD then far-ptr then text, longer runs first. */
+    std::stable_sort(s->table_candidates.begin(), s->table_candidates.end(),
+        [](const UiState::TableCandidate &a, const UiState::TableCandidate &b) {
+            if (a.kind != b.kind) return a.kind < b.kind; /* far_dmd < far_ptr < text */
+            return a.rows > b.rows;
+        });
+
+    char msg[64];
+    snprintf(msg, sizeof(msg), "%zu table candidate(s) — review and Accept",
+             s->table_candidates.size());
+    set_status(s, msg);
 }
 
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,

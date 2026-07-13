@@ -245,7 +245,7 @@ static int lookup_symbol_far_bank(const AsmState *st, const char *name, uint32_t
 
 static void init_rom(AsmState *st, size_t size)
 {
-    if (size != 512u * 1024u && size != 1024u * 1024u) {
+    if (size != 256u * 1024u && size != 512u * 1024u && size != 1024u * 1024u) {
         die("unsupported .ROM_SIZE %lu", (unsigned long)size);
     }
     if (st->size != 0 && st->size != size) {

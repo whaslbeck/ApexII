@@ -928,6 +928,32 @@ static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t a
     return 0;
 }
 
+/* A system-bank absolute JSR/JMP into the paged window (0x4000-0x7fff) targets
+   whatever bank is mapped at runtime, which is not knowable statically.  But when
+   exactly ONE paged bank has real content (non-0xFF) at that offset, that bank is
+   the unambiguous target — return its index; else -1 (0 or several candidates,
+   genuinely ambiguous). */
+static int unique_paged_bank_with_content(const uint8_t *paged_rom, size_t banks,
+                                          uint16_t addr)
+{
+    size_t off, b;
+    int found = -1;
+
+    if (!paged_rom || addr < APEX_PAGED_ORG || addr >= 0x8000u) {
+        return -1;
+    }
+    off = (size_t)(addr - APEX_PAGED_ORG);
+    for (b = 0; b < banks; b++) {
+        if (paged_rom[b * APEX_BANK_SIZE + off] != 0xffu) {
+            if (found >= 0) {
+                return -1; /* more than one candidate → ambiguous */
+            }
+            found = (int)b;
+        }
+    }
+    return found;
+}
+
 /* If the instruction at (bank, addr) is a [far_imm], returns 1 and sets
    *out_target to the bank its immediate operand addresses and *out_type to the
    target's FarImmType. */
@@ -1040,6 +1066,23 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
 
                     explain_label(target, "code_flow");
                     explain_label_kind(target, "code_flow");
+                } else if (base_addr == APEX_SYSTEM_ORG && bank_labels &&
+                           info.target >= APEX_PAGED_ORG && info.target < 0x8000u) {
+                    /* System-bank call/jump into the paged window: bank-ambiguous in
+                       general, but if exactly one paged bank has content at that
+                       offset, seed a code label + reference there so the target
+                       resolves (the render's single-bank fallback picks it up). */
+                    int ub = unique_paged_bank_with_content(paged_rom, banks,
+                                                            (uint16_t)info.target);
+                    if (ub >= 0) {
+                        uint8_t bid = bank_id_for_index(banks, ub);
+                        Label *target = add_label(&bank_labels[ub], info.target,
+                                                  make_bank_label(bid, (uint16_t)info.target), 1);
+                        explain_label(target, "code_flow");
+                        explain_label_kind(target, "code_flow");
+                        add_reference(refs, bid, info.target, current_bank, instr_addr,
+                                      "code", source);
+                    }
                 }
                 if (info.target >= base_addr && info.target < base_addr + used) {
                     add_reference(refs, current_bank, info.target, current_bank, instr_addr, "code",

@@ -1925,6 +1925,13 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                                             base_addr + (uint32_t)pos, rom_base + pos);
                     current_kind = BLOCK_UNCLASSIFIED;
                 } else {
+                    /* A system-bank absolute call/jump into the paged window that did
+                       not resolve is bank-ambiguous (the mapped bank is a runtime
+                       value); flag it so the raw target reads as expected, not a bug. */
+                    int paged_ambiguous =
+                        current_bank == 0xffu && info.has_target &&
+                        info.target >= APEX_PAGED_ORG && info.target < 0x8000u &&
+                        lookup_label_for_cpu(&lookup, info.target) == NULL;
                     /* Append doc as end-of-line comment when no code label at this
                        address (label-address docs are already in the label header). */
                     const char *idoc = has_code_label ? NULL
@@ -1935,6 +1942,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                             fprintf(out, "    %-40s ; %.*s\n", inst, (int)(nl - idoc), idoc);
                         else
                             fprintf(out, "    %-40s ; %s\n", inst, idoc);
+                    } else if (paged_ambiguous) {
+                        fprintf(out, "    %-40s ; paged (bank-ambiguous)\n", inst);
                     } else {
                         fprintf(out, "    %s\n", inst);
                     }

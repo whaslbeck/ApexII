@@ -234,6 +234,45 @@ else
     exit 1
 fi
 
+# System-bank absolute JSR into the paged window: bank-ambiguous in general, but
+# auto-resolves when exactly one paged bank has content at the offset; otherwise
+# it renders "; paged (bank-ambiguous)".  Comment must not affect the roundtrip.
+spc_rom="$OUT/sys_paged_call.rom"
+spc_asm="$OUT/sys_paged_call.disasm"
+spc_rebuilt="$OUT/sys_paged_call.rebuilt"
+"$ROOT/build/apexasm" "$spc_rom" "$ROOT/tests/sys_paged_call.asm"
+"$ROOT/build/apexdis" "$spc_rom" "$spc_asm" "$ROOT/tests/sys_paged_call.ini"
+"$ROOT/build/apexasm" "$spc_rebuilt" "$spc_asm"
+if cmp -s "$spc_rom" "$spc_rebuilt" &&
+    grep -q '^    JSR B20_A5000' "$spc_asm" &&
+    grep -qE '^    JSR 0x6000 +; paged \(bank-ambiguous\)' "$spc_asm" &&
+    grep -q '^    JSR Bff_A9000' "$spc_asm"; then
+    printf 'PASS sys_paged_call.asm\n'
+else
+    printf 'FAIL sys_paged_call.asm\n' >&2
+    exit 1
+fi
+
+# 256 KB ROM support (14 paged banks, bank-id base 0x30, ids 0x30..0x3d).
+# Assemble -> disassemble (via the config/apex_project path) -> assemble, and
+# verify labels resolve at the 0x30 base and the ROM round-trips byte-identical.
+r256_rom="$OUT/rom256k.rom"
+r256_asm="$OUT/rom256k.disasm"
+r256_rebuilt="$OUT/rom256k.rebuilt"
+"$ROOT/build/apexasm" "$r256_rom" "$ROOT/tests/rom256k.asm"
+"$ROOT/build/apexdis" "$r256_rom" "$r256_asm" "$ROOT/tests/rom256k.ini"
+"$ROOT/build/apexasm" "$r256_rebuilt" "$r256_asm"
+if [ "$(wc -c < "$r256_rom")" -eq 262144 ] &&
+    cmp -s "$r256_rom" "$r256_rebuilt" &&
+    grep -q '^BankStart:' "$r256_asm" &&
+    grep -q '^LastBank:' "$r256_asm" &&
+    grep -q '^    JSR BankStart' "$r256_asm"; then
+    printf 'PASS rom256k.asm\n'
+else
+    printf 'FAIL rom256k.asm\n' >&2
+    exit 1
+fi
+
 # Label name that collides with the generated Bxx_Ayyyy form ("Bcd_Add16" =>
 # B'cd'_A'dd16'): the assembler must resolve the DEFINED symbol (0xa651), not
 # decode the pattern (0xdd16). Assemble -> disassemble -> assemble byte-identical.

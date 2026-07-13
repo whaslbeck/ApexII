@@ -29,6 +29,7 @@ static float g_ui_font_scale = 1.0f;
    in the main loop). Kept as a global so the imgui.ini settings handler can reach
    it without a UiState pointer. */
 static int g_show_warnings = 0;
+static int g_show_flow_breaks = 0;
 
 static float clampf(float v, float lo, float hi)
 {
@@ -57,12 +58,15 @@ static void register_view_settings_handler(void)
             g_ui_font_scale = clampf(v, FONT_SCALE_MIN, FONT_SCALE_MAX);
         } else if (sscanf(line, "ShowWarnings=%d", &iv) == 1) {
             g_show_warnings = iv != 0;
+        } else if (sscanf(line, "ShowFlowBreaks=%d", &iv) == 1) {
+            g_show_flow_breaks = iv != 0;
         }
     };
     h.WriteAllFn = [](ImGuiContext *, ImGuiSettingsHandler *handler, ImGuiTextBuffer *buf) {
         buf->appendf("[%s][View]\n", handler->TypeName);
         buf->appendf("FontScale=%.3f\n", g_ui_font_scale);
-        buf->appendf("ShowWarnings=%d\n\n", g_show_warnings);
+        buf->appendf("ShowWarnings=%d\n", g_show_warnings);
+        buf->appendf("ShowFlowBreaks=%d\n\n", g_show_flow_breaks);
     };
     ImGui::AddSettingsHandler(&h);
 }
@@ -324,6 +328,8 @@ int main(int argc, char **argv)
     state.inline_candidates_stale = false;
     state.show_warnings           = false;
     state.warnings_stale          = true;
+    state.show_flow_breaks        = false;
+    state.flow_breaks_stale       = true;
     state.show_nvram_import       = false;
     state.nvram_source_path[0]    = '\0';
     state.show_rom_map           = false;
@@ -426,6 +432,16 @@ int main(int argc, char **argv)
                 ImGui::MarkIniSettingsDirty();
             }
         }
+        {
+            static bool fb_vis_applied = false;
+            if (!fb_vis_applied) {
+                fb_vis_applied = true;
+                state.show_flow_breaks = g_show_flow_breaks != 0;
+            } else if ((state.show_flow_breaks ? 1 : 0) != g_show_flow_breaks) {
+                g_show_flow_breaks = state.show_flow_breaks ? 1 : 0;
+                ImGui::MarkIniSettingsDirty();
+            }
+        }
         sync_editor_state(project, document, &state);
 
         if (ImGui::BeginMainMenuBar()) {
@@ -521,6 +537,7 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Code Candidates",    NULL, &state.show_code_candidates);
                 ImGui::MenuItem("Inline Candidates", NULL, &state.show_inline_candidates);
                 ImGui::MenuItem("Warnings",       NULL, &state.show_warnings);
+                ImGui::MenuItem("Flow Breaks",    NULL, &state.show_flow_breaks);
                 ImGui::MenuItem("ROM Map",        NULL, &state.show_rom_map);
                 ImGui::MenuItem("DMD Frames",     NULL, &state.show_dmd_list);
                 ImGui::MenuItem("Sprites",        NULL, &state.show_sprite_list);
@@ -603,6 +620,7 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Code Candidates",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Candidates", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Warnings",          dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Flow Breaks",       dock_bottom_id);
             ImGui::DockBuilderDockWindow("Global Search",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("ROM Map",        dock_right_id);
 
@@ -905,6 +923,12 @@ int main(int argc, char **argv)
         if (state.show_warnings) {
             ImGui::Begin("Warnings", &state.show_warnings);
             render_warnings_view(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_flow_breaks) {
+            ImGui::SetNextWindowSize(ImVec2(640, 220), ImGuiCond_FirstUseEver);
+            ImGui::Begin("Flow Breaks", &state.show_flow_breaks);
+            render_flow_breaks_view(project, &document, &state);
             ImGui::End();
         }
         render_xref_popup(project, document, &state);

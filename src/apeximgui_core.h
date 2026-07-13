@@ -181,6 +181,18 @@ struct RefEntry {
     uint32_t row_cpu_addr;
 };
 
+/* One place where code flow breaks off: a code block whose last instruction does
+   not transfer control (no RTS/JMP/BRA/... and not a flow-stop tail call) yet is
+   immediately followed by a non-code block — the signature of mis-classified code
+   or a wrong inline signature. */
+struct FlowBreakEntry {
+    size_t   line_index;   /* the last code instruction's line in the document */
+    uint8_t  bank;
+    uint32_t cpu_addr;
+    std::string insn;      /* rendered text of that last instruction */
+    std::string next;      /* what follows: "data", "unclassified", "fill", ... */
+};
+
 /* One "; WARNING ..." line scraped from the rendered document for the Warnings
    panel.  has_location is false for warnings whose bank/cpu could not be parsed. */
 struct WarningEntry {
@@ -347,6 +359,9 @@ struct UiState {
     bool show_warnings;
     std::vector<WarningEntry> warnings;
     bool warnings_stale;
+    bool show_flow_breaks;
+    std::vector<FlowBreakEntry> flow_breaks;
+    bool flow_breaks_stale;
     bool show_nvram_import;
     std::vector<NvramImportRow> nvram_import_rows;
     char nvram_source_path[512];  /* last imported nvram JSON — reused as export template */
@@ -399,6 +414,18 @@ struct UiState {
     std::vector<VsiTableEntry> vsi_table_entries;
     std::vector<VsiSubTableInfo> vsi_sub_tables;
     bool vsi_table_scan_done = false;
+
+    /* Reviewable table-search candidates (suggest-then-accept, like sprites). */
+    struct TableCandidate {
+        uint8_t  bank;
+        uint32_t cpu_addr;
+        std::string spec;   /* the [tables] spec to apply, e.g. rows[42](far_dmd_fullframe) */
+        int      rows;      /* row count (for display/sorting) */
+        std::string kind;   /* short label: "far_dmd", "far_ptr", "text" */
+        bool     already;   /* address already classified as a table */
+    };
+    std::vector<TableCandidate> table_candidates;
+    bool table_scan_done = false;
 };
 
 struct SnapshotLabel {
@@ -632,7 +659,7 @@ void render_tables_window(ApexProject *project, const ApexRenderedDocument **doc
 void render_hardware_window(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 // Analysis: Tables
-void auto_search_tables(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void scan_table_candidates(ApexProject *project, UiState *state);
 
 // Analysis: Hardware
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project, const ApexRenderedDocument *document);
@@ -665,6 +692,7 @@ void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **do
 void render_code_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_inline_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_warnings_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_flow_breaks_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_nvram_import_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 /* Populate state->nvram_import_rows from parsed nvram locations, flagging
    collisions against the project's current symbols/docs. Returns 0 on success. */

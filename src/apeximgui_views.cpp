@@ -10,6 +10,7 @@
 #include <cstdio>
 #include <cstring>
 #include <string>
+#include <tuple>
 #include <vector>
 #include <map>
 #include <cctype>
@@ -3129,8 +3130,83 @@ void render_hardware_window(ApexProject *project, const ApexRenderedDocument *do
 
 void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
-    if (ImGui::Button("Search Tables (Auto)")) {
-        auto_search_tables(p, dp, s);
+    /* ---- Suggestion/accept flow: scan proposes, the user accepts (like sprites) ---- */
+    if (ImGui::Button("Scan for Tables")) {
+        scan_table_candidates(p, s);
+    }
+    if (s->table_scan_done) {
+        size_t pending = 0;
+        for (auto &c : s->table_candidates) if (!c.already) pending++;
+        ImGui::SameLine();
+        ImGui::Text("%zu candidate(s), %zu new", s->table_candidates.size(), pending);
+        if (pending > 0) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("Accept all new")) {
+                /* snapshot the specs first — applying rerenders and could move state */
+                std::vector<std::tuple<uint8_t,uint32_t,std::string>> todo;
+                for (auto &c : s->table_candidates)
+                    if (!c.already) todo.emplace_back(c.bank, c.cpu_addr, c.spec);
+                int done = 0;
+                for (auto &t : todo) {
+                    if (apex_project_set_kind(p, 1, std::get<0>(t), std::get<1>(t),
+                                              APEX_KIND_TABLE, std::get<2>(t).c_str()) == 0)
+                        done++;
+                }
+                if (done) rerender_and_reselect(p, dp, s, 0xffu, 0u);
+                scan_table_candidates(p, s); /* refresh 'already' flags */
+                set_status(s, (std::to_string(done) + " table(s) accepted").c_str());
+            }
+        }
+    }
+    if (!s->table_candidates.empty()) {
+        if (ImGui::BeginTable("tbl_cands", 5,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+                ImVec2(0, 140.0f))) {
+            ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("Rows", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+            ImGui::TableSetupColumn("Spec", ImGuiTableColumnFlags_WidthStretch);
+            ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableHeadersRow();
+            int accept_idx = -1;
+            for (size_t ci = 0; ci < s->table_candidates.size(); ci++) {
+                auto &c = s->table_candidates[ci];
+                ImGui::PushID((int)ci);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char ab[24]; snprintf(ab, sizeof(ab), "B%02x_A%04x", c.bank, c.cpu_addr);
+                if (ImGui::Selectable(ab, false, ImGuiSelectableFlags_SpanAllColumns |
+                                                 ImGuiSelectableFlags_AllowOverlap)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(*dp, c.bank, c.cpu_addr, &li))
+                        select_line(s, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(c.kind.c_str());
+                ImGui::TableSetColumnIndex(2);
+                if (c.rows) ImGui::Text("%d", c.rows); else ImGui::TextDisabled("hdr");
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(c.spec.c_str());
+                ImGui::TableSetColumnIndex(4);
+                if (c.already) {
+                    ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.45f, 1.0f), "in table");
+                } else if (ImGui::SmallButton("Accept")) {
+                    accept_idx = (int)ci;
+                }
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+            if (accept_idx >= 0) {
+                auto &c = s->table_candidates[accept_idx];
+                if (apex_project_set_kind(p, 1, c.bank, c.cpu_addr, APEX_KIND_TABLE,
+                                          c.spec.c_str()) == 0) {
+                    uint8_t b = c.bank; uint32_t a = c.cpu_addr;
+                    rerender_and_reselect(p, dp, s, b, a);
+                    scan_table_candidates(p, s); /* refresh 'already' flags */
+                    set_status(s, "Table accepted");
+                }
+            }
+        }
     }
     ImGui::Separator();
     if (ImGui::BeginTable("tables_list", 5,
@@ -4434,6 +4510,136 @@ void render_warnings_view(ApexProject *project,
         state->overlay_dirty = true;
         rerender_and_reselect(project, document_ptr, state, tog_bank, tog_addr);
     }
+}
+
+/* ---- Flow Breaks: places where code flow runs off into non-code ---- */
+
+static const char *block_kind_short(ApexRenderedBlockKind k)
+{
+    switch (k) {
+    case APEX_RENDER_BLOCK_DATA:         return "data";
+    case APEX_RENDER_BLOCK_TABLE:        return "table";
+    case APEX_RENDER_BLOCK_UNCLASSIFIED: return "unclassified";
+    case APEX_RENDER_BLOCK_FREE:         return "fill (0xFF)";
+    case APEX_RENDER_BLOCK_SPRITE:       return "sprite";
+    default:                             return "non-code";
+    }
+}
+
+/* Scan the whole document for code blocks whose last instruction does not
+   transfer control (no flow-stop, and not a call into a flow-stop tail-call
+   helper) yet is immediately followed by a non-code block. */
+static void rebuild_flow_breaks(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    s->flow_breaks.clear();
+    s->flow_breaks_stale = false;
+    if (!d) return;
+
+    const ApexRenderedLine *last_code = nullptr;
+    size_t last_code_li = 0;
+    for (size_t li = 0; li < d->line_count; li++) {
+        const ApexRenderedLine *l = &d->lines[li];
+        if (!l->has_location) continue;
+
+        if (l->block_kind == APEX_RENDER_BLOCK_CODE) {
+            /* Track the last real instruction, skipping inline payload lines
+               (INLINE_*) so `last_code` is the call/branch itself. */
+            if (l->kind == APEX_RENDER_LINE_INSTRUCTION && l->length >= 1) {
+                const char *t = l->text;
+                size_t n = l->length;
+                while (n && (*t == ' ' || *t == '\t')) { t++; n--; }
+                if (!(n >= 7 && memcmp(t, "INLINE_", 7) == 0)) {
+                    last_code = l;
+                    last_code_li = li;
+                }
+            }
+            continue;
+        }
+
+        /* code -> non-code transition: judge the last code instruction */
+        if (last_code && last_code->rom_addr < p->rom.size) {
+            const uint8_t *isrc; size_t irem;
+            bool clean = false;
+            if (project_locate_rom_bytes(p, last_code->bank, last_code->cpu_addr,
+                                         &isrc, &irem, NULL)) {
+                char mn[32];
+                Cpu6809InstrInfo info = cpu6809_disassemble_info(
+                    isrc, irem < 8u ? irem : 8u, last_code->cpu_addr, mn, sizeof(mn));
+                if (info.flags & CPU6809_FLOW_STOP) {
+                    clean = true;
+                } else if (info.has_target && (info.flags & CPU6809_CALL)) {
+                    /* a call into a flow-stop tail-call helper ends the block */
+                    const InlineSignature *sig =
+                        inline_signature_for(&p->inline_sigs, last_code->bank, info.target);
+                    if (sig && sig->flow_stop) clean = true;
+                }
+            }
+            if (!clean) {
+                FlowBreakEntry e;
+                e.line_index = last_code_li;
+                e.bank = last_code->bank;
+                e.cpu_addr = last_code->cpu_addr;
+                e.insn.assign(last_code->text, last_code->length);
+                /* trim leading indent for display */
+                size_t b = e.insn.find_first_not_of(" \t");
+                if (b != std::string::npos && b) e.insn.erase(0, b);
+                e.next = block_kind_short(l->block_kind);
+                s->flow_breaks.push_back(std::move(e));
+            }
+        }
+        last_code = nullptr;
+    }
+}
+
+void render_flow_breaks_view(ApexProject *project,
+                             const ApexRenderedDocument **document_ptr, UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+    if (state->flow_breaks_stale) rebuild_flow_breaks(project, document, state);
+
+    ImGui::Text("%zu flow break%s", state->flow_breaks.size(),
+                state->flow_breaks.size() == 1 ? "" : "s");
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Reload")) rebuild_flow_breaks(project, document, state);
+    ImGui::SameLine();
+    ImGui::TextDisabled("| code that runs into non-code (mis-classification / wrong inline sig)");
+
+    if (state->flow_breaks.empty()) {
+        ImGui::Separator();
+        ImGui::TextDisabled("No flow breaks.");
+        return;
+    }
+    ImGui::Separator();
+
+    if (!ImGui::BeginTable("flowbreaks", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV, ImVec2(0, 0)))
+        return;
+    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Last instruction", ImGuiTableColumnFlags_WidthStretch);
+    ImGui::TableSetupColumn("Runs into", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+    ImGui::TableHeadersRow();
+
+    for (size_t i = 0; i < state->flow_breaks.size(); i++) {
+        const FlowBreakEntry &e = state->flow_breaks[i];
+        ImGui::PushID((int)i);
+        ImGui::TableNextRow();
+        ImGui::TableSetColumnIndex(0);
+        char ab[24]; snprintf(ab, sizeof(ab), "B%02x_A%04x", e.bank, e.cpu_addr);
+        if (ImGui::Selectable(ab, false, ImGuiSelectableFlags_SpanAllColumns)) {
+            size_t li;
+            if (apex_render_find_line_by_address(document, e.bank, e.cpu_addr, &li))
+                select_line(state, li, 1);
+            else
+                select_line(state, e.line_index, 1);
+        }
+        ImGui::TableSetColumnIndex(1);
+        ImGui::TextUnformatted(e.insn.c_str());
+        ImGui::TableSetColumnIndex(2);
+        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.25f, 1.0f), "%s", e.next.c_str());
+        ImGui::PopID();
+    }
+    ImGui::EndTable();
 }
 
 /* ---- RAM-map import / export (PinMAME nvram-maps JSON) ---- */

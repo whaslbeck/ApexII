@@ -1627,8 +1627,9 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
                                    &project->data_ranges);
 
     project->rom = read_file(project->rom_path);
-    if (project->rom.size != 512u * 1024u && project->rom.size != 1024u * 1024u) {
-        die("unsupported ROM size %lu; expected 512 KB or 1 MB",
+    if (project->rom.size != 256u * 1024u && project->rom.size != 512u * 1024u &&
+        project->rom.size != 1024u * 1024u) {
+        die("unsupported ROM size %lu; expected 256 KB, 512 KB or 1 MB",
             (unsigned long)project->rom.size);
     }
     if (project->rom.size < APEX_SYSTEM_SIZE ||
@@ -1957,31 +1958,49 @@ static void analyze_full_project(ApexProject *project)
                          project->rom.data, banks, project->bank_labels, &project->system_labels,
                          &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions,
                          &project->literals, &project->far_imms);
-    collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
-                              project->bank_labels, &project->system_labels,
-                              &project->data_ranges, &project->refs, &project->ref_exclusions,
-                              &project->literals, &project->far_imms);
+    /* Outer convergence over BOTH scans: a system-bank call into a paged bank
+       creates a paged label (see collect_code_targets), and a paged-bank call
+       into the system bank creates a system label — each can appear only after
+       the other scan has run, so re-run both until no new labels emerge.  The
+       `scanned` flag makes re-runs cheap (only fresh labels are followed). */
     {
-        size_t prev_count, prev_code;
+        size_t prev_total, prev_code;
         do {
             size_t j;
-            prev_count = project->system_labels.count;
+            prev_total = project->system_labels.count;
             prev_code = 0;
-            for (j = 0; j < project->system_labels.count; j++) {
+            for (j = 0; j < project->system_labels.count; j++)
                 if (project->system_labels.items[j].is_code) prev_code++;
+            for (j = 0; j < banks; j++) {
+                size_t k;
+                prev_total += project->bank_labels[j].count;
+                for (k = 0; k < project->bank_labels[j].count; k++)
+                    if (project->bank_labels[j].items[k].is_code) prev_code++;
             }
+
+            collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
+                                      project->bank_labels, &project->system_labels,
+                                      &project->data_ranges, &project->refs,
+                                      &project->ref_exclusions, &project->literals,
+                                      &project->far_imms);
             collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
                                  APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
                                  project->rom.data, banks, project->bank_labels,
                                  &project->system_labels, &project->data_ranges, 0xff,
                                  &project->refs, &project->ref_exclusions, &project->literals,
                                  &project->far_imms);
+
             {
-                size_t j2, curr_code = 0;
-                for (j2 = 0; j2 < project->system_labels.count; j2++) {
-                    if (project->system_labels.items[j2].is_code) curr_code++;
+                size_t total = project->system_labels.count, code = 0;
+                for (j = 0; j < project->system_labels.count; j++)
+                    if (project->system_labels.items[j].is_code) code++;
+                for (j = 0; j < banks; j++) {
+                    size_t k;
+                    total += project->bank_labels[j].count;
+                    for (k = 0; k < project->bank_labels[j].count; k++)
+                        if (project->bank_labels[j].items[k].is_code) code++;
                 }
-                if (curr_code == prev_code && project->system_labels.count == prev_count) break;
+                if (total == prev_total && code == prev_code) break;
             }
         } while (1);
     }
