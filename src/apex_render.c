@@ -200,17 +200,6 @@ static const char *skip_space(const char *text, size_t length, size_t *offset)
     return text + *offset;
 }
 
-static int mnemonic_equals(const char *text, size_t length, const char *name)
-{
-    size_t offset = 0;
-    size_t name_len = strlen(name);
-    const char *start = skip_space(text, length, &offset);
-
-    return offset + name_len <= length &&
-           memcmp(start, name, name_len) == 0 &&
-           (offset + name_len == length || start[name_len] == ' ' || start[name_len] == '\t');
-}
-
 static size_t parse_db_count(const char *text, size_t length)
 {
     size_t offset = 0;
@@ -279,73 +268,89 @@ static size_t parse_string_asm_length(const char *text, size_t length)
     return 0;
 }
 
+/* Whole-token compare against the pre-extracted mnemonic (tok,tok_len). */
+#define TOK_EQ(lit) (tok_len == sizeof(lit) - 1u && memcmp(tok, lit, sizeof(lit) - 1u) == 0)
+
 static size_t rendered_line_size(const ApexProject *project, const ApexRenderedLine *line)
 {
     Cpu6809InstrInfo info;
+    const char *tok;
+    size_t tok_off = 0, tok_len = 0;
 
     if (!line->has_location) {
         return 0;
     }
-    if (mnemonic_equals(line->text, line->length, ".DB")) {
-        return parse_db_count(line->text, line->length);
+    /* Extract the mnemonic token once (was ~30× skip_space+strlen via
+       mnemonic_equals). Every pseudo-op below starts with '.','S','B','I','F'
+       or 'T', so any other initial jumps straight to the instruction decode. */
+    tok = skip_space(line->text, line->length, &tok_off);
+    while (tok_off + tok_len < line->length &&
+           tok[tok_len] != ' ' && tok[tok_len] != '\t') {
+        tok_len++;
     }
-    if (mnemonic_equals(line->text, line->length, ".DW")) {
-        return 2u;
-    }
-    if (mnemonic_equals(line->text, line->length, "STRING")) {
-        return parse_string_asm_length(line->text, line->length);
-    }
-    if (mnemonic_equals(line->text, line->length, "STRING_FIXED")) {
-        size_t n = parse_string_asm_length(line->text, line->length);
-        return n > 0u ? n - 1u : 0u;  /* no null/length byte */
-    }
-    if (mnemonic_equals(line->text, line->length, "BCD")) {
-        /* BCD <2N digits> → N bytes */
-        size_t i = 0, digits = 0;
-        while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
-        i += 3; /* "BCD" */
-        while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
-        while (i < line->length && line->text[i] >= '0' && line->text[i] <= '9') { digits++; i++; }
-        return digits / 2u;
-    }
-    if (mnemonic_equals(line->text, line->length, "INLINE_BYTE")) {
-        return 1u;
-    }
-    if (mnemonic_equals(line->text, line->length, "INLINE_WORD")) {
-        return 2u;
-    }
-    if (mnemonic_equals(line->text, line->length, "INLINE_PTR") ||
-        mnemonic_equals(line->text, line->length, "INLINE_STRING_PTR") ||
-        mnemonic_equals(line->text, line->length, "INLINE_TABLE_PTR") ||
-        mnemonic_equals(line->text, line->length, "INLINE_CODE_PTR") ||
-        mnemonic_equals(line->text, line->length, "INLINE_PTR_DMD_FULLFRAME") ||
-        mnemonic_equals(line->text, line->length, "INLINE_PTR_SPRITE") ||
-        mnemonic_equals(line->text, line->length, "TABLE_PTR") ||
-        mnemonic_equals(line->text, line->length, "TABLE_STRING_PTR") ||
-        mnemonic_equals(line->text, line->length, "TABLE_CODE_PTR") ||
-        mnemonic_equals(line->text, line->length, "TABLE_PTR_DMD_FULLFRAME") ||
-        mnemonic_equals(line->text, line->length, "TABLE_PTR_SPRITE")) {
-        return 2u;
-    }
-    if (mnemonic_equals(line->text, line->length, "INLINE_FAR_PTR") ||
-        mnemonic_equals(line->text, line->length, "INLINE_FAR_STRING") ||
-        mnemonic_equals(line->text, line->length, "INLINE_FAR_TABLE") ||
-        mnemonic_equals(line->text, line->length, "INLINE_FAR_CODE") ||
-        mnemonic_equals(line->text, line->length, "INLINE_FAR_DMD_FULLFRAME") ||
-        mnemonic_equals(line->text, line->length, "INLINE_FAR_SPRITE") ||
-        mnemonic_equals(line->text, line->length, "FAR_PTR") ||
-        mnemonic_equals(line->text, line->length, "FAR_STRING") ||
-        mnemonic_equals(line->text, line->length, "FAR_TABLE") ||
-        mnemonic_equals(line->text, line->length, "FAR_CODE") ||
-        mnemonic_equals(line->text, line->length, "FAR_DMD_FULLFRAME") ||
-        mnemonic_equals(line->text, line->length, "FAR_SPRITE") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_PTR") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_STRING") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_TABLE") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_CODE") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_DMD_FULLFRAME") ||
-        mnemonic_equals(line->text, line->length, "TABLE_FAR_SPRITE")) {
-        return 3u;
+    switch (tok_len ? tok[0] : '\0') {
+    case '.':
+        if (TOK_EQ(".DB")) {
+            return parse_db_count(line->text, line->length);
+        }
+        if (TOK_EQ(".DW")) {
+            return 2u;
+        }
+        break;
+    case 'S':
+        if (TOK_EQ("STRING")) {
+            return parse_string_asm_length(line->text, line->length);
+        }
+        if (TOK_EQ("STRING_FIXED")) {
+            size_t n = parse_string_asm_length(line->text, line->length);
+            return n > 0u ? n - 1u : 0u;  /* no null/length byte */
+        }
+        break;
+    case 'B':
+        if (TOK_EQ("BCD")) {
+            /* BCD <2N digits> → N bytes */
+            size_t i = 0, digits = 0;
+            while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
+            i += 3; /* "BCD" */
+            while (i < line->length && (line->text[i] == ' ' || line->text[i] == '\t')) i++;
+            while (i < line->length && line->text[i] >= '0' && line->text[i] <= '9') { digits++; i++; }
+            return digits / 2u;
+        }
+        break;
+    case 'I':
+        if (TOK_EQ("INLINE_BYTE")) {
+            return 1u;
+        }
+        if (TOK_EQ("INLINE_WORD") || TOK_EQ("INLINE_PTR") || TOK_EQ("INLINE_STRING_PTR") ||
+            TOK_EQ("INLINE_TABLE_PTR") || TOK_EQ("INLINE_CODE_PTR") ||
+            TOK_EQ("INLINE_PTR_DMD_FULLFRAME") || TOK_EQ("INLINE_PTR_SPRITE")) {
+            return 2u;
+        }
+        if (TOK_EQ("INLINE_FAR_PTR") || TOK_EQ("INLINE_FAR_STRING") ||
+            TOK_EQ("INLINE_FAR_TABLE") || TOK_EQ("INLINE_FAR_CODE") ||
+            TOK_EQ("INLINE_FAR_DMD_FULLFRAME") || TOK_EQ("INLINE_FAR_SPRITE")) {
+            return 3u;
+        }
+        break;
+    case 'T':
+        if (TOK_EQ("TABLE_PTR") || TOK_EQ("TABLE_STRING_PTR") || TOK_EQ("TABLE_CODE_PTR") ||
+            TOK_EQ("TABLE_PTR_DMD_FULLFRAME") || TOK_EQ("TABLE_PTR_SPRITE")) {
+            return 2u;
+        }
+        if (TOK_EQ("TABLE_FAR_PTR") || TOK_EQ("TABLE_FAR_STRING") ||
+            TOK_EQ("TABLE_FAR_TABLE") || TOK_EQ("TABLE_FAR_CODE") ||
+            TOK_EQ("TABLE_FAR_DMD_FULLFRAME") || TOK_EQ("TABLE_FAR_SPRITE")) {
+            return 3u;
+        }
+        break;
+    case 'F':
+        if (TOK_EQ("FAR_PTR") || TOK_EQ("FAR_STRING") || TOK_EQ("FAR_TABLE") ||
+            TOK_EQ("FAR_CODE") || TOK_EQ("FAR_DMD_FULLFRAME") || TOK_EQ("FAR_SPRITE")) {
+            return 3u;
+        }
+        break;
+    default:
+        break;
     }
     if (line->kind == APEX_RENDER_LINE_INSTRUCTION) {
         if (line->rom_addr >= project->rom.size) {
@@ -359,14 +364,62 @@ static size_t rendered_line_size(const ApexProject *project, const ApexRenderedL
     return 0;
 }
 
+#undef TOK_EQ
+
 static void clear_document(ApexRenderedDocument *document)
 {
+    unsigned long gen;
+
     if (!document) {
         return;
     }
+    gen = document->generation;
     free(document->lines);
     free(document->text);
+    free(document->addr_index);
     memset(document, 0, sizeof(*document));
+    document->generation = gen;  /* persist across rebuilds for frontend caches */
+}
+
+static int addr_index_cmp(const void *pa, const void *pb)
+{
+    const ApexRenderedAddrIndex *a = (const ApexRenderedAddrIndex *)pa;
+    const ApexRenderedAddrIndex *b = (const ApexRenderedAddrIndex *)pb;
+
+    if (a->bank != b->bank) return (int)a->bank - (int)b->bank;
+    if (a->cpu_addr != b->cpu_addr) return a->cpu_addr < b->cpu_addr ? -1 : 1;
+    /* stable by line_index so a lookup returns the first line at the address,
+       matching the historical linear-scan semantics. */
+    if (a->line_index != b->line_index) return a->line_index < b->line_index ? -1 : 1;
+    return 0;
+}
+
+/* Build the (bank, cpu_addr) → line_index lookup index over has_location lines. */
+static void build_addr_index(ApexRenderedDocument *document)
+{
+    size_t i, n = 0;
+
+    for (i = 0; i < document->line_count; i++) {
+        if (document->lines[i].has_location) {
+            n++;
+        }
+    }
+    document->addr_index_count = n;
+    if (n == 0) {
+        document->addr_index = NULL;
+        return;
+    }
+    document->addr_index = xmalloc(n * sizeof(document->addr_index[0]));
+    n = 0;
+    for (i = 0; i < document->line_count; i++) {
+        if (document->lines[i].has_location) {
+            document->addr_index[n].bank = document->lines[i].bank;
+            document->addr_index[n].cpu_addr = document->lines[i].cpu_addr;
+            document->addr_index[n].line_index = i;
+            n++;
+        }
+    }
+    qsort(document->addr_index, n, sizeof(document->addr_index[0]), addr_index_cmp);
 }
 
 static long file_size(FILE *stream)
@@ -519,6 +572,8 @@ static void build_line_index(const ApexProject *project, ApexRenderedDocument *d
             current_rom_addr += size;
         }
     }
+    build_addr_index(document);
+    document->generation++;
 }
 
 int apex_render_project(const ApexProject *project, int emit_xrefs, int emit_explain,
@@ -574,6 +629,30 @@ const ApexRenderedLine *apex_render_find_line_by_address(const ApexRenderedDocum
     size_t i;
 
     if (!document) {
+        return NULL;
+    }
+    if (document->addr_index) {
+        /* Binary-search the sorted (bank, cpu_addr, line_index) index for the
+           first entry at (bank, cpu_addr) — matches the old first-match scan. */
+        size_t lo = 0, hi = document->addr_index_count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            const ApexRenderedAddrIndex *e = &document->addr_index[mid];
+            if (e->bank < bank || (e->bank == bank && e->cpu_addr < cpu_addr)) {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
+        }
+        if (lo < document->addr_index_count &&
+            document->addr_index[lo].bank == bank &&
+            document->addr_index[lo].cpu_addr == cpu_addr) {
+            i = document->addr_index[lo].line_index;
+            if (line_index) {
+                *line_index = i;
+            }
+            return &document->lines[i];
+        }
         return NULL;
     }
     for (i = 0; i < document->line_count; i++) {

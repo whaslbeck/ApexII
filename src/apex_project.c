@@ -933,6 +933,12 @@ static void free_config_symbols(ConfigSymbols *symbols)
 
 static void free_label_set(LabelSet *labels)
 {
+    size_t i;
+    for (i = 0; i < labels->count; i++) {
+        if (labels->items[i].owns_name && labels->items[i].name) {
+            free((char *)labels->items[i].name);
+        }
+    }
     free(labels->items);
     memset(labels, 0, sizeof(*labels));
 }
@@ -1023,6 +1029,9 @@ static void remove_runtime_label(LabelSet *labels, uint32_t addr, const char *na
     }
     for (i = 0; i < labels->count; i++) {
         if (labels->items[i].addr == addr && strcmp(labels->items[i].name, name) == 0) {
+            if (labels->items[i].owns_name && labels->items[i].name) {
+                free((char *)labels->items[i].name);
+            }
             memmove(&labels->items[i], &labels->items[i + 1],
                     (labels->count - i - 1u) * sizeof(labels->items[0]));
             labels->count--;
@@ -1116,6 +1125,7 @@ static ConfigDoc *upsert_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank
     docs->items[docs->count].addr = addr;
     docs->items[docs->count].text = project_dup_string(text);
     docs->count++;
+    docs->sorted = 0;
     return &docs->items[docs->count - 1u];
 }
 
@@ -1768,7 +1778,7 @@ static void analyze_system_region(ApexProject *project)
                 continue;
             }
             if (!label_name_at(addr, ls->items, ls->count, 0)) {
-                Label *t = add_label(ls, addr, make_generated_label(addr), 1);
+                Label *t = add_owned_label(ls, addr, make_generated_label(addr), 1);
                 explain_label(t, "code_flow");
                 explain_label_kind(t, "code_flow");
             } else {
@@ -1879,7 +1889,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
                 continue;
             }
             if (!label_name_at(addr, ls->items, ls->count, 0)) {
-                Label *t = add_label(ls, addr, make_bank_label(bank_id, addr), 1);
+                Label *t = add_owned_label(ls, addr, make_bank_label(bank_id, addr), 1);
                 explain_label(t, "code_flow");
                 explain_label_kind(t, "code_flow");
             } else {
@@ -2070,7 +2080,14 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
         if (labels->items[i].addr == addr &&
             (old_name ? strcmp(labels->items[i].name, old_name) == 0
                       : generated_any_label_name(labels->items[i].name))) {
+            /* Replacing an owned generated name with the borrowed config name:
+               free the old and mark the slot as no longer owning it (else
+               free_label_set would later double-free the config string). */
+            if (labels->items[i].owns_name && labels->items[i].name) {
+                free((char *)labels->items[i].name);
+            }
             labels->items[i].name = config_label->name;
+            labels->items[i].owns_name = 0;
             updated = 1;
             break;
         }
@@ -2079,7 +2096,11 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
         Label *label = add_label(labels, addr, config_label->name,
                                  code_label_at(addr, labels->items, labels->count, 0));
 
+        if (label->owns_name && label->name) {
+            free((char *)label->name);
+        }
         label->name = config_label->name;
+        label->owns_name = 0;
     }
     /* Drop any other now-redundant label at this address (a stray generated
        placeholder or a duplicate of the new name). */
@@ -2088,6 +2109,9 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
             labels->items[i].name != config_label->name &&
             (generated_any_label_name(labels->items[i].name) ||
              strcmp(labels->items[i].name, config_label->name) == 0)) {
+            if (labels->items[i].owns_name && labels->items[i].name) {
+                free((char *)labels->items[i].name);
+            }
             memmove(&labels->items[i], &labels->items[i + 1],
                     (labels->count - i - 1u) * sizeof(labels->items[0]));
             labels->count--;
@@ -2357,12 +2381,58 @@ const ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_x
     if ((project->dirty_flags & APEX_DIRTY_RENDER) || !project->render_cache->text ||
         project->render_cache_emit_xrefs != emit_xrefs ||
         project->render_cache_emit_explain != emit_explain) {
+        sort_config_docs(&project->docs); /* enables O(log n) config_doc_at during emit */
         apex_render_project(project, emit_xrefs, emit_explain, project->render_cache);
         project->render_cache_emit_xrefs = emit_xrefs;
         project->render_cache_emit_explain = emit_explain;
         project->dirty_flags &= ~(APEX_DIRTY_RENDER | APEX_DIRTY_LABELS | APEX_DIRTY_DOCS);
     }
     return project->render_cache;
+}
+
+ApexRenderedDocument *apex_project_render_detached(ApexProject *project, int emit_xrefs,
+                                                   int emit_explain)
+{
+    ApexRenderedDocument *doc;
+
+    if (!project) {
+        return NULL;
+    }
+    if (apex_project_analyze(project) != 0) {
+        return NULL;
+    }
+    sort_config_docs(&project->docs);
+    doc = xmalloc(sizeof(*doc));
+    memset(doc, 0, sizeof(*doc));
+    /* Continue the monotonic render generation from the currently displayed
+       document (build_line_index increments it) so frontend caches keyed on
+       generation actually invalidate — a fresh doc would always reset it to 1
+       and leave those caches (visible rows, hex kind map, …) permanently stale. */
+    if (project->render_cache) {
+        doc->generation = project->render_cache->generation;
+    }
+    if (apex_render_project(project, emit_xrefs, emit_explain, doc) != 0) {
+        apex_render_document_free(doc);
+        free(doc);
+        return NULL;
+    }
+    return doc;
+}
+
+void apex_project_adopt_render_cache(ApexProject *project, ApexRenderedDocument *doc,
+                                     int emit_xrefs, int emit_explain)
+{
+    if (!project || !doc) {
+        return;
+    }
+    if (project->render_cache) {
+        apex_render_document_free(project->render_cache);
+        free(project->render_cache);
+    }
+    project->render_cache = doc;
+    project->render_cache_emit_xrefs = emit_xrefs;
+    project->render_cache_emit_explain = emit_explain;
+    project->dirty_flags &= ~(APEX_DIRTY_RENDER | APEX_DIRTY_LABELS | APEX_DIRTY_DOCS);
 }
 
 /* ---- deterministic config ordering (mirrors apexini's sorted output) ---- */
@@ -2468,6 +2538,10 @@ void apex_project_sort_config(ApexProject *project)
     if (project->docs.count > 1) {
         qsort(project->docs.items, project->docs.count,
               sizeof(project->docs.items[0]), cfg_cmp_doc);
+        /* cfg_cmp_doc orders by (effective-bank, addr); config_doc_at's binary
+           search needs addr-primary order. Clear the flag so the next lookup
+           re-sorts (via sort_config_docs) or falls back to the linear scan. */
+        project->docs.sorted = 0;
     }
     if (project->ref_exclusions.count > 1) {
         qsort(project->ref_exclusions.items, project->ref_exclusions.count,

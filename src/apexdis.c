@@ -909,9 +909,13 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                                           rom_base + (size_t)(addr - base_addr));
                     emit_reference_comment(out, refs, bank, addr);
                 }
-                fprintf(out, "%s:\n",
-                        bank == 0xffu ? make_generated_label(addr) :
-                                        make_bank_label(bank, (uint16_t)addr));
+                {
+                    char *lbl = (char *)(bank == 0xffu
+                                    ? make_generated_label(addr)
+                                    : make_bank_label(bank, (uint16_t)addr));
+                    fprintf(out, "%s:\n", lbl);
+                    free(lbl);
+                }
                 break;
             }
             if (refs->sorted && (refs->items[ri].bank > bank ||
@@ -1125,21 +1129,27 @@ static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t le
     }
 }
 
+/* Returns a label string for the pointer target. *owned is set to 1 when the
+   result is a freshly allocated make_*_label the caller must free, 0 when it is
+   a borrowed pointer into a label set. */
 static const char *table_ptr_label(uint16_t ptr, uint8_t bank,
                                    const Label *labels,
                                    size_t label_count, const Label *extra_labels,
-                                   size_t extra_label_count)
+                                   size_t extra_label_count, int *owned)
 {
     const char *label = label_name_at(ptr, labels, label_count, 0);
 
+    *owned = 0;
     if (!label) {
         label = label_name_at(ptr, extra_labels, extra_label_count, 0);
     }
     if (!label && ptr >= APEX_PAGED_ORG && ptr < 0x8000u) {
         label = make_bank_label(bank, ptr);
+        *owned = 1;
     }
     if (!label && in_system_addr(ptr)) {
         label = make_generated_label(ptr);
+        *owned = 1;
     }
     return label;
 }
@@ -1156,7 +1166,9 @@ static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
         return;
     }
     ptr = read_be16(data + *pos);
-    label = table_ptr_label(ptr, bank, labels, label_count, extra_labels, extra_label_count);
+    int label_owned = 0;
+    label = table_ptr_label(ptr, bank, labels, label_count, extra_labels, extra_label_count,
+                            &label_owned);
     {
         const char *pseudo = kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME" :
                              kind == TABLE_PTR16_SPRITE         ? "TABLE_PTR_SPRITE"         :
@@ -1166,6 +1178,9 @@ static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
         } else {
             fprintf(out, "    %s 0x%04x", pseudo, ptr);
         }
+    }
+    if (label_owned) {
+        free((char *)label);
     }
     if (kind == TABLE_PTR16_DMD_FULLFRAME) {
         emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, ptr);
@@ -1248,6 +1263,9 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
         fprintf(out, "    %s %s", pseudo, label);
     } else {
         fprintf(out, "    %s %s, 0x%02x", pseudo, label, bank);
+    }
+    if (generated) {
+        free((char *)label);
     }
 }
 
@@ -1384,19 +1402,20 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
             uint32_t row_addr = base_addr + (uint32_t)row_start;
             size_t li;
 
-            for (li = 0; li < label_count; li++) {
-                if (labels[li].addr == row_addr) {
-                    fprintf(out, "%s:\n", labels[li].name);
-                }
+            /* labels/extra_labels are sorted by addr during emit, so binary-search
+               for the row address instead of scanning every label per row — the
+               linear form is O(rows * labels) and dominates large tables. */
+            for (li = label_lower_bound(labels, label_count, row_addr);
+                 li < label_count && labels[li].addr == row_addr; li++) {
+                fprintf(out, "%s:\n", labels[li].name);
             }
-            for (li = 0; li < extra_label_count; li++) {
-                if (extra_labels[li].addr == row_addr) {
-                    fprintf(out, "%s:\n", extra_labels[li].name);
-                }
+            for (li = label_lower_bound(extra_labels, extra_label_count, row_addr);
+                 li < extra_label_count && extra_labels[li].addr == row_addr; li++) {
+                fprintf(out, "%s:\n", extra_labels[li].name);
             }
         }
 
-        fprintf(out, "; [row %lu]\n", (unsigned long)row);
+        fprintf(out, "; [row %lu / %04lx]\n", (unsigned long)row, (unsigned long)(row & 0xffffu));
         emit_doc_comment(out, config_doc_at(docs, current_bank, base_addr + (uint32_t)row_start));
 
         for (i = 0; i < table->schema.count; i++) {
@@ -1552,17 +1571,21 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         range->kind == DATA_PTR16_CODE  || range->kind == DATA_PTR16_TABLE) {
         uint16_t ptr;
         const char *lbl;
+        int lbl_owned = 0;
 
         if (*pos + 2u > len) {
             return 0;
         }
         ptr = read_be16(data + *pos);
         lbl = table_ptr_label(ptr, range->bank, labels, label_count,
-                              extra_labels, extra_label_count);
+                              extra_labels, extra_label_count, &lbl_owned);
         if (lbl) {
             fprintf(out, "    .DW %s\n", lbl);
         } else {
             fprintf(out, "    .DW 0x%04x\n", ptr);
+        }
+        if (lbl_owned) {
+            free((char *)lbl);
         }
         *pos += 2u;
         return 1;
@@ -1704,13 +1727,17 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 *pos += 3u;
             } else {
                 uint16_t ptr = read_be16(data + *pos);
+                int label_owned = 0;
                 const char *label = table_ptr_label(ptr, current_bank, labels, label_count,
-                                                    extra_labels, extra_label_count);
+                                                    extra_labels, extra_label_count, &label_owned);
 
                 if (label) {
                     fprintf(out, "        %s %s ; for %s", inline_ptr_pseudo(kind), label, inst);
                 } else {
                     fprintf(out, "        %s 0x%04x ; for %s", inline_ptr_pseudo(kind), ptr, inst);
+                }
+                if (label_owned) {
+                    free((char *)label);
                 }
                 if (kind == TABLE_PTR16_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, current_bank, ptr);
@@ -2093,7 +2120,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
         if (((!config_entries->items[i].has_bank) ||
              (config_entries->items[i].has_bank && config_entries->items[i].bank == 0xffu)) &&
             in_system_addr(config_entries->items[i].addr)) {
-            Label *label = add_label(labels, config_entries->items[i].addr,
+            Label *label = add_owned_label(labels, config_entries->items[i].addr,
                                      make_generated_label(config_entries->items[i].addr), 1);
 
             label->is_explicit_entry = 1;
@@ -2281,7 +2308,7 @@ void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_
         }
         bank_index = bank_index_for_id(paged_rom, banks, entry->bank);
         if (bank_index >= 0 && entry->addr >= APEX_PAGED_ORG && entry->addr < 0x8000u) {
-            Label *label = add_label(&bank_labels[bank_index], entry->addr,
+            Label *label = add_owned_label(&bank_labels[bank_index], entry->addr,
                                      make_bank_label(entry->bank, entry->addr), 1);
 
             label->is_explicit_entry = 1;
@@ -2357,14 +2384,14 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
             if (!in_system_addr(range->addr)) {
                 continue;
             }
-            label = add_label(system_labels, range->addr, make_generated_label(range->addr), 0);
+            label = add_owned_label(system_labels, range->addr, make_generated_label(range->addr), 0);
         } else {
             int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
 
             if (bank_index < 0 || range->addr < APEX_PAGED_ORG || range->addr >= 0x8000u) {
                 continue;
             }
-            label = add_label(&bank_labels[bank_index], range->addr,
+            label = add_owned_label(&bank_labels[bank_index], range->addr,
                               make_bank_label(range->bank, range->addr), 0);
         }
         explain_label(label, config_data_source(range->kind));
@@ -2466,7 +2493,7 @@ static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom,
     Label *label;
 
     if (bank == 0xffu && in_system_addr(addr)) {
-        label = add_label(system_labels, addr, make_generated_label(addr), is_code);
+        label = add_owned_label(system_labels, addr, make_generated_label(addr), is_code);
         explain_label(label, table_far_ref_source(kind));
         explain_label_kind(label, table_far_ref_source(kind));
         if (!is_code) {
@@ -2479,7 +2506,7 @@ static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom,
     }
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-        label = add_label(&bank_labels[bank_index], addr,
+        label = add_owned_label(&bank_labels[bank_index], addr,
                           make_bank_label(bank_id_for_index(banks, bank_index), addr),
                           is_code);
         explain_label(label, table_far_ref_source(kind));
@@ -2520,7 +2547,7 @@ static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8
     if (ptr < APEX_PAGED_ORG || ptr >= 0x8000u) {
         return;
     }
-    target = add_label(labels, ptr, make_bank_label(bank, ptr), kind == TABLE_PTR16_CODE);
+    target = add_owned_label(labels, ptr, make_bank_label(bank, ptr), kind == TABLE_PTR16_CODE);
     explain_label(target, table_ptr_ref_source(kind));
     explain_label_kind(target, table_ptr_ref_source(kind));
     if (kind != TABLE_PTR16_CODE) {
@@ -2630,7 +2657,7 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
             pos = (size_t)(table->addr - APEX_SYSTEM_ORG);
             {
                 Label *table_label =
-                    add_label(system_labels, table->addr, make_generated_label(table->addr), 0);
+                    add_owned_label(system_labels, table->addr, make_generated_label(table->addr), 0);
 
                 explain_label(table_label, "config_table");
                 explain_label_kind(table_label, "config_table");
@@ -2662,7 +2689,7 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
         used = last_non_ff(bank, APEX_BANK_SIZE);
         pos = (size_t)(table->addr - APEX_PAGED_ORG);
         {
-            Label *table_label = add_label(&bank_labels[bank_index], table->addr,
+            Label *table_label = add_owned_label(&bank_labels[bank_index], table->addr,
                                            make_bank_label(table->bank, table->addr), 0);
 
             explain_label(table_label, "config_table");
@@ -2750,6 +2777,18 @@ static void emit_preamble(FILE *out, const ApexProject *project)
         fprintf(out, "; %-14s%s\n", "Game Version:", info.game_version);
     else
         fprintf(out, "; %-14snot found\n", "Game Version:");
+
+    if (info.game_id_found) {
+        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
+                "Game Name:", info.game_name, info.game_id_ptr_addr,
+                info.game_name_bank, info.game_name_addr);
+        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
+                "Game Number:", info.game_number, (unsigned)(info.game_id_ptr_addr + 3u),
+                info.game_number_bank, info.game_number_addr);
+        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
+                "Game Date:", info.game_date, (unsigned)(info.game_id_ptr_addr + 6u),
+                info.game_date_bank, info.game_date_addr);
+    }
 
     fputs(";\n", out);
 

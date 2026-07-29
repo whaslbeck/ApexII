@@ -1,4 +1,5 @@
 #include "apeximgui_core.h"
+#include "apeximgui_views_internal.h"
 #include "apex_rominfo.h"
 #include "apex_nvram.h"
 #include "ImGuiFileDialog.h"
@@ -19,7 +20,7 @@
 
 // --- UI Rendering Helpers (Internal) ---
 
-static bool str_icontains(const char *hay, const char *needle)
+bool str_icontains(const char *hay, const char *needle)
 {
     if (!needle || !*needle) return true;
     size_t nl = strlen(needle);
@@ -36,11 +37,10 @@ static bool str_icontains(const char *hay, const char *needle)
 /* Click-to-sort support for the data tables.  Add the flags below to a
    BeginTable, give each column a user id in TableSetupColumn, then call
    ui_table_sort() once after the header to learn the active sort column. */
-#define APEX_TABLE_SORT_FLAGS (ImGuiTableFlags_Sortable | ImGuiTableFlags_SortTristate)
 
 /* Returns true and fills *col (column user id) + *asc when a column is sorted;
    false in the tri-state "unsorted" state.  Always clears SpecsDirty. */
-static bool ui_table_sort(int *col, bool *asc)
+bool ui_table_sort(int *col, bool *asc)
 {
     ImGuiTableSortSpecs *sp = ImGui::TableGetSortSpecs();
     if (!sp || sp->SpecsCount == 0) {
@@ -54,9 +54,9 @@ static bool ui_table_sort(int *col, bool *asc)
 }
 
 /* Three-way compares for use inside per-table sort comparators. */
-static int ui_cmp_u32(uint32_t a, uint32_t b) { return a < b ? -1 : a > b ? 1 : 0; }
-static int ui_cmp_sz(size_t a, size_t b)      { return a < b ? -1 : a > b ? 1 : 0; }
-static int ui_cmp_int(long a, long b)         { return a < b ? -1 : a > b ? 1 : 0; }
+int ui_cmp_u32(uint32_t a, uint32_t b) { return a < b ? -1 : a > b ? 1 : 0; }
+int ui_cmp_sz(size_t a, size_t b)      { return a < b ? -1 : a > b ? 1 : 0; }
+int ui_cmp_int(long a, long b)         { return a < b ? -1 : a > b ? 1 : 0; }
 
 static void render_text_chunk(const char *start, const char *end, const ImVec4 *color)
 {
@@ -122,7 +122,7 @@ static void render_line_text(const ApexRenderedDocument *document, UiState *stat
     }
 }
 
-static void render_dmd_preview(const DmdPreviewInfo &preview, float max_scale = 6.0f)
+void render_dmd_preview(const DmdPreviewInfo &preview, float max_scale)
 {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float scale = std::max(1.0f, std::min(max_scale, avail.x / (float)APEX_DMD_WIDTH));
@@ -181,6 +181,33 @@ static int find_table_row_index(const ApexRenderedDocument *d, size_t line_idx)
     return -1;
 }
 
+/* From a line inside a TABLE block, find the table's start address (the header)
+   by walking backwards to the top of the contiguous TABLE block. Returns false
+   if the line is not part of a table. */
+bool find_table_start(const ApexRenderedDocument *d, size_t line_idx,
+                      uint8_t *out_bank, uint32_t *out_addr)
+{
+    size_t i = line_idx;
+    bool found = false;
+    uint8_t b = 0;
+    uint32_t a = 0;
+    for (;;) {
+        const ApexRenderedLine *l = &d->lines[i];
+        if (l->has_location) {
+            if (l->block_kind != APEX_RENDER_BLOCK_TABLE) {
+                break; /* reached the line before the table */
+            }
+            b = l->bank;      /* keep updating; the topmost TABLE location wins */
+            a = l->cpu_addr;
+            found = true;
+        }
+        if (i == 0) break;
+        i--;
+    }
+    if (found) { *out_bank = b; *out_addr = a; }
+    return found;
+}
+
 static bool is_dmd_fullframe_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
 {
     /* The byte belongs to a DMD frame only if the data range that *owns* it (the
@@ -215,7 +242,7 @@ static bool is_sprite_addr(const ApexProject *p, uint8_t bank, uint32_t addr)
     return false;
 }
 
-static void render_sprite_preview(const SpritePreviewInfo &pr, float max_scale = 6.0f)
+void render_sprite_preview(const SpritePreviewInfo &pr, float max_scale)
 {
     ImVec2 avail = ImGui::GetContentRegionAvail();
     float scale_x = pr.width  > 0 ? avail.x / (float)pr.width  : 1.0f;
@@ -593,6 +620,58 @@ static bool render_line_sprite_dmd_preview(const ApexProject *project,
     return false;
 }
 
+/* Hover-peek: preview the destination of a branch/call/pointer, whatever its
+   kind.  Code targets get the rich disassembly preview; sprites/DMD get the
+   image; strings/data/tables show their already-rendered document text so the
+   preview matches exactly what the listing shows. */
+static void render_target_preview(const ApexProject *p, const ApexRenderedDocument *d,
+                                  UiState *state, uint8_t t_bank, uint32_t t_addr)
+{
+    size_t tl;
+    if (!apex_render_find_line_by_address(d, t_bank, t_addr, &tl)) {
+        return;
+    }
+    const ApexRenderedLine *tline = &d->lines[tl];
+    if (!tline->has_location) {
+        return;
+    }
+    if (tline->block_kind == APEX_RENDER_BLOCK_CODE) {
+        if (tline->rom_addr < p->rom.size) {
+            render_disasm_preview(p, tline->rom_addr, t_bank, t_addr);
+        }
+        return;
+    }
+    if (tline->block_kind == APEX_RENDER_BLOCK_SPRITE) {
+        render_line_sprite_dmd_preview(p, d, state, tline);
+        return;
+    }
+    /* String / data / table / unclassified: echo the rendered listing lines. */
+    char title[48];
+    snprintf(title, sizeof(title), "Target at B%02x_A%04x", (unsigned)t_bank,
+             (unsigned)t_addr & 0xffffu);
+    ImGui::SeparatorText(title);
+    ImGui::PushTextWrapPos(ImGui::GetFontSize() * 40.0f);
+    int shown = 0;
+    static const int kMaxTargetLines = 12;
+    for (size_t i = tl; i < d->line_count && shown < kMaxTargetLines; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        if (l->kind == APEX_RENDER_LINE_LOCATION ||
+            l->kind == APEX_RENDER_LINE_COMMENT) {
+            continue;  /* skip anchor comments + "; referenced_by/doc" metadata */
+        }
+        if (l->length == 0) {
+            if (shown > 0) break;  /* blank line ends the block once we've shown some */
+            continue;
+        }
+        if (shown > 0 && l->kind == APEX_RENDER_LINE_LABEL) {
+            break;  /* next block's label — stop */
+        }
+        ImGui::TextUnformatted(l->text, l->text + l->length);
+        shown++;
+    }
+    ImGui::PopTextWrapPos();
+}
+
 /* Shared "Classify as ▸" submenu of pointer / sprite / DMD data kinds, used by
    both the disassembly row context menu and the hex view context menu.  Each
    item classifies the current selection (hex byte when the hex view is the edit
@@ -646,16 +725,29 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
     int selected_visible_row = -1;
     ensure_label_index(document, state);
 
-    std::vector<size_t> visible;
-    visible.reserve(document->line_count);
-    for (size_t i = 0; i < document->line_count; i++) {
-        if (is_acked_warning_line(&document->lines[i]))
-            continue;
-        if (line_matches_filter(&document->lines[i], state->filter_input)) {
-            if (state->selected_line == i)
-                selected_visible_row = (int)visible.size();
-            visible.push_back(i);
+    /* Rebuild the filtered row list only when the document (generation) or the
+       filter text changed; otherwise reuse the cached vector. This runs every
+       frame and the document can be ~200K lines, so the reuse matters. */
+    if (state->cached_visible_gen != document->generation ||
+        state->cached_visible_filter != state->filter_input) {
+        state->cached_visible.clear();
+        state->cached_visible.reserve(document->line_count);
+        for (size_t i = 0; i < document->line_count; i++) {
+            if (is_acked_warning_line(&document->lines[i]))
+                continue;
+            if (line_matches_filter(&document->lines[i], state->filter_input))
+                state->cached_visible.push_back(i);
         }
+        state->cached_visible_gen = document->generation;
+        state->cached_visible_filter = state->filter_input;
+    }
+    const std::vector<size_t> &visible = state->cached_visible;
+    /* The cursor moves without changing the visible set, so locate its row each
+       frame — visible[] holds line indices in ascending order. */
+    if (state->selected_line < document->line_count) {
+        auto it = std::lower_bound(visible.begin(), visible.end(), state->selected_line);
+        if (it != visible.end() && *it == state->selected_line)
+            selected_visible_row = (int)(it - visible.begin());
     }
     /* Flow-arrow gutter constants */
     static constexpr int   FA_MAX_LANES  = 5;
@@ -698,12 +790,23 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
         while (clipper.Step()) {
             for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
                 size_t line_idx = visible[(size_t)row];
+                if (line_idx >= document->line_count) {
+                    continue;  /* defensive: never index past the current document */
+                }
                 const auto *line = &document->lines[line_idx];
-                size_t sel_min = std::min(state->selected_line, state->selection_end);
-                size_t sel_max = std::max(state->selected_line, state->selection_end);
-                bool in_range = (line_idx >= sel_min && line_idx <= sel_max);
+                bool is_cursor = (line_idx == state->selected_line);
+                bool in_block  = state->block_active &&
+                                 line_idx >= std::min(state->block_a, state->block_b) &&
+                                 line_idx <= std::max(state->block_a, state->block_b);
+                bool in_range = is_cursor; /* the Selectable highlights the cursor line */
                 ImGui::PushID((int)line_idx);
                 ImGui::TableNextRow();
+                if (in_block && !is_cursor) {
+                    /* distinct translucent-blue background for the marked block */
+                    ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.20f, 0.45f, 0.85f, 0.28f));
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                }
                 if (line->has_conflict) {
                     ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.85f, 0.45f, 0.05f, 0.28f));
                     ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
@@ -813,6 +916,33 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 }
                 ImGui::TableSetColumnIndex(3);
                 ImGui::BeginGroup();
+                if (state->inline_edit_line == line_idx) {
+                    /* Inline label editor (double-click a label to open). */
+                    if (state->inline_edit_focus) {
+                        ImGui::SetKeyboardFocusHere();
+                        state->inline_edit_focus = false;
+                    }
+                    ImGui::SetNextItemWidth(320.0f);
+                    bool commit = ImGui::InputText("##inline_label", state->inline_edit_buf,
+                                       sizeof(state->inline_edit_buf),
+                                       ImGuiInputTextFlags_EnterReturnsTrue |
+                                       ImGuiInputTextFlags_AutoSelectAll);
+                    bool cancel = ImGui::IsItemDeactivated() && !commit; /* Esc / click-away */
+                    if (commit) {
+                        if (state->inline_edit_buf[0] &&
+                            apex_project_set_label(project, 1, state->inline_edit_bank,
+                                       state->inline_edit_addr, state->inline_edit_buf) == 0) {
+                            state->inline_edit_line = (size_t)-1;
+                            rerender_and_reselect(project, document_ptr, state,
+                                       state->inline_edit_bank, state->inline_edit_addr);
+                        } else {
+                            state->inline_edit_line = (size_t)-1; /* empty/failed → cancel */
+                        }
+                    } else if (cancel) {
+                        state->inline_edit_line = (size_t)-1;
+                    }
+                    ImGui::EndGroup();
+                } else {
                 render_line_text(document, state, line);
                 {
                     uint8_t excl_bank; uint32_t excl_addr;
@@ -872,6 +1002,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     }
                 }
                 ImGui::EndGroup();
+                }  /* end else: normal text (vs. inline label editor) */
 
                 uint8_t t_bank;
                 uint32_t t_addr;
@@ -969,18 +1100,16 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         } else {
                             ImGui::Text("Jump: B%02x_A%04x", t_bank, (unsigned)t_addr & 0xffffu);
                         }
-                        size_t tl;
-                        if (apex_render_find_line_by_address(document, t_bank, t_addr, &tl)) {
-                            const ApexRenderedLine *tline = &document->lines[tl];
-                            if (tline->block_kind == APEX_RENDER_BLOCK_CODE &&
-                                tline->has_location &&
-                                tline->rom_addr < project->rom.size) {
-                                render_disasm_preview(project, tline->rom_addr, t_bank, t_addr);
-                            }
-                        }
+                        render_target_preview(project, document, state, t_bank, t_addr);
                     }
-                    /* Instruction: follow branch/call target, show code preview */
-                    if (line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location) {
+                    /* Instruction: follow branch/call target, show code preview.
+                       Restrict to real code — table/data pointer rows also render
+                       with kind INSTRUCTION (the TABLE_*_PTR pseudo-op); those are
+                       handled by the has_pointer preview above and must NOT be
+                       disassembled as 6809 code (that showed junk instead of the
+                       pointed-to string/data). */
+                    if (line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location &&
+                        line->block_kind == APEX_RENDER_BLOCK_CODE) {
                         const uint8_t *isrc; size_t irem;
                         if (project_locate_rom_bytes(project, line->bank, line->cpu_addr,
                                                      &isrc, &irem, NULL)) {
@@ -1008,16 +1137,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                         }
                                     }
                                 }
-                                size_t tl;
-                                if (apex_render_find_line_by_address(document, tgt_bank, tgt_addr, &tl)) {
-                                    const ApexRenderedLine *tline = &document->lines[tl];
-                                    if (tline->block_kind == APEX_RENDER_BLOCK_CODE &&
-                                        tline->has_location &&
-                                        tline->rom_addr < project->rom.size) {
-                                        render_disasm_preview(project, tline->rom_addr,
-                                                              tgt_bank, tgt_addr);
-                                    }
-                                }
+                                render_target_preview(project, document, state, tgt_bank, tgt_addr);
                             }
                         }
                     }
@@ -1045,7 +1165,12 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     /* Sprite/DMD preview FIRST so it stays visible even when the
                        disassembly preview below it is long. */
                     render_line_sprite_dmd_preview(project, document, state, line);
-                    if (line->has_location &&
+                    /* Raw "what these bytes look like as code" preview — helpful
+                       for unclassified/data bytes, but NOT for a pointer row (a
+                       ptr16_string/table entry): there has_pointer is set and the
+                       target's real content is already previewed above, so the
+                       raw disassembly of the pointer bytes would just be noise. */
+                    if (line->has_location && !has_pointer &&
                         (line->block_kind == APEX_RENDER_BLOCK_DATA ||
                          line->block_kind == APEX_RENDER_BLOCK_SPRITE ||
                          line->block_kind == APEX_RENDER_BLOCK_TABLE ||
@@ -1062,6 +1187,12 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 const bool     pop_has_loc  = line->has_location;
                 const uint8_t  pop_bank     = line->bank;
                 const uint32_t pop_cpu_addr = line->cpu_addr;
+                /* If the line is inside a table, where the table header is. */
+                uint8_t  pop_table_bank = 0;
+                uint32_t pop_table_addr = 0;
+                const bool pop_in_table =
+                    pop_has_loc && line->block_kind == APEX_RENDER_BLOCK_TABLE &&
+                    find_table_start(document, line_idx, &pop_table_bank, &pop_table_addr);
                 uint8_t  pop_excl_bank = 0;
                 uint32_t pop_excl_addr = 0;
                 const bool pop_has_excl =
@@ -1123,6 +1254,13 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                             select_line(state, tl, 1);
                         }
                     }
+                    if (pop_in_table && ImGui::MenuItem("Jump to table header", "Home")) {
+                        size_t tl;
+                        if (apex_render_find_line_by_address(document, pop_table_bank,
+                                                             pop_table_addr, &tl)) {
+                            select_line(state, tl, 1);
+                        }
+                    }
                     if (pop_has_loc && ImGui::MenuItem("Show incoming references", "X")) {
                         state->request_xref_popup = true;
                         state->xref_popup_bank = pop_bank;
@@ -1132,6 +1270,19 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                     if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {
                         copy_selection_to_clipboard(document, state);
                         set_status(state, "copied");
+                    }
+                    if (ImGui::MenuItem("Set block start", "A")) {
+                        state->block_a = state->selected_line;
+                        if (!state->block_active) state->block_b = state->block_a;
+                        state->block_active = true;
+                    }
+                    if (ImGui::MenuItem("Set block end", "E")) {
+                        state->block_b = state->selected_line;
+                        if (!state->block_active) state->block_a = state->block_b;
+                        state->block_active = true;
+                    }
+                    if (state->block_active && ImGui::MenuItem("Clear block", "Esc")) {
+                        state->block_active = false;
                     }
                     if (ImGui::MenuItem("Mark as Code", "C")) {
                         apply_code_at_selection(project, document_ptr, state);
@@ -1321,7 +1472,17 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 }
                 if (row_double_clicked) {
                     size_t tl;
-                    if (has_pointer && apex_render_find_line_by_address(document, t_bank, t_addr, &tl)) {
+                    if (line->kind == APEX_RENDER_LINE_LABEL && line->has_location) {
+                        /* Double-click a label → rename it in place. */
+                        state->inline_edit_line  = line_idx;
+                        state->inline_edit_bank  = line->bank;
+                        state->inline_edit_addr  = line->cpu_addr;
+                        state->inline_edit_focus = true;
+                        std::string nm = label_name(line);
+                        snprintf(state->inline_edit_buf, sizeof(state->inline_edit_buf),
+                                 "%s", nm.c_str());
+                    } else if (has_pointer &&
+                               apex_render_find_line_by_address(document, t_bank, t_addr, &tl)) {
                         select_line(state, tl, 1);
                     } else {
                         jump_to_first_line_target(document, state, line);
@@ -1510,19 +1671,146 @@ void render_bank_list(const ApexProject *p, const ApexRenderedDocument *d, UiSta
 
 void render_transition_list(const ApexRenderedDocument *d, UiState *s)
 {
-    for (size_t i = 0; i < d->line_count; i++) {
-        const auto *l = &d->lines[i];
-        if (l->transition_kind == APEX_RENDER_TRANSITION_NONE || !l->has_location ||
-            !line_matches_filter(l, s->filter_input)) {
-            continue;
+    /* Collect matching transition rows (cached on generation+filter), then render
+       through a clipper — a large ROM can have thousands of transitions and both
+       the scan and unclipped widgets were a major per-frame cost. */
+    if (s->cached_transitions_gen != d->generation ||
+        s->cached_transitions_filter != s->filter_input) {
+        s->cached_transitions.clear();
+        for (size_t i = 0; i < d->line_count; i++) {
+            const auto *l = &d->lines[i];
+            if (l->transition_kind == APEX_RENDER_TRANSITION_NONE || !l->has_location ||
+                !line_matches_filter(l, s->filter_input)) {
+                continue;
+            }
+            s->cached_transitions.push_back(i);
         }
-        char lbl[128];
-        snprintf(lbl, 128, "%s @ B%02x_A%04x", transition_name(l->transition_kind),
-                 l->bank, (unsigned)l->cpu_addr & 0xffffu);
-        if (ImGui::Selectable(lbl, s->selected_line == i)) {
-            select_line(s, i, 1);
+        s->cached_transitions_gen = d->generation;
+        s->cached_transitions_filter = s->filter_input;
+    }
+    const std::vector<size_t> &rows = s->cached_transitions;
+    ImGuiListClipper clipper;
+    clipper.Begin((int)rows.size());
+    while (clipper.Step()) {
+        for (int r = clipper.DisplayStart; r < clipper.DisplayEnd; r++) {
+            size_t i = rows[(size_t)r];
+            const auto *l = &d->lines[i];
+            char lbl[128];
+            snprintf(lbl, 128, "%s @ B%02x_A%04x", transition_name(l->transition_kind),
+                     l->bank, (unsigned)l->cpu_addr & 0xffffu);
+            ImGui::PushID((int)i);
+            if (ImGui::Selectable(lbl, s->selected_line == i)) {
+                select_line(s, i, 1);
+            }
+            ImGui::PopID();
         }
     }
+}
+
+/* Command palette (Ctrl+P): fuzzy-jump to any label, or type an address. */
+void render_command_palette(const ApexRenderedDocument **dp, UiState *s)
+{
+    const ApexRenderedDocument *d = *dp;
+    if (s->request_command_palette) {
+        s->request_command_palette = false;
+        s->cmd_palette_input[0] = '\0';
+        s->cmd_palette_sel = 0;
+        s->cmd_palette_focus = true;
+        ImGui::OpenPopup("Command Palette");
+    }
+    ImVec2 center = ImGui::GetMainViewport()->GetCenter();
+    ImGui::SetNextWindowPos(center, ImGuiCond_Appearing, ImVec2(0.5f, 0.3f));
+    ImGui::SetNextWindowSize(ImVec2(560.0f, 400.0f), ImGuiCond_Appearing);
+    if (!ImGui::BeginPopup("Command Palette")) {
+        return;
+    }
+    ensure_label_index(d, s);
+
+    if (s->cmd_palette_focus) {
+        ImGui::SetKeyboardFocusHere();
+        s->cmd_palette_focus = false;
+    }
+    ImGui::SetNextItemWidth(-1.0f);
+    bool entered = ImGui::InputText("##cmd", s->cmd_palette_input, sizeof(s->cmd_palette_input),
+                                    ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::TextDisabled("label name or address (e.g. B3d_A784b, 8000) — \xE2\x86\x91\xE2\x86\x93 select, Enter jump, Esc close");
+    ImGui::Separator();
+
+    /* Optional address result on top when the query parses as an address. */
+    uint8_t ab = 0; uint32_t aa = 0; size_t addr_line = 0;
+    bool addr_ok = parse_target_address(s->cmd_palette_input, &ab, &aa) &&
+                   apex_render_find_line_by_address(d, ab, aa, &addr_line);
+
+    std::vector<size_t> results;  /* indices into cached_labels */
+    for (size_t i = 0; i < s->cached_labels.size(); i++) {
+        if (label_entry_matches_filter(s->cached_labels[i], s->cmd_palette_input)) {
+            results.push_back(i);
+        }
+    }
+    int addr_rows = addr_ok ? 1 : 0;
+    int total = (int)results.size() + addr_rows;
+    if (total == 0) {
+        ImGui::TextDisabled("No matches.");
+        ImGui::EndPopup();
+        return;
+    }
+    if (s->cmd_palette_sel >= total) s->cmd_palette_sel = total - 1;
+    if (s->cmd_palette_sel < 0)      s->cmd_palette_sel = 0;
+    if (ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+        s->cmd_palette_sel = (s->cmd_palette_sel + 1) % total;
+        s->cmd_palette_scroll = true;
+    }
+    if (ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+        s->cmd_palette_sel = (s->cmd_palette_sel + total - 1) % total;
+        s->cmd_palette_scroll = true;
+    }
+
+    auto activate = [&](int idx) {
+        if (addr_ok && idx == 0) {
+            select_line(s, addr_line, 1);
+        } else {
+            const LabelIndexEntry &e = s->cached_labels[results[(size_t)(idx - addr_rows)]];
+            select_line(s, e.line_index, 1);
+        }
+        ImGui::CloseCurrentPopup();
+    };
+
+    if (entered) {
+        activate(s->cmd_palette_sel);
+        ImGui::EndPopup();
+        return;
+    }
+
+    ImGui::BeginChild("cmd_results", ImVec2(0.0f, 0.0f), false);
+    ImGuiListClipper clip;
+    clip.Begin(total);
+    if (s->cmd_palette_scroll) {
+        clip.IncludeItemByIndex(s->cmd_palette_sel);
+    }
+    while (clip.Step()) {
+        for (int r = clip.DisplayStart; r < clip.DisplayEnd; r++) {
+            bool sel = (r == s->cmd_palette_sel);
+            char buf[192];
+            if (addr_ok && r == 0) {
+                snprintf(buf, sizeof(buf), "\xE2\x86\x92 go to  B%02x_A%04x", ab, (unsigned)aa & 0xffffu);
+            } else {
+                const LabelIndexEntry &e = s->cached_labels[results[(size_t)(r - addr_rows)]];
+                snprintf(buf, sizeof(buf), "%s      B%02x_A%04x", e.name.c_str(), e.bank,
+                         (unsigned)e.cpu_addr & 0xffffu);
+            }
+            ImGui::PushID(r);
+            if (ImGui::Selectable(buf, sel)) {
+                activate(r);
+            }
+            if (sel && s->cmd_palette_scroll) {
+                ImGui::SetScrollHereY(0.5f);
+            }
+            ImGui::PopID();
+        }
+    }
+    s->cmd_palette_scroll = false;
+    ImGui::EndChild();
+    ImGui::EndPopup();
 }
 
 void render_xref_popup(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
@@ -1766,12 +2054,25 @@ static void hex_bank_range(const ApexProject *p, size_t off, size_t *lo, size_t 
     }
 }
 
+/* Byte-run equality; when ci is set, ASCII letters compare case-insensitively. */
+static bool bytes_match(const uint8_t *a, const uint8_t *b, size_t n, bool ci)
+{
+    if (!ci) return memcmp(a, b, n) == 0;
+    for (size_t i = 0; i < n; i++) {
+        uint8_t x = a[i], y = b[i];
+        if (x >= 'A' && x <= 'Z') x = (uint8_t)(x + 32);
+        if (y >= 'A' && y <= 'Z') y = (uint8_t)(y + 32);
+        if (x != y) return false;
+    }
+    return true;
+}
+
 /* Search forward from cur_off+1 within the window [lo, hi); wraps to lo if not
    found before hi. Returns SIZE_MAX if the needle is not present in the window.
    Sets *wrapped=true on wrap. A match must lie wholly inside [lo, hi). */
 static size_t hex_search_forward(const uint8_t *rom, size_t lo, size_t hi,
                                  size_t cur_off, const uint8_t *needle, size_t nlen,
-                                 bool *wrapped)
+                                 bool ci, bool *wrapped)
 {
     *wrapped = false;
     if (nlen == 0 || hi < lo || nlen > hi - lo) return SIZE_MAX;
@@ -1779,13 +2080,13 @@ static size_t hex_search_forward(const uint8_t *rom, size_t lo, size_t hi,
     /* primary pass: max(cur_off+1, lo) .. limit */
     size_t start = cur_off + 1 < lo ? lo : cur_off + 1;
     for (size_t i = start; i <= limit; i++) {
-        if (memcmp(rom + i, needle, nlen) == 0) return i;
+        if (bytes_match(rom + i, needle, nlen, ci)) return i;
     }
     /* wrap: lo .. min(cur_off, limit) */
     if (cur_off >= lo) {
         size_t wrap_end = cur_off < limit ? cur_off : limit;
         for (size_t i = lo; i <= wrap_end; i++) {
-            if (memcmp(rom + i, needle, nlen) == 0) { *wrapped = true; return i; }
+            if (bytes_match(rom + i, needle, nlen, ci)) { *wrapped = true; return i; }
         }
     }
     return SIZE_MAX;
@@ -1794,7 +2095,7 @@ static size_t hex_search_forward(const uint8_t *rom, size_t lo, size_t hi,
 /* Search backward from cur_off-1 within the window [lo, hi); wraps to hi. */
 static size_t hex_search_backward(const uint8_t *rom, size_t lo, size_t hi,
                                   size_t cur_off, const uint8_t *needle, size_t nlen,
-                                  bool *wrapped)
+                                  bool ci, bool *wrapped)
 {
     *wrapped = false;
     if (nlen == 0 || hi < lo || nlen > hi - lo) return SIZE_MAX;
@@ -1803,13 +2104,13 @@ static size_t hex_search_backward(const uint8_t *rom, size_t lo, size_t hi,
     if (cur_off > lo) {
         size_t start = (cur_off - 1) < limit ? (cur_off - 1) : limit;
         for (size_t i = start + 1; i-- > lo; ) {
-            if (memcmp(rom + i, needle, nlen) == 0) return i;
+            if (bytes_match(rom + i, needle, nlen, ci)) return i;
         }
     }
     /* wrap: limit .. max(cur_off, lo) */
     size_t wrap_lo = cur_off > lo ? cur_off : lo;
     for (size_t i = limit + 1; i-- > wrap_lo; ) {
-        if (memcmp(rom + i, needle, nlen) == 0) { *wrapped = true; return i; }
+        if (bytes_match(rom + i, needle, nlen, ci)) { *wrapped = true; return i; }
     }
     return SIZE_MAX;
 }
@@ -1866,6 +2167,56 @@ static bool hex_block_extent(const ApexProject *p, const ApexRenderedDocument *d
     *lo = start_off;
     *hi = end_off;
     return true;
+}
+
+/* Extended block-kind for a rendered line: DATA lines get sub-kinds 7-10 for
+   STRING/.DW/FAR/DMD so the Hex/ROM-Map views can colour them distinctly. */
+static uint8_t hex_line_extended_kind(const ApexProject *p, const ApexRenderedLine *l)
+{
+    uint8_t lk = (uint8_t)l->block_kind;
+    if (l->block_kind == APEX_RENDER_BLOCK_DATA && l->text && l->length >= 3) {
+        const char *t = l->text;
+        size_t rem = l->length;
+        while (rem > 0 && (*t == ' ' || *t == '\t')) { t++; rem--; }
+        if ((rem >= 12 && memcmp(t, "STRING_FIXED", 12) == 0 &&
+             (rem == 12 || t[12] == ' ' || t[12] == '\t')) ||
+            (rem >= 6 && memcmp(t, "STRING", 6) == 0 &&
+             (rem == 6 || t[6] == ' ' || t[6] == '\t')))
+            lk = 7;
+        else if (rem >= 3 && memcmp(t, ".DW", 3) == 0 && (rem == 3 || t[3] == ' ' || t[3] == '\t'))
+            lk = 8;
+        else if (rem >= 4 && memcmp(t, "FAR_", 4) == 0)
+            lk = 9;
+        else if (is_dmd_fullframe_addr(p, l->bank, l->cpu_addr))
+            lk = 10;
+    }
+    return lk;
+}
+
+/* Build (once per document generation) the full per-ROM-byte extended kind map. */
+static void ensure_hex_kind_map(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
+{
+    if (s->cached_hex_kinds_gen == d->generation &&
+        s->cached_hex_kinds.size() == p->rom.size) {
+        return;
+    }
+    size_t rom_size = p->rom.size, fill = 0;
+    uint8_t cur = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
+    s->cached_hex_kinds.assign(rom_size, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
+    for (size_t li = 0; li < d->line_count && fill < rom_size; li++) {
+        const ApexRenderedLine *l = &d->lines[li];
+        if (!l->has_location) continue;
+        uint8_t lk = hex_line_extended_kind(p, l);
+        if (l->rom_addr <= fill) {
+            cur = lk;
+        } else {
+            size_t end = l->rom_addr < rom_size ? l->rom_addr : rom_size;
+            while (fill < end) s->cached_hex_kinds[fill++] = cur;
+            cur = lk;
+        }
+    }
+    while (fill < rom_size) s->cached_hex_kinds[fill++] = cur;
+    s->cached_hex_kinds_gen = d->generation;
 }
 
 void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
@@ -1934,8 +2285,13 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         float btn_w = ImGui::CalcTextSize("Next").x + ImGui::GetStyle().FramePadding.x * 2.0f;
         float bank_w = ImGui::CalcTextSize("Bank only").x + ImGui::GetFrameHeight() +
                        ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        float ascii_w = ImGui::CalcTextSize("ASCII").x + ImGui::GetFrameHeight() +
+                        ImGui::GetStyle().ItemSpacing.x * 2.0f;
+        float ci_w = ImGui::CalcTextSize("Aa").x + ImGui::GetFrameHeight() +
+                     ImGui::GetStyle().ItemSpacing.x * 2.0f;
         ImGui::SetNextItemWidth(ImGui::GetContentRegionAvail().x -
-                                (btn_w + ImGui::GetStyle().ItemSpacing.x) * 2.0f - bank_w - 2.0f);
+                                (btn_w + ImGui::GetStyle().ItemSpacing.x) * 2.0f -
+                                bank_w - ascii_w - ci_w - 2.0f);
         bool enter_next = ImGui::InputText("##hexsearch", s->hex_search_input,
                                            sizeof(s->hex_search_input),
                                            ImGuiInputTextFlags_EnterReturnsTrue);
@@ -1944,6 +2300,19 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         ImGui::SameLine();
         bool do_prev = ImGui::Button("Prev##hexsrch");
         ImGui::SameLine();
+        ImGui::Checkbox("ASCII", &s->hex_search_ascii);
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Search the query as ASCII text (e.g. FREE) instead of hex bytes.\n"
+                              "Finds strings in the ROM even where they are not yet classified.");
+        }
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!s->hex_search_ascii);
+        ImGui::Checkbox("Aa", &s->hex_search_ci);
+        ImGui::EndDisabled();
+        if (ImGui::IsItemHovered()) {
+            ImGui::SetTooltip("Case-insensitive (ASCII text search only)");
+        }
+        ImGui::SameLine();
         ImGui::Checkbox("Bank only", &s->hex_search_bank_only);
         if (ImGui::IsItemHovered()) {
             ImGui::SetTooltip("Restrict the search to the bank the cursor is in");
@@ -1951,7 +2320,15 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
 
         if ((do_next || do_prev) && s->hex_search_input[0]) {
             uint8_t needle[32];
-            int nlen = parse_hex_search_bytes(s->hex_search_input, needle, (int)sizeof(needle));
+            int nlen;
+            if (s->hex_search_ascii) {
+                size_t n = strnlen(s->hex_search_input, sizeof(s->hex_search_input));
+                if (n > sizeof(needle)) n = sizeof(needle);
+                memcpy(needle, s->hex_search_input, n);
+                nlen = (int)n;
+            } else {
+                nlen = parse_hex_search_bytes(s->hex_search_input, needle, (int)sizeof(needle));
+            }
             if (nlen > 0) {
                 bool wrapped = false;
                 size_t cur = s->hex_active ? s->hex_selected_offset : 0;
@@ -1959,9 +2336,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (s->hex_search_bank_only) {
                     hex_bank_range(p, cur, &lo, &hi);
                 }
+                bool ci = s->hex_search_ascii && s->hex_search_ci;
                 size_t found = do_next
-                    ? hex_search_forward (p->rom.data, lo, hi, cur, needle, (size_t)nlen, &wrapped)
-                    : hex_search_backward(p->rom.data, lo, hi, cur, needle, (size_t)nlen, &wrapped);
+                    ? hex_search_forward (p->rom.data, lo, hi, cur, needle, (size_t)nlen, ci, &wrapped)
+                    : hex_search_backward(p->rom.data, lo, hi, cur, needle, (size_t)nlen, ci, &wrapped);
                 if (found != SIZE_MAX) {
                     s->hex_selected_offset = found;
                     s->hex_active          = true;
@@ -1978,7 +2356,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                                                           : "search: not found");
                 }
             } else {
-                set_status(s, "search: invalid hex");
+                set_status(s, s->hex_search_ascii ? "search: empty query"
+                                                   : "search: invalid hex");
             }
         }
     }
@@ -2006,9 +2385,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             int64_t next = (int64_t)s->hex_selected_offset + delta;
             if (next < 0) next = 0;
             if (next >= (int64_t)p->rom.size) next = (int64_t)p->rom.size - 1;
-            s->hex_anchor_offset   = (size_t)next;
-            s->hex_selected_offset = (size_t)next;
-            s->hex_has_range       = false;
+            s->hex_selected_offset = (size_t)next;   /* cursor only; block untouched */
             s->hex_is_edit_target  = true;
             s->hex_request_follow  = 1;
             size_t li;
@@ -2023,6 +2400,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))  hex_move(+(int64_t)bytes_per_row);
         if (ImGui::IsKeyPressed(ImGuiKey_PageUp))     hex_move(-(int64_t)bytes_per_row * 16);
         if (ImGui::IsKeyPressed(ImGuiKey_PageDown))   hex_move(+(int64_t)bytes_per_row * 16);
+        /* Block hotkeys (A/E/Esc) are handled centrally in the main hotkey block
+           so Escape is not swallowed by ImGui keyboard-nav in the focused child. */
     }
 
     /* Scroll to cursor when requested (must be called inside BeginChild). */
@@ -2067,46 +2446,10 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
            Non-located lines (comments, section headers) have no ROM bytes and
            are skipped entirely. */
         size_t vis_count = vis_end - vis_start;
-        std::vector<uint8_t> kinds(vis_count, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
-        {
-            uint8_t cur_kind = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
-            size_t fill = vis_start;
-            for (size_t li = 0; li < d->line_count && fill < vis_end; li++) {
-                const ApexRenderedLine *l = &d->lines[li];
-                if (!l->has_location) continue;
-                /* Resolve extended kind: DATA lines with distinct pseudo-ops get own colors.
-                   SPRITE block kind (=6) maps directly; DATA sub-types use indices 7-10. */
-                uint8_t lk = (uint8_t)l->block_kind;
-                if (l->block_kind == APEX_RENDER_BLOCK_DATA && l->text && l->length >= 3) {
-                    const char *p2 = l->text;
-                    size_t rem = l->length;
-                    while (rem > 0 && (*p2 == ' ' || *p2 == '\t')) { p2++; rem--; }
-                    if ((rem >= 12 && memcmp(p2, "STRING_FIXED", 12) == 0 &&
-                         (rem == 12 || p2[12] == ' ' || p2[12] == '\t')) ||
-                        (rem >= 6 && memcmp(p2, "STRING", 6) == 0 &&
-                         (rem == 6 || p2[6] == ' ' || p2[6] == '\t')))
-                        lk = 7; /* STRING / STRING_FIXED — purple */
-                    else if (rem >= 3 && memcmp(p2, ".DW", 3) == 0 &&
-                             (rem == 3 || p2[3] == ' ' || p2[3] == '\t'))
-                        lk = 8; /* .DW — cyan */
-                    else if (rem >= 4 && memcmp(p2, "FAR_", 4) == 0)
-                        lk = 9; /* FAR pointer — red */
-                    else if (is_dmd_fullframe_addr(p, l->bank, l->cpu_addr)) {
-                        lk = 10; /* DMD fullframe — magenta */
-                    }
-                }
-                if (l->rom_addr <= vis_start) {
-                    cur_kind = lk;
-                } else {
-                    size_t boundary = std::min(vis_end, l->rom_addr);
-                    while (fill < boundary)
-                        kinds[fill++ - vis_start] = cur_kind;
-                    cur_kind = lk;
-                }
-            }
-            while (fill < vis_end)
-                kinds[fill++ - vis_start] = cur_kind;
-        }
+        /* Extended block-kind per byte, built once per document generation and
+           cached (was an O(line_count) forward-fill every frame). */
+        ensure_hex_kind_map(p, d, s);
+        const std::vector<uint8_t> &kinds_full = s->cached_hex_kinds;
 
         /* Per-byte code annotations, drawn as small corner marks on the hex digit:
              top-left    = entry point (green) / entry with inline params (magenta)
@@ -2185,9 +2528,9 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
 
             /* Hex bytes */
             size_t rng_lo = s->hex_has_range
-                ? std::min(s->hex_anchor_offset, s->hex_selected_offset) : 0;
+                ? std::min(s->hex_anchor_offset, s->hex_block_end) : 0;
             size_t rng_hi = s->hex_has_range
-                ? std::max(s->hex_anchor_offset, s->hex_selected_offset) : 0;
+                ? std::max(s->hex_anchor_offset, s->hex_block_end) : 0;
             for (int col = 0; col < bytes_per_row; col++) {
                 size_t o = row_start + (size_t)col;
                 if (o >= p->rom.size) {
@@ -2197,7 +2540,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 bool is_cur      = s->hex_active && o == s->hex_selected_offset;
                 bool is_in_range = s->hex_active && s->hex_has_range
                                    && o >= rng_lo && o <= rng_hi;
-                uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
+                uint8_t ki  = o < kinds_full.size() ? kinds_full[o] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
                 bool is_in_block = blk_show && o >= blk_lo && o < blk_hi;
@@ -2304,12 +2647,15 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     bool shift = ImGui::GetIO().KeyShift;
                     if (shift && s->hex_active) {
-                        s->hex_selected_offset = o;
-                        s->hex_has_range = (s->hex_anchor_offset != o);
+                        /* set/extend the block, anchored at the cursor */
+                        if (!s->hex_has_range) {
+                            s->hex_anchor_offset = s->hex_selected_offset;
+                            s->hex_has_range     = true;
+                        }
+                        s->hex_block_end       = o;
+                        s->hex_selected_offset = o;   /* cursor follows */
                     } else {
-                        s->hex_anchor_offset   = o;
-                        s->hex_selected_offset = o;
-                        s->hex_has_range       = false;
+                        s->hex_selected_offset = o;   /* cursor only; block untouched */
                     }
                     s->hex_active = true;
                     s->hex_is_edit_target = true;
@@ -2342,7 +2688,7 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 bool is_cur      = s->hex_active && o == s->hex_selected_offset;
                 bool is_in_range = s->hex_active && s->hex_has_range
                                    && o >= rng_lo && o <= rng_hi;
-                uint8_t ki  = (o >= vis_start && o < vis_end) ? kinds[o - vis_start] : 0u;
+                uint8_t ki  = o < kinds_full.size() ? kinds_full[o] : 0u;
                 const ImVec4 &tc = kind_colors[ki < kind_colors_count ? ki : 0u];
 
                 bool is_in_block = blk_show && o >= blk_lo && o < blk_hi;
@@ -2379,12 +2725,15 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 if (ImGui::IsItemClicked(ImGuiMouseButton_Left)) {
                     bool shift = ImGui::GetIO().KeyShift;
                     if (shift && s->hex_active) {
-                        s->hex_selected_offset = o;
-                        s->hex_has_range = (s->hex_anchor_offset != o);
+                        /* set/extend the block, anchored at the cursor */
+                        if (!s->hex_has_range) {
+                            s->hex_anchor_offset = s->hex_selected_offset;
+                            s->hex_has_range     = true;
+                        }
+                        s->hex_block_end       = o;
+                        s->hex_selected_offset = o;   /* cursor follows */
                     } else {
-                        s->hex_anchor_offset   = o;
-                        s->hex_selected_offset = o;
-                        s->hex_has_range       = false;
+                        s->hex_selected_offset = o;   /* cursor only; block untouched */
                     }
                     s->hex_active = true;
                     s->hex_is_edit_target = true;
@@ -2405,14 +2754,17 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
         ImGui::OpenPopup("hex_ctx");
     }
     if (ImGui::BeginPopup("hex_ctx")) {
-        if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {
-            copy_selection_to_clipboard(*dp, s);
-            set_status(s, "copied");
+        if (ImGui::MenuItem(s->hex_has_range ? "Copy block as hex" : "Copy byte as hex", "Ctrl+C")) {
+            copy_hex_block_to_clipboard(p, s);
+            set_status(s, "copied hex bytes");
+        }
+        if (s->hex_has_range && ImGui::MenuItem("Clear block", "Esc")) {
+            s->hex_has_range = false;
         }
         if (ImGui::MenuItem("Mark as Code",   "C")) { apply_code_at_selection(p, dp, s); }
         if (s->hex_has_range) {
-            size_t rlo = std::min(s->hex_anchor_offset, s->hex_selected_offset);
-            size_t rhi = std::max(s->hex_anchor_offset, s->hex_selected_offset);
+            size_t rlo = std::min(s->hex_anchor_offset, s->hex_block_end);
+            size_t rhi = std::max(s->hex_anchor_offset, s->hex_block_end);
             size_t rn  = rhi - rlo + 1;
             char blabel[48], slabel[48], clabel[48];
             snprintf(blabel, sizeof(blabel), "Assign bytes[%zu]", rn);
@@ -3128,6 +3480,74 @@ void render_hardware_window(ApexProject *project, const ApexRenderedDocument *do
     }
 }
 
+static bool valid_identifier(const char *s);
+
+/* Turn arbitrary text into a valid enum identifier: keep [A-Za-z0-9_], collapse
+   other runs to a single '_', trim, prefix '_' if it would start with a digit.
+   Returns "" if nothing usable remains. */
+static std::string sanitize_enum_name(const std::string &in)
+{
+    std::string out;
+    bool last_us = false;
+    for (char c : in) {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9') || c == '_') {
+            out += c;
+            last_us = false;
+        } else if (!out.empty() && !last_us) {
+            out += '_';
+            last_us = true;
+        }
+    }
+    while (!out.empty() && out.back() == '_') out.pop_back();
+    if (!out.empty() && out[0] >= '0' && out[0] <= '9') out.insert(out.begin(), '_');
+    return out;
+}
+
+/* If `t` is a text table (rows of ptr16_string or far_string), read each row's
+   string into `out` (empty string where a row can't be resolved).  Returns false
+   if it is not a string table or its bytes can't be located. */
+static bool text_table_row_strings(const ApexProject *p, const TableDef *t,
+                                   std::vector<std::string> &out)
+{
+    out.clear();
+    if (t->schema.count == 0) return false;
+    TableFieldKind k = t->schema.items[0].kind;
+    bool is_far = (k == TABLE_FAR_STRING);
+    if (k != TABLE_PTR16_STRING && !is_far) return false;
+
+    const uint8_t *tsrc; size_t trem;
+    if (!project_locate_rom_bytes(p, t->bank, t->addr, &tsrc, &trem, NULL)) return false;
+
+    size_t header = 0, count;
+    if (t->has_header) {
+        if (trem < 3u) return false;
+        count = ((size_t)tsrc[0] << 8) | tsrc[1];
+        header = 3u;
+    } else {
+        count = t->rows;
+    }
+    size_t row_width = table_schema_width(&t->schema);
+    size_t ptr_len = is_far ? 3u : 2u;
+    if (row_width == 0) return false;
+
+    for (size_t r = 0; r < count; r++) {
+        size_t off = header + r * row_width;
+        std::string sval;
+        if (off + ptr_len <= trem) {
+            uint16_t addr = (uint16_t)(((uint16_t)tsrc[off] << 8) | tsrc[off + 1]);
+            uint8_t bank = is_far ? tsrc[off + 2] : (addr >= 0x8000u ? 0xffu : t->bank);
+            const uint8_t *ssrc; size_t srem;
+            if (project_locate_rom_bytes(p, bank, addr, &ssrc, &srem, NULL)) {
+                size_t slen = valid_string_len(ssrc, srem);
+                sval.assign((const char *)ssrc, slen);
+            }
+        }
+        out.push_back(std::move(sval));
+    }
+    return true;
+}
+
 void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
     /* ---- Suggestion/accept flow: scan proposes, the user accepts (like sprites) ---- */
@@ -3248,13 +3668,18 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             ImGui::TableSetColumnIndex(0);
             char a[32];
             snprintf(a, 32, "B%02x_A%04x", t->bank, t->addr);
-            if (ImGui::Selectable(a, false, ImGuiSelectableFlags_AllowDoubleClick) &&
-                ImGui::IsMouseDoubleClicked(0)) {
+            if (ImGui::Selectable(a, false)) {
+                /* single click → go to the address in the disassembly */
                 size_t li;
-                if (apex_render_find_line_by_address(*dp, t->bank, t->addr, &li)) {
+                const uint8_t *src; size_t len, off;
+                if (apex_render_find_line_by_address(*dp, t->bank, t->addr, &li))
                     select_line(s, li, 1);
-                }
+                else if (project_locate_rom_bytes(p, t->bank, t->addr, &src, &len, &off) &&
+                         find_line_by_rom_offset(*dp, off, &li))
+                    select_line(s, li, 1);
             }
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("go to this address in the disassembly");
 
             ImGui::TableSetColumnIndex(1);
             char spec_buf[128];
@@ -3302,6 +3727,29 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             ImGui::PopItemWidth();
 
             ImGui::TableSetColumnIndex(4);
+            bool is_text = t->schema.count > 0 &&
+                           (t->schema.items[0].kind == TABLE_PTR16_STRING ||
+                            t->schema.items[0].kind == TABLE_FAR_STRING);
+            if (is_text) {
+                if (ImGui::SmallButton("Type")) {
+                    s->tt_type_bank = t->bank;
+                    s->tt_type_addr = t->addr;
+                    s->tt_type_word = 0;
+                    /* default name: type_<table label>, else type_B##_A#### */
+                    const char *lbl = NULL;
+                    for (size_t li = 0; li < p->config_labels.count; li++) {
+                        const ConfigLabel *cl = &p->config_labels.items[li];
+                        if (cl->addr == t->addr && (!cl->has_bank || cl->bank == t->bank)) {
+                            lbl = cl->name; break;
+                        }
+                    }
+                    if (lbl) snprintf(s->tt_type_name, sizeof(s->tt_type_name), "type_%s", lbl);
+                    else snprintf(s->tt_type_name, sizeof(s->tt_type_name),
+                                  "type_B%02x_A%04x", t->bank, t->addr);
+                    s->tt_type_request = true;
+                }
+                ImGui::SameLine();
+            }
             if (ImGui::SmallButton("Del")) {
                 uint8_t  del_bank = t->bank;
                 uint32_t del_addr = t->addr;
@@ -3311,6 +3759,72 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
             ImGui::PopID();
         }
         ImGui::EndTable();
+    }
+
+    /* ---- Create Type from a text table's strings ---- */
+    if (s->tt_type_request) {
+        ImGui::OpenPopup("mk_type_from_table");
+        s->tt_type_request = false;
+    }
+    if (ImGui::BeginPopup("mk_type_from_table")) {
+        const TableDef *tt = table_def_at(s->tt_type_bank, s->tt_type_addr, &p->tables);
+        ImGui::TextUnformatted("Create enum type from table strings");
+        ImGui::Separator();
+        ImGui::SetNextItemWidth(220);
+        ImGui::InputText("Type name", s->tt_type_name, sizeof(s->tt_type_name));
+        ImGui::RadioButton("byte", &s->tt_type_word, 0); ImGui::SameLine();
+        ImGui::RadioButton("word", &s->tt_type_word, 1);
+
+        std::vector<std::string> strings;
+        bool have = tt && text_table_row_strings(p, tt, strings);
+        int usable = 0;
+        if (have)
+            for (auto &str : strings)
+                if (!sanitize_enum_name(str).empty()) usable++;
+
+        if (!have) {
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "Not a resolvable text table.");
+        } else {
+            ImGui::TextDisabled("%d value(s) from %zu row(s). Preview:",
+                                usable, strings.size());
+            ImGui::BeginChild("ttprev", ImVec2(360, 120), true);
+            for (size_t r = 0; r < strings.size(); r++) {
+                std::string nm = sanitize_enum_name(strings[r]);
+                if (nm.empty()) continue;
+                ImGui::Text(s->tt_type_word ? "0x%04zx : %s" : "0x%02zx : %s", r, nm.c_str());
+            }
+            ImGui::EndChild();
+        }
+
+        bool name_ok = valid_identifier(s->tt_type_name);
+        ImGui::BeginDisabled(!have || usable == 0 || !name_ok);
+        if (ImGui::Button("Create")) {
+            std::string vs;
+            char buf[24];
+            for (size_t r = 0; r < strings.size(); r++) {
+                std::string nm = sanitize_enum_name(strings[r]);
+                if (nm.empty()) continue;
+                snprintf(buf, sizeof(buf), s->tt_type_word ? "0x%04zx:" : "0x%02zx:", r);
+                if (!vs.empty()) vs += ", ";
+                vs += buf; vs += nm;
+            }
+            if (apex_project_set_type(p, s->tt_type_name, s->tt_type_word, vs.c_str()) == 0) {
+                s->overlay_dirty = true;
+                set_status(s, (std::string("Created type ") + s->tt_type_name +
+                               " (" + std::to_string(usable) + " values)").c_str());
+                ImGui::CloseCurrentPopup();
+            } else {
+                set_status(s, "Type creation failed (name in use?)");
+            }
+        }
+        ImGui::EndDisabled();
+        if (!name_ok && s->tt_type_name[0]) {
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(1, 0.5f, 0.3f, 1), "invalid name");
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Cancel")) ImGui::CloseCurrentPopup();
+        ImGui::EndPopup();
     }
 }
 
@@ -3930,27 +4444,38 @@ void render_strings_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
     const char *filter = s->strings_filter_input;
 
     /* Collect string directive lines, applying the case-insensitive filter to
-       content / label / address. */
+       content / label / address. The O(line_count) scan is cached on
+       (generation, filter); only the small matched set is materialised per frame. */
     struct StrRow { size_t line_idx; std::string content; const char *type; };
-    std::vector<StrRow> rows;
-    for (size_t i = 0; i < d->line_count; i++) {
-        const ApexRenderedLine *l = &d->lines[i];
-        const char *type = string_directive_type(l);
-        if (!type || !l->has_location)
-            continue;
-        std::string content = string_directive_content(l);
-        if (filter[0]) {
-            char addrstr[32];
-            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", l->bank,
-                     (unsigned)l->cpu_addr & 0xffffu);
-            std::string lbl = label_at_address(d, s, l->bank, l->cpu_addr);
-            bool match = str_icontains(content.c_str(), filter) ||
-                         str_icontains(addrstr, filter) ||
-                         (!lbl.empty() && str_icontains(lbl.c_str(), filter));
-            if (!match)
+    if (s->cached_strings_gen != d->generation || s->cached_strings_filter != filter) {
+        s->cached_strings_rows.clear();
+        for (size_t i = 0; i < d->line_count; i++) {
+            const ApexRenderedLine *l = &d->lines[i];
+            const char *type = string_directive_type(l);
+            if (!type || !l->has_location)
                 continue;
+            if (filter[0]) {
+                std::string content = string_directive_content(l);
+                char addrstr[32];
+                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", l->bank,
+                         (unsigned)l->cpu_addr & 0xffffu);
+                std::string lbl = label_at_address(d, s, l->bank, l->cpu_addr);
+                bool match = str_icontains(content.c_str(), filter) ||
+                             str_icontains(addrstr, filter) ||
+                             (!lbl.empty() && str_icontains(lbl.c_str(), filter));
+                if (!match)
+                    continue;
+            }
+            s->cached_strings_rows.push_back(i);
         }
-        rows.push_back({i, content, type});
+        s->cached_strings_gen = d->generation;
+        s->cached_strings_filter = filter;
+    }
+    std::vector<StrRow> rows;
+    rows.reserve(s->cached_strings_rows.size());
+    for (size_t idx : s->cached_strings_rows) {
+        const ApexRenderedLine *l = &d->lines[idx];
+        rows.push_back({idx, string_directive_content(l), string_directive_type(l)});
     }
     ImGui::SameLine();
     ImGui::TextDisabled("(%zu)", rows.size());
@@ -4030,1086 +4555,6 @@ void render_strings_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
     }
 }
 
-void render_pattern_search(ApexProject *project, const ApexRenderedDocument **document_ptr,
-                           UiState *state)
-{
-    if (state->request_focus_pattern_search) {
-        ImGui::SetKeyboardFocusHere();
-        state->request_focus_pattern_search = 0;
-    }
-    ImGui::TextUnformatted("Pattern (hex bytes, ?? = wildcard):");
-    ImGui::SetNextItemWidth(-80.0f);
-    bool run = ImGui::InputText("##pat", state->pattern_search_input, 128,
-                                ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    run |= ImGui::Button("Search");
-    if (run && state->pattern_search_input[0]) {
-        state->pattern_search_results = search_hex_pattern(project, state->pattern_search_input);
-        char msg[64];
-        snprintf(msg, 64, "%lu match(es)%s",
-                 (unsigned long)state->pattern_search_results.size(),
-                 state->pattern_search_results.size() >= 500 ? " (capped at 500)" : "");
-        set_status(state, msg);
-    }
-    ImGui::Text("%lu result(s)", (unsigned long)state->pattern_search_results.size());
-    if (ImGui::BeginTable("pat_results", 3,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("ROM Offset", ImGuiTableColumnFlags_WidthFixed,  90.0f);
-        ImGui::TableSetupColumn("CPU Addr",   ImGuiTableColumnFlags_WidthFixed,  90.0f);
-        ImGui::TableSetupColumn("Bytes",      ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-        ImGuiListClipper clipper;
-        clipper.Begin((int)state->pattern_search_results.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                size_t offset = state->pattern_search_results[(size_t)row];
-                uint8_t bank;
-                uint32_t cpu_addr;
-                size_t line_idx = 0;
-                bool has_addr = rom_offset_to_cpu_address(project, offset, &bank, &cpu_addr) != 0;
-                bool has_line = find_line_by_rom_offset(*document_ptr, offset, &line_idx);
-                ImGui::PushID((int)row);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                char off_buf[24];
-                snprintf(off_buf, sizeof(off_buf), "0x%06lx", (unsigned long)offset);
-                if (ImGui::Selectable(off_buf,
-                        has_line && state->selected_line == line_idx,
-                        ImGuiSelectableFlags_SpanAllColumns)) {
-                    if (has_line) {
-                        select_line(state, line_idx, 1);
-                    }
-                }
-                ImGui::TableSetColumnIndex(1);
-                if (has_addr) {
-                    ImGui::Text("B%02x_A%04x", bank, (unsigned)cpu_addr & 0xffff);
-                } else {
-                    ImGui::TextDisabled("-");
-                }
-                ImGui::TableSetColumnIndex(2);
-                char bytes_buf[40] = "";
-                size_t show = 8;
-                if (offset + show > project->rom.size) {
-                    show = project->rom.size - offset;
-                }
-                for (size_t k = 0; k < show; k++) {
-                    char hex[4];
-                    snprintf(hex, sizeof(hex), k ? " %02X" : "%02X",
-                             (unsigned)project->rom.data[offset + k]);
-                    strncat(bytes_buf, hex, sizeof(bytes_buf) - strlen(bytes_buf) - 1);
-                }
-                ImGui::TextUnformatted(bytes_buf);
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-}
-
-void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *document,
-                     UiState *state)
-{
-    (void)project;
-    if (state->request_focus_ram_refs) {
-        ImGui::SetKeyboardFocusHere();
-        state->request_focus_ram_refs = 0;
-    }
-    ImGui::TextUnformatted("RAM address ($XX, $XXXX, or hex):");
-    ImGui::SetNextItemWidth(-80.0f);
-    bool run = ImGui::InputText("##ramaddr", state->ram_ref_input, 32,
-                                ImGuiInputTextFlags_EnterReturnsTrue);
-    ImGui::SameLine();
-    run |= ImGui::Button("Search");
-    if (run && state->ram_ref_input[0]) {
-        state->ram_ref_results = find_ram_refs(document, state->ram_ref_input);
-        char msg[64];
-        snprintf(msg, 64, "%lu RAM ref(s) found", (unsigned long)state->ram_ref_results.size());
-        set_status(state, msg);
-    }
-    ImGui::Text("%lu result(s)", (unsigned long)state->ram_ref_results.size());
-    if (ImGui::BeginTable("ram_results", 3,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f, 0);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed,  50.0f, 1);
-        ImGui::TableSetupColumn("Text",  ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
-        ImGui::TableHeadersRow();
-        {
-            int sort_col; bool sort_asc;
-            if (ui_table_sort(&sort_col, &sort_asc)) {
-                std::stable_sort(state->ram_ref_results.begin(), state->ram_ref_results.end(),
-                    [&](size_t ia, size_t ib) {
-                        if (ia >= document->line_count || ib >= document->line_count)
-                            return ia < ib;
-                        const ApexRenderedLine *a = &document->lines[ia];
-                        const ApexRenderedLine *b = &document->lines[ib];
-                        int c = 0;
-                        if (sort_col == 0)
-                            c = ui_cmp_u32(((uint32_t)a->bank<<16)|(a->cpu_addr&0xffffu),
-                                           ((uint32_t)b->bank<<16)|(b->cpu_addr&0xffffu));
-                        else if (sort_col == 1)
-                            c = ui_cmp_int(a->block_kind, b->block_kind);
-                        else {
-                            size_t n = a->length < b->length ? a->length : b->length;
-                            c = memcmp(a->text, b->text, n);
-                            if (c == 0) c = ui_cmp_sz(a->length, b->length);
-                        }
-                        return sort_asc ? c < 0 : c > 0;
-                    });
-            }
-        }
-        ImGuiListClipper clipper;
-        clipper.Begin((int)state->ram_ref_results.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                size_t li = state->ram_ref_results[(size_t)row];
-                if (li >= document->line_count) {
-                    continue;
-                }
-                const auto *line = &document->lines[li];
-                ImGui::PushID((int)row);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                char addr_buf[32];
-                if (line->has_location) {
-                    snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x",
-                             line->bank, (unsigned)line->cpu_addr & 0xffff);
-                } else {
-                    strcpy(addr_buf, "-");
-                }
-                if (ImGui::Selectable(addr_buf, state->selected_line == li,
-                        ImGuiSelectableFlags_SpanAllColumns)) {
-                    select_line(state, li, 1);
-                }
-                ImGui::TableSetColumnIndex(1);
-                ImGui::TextUnformatted(block_name(line->block_kind));
-                ImGui::TableSetColumnIndex(2);
-                ImGui::TextUnformatted(line->text, line->text + line->length);
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-}
-
-void render_code_candidates(ApexProject *project,
-                            const ApexRenderedDocument **document_ptr,
-                            UiState *state)
-{
-    const ApexRenderedDocument *document = *document_ptr;
-
-    /* ---- Header row ---- */
-    bool want_scan = ImGui::Button("Scan");
-    ImGui::SameLine();
-    if (state->code_candidates_stale)
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "stale – rescan recommended");
-    else if (state->code_candidates.count == 0 && !state->code_candidates_stale)
-        ImGui::TextDisabled("no candidates (run scan)");
-    else
-        ImGui::Text("%zu candidates", state->code_candidates.count);
-
-    ImGui::SameLine();
-    ImGui::TextDisabled("| Tier 1 = far-ptr  Tier 2 = probe");
-
-    if (want_scan) {
-        apex_free_code_candidates(&state->code_candidates);
-        apex_scan_code_candidates(project, &state->code_candidates);
-        state->code_candidates_stale = false;
-    }
-
-    if (state->code_candidates.count == 0) return;
-
-    ImGui::Separator();
-
-    /* ---- Table ---- */
-    if (!ImGui::BeginTable("cand_tbl", 5,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS,
-            ImVec2(0, 0)))
-        return;
-
-    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed,  48.0f, 0);
-    ImGui::TableSetupColumn("T",     ImGuiTableColumnFlags_WidthFixed,  18.0f, 1);
-    ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed,  90.0f, 2);
-    ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
-    ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
-                            100.0f, 4);
-    ImGui::TableHeadersRow();
-
-    {
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc) && state->code_candidates.count > 1) {
-            std::stable_sort(state->code_candidates.items,
-                state->code_candidates.items + state->code_candidates.count,
-                [&](const ApexCodeCandidate &a, const ApexCodeCandidate &b) {
-                    int c = 0;
-                    switch (sort_col) {
-                    case 0: c = ui_cmp_int(a.score, b.score); break;
-                    case 1: c = ui_cmp_int(a.tier, b.tier); break;
-                    case 2: c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.addr&0xffffu),
-                                           ((uint32_t)b.bank<<16)|(b.addr&0xffffu)); break;
-                    case 3: c = strcmp(a.preview, b.preview); break;
-                    }
-                    return sort_asc ? c < 0 : c > 0;
-                });
-        }
-    }
-
-    /* iterate a copy index so "Accept" can remove items without iterator UB */
-    size_t i = 0;
-    while (i < state->code_candidates.count) {
-        ApexCodeCandidate *c = &state->code_candidates.items[i];
-        ImGui::PushID((int)i);
-        ImGui::TableNextRow();
-
-        /* score column — colour-coded */
-        ImGui::TableSetColumnIndex(0);
-        ImVec4 score_col = c->score >= 80
-            ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f)
-            : c->score >= 60
-                ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
-                : ImVec4(0.9f, 0.55f, 0.2f, 1.0f);
-        ImGui::TextColored(score_col, "%d", c->score);
-
-        /* tier column */
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextDisabled("%d", c->tier);
-
-        /* address column */
-        ImGui::TableSetColumnIndex(2);
-        char addr_buf[24];
-        snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x",
-                 c->bank, (unsigned)c->addr & 0xffffu);
-        ImGui::TextUnformatted(addr_buf);
-
-        /* preview column */
-        ImGui::TableSetColumnIndex(3);
-        ImGui::TextUnformatted(c->preview);
-
-        /* action column */
-        ImGui::TableSetColumnIndex(4);
-        if (ImGui::SmallButton("Go")) {
-            size_t li;
-            if (!apex_render_find_line_by_address(document, c->bank, c->addr, &li)) {
-                /* Exact match missing (unclassified region): find the nearest
-                   rendered line with matching bank and cpu_addr <= candidate. */
-                li = (size_t)-1;
-                for (size_t di = 0; di < document->line_count; di++) {
-                    const ApexRenderedLine *dl = &document->lines[di];
-                    if (dl->has_location && dl->bank == c->bank &&
-                        dl->cpu_addr <= c->addr) {
-                        if (li == (size_t)-1 ||
-                            dl->cpu_addr > document->lines[li].cpu_addr)
-                            li = di;
-                    }
-                }
-            }
-            if (li != (size_t)-1)
-                select_line(state, li, 1);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Accept")) {
-            /* classify as code and rerender */
-            if (apex_project_set_kind(project, 1, c->bank, c->addr,
-                                      APEX_KIND_CODE, NULL) == 0) {
-                state->overlay_dirty = true;
-                state->labels_valid  = false;
-                state->code_candidates_stale = true;
-                rerender_and_reselect(project, document_ptr, state, c->bank, c->addr);
-            }
-            document = *document_ptr;
-            /* remove this candidate from the list */
-            size_t rem = state->code_candidates.count - i - 1;
-            if (rem > 0)
-                memmove(&state->code_candidates.items[i],
-                        &state->code_candidates.items[i + 1],
-                        rem * sizeof(state->code_candidates.items[0]));
-            state->code_candidates.count--;
-            ImGui::PopID();
-            continue;
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Dismiss")) {
-            size_t rem = state->code_candidates.count - i - 1;
-            if (rem > 0)
-                memmove(&state->code_candidates.items[i],
-                        &state->code_candidates.items[i + 1],
-                        rem * sizeof(state->code_candidates.items[0]));
-            state->code_candidates.count--;
-            ImGui::PopID();
-            continue;
-        }
-        ImGui::PopID();
-        i++;
-    }
-    ImGui::EndTable();
-}
-
-/* Scrape "; WARNING[_ACK] <type> bank=0x.. cpu=0x.. rom=0x.. <detail>" comment
-   lines from the rendered document into state->warnings for the Warnings panel.
-   "; WARNING_ACK" lines are acknowledged warnings (shown green, un-ackable). */
-static void rebuild_warnings(const ApexRenderedDocument *d, UiState *s)
-{
-    s->warnings.clear();
-    s->warnings_stale = false;
-    if (!d) return;
-    static const char PREFIX[]     = "; WARNING ";
-    static const char PREFIX_ACK[] = "; WARNING_ACK ";
-    const size_t PLEN     = sizeof(PREFIX) - 1;
-    const size_t PLEN_ACK = sizeof(PREFIX_ACK) - 1;
-    for (size_t i = 0; i < d->line_count; i++) {
-        const ApexRenderedLine *l = &d->lines[i];
-        /* "; WARNING " and "; WARNING_ACK " diverge at the space/underscore, so
-           they are mutually exclusive; test the acked form first. */
-        bool acked = (l->length >= PLEN_ACK && memcmp(l->text, PREFIX_ACK, PLEN_ACK) == 0);
-        if (!acked && (l->length < PLEN || memcmp(l->text, PREFIX, PLEN) != 0)) continue;
-        size_t plen = acked ? PLEN_ACK : PLEN;
-
-        std::string line(l->text, l->length); /* null-terminated working copy */
-        const char *p = line.c_str() + plen;
-
-        WarningEntry w;
-        w.line_index = i;
-        w.has_location = false;
-        w.acked = acked;
-        w.bank = 0;
-        w.cpu_addr = 0;
-
-        const char *sp = strchr(p, ' ');
-        w.type.assign(p, sp ? (size_t)(sp - p) : strlen(p));
-
-        unsigned bank = 0, cpu = 0;
-        const char *bptr = strstr(p, "bank=0x");
-        const char *cptr = strstr(p, "cpu=0x");
-        if (bptr && cptr && sscanf(bptr, "bank=0x%x", &bank) == 1 &&
-            sscanf(cptr, "cpu=0x%x", &cpu) == 1) {
-            w.bank = (uint8_t)bank;
-            w.cpu_addr = (uint32_t)cpu;
-            w.has_location = true;
-        }
-
-        /* detail = text after the last location field (rom=, else cpu=), else
-           after the type token */
-        const char *anchor = strstr(p, "rom=0x");
-        if (!anchor) anchor = cptr;
-        const char *detail = NULL;
-        if (anchor && (detail = strchr(anchor, ' ')) != NULL) {
-            while (*detail == ' ') detail++;
-        } else if (sp) {
-            detail = sp;
-            while (*detail == ' ') detail++;
-        }
-        if (detail && *detail) w.detail.assign(detail);
-
-        s->warnings.push_back(std::move(w));
-    }
-}
-
-void render_warnings_view(ApexProject *project,
-                          const ApexRenderedDocument **document_ptr,
-                          UiState *state)
-{
-    (void)project;
-    const ApexRenderedDocument *document = *document_ptr;
-
-    if (state->warnings_stale) rebuild_warnings(document, state);
-
-    size_t acked_count = 0;
-    for (auto &w : state->warnings) if (w.acked) acked_count++;
-    size_t active_count = state->warnings.size() - acked_count;
-
-    ImGui::Text("%zu active", active_count);
-    ImGui::SameLine();
-    ImGui::TextColored(ImVec4(0.40f, 0.85f, 0.45f, 1.0f), "%zu acked", acked_count);
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Refresh")) rebuild_warnings(document, state);
-    ImGui::SameLine();
-    ImGui::TextDisabled("| click a row to jump");
-
-    if (state->warnings.empty()) {
-        ImGui::Separator();
-        ImGui::TextDisabled("No warnings.");
-        return;
-    }
-    ImGui::Separator();
-
-    if (!ImGui::BeginTable("warn_tbl", 4,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV, ImVec2(0, 0)))
-        return;
-    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 190.0f);
-    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-    ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("##ack", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-    ImGui::TableHeadersRow();
-
-    /* Deferred ack toggle: applied after the loop so we never rerender (which
-       rebuilds state->warnings) while iterating it. */
-    int      do_toggle = 0;   /* +1 = ack, -1 = un-ack */
-    uint8_t  tog_bank = 0;
-    uint32_t tog_addr = 0;
-    const ImVec4 kAckGreen(0.40f, 0.85f, 0.45f, 1.0f);
-
-    for (size_t i = 0; i < state->warnings.size(); i++) {
-        const WarningEntry &w = state->warnings[i];
-        ImGui::PushID((int)i);
-        ImGui::TableNextRow();
-
-        ImGui::TableSetColumnIndex(0);
-        if (w.acked) ImGui::PushStyleColor(ImGuiCol_Text, kAckGreen);
-        /* AllowOverlap so the Ack button (submitted later, in the last column)
-           receives clicks instead of this row-spanning Selectable swallowing them. */
-        bool clicked = ImGui::Selectable(w.type.c_str(), false,
-                                         ImGuiSelectableFlags_SpanAllColumns |
-                                         ImGuiSelectableFlags_AllowOverlap);
-        if (w.acked) ImGui::PopStyleColor();
-
-        ImGui::TableSetColumnIndex(1);
-        if (w.has_location) {
-            char addr[32];
-            snprintf(addr, sizeof(addr), "B%02x_A%04x", w.bank, w.cpu_addr);
-            if (w.acked) ImGui::TextColored(kAckGreen, "%s", addr);
-            else         ImGui::TextUnformatted(addr);
-        } else {
-            ImGui::TextDisabled("-");
-        }
-
-        ImGui::TableSetColumnIndex(2);
-        if (w.acked) ImGui::TextColored(kAckGreen, "%s", w.detail.c_str());
-        else         ImGui::TextUnformatted(w.detail.c_str());
-
-        ImGui::TableSetColumnIndex(3);
-        if (w.has_location) {
-            if (ImGui::SmallButton(w.acked ? "Un-ack" : "Ack")) {
-                do_toggle = w.acked ? -1 : 1;
-                tog_bank  = w.bank;
-                tog_addr  = w.cpu_addr;
-            }
-        }
-
-        if (clicked) {
-            size_t li;
-            if (w.has_location &&
-                apex_render_find_line_by_address(document, w.bank, w.cpu_addr, &li)) {
-                select_line(state, li, 1);
-            } else {
-                select_line(state, w.line_index, 1);
-            }
-        }
-        ImGui::PopID();
-    }
-    ImGui::EndTable();
-
-    if (do_toggle > 0) {
-        apex_project_add_ack(project, 1, tog_bank, tog_addr);
-        state->overlay_dirty = true;
-        rerender_and_reselect(project, document_ptr, state, tog_bank, tog_addr);
-    } else if (do_toggle < 0) {
-        apex_project_remove_ack(project, 1, tog_bank, tog_addr);
-        state->overlay_dirty = true;
-        rerender_and_reselect(project, document_ptr, state, tog_bank, tog_addr);
-    }
-}
-
-/* ---- Flow Breaks: places where code flow runs off into non-code ---- */
-
-static const char *block_kind_short(ApexRenderedBlockKind k)
-{
-    switch (k) {
-    case APEX_RENDER_BLOCK_DATA:         return "data";
-    case APEX_RENDER_BLOCK_TABLE:        return "table";
-    case APEX_RENDER_BLOCK_UNCLASSIFIED: return "unclassified";
-    case APEX_RENDER_BLOCK_FREE:         return "fill (0xFF)";
-    case APEX_RENDER_BLOCK_SPRITE:       return "sprite";
-    default:                             return "non-code";
-    }
-}
-
-/* Scan the whole document for code blocks whose last instruction does not
-   transfer control (no flow-stop, and not a call into a flow-stop tail-call
-   helper) yet is immediately followed by a non-code block. */
-static void rebuild_flow_breaks(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
-    s->flow_breaks.clear();
-    s->flow_breaks_stale = false;
-    if (!d) return;
-
-    const ApexRenderedLine *last_code = nullptr;
-    size_t last_code_li = 0;
-    for (size_t li = 0; li < d->line_count; li++) {
-        const ApexRenderedLine *l = &d->lines[li];
-        if (!l->has_location) continue;
-
-        if (l->block_kind == APEX_RENDER_BLOCK_CODE) {
-            /* Track the last real instruction, skipping inline payload lines
-               (INLINE_*) so `last_code` is the call/branch itself. */
-            if (l->kind == APEX_RENDER_LINE_INSTRUCTION && l->length >= 1) {
-                const char *t = l->text;
-                size_t n = l->length;
-                while (n && (*t == ' ' || *t == '\t')) { t++; n--; }
-                if (!(n >= 7 && memcmp(t, "INLINE_", 7) == 0)) {
-                    last_code = l;
-                    last_code_li = li;
-                }
-            }
-            continue;
-        }
-
-        /* code -> non-code transition: judge the last code instruction */
-        if (last_code && last_code->rom_addr < p->rom.size) {
-            const uint8_t *isrc; size_t irem;
-            bool clean = false;
-            if (project_locate_rom_bytes(p, last_code->bank, last_code->cpu_addr,
-                                         &isrc, &irem, NULL)) {
-                char mn[32];
-                Cpu6809InstrInfo info = cpu6809_disassemble_info(
-                    isrc, irem < 8u ? irem : 8u, last_code->cpu_addr, mn, sizeof(mn));
-                if (info.flags & CPU6809_FLOW_STOP) {
-                    clean = true;
-                } else if (info.has_target && (info.flags & CPU6809_CALL)) {
-                    /* a call into a flow-stop tail-call helper ends the block */
-                    const InlineSignature *sig =
-                        inline_signature_for(&p->inline_sigs, last_code->bank, info.target);
-                    if (sig && sig->flow_stop) clean = true;
-                }
-            }
-            if (!clean) {
-                FlowBreakEntry e;
-                e.line_index = last_code_li;
-                e.bank = last_code->bank;
-                e.cpu_addr = last_code->cpu_addr;
-                e.insn.assign(last_code->text, last_code->length);
-                /* trim leading indent for display */
-                size_t b = e.insn.find_first_not_of(" \t");
-                if (b != std::string::npos && b) e.insn.erase(0, b);
-                e.next = block_kind_short(l->block_kind);
-                s->flow_breaks.push_back(std::move(e));
-            }
-        }
-        last_code = nullptr;
-    }
-}
-
-void render_flow_breaks_view(ApexProject *project,
-                             const ApexRenderedDocument **document_ptr, UiState *state)
-{
-    const ApexRenderedDocument *document = *document_ptr;
-    if (state->flow_breaks_stale) rebuild_flow_breaks(project, document, state);
-
-    ImGui::Text("%zu flow break%s", state->flow_breaks.size(),
-                state->flow_breaks.size() == 1 ? "" : "s");
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Reload")) rebuild_flow_breaks(project, document, state);
-    ImGui::SameLine();
-    ImGui::TextDisabled("| code that runs into non-code (mis-classification / wrong inline sig)");
-
-    if (state->flow_breaks.empty()) {
-        ImGui::Separator();
-        ImGui::TextDisabled("No flow breaks.");
-        return;
-    }
-    ImGui::Separator();
-
-    if (!ImGui::BeginTable("flowbreaks", 3,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV, ImVec2(0, 0)))
-        return;
-    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-    ImGui::TableSetupColumn("Last instruction", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Runs into", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-    ImGui::TableHeadersRow();
-
-    for (size_t i = 0; i < state->flow_breaks.size(); i++) {
-        const FlowBreakEntry &e = state->flow_breaks[i];
-        ImGui::PushID((int)i);
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0);
-        char ab[24]; snprintf(ab, sizeof(ab), "B%02x_A%04x", e.bank, e.cpu_addr);
-        if (ImGui::Selectable(ab, false, ImGuiSelectableFlags_SpanAllColumns)) {
-            size_t li;
-            if (apex_render_find_line_by_address(document, e.bank, e.cpu_addr, &li))
-                select_line(state, li, 1);
-            else
-                select_line(state, e.line_index, 1);
-        }
-        ImGui::TableSetColumnIndex(1);
-        ImGui::TextUnformatted(e.insn.c_str());
-        ImGui::TableSetColumnIndex(2);
-        ImGui::TextColored(ImVec4(0.95f, 0.55f, 0.25f, 1.0f), "%s", e.next.c_str());
-        ImGui::PopID();
-    }
-    ImGui::EndTable();
-}
-
-/* ---- RAM-map import / export (PinMAME nvram-maps JSON) ---- */
-
-static const ConfigSymbol *nvram_symbol_at(const ApexProject *p, uint32_t addr)
-{
-    for (size_t i = 0; i < p->symbols.count; i++)
-        if (p->symbols.items[i].value == addr) return &p->symbols.items[i];
-    return nullptr;
-}
-
-static const ConfigSymbol *nvram_symbol_named(const ApexProject *p, const char *name)
-{
-    for (size_t i = 0; i < p->symbols.count; i++)
-        if (p->symbols.items[i].name && strcmp(p->symbols.items[i].name, name) == 0)
-            return &p->symbols.items[i];
-    return nullptr;
-}
-
-static const ConfigDoc *nvram_doc_at(const ApexProject *p, uint32_t addr)
-{
-    for (size_t i = 0; i < p->docs.count; i++)
-        if (p->docs.items[i].addr == addr) return &p->docs.items[i];
-    return nullptr;
-}
-
-int nvram_prepare_import(ApexProject *project, UiState *state, const char *json_path,
-                        std::string *err)
-{
-    FILE *f = fopen(json_path, "rb");
-    if (!f) { if (err) *err = std::string("cannot read ") + json_path; return 1; }
-    fseek(f, 0, SEEK_END);
-    long sz = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    if (sz < 0) { fclose(f); if (err) *err = "cannot size file"; return 1; }
-    std::string text((size_t)sz, '\0');
-    size_t got = fread(&text[0], 1, (size_t)sz, f);
-    fclose(f);
-    text.resize(got);
-
-    ApexNvramLocs locs;
-    char emsg[128] = {0};
-    if (apex_nvram_parse_json(text.data(), text.size(), 0, &locs, emsg, sizeof(emsg)) != 0) {
-        if (err) *err = emsg;
-        return 1;
-    }
-    state->nvram_import_rows.clear();
-    for (size_t i = 0; i < locs.count; i++) {
-        NvramImportRow r;
-        r.name = locs.items[i].name ? locs.items[i].name : "";
-        r.addr = locs.items[i].addr;
-        r.doc  = locs.items[i].doc ? locs.items[i].doc : "";
-        r.selected = true;
-        r.overwrites = false;
-        const ConfigSymbol *sa = nvram_symbol_at(project, r.addr);
-        const ConfigSymbol *sn = nvram_symbol_named(project, r.name.c_str());
-        const ConfigDoc *da = nvram_doc_at(project, r.addr);
-        if (sa && sa->name && r.name != sa->name) {
-            r.overwrites = true;
-            r.conflict = std::string("addr has symbol ") + sa->name;
-        } else if (sn && sn->value != r.addr) {
-            r.overwrites = true;
-            char b[48]; snprintf(b, sizeof(b), "name used at 0x%04x", sn->value & 0xffffu);
-            r.conflict = b;
-        } else if (da && da->text && r.doc != da->text) {
-            r.overwrites = true;
-            r.conflict = "addr has a different doc";
-        }
-        state->nvram_import_rows.push_back(std::move(r));
-    }
-    apex_nvram_locs_free(&locs);
-    state->show_nvram_import = true;
-    return 0;
-}
-
-void render_nvram_import_window(ApexProject *project,
-                                const ApexRenderedDocument **document_ptr, UiState *state)
-{
-    auto &rows = state->nvram_import_rows;
-    size_t sel = 0, conflicts = 0;
-    for (auto &r : rows) { if (r.selected) sel++; if (r.overwrites) conflicts++; }
-
-    ImGui::Text("%zu location%s", rows.size(), rows.size() == 1 ? "" : "s");
-    ImGui::SameLine();
-    if (conflicts) ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f),
-                                      "| %zu would overwrite existing entries", conflicts);
-    if (ImGui::SmallButton("Select all"))  for (auto &r : rows) r.selected = true;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Select none")) for (auto &r : rows) r.selected = false;
-    ImGui::SameLine();
-    if (ImGui::SmallButton("Only non-conflicting"))
-        for (auto &r : rows) r.selected = !r.overwrites;
-    ImGui::Separator();
-
-    if (ImGui::BeginTable("nvimp", 4,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
-            ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - 4.0f))) {
-        ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, 24.0f);
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 170.0f);
-        ImGui::TableSetupColumn("Doc / conflict", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-        for (size_t i = 0; i < rows.size(); i++) {
-            NvramImportRow &r = rows[i];
-            ImGui::PushID((int)i);
-            ImGui::TableNextRow();
-            if (r.overwrites) {
-                ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.85f, 0.45f, 0.05f, 0.20f));
-                ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
-            }
-            ImGui::TableSetColumnIndex(0);
-            ImGui::Checkbox("##s", &r.selected);
-            ImGui::TableSetColumnIndex(1);
-            ImGui::Text("0x%04x", r.addr & 0xffffu);
-            ImGui::TableSetColumnIndex(2);
-            ImGui::TextUnformatted(r.name.c_str());
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(r.doc.c_str());
-            if (r.overwrites) {
-                ImGui::SameLine();
-                ImGui::TextColored(ImVec4(1.0f, 0.7f, 0.2f, 1.0f), "  [!] %s",
-                                   r.conflict.c_str());
-            }
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-
-    if (ImGui::Button("Import selected")) {
-        int applied = 0;
-        for (auto &r : rows) {
-            if (!r.selected) continue;
-            apex_project_set_symbol(project, r.name.c_str(), r.addr);
-            if (!r.doc.empty())
-                apex_project_set_doc(project, 0, 0, r.addr, r.doc.c_str());
-            applied++;
-        }
-        if (applied) {
-            state->overlay_dirty = true;
-            state->labels_valid = false;
-            rerender_and_reselect(project, document_ptr, state, 0xffu, 0u);
-        }
-        set_status(state, (std::to_string(applied) + " location(s) imported").c_str());
-        state->show_nvram_import = false;
-        rows.clear();
-    }
-    ImGui::SameLine();
-    ImGui::Text("(%zu selected)", sel);
-    ImGui::SameLine();
-    if (ImGui::Button("Cancel")) {
-        state->show_nvram_import = false;
-        rows.clear();
-    }
-}
-
-int nvram_export(const ApexProject *project, const char *json_path,
-                 const char *template_path, std::string *err)
-{
-    std::vector<ApexNvramLoc> arr;
-    std::vector<std::string> gen_names; /* backing store for generated names */
-    for (size_t i = 0; i < project->symbols.count; i++) {
-        if (project->symbols.items[i].value >= APEX_RAM_LIMIT) continue;
-        ApexNvramLoc l;
-        l.name = (char *)project->symbols.items[i].name;
-        l.addr = project->symbols.items[i].value;
-        const ConfigDoc *d = nvram_doc_at(project, l.addr);
-        l.doc = d ? d->text : (char *)"";
-        arr.push_back(l);
-    }
-    for (size_t i = 0; i < project->docs.count; i++) {
-        uint32_t a = project->docs.items[i].addr;
-        if (a >= APEX_RAM_LIMIT || nvram_symbol_at(project, a)) continue;
-        char b[16]; snprintf(b, sizeof(b), "RAM_%04x", a & 0xffffu);
-        gen_names.push_back(b);
-    }
-    /* second pass now that gen_names won't reallocate */
-    size_t gi = 0;
-    for (size_t i = 0; i < project->docs.count; i++) {
-        uint32_t a = project->docs.items[i].addr;
-        if (a >= APEX_RAM_LIMIT || nvram_symbol_at(project, a)) continue;
-        ApexNvramLoc l;
-        l.name = (char *)gen_names[gi++].c_str();
-        l.addr = a;
-        l.doc  = project->docs.items[i].text;
-        arr.push_back(l);
-    }
-    if (arr.empty()) { if (err) *err = "no RAM symbols/docs to export"; return 1; }
-
-    /* Optional zero-loss merge into the originally-imported map.  If a template
-       was requested but is no longer readable, fail rather than silently writing
-       a fresh (lossy) map — otherwise the caller would wrongly report a merge. */
-    std::string tmpl;
-    bool want_merge = template_path && template_path[0];
-    if (want_merge) {
-        FILE *tf = fopen(template_path, "rb");
-        if (!tf) {
-            if (err) *err = std::string("template not readable: ") + template_path;
-            return 1;
-        }
-        fseek(tf, 0, SEEK_END); long ts = ftell(tf); fseek(tf, 0, SEEK_SET);
-        if (ts > 0) { tmpl.resize((size_t)ts); tmpl.resize(fread(&tmpl[0], 1, (size_t)ts, tf)); }
-        fclose(tf);
-    }
-
-    FILE *f = fopen(json_path, "w");
-    if (!f) { if (err) *err = std::string("cannot write ") + json_path; return 1; }
-    int rc = 0;
-    if (want_merge) {
-        char terr[128] = {0};
-        rc = apex_nvram_export_merged(f, tmpl.data(), tmpl.size(), arr.data(), arr.size(),
-                                      terr, sizeof(terr));
-        if (rc != 0 && err) *err = terr;
-    } else {
-        const char *rom = project->rom_path
-            ? (strrchr(project->rom_path, '/') ? strrchr(project->rom_path, '/') + 1
-                                               : project->rom_path)
-            : nullptr;
-        apex_nvram_write_json(f, arr.data(), arr.size(), rom);
-    }
-    fclose(f);
-    return rc;
-}
-
-void render_inline_candidates(ApexProject *project,
-                              const ApexRenderedDocument **document_ptr,
-                              UiState *state)
-{
-    const ApexRenderedDocument *document = *document_ptr;
-
-    bool want_scan = ImGui::Button("Scan");
-    ImGui::SameLine();
-    if (state->inline_candidates_stale)
-        ImGui::TextColored(ImVec4(1.0f, 0.8f, 0.3f, 1.0f), "stale – rescan recommended");
-    else if (state->inline_candidates.count == 0)
-        ImGui::TextDisabled("no candidates (run scan)");
-    else
-        ImGui::Text("%zu candidates", state->inline_candidates.count);
-
-    ImGui::SameLine();
-    ImGui::TextDisabled("| score: green>=80 yellow>=60 orange<60");
-
-    if (want_scan) {
-        apex_free_inline_candidates(&state->inline_candidates);
-        apex_scan_inline_candidates(project, &state->inline_candidates);
-        state->inline_candidates_stale = false;
-    }
-
-    if (state->inline_candidates.count == 0) return;
-
-    ImGui::Separator();
-
-    if (!ImGui::BeginTable("icand_tbl", 5,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS,
-            ImVec2(0, 0)))
-        return;
-
-    ImGui::TableSetupColumn("Score",     ImGuiTableColumnFlags_WidthFixed,  48.0f, 0);
-    ImGui::TableSetupColumn("Addr",      ImGuiTableColumnFlags_WidthFixed,  90.0f, 1);
-    ImGui::TableSetupColumn("Spec",      ImGuiTableColumnFlags_WidthFixed, 120.0f, 2);
-    ImGui::TableSetupColumn("Callsites", ImGuiTableColumnFlags_WidthFixed,  70.0f, 3);
-    ImGui::TableSetupColumn("##act",     ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
-                            100.0f, 4);
-    ImGui::TableHeadersRow();
-
-    {
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc) && state->inline_candidates.count > 1) {
-            std::stable_sort(state->inline_candidates.items,
-                state->inline_candidates.items + state->inline_candidates.count,
-                [&](const ApexInlineCandidate &a, const ApexInlineCandidate &b) {
-                    int c = 0;
-                    switch (sort_col) {
-                    case 0: c = ui_cmp_int(a.score, b.score); break;
-                    case 1: c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.addr&0xffffu),
-                                           ((uint32_t)b.bank<<16)|(b.addr&0xffffu)); break;
-                    case 2: c = strcmp(a.spec, b.spec); break;
-                    case 3: c = ui_cmp_int(a.callsite_count, b.callsite_count); break;
-                    }
-                    return sort_asc ? c < 0 : c > 0;
-                });
-        }
-    }
-
-    size_t i = 0;
-    while (i < state->inline_candidates.count) {
-        ApexInlineCandidate *c = &state->inline_candidates.items[i];
-        ImGui::PushID((int)i);
-        ImGui::TableNextRow();
-
-        ImGui::TableSetColumnIndex(0);
-        ImVec4 score_col = c->score >= 80
-            ? ImVec4(0.3f, 0.9f, 0.4f, 1.0f)
-            : c->score >= 60
-                ? ImVec4(1.0f, 0.85f, 0.2f, 1.0f)
-                : ImVec4(0.9f, 0.55f, 0.2f, 1.0f);
-        ImGui::TextColored(score_col, "%d", c->score);
-
-        ImGui::TableSetColumnIndex(1);
-        char addr_buf[24];
-        snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x",
-                 c->bank, (unsigned)c->addr & 0xffffu);
-        ImGui::TextUnformatted(addr_buf);
-
-        ImGui::TableSetColumnIndex(2);
-        /* Editable spec field so user can correct before accepting */
-        ImGui::SetNextItemWidth(-1.0f);
-        ImGui::InputText("##spec", c->spec, sizeof(c->spec));
-
-        ImGui::TableSetColumnIndex(3);
-        if (c->callsite_count > 0)
-            ImGui::Text("%d/%d", c->callsite_valid, c->callsite_count);
-        else
-            ImGui::TextDisabled("?");
-
-        ImGui::TableSetColumnIndex(4);
-        if (ImGui::SmallButton("Go")) {
-            size_t li;
-            if (!apex_render_find_line_by_address(document, c->bank, c->addr, &li)) {
-                li = (size_t)-1;
-                for (size_t di = 0; di < document->line_count; di++) {
-                    const ApexRenderedLine *dl = &document->lines[di];
-                    if (dl->has_location && dl->bank == c->bank &&
-                        dl->cpu_addr <= c->addr &&
-                        (li == (size_t)-1 ||
-                         dl->cpu_addr > document->lines[li].cpu_addr))
-                        li = di;
-                }
-            }
-            if (li != (size_t)-1) select_line(state, li, 1);
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Accept")) {
-            if (apex_project_set_inline(project, 1, c->bank, c->addr, c->spec) == 0) {
-                state->overlay_dirty = true;
-                state->labels_valid  = false;
-                state->inline_candidates_stale = true;
-                rerender_and_reselect(project, document_ptr, state, c->bank, c->addr);
-                document = *document_ptr;
-            }
-            size_t rem = state->inline_candidates.count - i - 1;
-            if (rem > 0)
-                memmove(&state->inline_candidates.items[i],
-                        &state->inline_candidates.items[i + 1],
-                        rem * sizeof(state->inline_candidates.items[0]));
-            state->inline_candidates.count--;
-            ImGui::PopID();
-            continue;
-        }
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Dismiss")) {
-            size_t rem = state->inline_candidates.count - i - 1;
-            if (rem > 0)
-                memmove(&state->inline_candidates.items[i],
-                        &state->inline_candidates.items[i + 1],
-                        rem * sizeof(state->inline_candidates.items[0]));
-            state->inline_candidates.count--;
-            ImGui::PopID();
-            continue;
-        }
-        ImGui::PopID();
-        i++;
-    }
-    ImGui::EndTable();
-}
-
-void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr,
-                           UiState *state)
-{
-    const ApexRenderedDocument *document = *document_ptr;
-
-    ImGui::TextDisabled("Addresses excluded from false-positive ref detection");
-    ImGui::Separator();
-
-    if (project->ref_exclusions.count == 0) {
-        ImGui::TextDisabled("(no exclusions)");
-        return;
-    }
-
-    if (!ImGui::BeginTable("excl_table", 3,
-                           ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-                           ImGuiTableFlags_ScrollY | ImGuiTableFlags_SizingStretchProp |
-                           APEX_TABLE_SORT_FLAGS,
-                           ImVec2(0, 0))) {
-        return;
-    }
-    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.f, 0);
-    ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
-                            0.0f, 1);
-    ImGui::TableSetupColumn("##act",   ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort,
-                            120.f, 2);
-    ImGui::TableHeadersRow();
-
-    std::vector<size_t> order(project->ref_exclusions.count);
-    for (size_t k = 0; k < order.size(); k++) order[k] = k;
-    {
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc)) {
-            std::stable_sort(order.begin(), order.end(), [&](size_t ia, size_t ib) {
-                const ConfigEntry *a = &project->ref_exclusions.items[ia];
-                const ConfigEntry *b = &project->ref_exclusions.items[ib];
-                uint8_t ab = a->has_bank ? a->bank : 0xffu;
-                uint8_t bb = b->has_bank ? b->bank : 0xffu;
-                int c = ui_cmp_u32(((uint32_t)ab<<16)|(a->addr&0xffffu),
-                                   ((uint32_t)bb<<16)|(b->addr&0xffffu));
-                return sort_asc ? c < 0 : c > 0;
-            });
-        }
-    }
-
-    int to_remove_idx = -1;
-    for (size_t oi = 0; oi < order.size(); oi++) {
-        size_t i = order[oi];
-        const ConfigEntry *e = &project->ref_exclusions.items[i];
-        ImGui::PushID((int)i);
-        ImGui::TableNextRow();
-
-        ImGui::TableSetColumnIndex(0);
-        char addr_buf[32];
-        if (e->has_bank) {
-            snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x", e->bank,
-                     (unsigned)e->addr & 0xffff);
-        } else {
-            snprintf(addr_buf, sizeof(addr_buf), "0x%04x", (unsigned)e->addr & 0xffff);
-        }
-        ImGui::TextUnformatted(addr_buf);
-
-        ImGui::TableSetColumnIndex(1);
-        std::string lbl = label_at_address(document, state, e->bank, e->addr);
-        if (!lbl.empty()) {
-            ImGui::TextUnformatted(lbl.c_str());
-        } else {
-            ImGui::TextDisabled("-");
-        }
-
-        ImGui::TableSetColumnIndex(2);
-        if (ImGui::Button("Navigate")) {
-            size_t li;
-            if (apex_render_find_line_by_address(document, e->bank, e->addr, &li)) {
-                select_line(state, li, 1);
-            }
-        }
-        ImGui::SameLine();
-        if (ImGui::Button("Remove")) {
-            to_remove_idx = (int)i;
-        }
-        ImGui::PopID();
-    }
-    ImGui::EndTable();
-
-    if (to_remove_idx >= 0) {
-        const ConfigEntry *e = &project->ref_exclusions.items[to_remove_idx];
-        uint8_t bank = e->bank;
-        uint32_t addr = e->addr;
-        int has_bank = e->has_bank;
-        uint8_t sel_bank = 0;
-        uint32_t sel_addr = 0;
-        selected_address(document, state, &sel_bank, &sel_addr);
-        apex_project_remove_ref_exclusion(project, has_bank, bank, addr);
-        const ApexRenderedDocument *new_doc = apex_project_render(project, 1, 0);
-        if (new_doc) {
-            *document_ptr = new_doc;
-        }
-        state->labels_valid = false;
-        state->overlay_dirty = true;
-        set_status(state, "ref exclusion removed");
-    }
-}
-
 void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, UiState *s)
 {
     const ApexRenderedDocument *d = *document_ptr;
@@ -5147,45 +4592,10 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
         tex_w = map_w;
         tex_h = h;
 
-        /* Build per-byte kind array (same logic as hex view). */
-        std::vector<uint8_t> kinds(rom_size, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
-        {
-            uint8_t cur_kind = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
-            size_t fill = 0;
-            for (size_t li = 0; li < d->line_count; li++) {
-                const ApexRenderedLine *l = &d->lines[li];
-                if (!l->has_location) continue;
-                uint8_t lk = (uint8_t)l->block_kind;
-                if (l->block_kind == APEX_RENDER_BLOCK_DATA && l->text && l->length >= 3) {
-                    const char *tp = l->text;
-                    size_t rem = l->length;
-                    while (rem > 0 && (*tp == ' ' || *tp == '\t')) { tp++; rem--; }
-                    if ((rem >= 12 && memcmp(tp, "STRING_FIXED", 12) == 0 &&
-                         (rem == 12 || tp[12] == ' ' || tp[12] == '\t')) ||
-                        (rem >= 6 && memcmp(tp, "STRING", 6) == 0 &&
-                         (rem == 6 || tp[6] == ' ' || tp[6] == '\t')))
-                        lk = 7;
-                    else if (rem >= 3 && memcmp(tp, ".DW", 3) == 0 &&
-                             (rem == 3 || tp[3] == ' ' || tp[3] == '\t'))
-                        lk = 8;
-                    else if (rem >= 4 && memcmp(tp, "FAR_", 4) == 0)
-                        lk = 9;
-                    else if (is_dmd_fullframe_addr(p, l->bank, l->cpu_addr)) {
-                        lk = 10;
-                    }
-                }
-                if (l->rom_addr <= fill) {
-                    cur_kind = lk;
-                } else {
-                    size_t boundary = std::min(rom_size, l->rom_addr);
-                    while (fill < boundary)
-                        kinds[fill++] = cur_kind;
-                    cur_kind = lk;
-                }
-            }
-            while (fill < rom_size)
-                kinds[fill++] = cur_kind;
-        }
+        /* Per-byte extended kind array, shared with the Hex view (cached on the
+           document generation) — same classifier, one implementation. */
+        ensure_hex_kind_map(p, d, s);
+        const std::vector<uint8_t> &kinds = s->cached_hex_kinds;
 
         /* Convert kind array to RGBA pixels. */
         std::vector<uint8_t> pixels((size_t)tex_w * (size_t)tex_h * 4, 0);
@@ -5331,1931 +4741,3 @@ void render_rom_map(ApexProject *p, const ApexRenderedDocument **document_ptr, U
     }
 }
 
-void render_dmd_list_window(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
-    size_t dmd_count = 0;
-    for (size_t i = 0; i < p->data_ranges.count; i++)
-        if (p->data_ranges.items[i].kind == DATA_DMD_FULLFRAME)
-            dmd_count++;
-    ImGui::TextDisabled("(%zu frames)", dmd_count);
-
-    if (ImGui::BeginTable("dmd_list", 2,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,  110.0f, 0);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
-                                0.0f, 1);
-        ImGui::TableHeadersRow();
-
-        std::vector<size_t> dmd_rows;
-        for (size_t i = 0; i < p->data_ranges.count; i++)
-            if (p->data_ranges.items[i].kind == DATA_DMD_FULLFRAME)
-                dmd_rows.push_back(i);
-        {
-            int sort_col; bool sort_asc;
-            if (ui_table_sort(&sort_col, &sort_asc)) {
-                std::stable_sort(dmd_rows.begin(), dmd_rows.end(), [&](size_t ia, size_t ib) {
-                    const DataRange *a = &p->data_ranges.items[ia];
-                    const DataRange *b = &p->data_ranges.items[ib];
-                    int c = ui_cmp_u32(((uint32_t)a->bank<<16)|(a->addr&0xffffu),
-                                       ((uint32_t)b->bank<<16)|(b->addr&0xffffu));
-                    return sort_asc ? c < 0 : c > 0;
-                });
-            }
-        }
-
-        int row_id = 0;
-        for (size_t oi = 0; oi < dmd_rows.size(); oi++) {
-            const DataRange *dr = &p->data_ranges.items[dmd_rows[oi]];
-
-            char addrstr[32];
-            snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                     (unsigned)dr->bank, (unsigned)dr->addr & 0xffffu);
-            std::string lbl = label_at_address(d, s, dr->bank, dr->addr);
-            size_t li = 0;
-            bool found = apex_render_find_line_by_address(d, dr->bank, dr->addr, &li) != NULL;
-            bool sel = found && s->selected_line == li;
-
-            ImGui::PushID(row_id++);
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0);
-            if (ImGui::Selectable(addrstr, sel,
-                    ImGuiSelectableFlags_SpanAllColumns |
-                    ImGuiSelectableFlags_AllowOverlap)) {
-                if (found) select_line(s, li, 1);
-            }
-            if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
-                DmdPreviewInfo pr = {};
-                if (decode_dmd_preview_at(p, dr->bank, dr->addr, &pr)) {
-                    ImGui::BeginTooltip();
-                    render_dmd_preview(pr, 4.0f);
-                    ImGui::EndTooltip();
-                }
-            }
-            ImGui::TableSetColumnIndex(1);
-            ImGui::TextUnformatted(lbl.c_str());
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-}
-
-/* Resolve a WPC far pointer {cpu, bank} to a ROM offset.
-   Returns true on success.  bank == 0xFF means the system bank. */
-static bool vsi_resolve_far(const ApexProject *p,
-                             uint32_t cpu, uint8_t bank, size_t *out)
-{
-    if (bank == 0xFFu) {
-        if (cpu < 0x8000u || cpu >= 0x10000u) return false;
-        size_t o = p->paged_size + (cpu - 0x8000u);
-        if (o >= p->rom.size) return false;
-        *out = o;
-        return true;
-    }
-    if (cpu < 0x4000u || cpu >= 0x8000u) return false;
-    int bi = bank_index_for_far_ref(p->rom.data, p->banks, bank);
-    if (bi < 0) return false;
-    size_t o = (size_t)bi * 0x4000u + (cpu - 0x4000u);
-    if (o >= p->rom.size) return false;
-    *out = o;
-    return true;
-}
-
-/* Resolve a 16-bit near pointer from a ptr16_sprite table entry.
-   If cpu >= 0x8000 the target is in the system bank regardless of tbl_bank. */
-static bool ptr16_sprite_resolve(const ApexProject *p, uint32_t cpu, uint8_t tbl_bank,
-                                  size_t *out, uint8_t *out_bank)
-{
-    uint8_t effective_bank = (cpu >= 0x8000u) ? 0xFFu : tbl_bank;
-    if (!vsi_resolve_far(p, cpu, effective_bank, out)) return false;
-    *out_bank = effective_bank;
-    return true;
-}
-
-/* Scan the ROM for the WPC font-table code signature, walk the master VSI
-   table, and populate s->vsi_table_entries with every discoverable image. */
-static void scan_vsi_table_candidates(const ApexProject *p, UiState *s)
-{
-    s->vsi_table_entries.clear();
-    s->vsi_sub_tables.clear();
-    s->vsi_table_scan_done = true; /* set early so early-returns leave it true */
-
-    if (!p->rom.data || p->rom.size == 0 || p->paged_size >= p->rom.size)
-        return;
-
-    /* --- Step 1: find the LDX / ABX / ASLB code signature in system bank ---
-       Pattern (from WPCEdit initTableAddrs):
-         BE xx xx 3A 58 3A D6 ?? 34 04 (F6|BD) ?? ?? (BD|F6) ??
-       where xx xx is the system-bank CPU address of the 3-byte far pointer
-       that points to the font master table. */
-    const uint8_t *sys = p->rom.data + p->paged_size;
-    size_t sys_len = p->rom.size - p->paged_size;
-    size_t sig = SIZE_MAX;
-    for (size_t i = 0; i + 16u <= sys_len; i++) {
-        if (sys[i]    == 0xBEu &&
-            sys[i+3]  == 0x3Au && sys[i+4] == 0x58u &&
-            sys[i+5]  == 0x3Au && sys[i+6] == 0xD6u &&
-            sys[i+8]  == 0x34u && sys[i+9] == 0x04u &&
-            (sys[i+10] == 0xF6u || sys[i+10] == 0xBDu) &&
-            (sys[i+13] == 0xBDu || sys[i+13] == 0xF6u)) {
-            sig = i;
-            break;
-        }
-    }
-    if (sig == SIZE_MAX) return;
-
-    /* --- Step 2: extract the CPU address of the far-pointer cell ---
-       The LDX operand (bytes 1-2 of the pattern) is a system-bank address
-       that holds the 3-byte far pointer to the master table. */
-    uint32_t ptr_cpu = ((uint32_t)sys[sig+1] << 8) | sys[sig+2];
-    if (ptr_cpu < 0x8000u) return;
-    size_t ptr_off = p->paged_size + (ptr_cpu - 0x8000u);
-    if (ptr_off + 3u > p->rom.size) return;
-
-    /* --- Step 3: read the 3-byte far pointer → master table address ---
-       Force bank to 0xFF when cpu address is in system range (WPCEdit does
-       the same when the page byte is not a valid paged bank indicator). */
-    uint32_t master_cpu  = ((uint32_t)p->rom.data[ptr_off] << 8)
-                           | p->rom.data[ptr_off+1];
-    uint8_t  master_bank = p->rom.data[ptr_off+2];
-    if (master_cpu >= 0x8000u) master_bank = 0xFFu;
-
-    size_t master_off;
-    if (!vsi_resolve_far(p, master_cpu, master_bank, &master_off)) return;
-
-    /* --- Step 4: walk master table (array of 3-byte far pointers) ---
-       Stop at the first entry that cannot be parsed as a valid VSI sub-table
-       (matches WPCEdit's preAnalyzeVariableSizedImageTable behaviour). */
-    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
-
-    for (int tidx = 0; tidx < 512; tidx++) {
-        size_t eoff = master_off + (size_t)tidx * 3u;
-        if (eoff + 3u > p->rom.size) break;
-
-        uint32_t e_cpu  = ((uint32_t)p->rom.data[eoff] << 8) | p->rom.data[eoff+1];
-        uint8_t  e_bank = p->rom.data[eoff+2];
-        if (e_cpu >= 0x8000u) e_bank = 0xFFu;
-
-        /* First hop: resolve the far pointer from the master table entry. */
-        size_t inter_off;
-        if (!vsi_resolve_far(p, e_cpu, e_bank, &inter_off)) break;
-
-        /* Near-pointer fixup (some ROMs store a 2-byte near pointer at the
-           first hop instead of the sub-table directly).  If the 2-byte word
-           at the first hop is itself in the paged range, follow it (keeping
-           the same bank byte). */
-        if (inter_off + 2u <= p->rom.size) {
-            uint32_t tmp_cpu = ((uint32_t)p->rom.data[inter_off] << 8)
-                               | p->rom.data[inter_off+1];
-            if (tmp_cpu >= 0x4000u && tmp_cpu < 0x8000u)
-                e_cpu = tmp_cpu;
-        }
-
-        size_t sub_off;
-        if (!vsi_resolve_far(p, e_cpu, e_bank, &sub_off)) break;
-        if (sub_off + 4u > p->rom.size) break;
-
-        /* --- Step 5: parse the sub-table header ---
-           Layout: [ImgIndexMin][ImgIndexMax]... 0x00 [TableHeight] [TableSpacing]
-                   followed by total_images × 2-byte BE near pointers. */
-        const uint8_t *sub  = p->rom.data + sub_off;
-        size_t         slen = p->rom.size - sub_off;
-
-        size_t pos = 0;
-        int total_imgs = 0;
-        bool valid = true;
-        while (pos + 1u < slen && sub[pos] != 0x00u) {
-            uint8_t imin = sub[pos], imax = sub[pos+1];
-            if (imin > imax || total_imgs + (imax - imin + 1) > 512) {
-                valid = false; break;
-            }
-            total_imgs += (int)(imax - imin + 1);
-            pos += 2;
-        }
-        if (!valid || total_imgs == 0) break;
-        if (pos >= slen || sub[pos] != 0x00u) break;
-        pos++; /* skip terminator */
-
-        if (pos + 2u > slen) break;
-        uint8_t tbl_h = sub[pos++];
-        pos++; /* spacing byte */
-        if (tbl_h == 0 || tbl_h > 32) break;
-        if (pos + (size_t)total_imgs * 2u > slen) break;
-
-        /* Record sub-table metadata (pos = header length: pairs + terminator + H + spacing) */
-        {
-            uint8_t sb; uint32_t sa;
-            if (rom_offset_to_cpu_address(p, sub_off, &sb, &sa)) {
-                UiState::VsiSubTableInfo st;
-                st.table_idx   = tidx;
-                st.bank        = sb;
-                st.cpu_addr    = sa;
-                st.header_len  = pos;
-                st.num_images  = total_imgs;
-                st.table_height= tbl_h;
-                s->vsi_sub_tables.push_back(st);
-            }
-        }
-
-        /* --- Step 6: enumerate images in this sub-table --- */
-        for (int iidx = 0; iidx < total_imgs; iidx++) {
-            size_t ppos = pos + (size_t)iidx * 2u;
-            uint32_t img_cpu = ((uint32_t)sub[ppos] << 8) | sub[ppos+1];
-
-            size_t img_off;
-            uint8_t img_effective_bank;
-            if (!ptr16_sprite_resolve(p, img_cpu, e_bank, &img_off, &img_effective_bank)) continue;
-
-            const uint8_t *img = p->rom.data + img_off;
-            size_t img_len = p->rom.size - img_off;
-
-            uint8_t img_bank_out;
-            uint32_t img_cpu_out;
-            if (!rom_offset_to_cpu_address(p, img_off, &img_bank_out, &img_cpu_out))
-                continue;
-
-            uint8_t b0 = img_len > 0 ? img[0] : 0;
-            bool is_nh = false;
-            uint8_t w = 0, h = 0;
-            bool decoded = false;
-
-            if (b0 == 0x00u || b0 == 0xFDu || b0 == 0xFEu || b0 == 0xFFu) {
-                uint8_t ht, vb, hb, enc; size_t con;
-                if (apexsprite_decode(img, img_len, tmp,
-                                      &ht, &vb, &hb, &w, &h, &enc, &con))
-                    decoded = true;
-            } else if (b0 >= 1u && b0 <= 128u) {
-                uint8_t pw; size_t con;
-                if (apexsprite_decode_noheader(img, img_len, tmp,
-                                               tbl_h, &pw, &con)) {
-                    w = pw; h = tbl_h; is_nh = true; decoded = true;
-                }
-            }
-            if (!decoded) continue;
-
-            bool classified = false;
-            for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
-                const DataRange *dr = &p->data_ranges.items[ri];
-                if ((dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER) &&
-                    dr->bank == img_bank_out && dr->addr == img_cpu_out) {
-                    classified = true; break;
-                }
-            }
-
-            UiState::VsiTableEntry e;
-            e.table_idx   = tidx;
-            e.image_idx   = iidx;
-            e.table_height= tbl_h;
-            e.bank        = img_bank_out;
-            e.cpu_addr    = img_cpu_out;
-            e.rom_offset  = img_off;
-            e.is_noheader = is_nh;
-            e.width       = w;
-            e.height      = h;
-            e.classified  = classified;
-            s->vsi_table_entries.push_back(e);
-        }
-    }
-}
-
-/* Bulk-classify a complete VSI sub-table: header bytes + pointer-array table + all images. */
-/* Classify one VSI sub-table's descriptor + pointer array, no re-analysis.
-   The image data ranges are produced later by inject_sprite_table_data_ranges
-   (a full analysis).  Caller wraps this in an edit group and triggers the
-   re-analysis / rescan. */
-static void classify_vsi_table_core(ApexProject *p, UiState *s, int table_idx)
-{
-    const UiState::VsiSubTableInfo *st = nullptr;
-    for (auto &t : s->vsi_sub_tables) {
-        if (t.table_idx == table_idx) { st = &t; break; }
-    }
-    if (!st) return;
-
-    /* Sub-table header bytes (min/max pairs + 0x00 + height + spacing).  The raw
-       bytes[] carry no semantics on their own, so attach a doc comment that
-       explains the descriptor layout and what the table holds. */
-    if (st->header_len > 0) {
-        char spec[32];
-        snprintf(spec, sizeof(spec), "bytes[%zu]", st->header_len);
-        apex_project_set_kind(p, 1, st->bank, st->cpu_addr, APEX_KIND_DATA, spec);
-
-        char doc[128];
-        snprintf(doc, sizeof(doc),
-                 "VSI sub-table header: %d image(s), height %u px "
-                 "[index-range pairs, 0x00, height, spacing]",
-                 st->num_images, (unsigned)st->table_height);
-        apex_project_set_doc(p, 1, st->bank, st->cpu_addr, doc);
-    }
-
-    /* Pointer array: rows[N](ptr16_sprite(H)).  The height parameter lets the
-       analyser auto-classify the pointed-to images (header-format images are
-       self-describing; no-header ones need this height). */
-    if (st->num_images > 0) {
-        uint32_t ptr_addr = st->cpu_addr + (uint32_t)st->header_len;
-        char spec[64];
-        snprintf(spec, sizeof(spec), "rows[%d](ptr16_sprite(%d))",
-                 st->num_images, (int)st->table_height);
-        apex_project_set_kind(p, 1, st->bank, ptr_addr, APEX_KIND_TABLE, spec);
-    }
-}
-
-static void classify_vsi_table(ApexProject *p, const ApexRenderedDocument **dp,
-                               UiState *s, int table_idx)
-{
-    uint8_t b = 0xffu; uint32_t a = 0;
-    for (auto &t : s->vsi_sub_tables) {
-        if (t.table_idx == table_idx) { b = t.bank; a = t.cpu_addr; break; }
-    }
-    /* One logical action -> one undo step. */
-    apex_project_begin_edit_group(p, "classify VSI table");
-    classify_vsi_table_core(p, s, table_idx);
-    apex_project_end_edit_group(p);
-
-    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS);
-    rerender_and_reselect(p, dp, s, b, a);
-    scan_vsi_table_candidates(p, s);
-}
-
-/* Classify every detected VSI sub-table in one undo step / one re-analysis. */
-static void classify_all_vsi_tables(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
-    /* Snapshot the table indices first: classify_vsi_table_core doesn't rescan,
-       so vsi_sub_tables is stable during the loop, but copying is robust. */
-    std::vector<int> idxs;
-    for (auto &t : s->vsi_sub_tables) idxs.push_back(t.table_idx);
-    if (idxs.empty()) return;
-
-    uint8_t keep_b = 0xffu; uint32_t keep_a = 0;
-    selected_address(*dp, s, &keep_b, &keep_a);
-
-    apex_project_begin_edit_group(p, "classify all VSI tables");
-    for (int idx : idxs) classify_vsi_table_core(p, s, idx);
-    apex_project_end_edit_group(p);
-
-    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS);
-    rerender_and_reselect(p, dp, s, keep_b, keep_a);
-    scan_vsi_table_candidates(p, s);
-    set_status(s, "classified all VSI tables");
-}
-
-/* Build a per-byte block-kind map of the ROM from the rendered document, the
-   same forward-fill used by the coverage panel.  Used to restrict the sprite
-   scan to not-yet-classified bytes. */
-static void build_kind_map(const ApexProject *p, const ApexRenderedDocument *d,
-                           std::vector<uint8_t> &kinds)
-{
-    size_t rom_size = p->rom.size, i, fill = 0;
-    uint8_t cur = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
-
-    kinds.assign(rom_size, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
-    if (!d) return;
-    for (i = 0; i < d->line_count && fill < rom_size; i++) {
-        const ApexRenderedLine *l = &d->lines[i];
-        if (!l->has_location) continue;
-        if (l->rom_addr <= fill) {
-            cur = (uint8_t)l->block_kind;
-        } else {
-            size_t end = l->rom_addr < rom_size ? l->rom_addr : rom_size;
-            while (fill < end) kinds[fill++] = cur;
-            cur = (uint8_t)l->block_kind;
-        }
-    }
-    while (fill < rom_size) kinds[fill++] = cur;
-}
-
-static void scan_sprite_candidates(const ApexProject *p, const ApexRenderedDocument *d,
-                                   UiState *s)
-{
-    s->sprite_candidates.clear();
-    if (!p->rom.data || p->rom.size == 0) {
-        s->sprite_scan_done = true;
-        return;
-    }
-    /* Only scan bytes that aren't already classified — this drops the bulk of
-       false hits that land inside known code/data/table/sprite regions. */
-    std::vector<uint8_t> kinds;
-    build_kind_map(p, d, kinds);
-    uint8_t tmp[APEX_SPRITE_MAX_BYTES];
-    for (size_t off = 0; off < p->rom.size; off++) {
-        uint8_t k = kinds[off];
-        if (k != (uint8_t)APEX_RENDER_BLOCK_UNKNOWN &&
-            k != (uint8_t)APEX_RENDER_BLOCK_UNCLASSIFIED)
-            continue;
-        uint8_t b0 = p->rom.data[off];
-        if (b0 != 0x00u && b0 != 0xFDu && b0 != 0xFEu && b0 != 0xFFu)
-            continue;
-        const uint8_t *src = p->rom.data + off;
-        size_t src_size = p->rom.size - off;
-        uint8_t htype, voff_b, hoff_b, width, height, enc_type;
-        size_t consumed;
-        if (!apexsprite_decode(src, src_size, tmp, &htype, &voff_b, &hoff_b,
-                               &width, &height, &enc_type, &consumed))
-            continue;
-        uint8_t bank;
-        uint32_t cpu_addr;
-        if (!rom_offset_to_cpu_address(p, off, &bank, &cpu_addr))
-            continue;
-        bool classified = false;
-        for (size_t ri = 0; ri < p->data_ranges.count; ri++) {
-            const DataRange *dr = &p->data_ranges.items[ri];
-            if (dr->kind == DATA_SPRITE && dr->bank == bank && dr->addr == cpu_addr) {
-                classified = true;
-                break;
-            }
-        }
-        UiState::SpriteScanEntry e;
-        e.bank        = bank;
-        e.cpu_addr    = cpu_addr;
-        e.rom_offset  = off;
-        e.header_type = htype;
-        e.enc_type    = enc_type;
-        e.width       = width;
-        e.height      = height;
-        e.consumed    = consumed;
-        e.classified  = classified;
-        s->sprite_candidates.push_back(e);
-    }
-    s->sprite_scan_done = true;
-}
-
-/* Jump the disassembly and hex views to a sprite at (bank, addr).  The hex
-   cursor lands on the exact sprite offset even when the sprite sits inside a
-   larger data block whose disassembly line starts earlier. */
-static void sprite_navigate(ApexProject *p, const ApexRenderedDocument *d, UiState *s,
-                            uint8_t bank, uint32_t addr)
-{
-    const uint8_t *src;
-    size_t len = 0, off = 0;
-    size_t li = 0;
-
-    if (!project_locate_rom_bytes(p, bank, addr, &src, &len, &off)) {
-        return;
-    }
-    if (d && find_line_by_rom_offset(d, off, &li)) {
-        select_line(s, li, 1);
-    }
-    /* Point the hex cursor at the exact sprite offset and suppress the
-       disasm->hex re-sync that would otherwise snap it to the line start. */
-    s->hex_selected_offset    = off;
-    s->hex_active             = true;
-    s->hex_is_edit_target     = true;
-    s->hex_request_follow     = 1;
-    s->hex_prev_selected_line = s->selected_line;
-    /* Make both views visible so the jump is observable. */
-    s->show_disasm = true;
-    s->show_hex    = true;
-}
-
-static bool sprite_addr_classified(const ApexProject *p, uint8_t bank, uint32_t addr)
-{
-    for (size_t i = 0; i < p->data_ranges.count; i++) {
-        const DataRange *dr = &p->data_ranges.items[i];
-        if ((dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER) &&
-            dr->bank == bank && dr->addr == addr) {
-            return true;
-        }
-    }
-    return false;
-}
-
-/* Re-derive the cached "classified" flags from the live config so the sprite
-   windows reflect classify/clear edits — including undo/redo — without a
-   re-scan. */
-static void refresh_sprite_classified(const ApexProject *p, UiState *s)
-{
-    for (auto &e : s->vsi_table_entries)
-        e.classified = sprite_addr_classified(p, e.bank, e.cpu_addr);
-    for (auto &e : s->sprite_candidates)
-        e.classified = sprite_addr_classified(p, e.bank, e.cpu_addr);
-}
-
-void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
-    /* Auto-run the (cheap, structured) VSI table scan the first time the window
-       is shown so sprites appear without a manual click; the ROM byte scan stays
-       on its button. */
-    if (!s->vsi_table_scan_done) {
-        scan_vsi_table_candidates(p, s);
-    }
-    refresh_sprite_classified(p, s);
-    const ApexRenderedDocument *d = *dp;
-    size_t classified_count = 0;
-    for (size_t i = 0; i < p->data_ranges.count; i++) {
-        DataKind k = p->data_ranges.items[i].kind;
-        if (k == DATA_SPRITE || k == DATA_SPRITE_NOHEADER)
-            classified_count++;
-    }
-
-    if (ImGui::Button("Scan VSI Tables")) {
-        scan_vsi_table_candidates(p, s);
-    }
-    ImGui::SameLine();
-    if (ImGui::Button("Scan ROM")) {
-        scan_sprite_candidates(p, d, s);
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Find sprite candidates in not-yet-classified ROM regions.\n"
-                          "Review each (hover/Gallery) and click Classify to apply.");
-    ImGui::SameLine();
-    if (ImGui::Button("Gallery")) {
-        s->show_sprite_gallery = true;
-    }
-    ImGui::SameLine();
-    {
-        size_t vsi_count  = s->vsi_table_scan_done ? s->vsi_table_entries.size() : 0;
-        size_t cand_count = 0;
-        if (s->sprite_scan_done) {
-            for (auto &e : s->sprite_candidates)
-                if (!e.classified &&
-                    e.width  >= s->sprite_filter_min_w && e.width  <= s->sprite_filter_max_w &&
-                    e.height >= s->sprite_filter_min_h && e.height <= s->sprite_filter_max_h)
-                    cand_count++;
-        }
-        ImGui::TextDisabled("(%zu classified, %zu vsi, %zu scan)",
-                            classified_count, vsi_count, cand_count);
-    }
-
-    /* Filter controls. InputInt's width is the whole widget (field + the two
-       step buttons), so size it to fit a 3-digit field plus both buttons; derive
-       it from font metrics so it stays correct under font zoom. */
-    const float sp_field_w = ImGui::CalcTextSize("000").x + ImGui::GetStyle().FramePadding.x * 2.0f +
-                             (ImGui::GetFrameHeight() + ImGui::GetStyle().ItemInnerSpacing.x) * 2.0f;
-    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("W min", &s->sprite_filter_min_w);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("W max", &s->sprite_filter_max_w);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("H min", &s->sprite_filter_min_h);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(sp_field_w); ImGui::InputInt("H max", &s->sprite_filter_max_h);
-    s->sprite_filter_min_w = std::max(1, std::min(s->sprite_filter_min_w, 128));
-    s->sprite_filter_max_w = std::max(s->sprite_filter_min_w, std::min(s->sprite_filter_max_w, 128));
-    s->sprite_filter_min_h = std::max(1, std::min(s->sprite_filter_min_h, 32));
-    s->sprite_filter_max_h = std::max(s->sprite_filter_min_h, std::min(s->sprite_filter_max_h, 32));
-
-    /* --- VSI Sub-Table overview (shown when scan produced results) --- */
-    if (s->vsi_table_scan_done && !s->vsi_sub_tables.empty()) {
-        ImGui::Separator();
-        ImGui::TextDisabled("VSI sub-tables — click Classify to apply all entries to config");
-        ImGui::SameLine();
-        if (ImGui::SmallButton("Classify all##vsi")) {
-            classify_all_vsi_tables(p, dp, s);
-            d = *dp; /* document + sub-table scan rebuilt; refresh local pointer */
-        }
-
-        if (ImGui::BeginTable("vsi_subtables", 6,
-                ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV |
-                ImGuiTableFlags_SizingFixedFit)) {
-            ImGui::TableSetupColumn("Tbl",   0, 30.0f);
-            ImGui::TableSetupColumn("Address", 0, 110.0f);
-            ImGui::TableSetupColumn("H",     0, 25.0f);
-            ImGui::TableSetupColumn("Imgs",  0, 35.0f);
-            ImGui::TableSetupColumn("Hdr",   0, 35.0f);
-            ImGui::TableSetupColumn("",      0, 90.0f); /* Classify button */
-            ImGui::TableHeadersRow();
-
-            /* Precompute per-table (pass, done) counts in a single pass instead
-               of re-scanning every entry for every sub-table row. */
-            std::map<int, std::pair<int, int>> tbl_counts;
-            for (auto &e : s->vsi_table_entries) {
-                if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-                if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-                auto &c = tbl_counts[e.table_idx];
-                c.first++;
-                if (e.classified) c.second++;
-            }
-
-            bool vsi_reclassified = false;
-            for (auto &st : s->vsi_sub_tables) {
-                int pass = tbl_counts[st.table_idx].first;
-                int done = tbl_counts[st.table_idx].second;
-
-                ImGui::PushID(st.table_idx);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::Text("T%d", st.table_idx);
-                ImGui::TableSetColumnIndex(1);
-                {
-                    char addrstr[32];
-                    snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                             (unsigned)st.bank, (unsigned)st.cpu_addr & 0xffffu);
-                    size_t li = 0;
-                    bool found = apex_render_find_line_by_address(d, st.bank, st.cpu_addr, &li) != NULL;
-                    if (ImGui::SmallButton(addrstr) && found)
-                        select_line(s, li, 1);
-                }
-                ImGui::TableSetColumnIndex(2);
-                ImGui::Text("%u", (unsigned)st.table_height);
-                ImGui::TableSetColumnIndex(3);
-                ImGui::Text("%d", st.num_images);
-                ImGui::TableSetColumnIndex(4);
-                ImGui::Text("%zu", st.header_len);
-                ImGui::TableSetColumnIndex(5);
-                bool all_done = (done == pass && pass == st.num_images);
-                if (all_done) {
-                    ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.0f, 1.0f), "classified");
-                } else {
-                    char btn[24];
-                    snprintf(btn, sizeof(btn), "Classify##t%d", st.table_idx);
-                    if (ImGui::SmallButton(btn)) {
-                        int tidx = st.table_idx; /* copy before vsi_sub_tables is invalidated */
-                        classify_vsi_table(p, dp, s, tidx);
-                        d = *dp;
-                        vsi_reclassified = true;
-                    }
-                    if (!vsi_reclassified && done > 0) {
-                        ImGui::SameLine();
-                        ImGui::TextDisabled("%d/%d", done, st.num_images);
-                    }
-                }
-                ImGui::PopID();
-                if (vsi_reclassified) break; /* vsi_sub_tables was rebuilt — must not iterate further */
-            }
-            ImGui::EndTable();
-        }
-        ImGui::Separator();
-    } else if (s->vsi_table_scan_done && s->vsi_sub_tables.empty()) {
-        ImGui::TextDisabled("VSI table signature not found in this ROM.");
-        ImGui::Separator();
-    }
-
-    /* Build a flat list of rows to display (cheap metadata only — no sprite
-       decoding here).  The table is then virtualised with ImGuiListClipper so
-       per-row work (label lookup, line lookup, and sprite decode for size/hover)
-       only happens for the handful of rows actually on screen.  Decoding every
-       sprite every frame was what made this window crawl with many sprites. */
-    enum RowSrc { ROW_VSI, ROW_CLASS, ROW_SCAN };
-    struct SpriteRow {
-        RowSrc   src;
-        uint8_t  bank;
-        uint32_t addr;
-        uint16_t w, h;        /* known for VSI/SCAN; 0 for CLASS (decode on demand) */
-        bool     is_noheader;
-        bool     classified;  /* VSI: already applied to config */
-        int      table_idx, image_idx;  /* VSI */
-        bool     class_noheader;         /* CLASS: DATA_SPRITE_NOHEADER */
-    };
-    std::vector<SpriteRow> rows;
-
-    if (s->vsi_table_scan_done) {
-        for (auto &e : s->vsi_table_entries) {
-            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-            rows.push_back({ROW_VSI, e.bank, e.cpu_addr, e.width, e.height,
-                            e.is_noheader, e.classified, e.table_idx, e.image_idx, false});
-        }
-    }
-    for (size_t i = 0; i < p->data_ranges.count; i++) {
-        const DataRange *dr = &p->data_ranges.items[i];
-        if (dr->kind != DATA_SPRITE && dr->kind != DATA_SPRITE_NOHEADER) continue;
-        rows.push_back({ROW_CLASS, dr->bank, dr->addr, 0, 0, false, false, 0, 0,
-                        dr->kind == DATA_SPRITE_NOHEADER});
-    }
-    if (s->sprite_scan_done) {
-        for (auto &e : s->sprite_candidates) {
-            if (e.classified) continue;
-            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-            rows.push_back({ROW_SCAN, e.bank, e.cpu_addr, e.width, e.height,
-                            false, false, 0, 0, false});
-        }
-    }
-
-    /* Deferred classify: applied after the table loop so we never mutate the
-       config / rerender while iterating the clipped rows. */
-    bool     do_classify = false;
-    uint8_t  cls_bank = 0;
-    uint32_t cls_addr = 0;
-    bool     cls_noheader = false;
-
-    if (ImGui::BeginTable("sprite_list", 5,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed,   110.0f, 0);
-        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,    60.0f, 1);
-        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed,    90.0f, 2);
-        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed,    60.0f, 3);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort,
-                                0.0f, 4);
-        ImGui::TableHeadersRow();
-
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc)) {
-            std::stable_sort(rows.begin(), rows.end(),
-                [&](const SpriteRow &a, const SpriteRow &b) {
-                    int c = 0;
-                    switch (sort_col) {
-                    case 0: c = ui_cmp_u32(((uint32_t)a.bank<<16)|a.addr,
-                                           ((uint32_t)b.bank<<16)|b.addr); break;
-                    case 1: c = ui_cmp_int(a.w*a.h, b.w*b.h); break;
-                    case 2: c = ui_cmp_int(a.src, b.src); break;
-                    case 3: c = a.table_idx != b.table_idx ? ui_cmp_int(a.table_idx, b.table_idx)
-                                                           : ui_cmp_int(a.image_idx, b.image_idx); break;
-                    }
-                    return sort_asc ? c < 0 : c > 0;
-                });
-        }
-
-        ImGuiListClipper clipper;
-        clipper.Begin((int)rows.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                const SpriteRow &r = rows[(size_t)row];
-                char addrstr[32];
-                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                         (unsigned)r.bank, (unsigned)r.addr & 0xffffu);
-                std::string lbl = label_at_address(d, s, r.bank, r.addr);
-                size_t li = 0;
-                bool found = apex_render_find_line_by_address(d, r.bank, r.addr, &li) != NULL;
-                bool sel = found && s->selected_line == li;
-
-                /* CLASS rows need a decode to show their size; reuse it for the
-                   hover preview.  VSI/SCAN already carry dimensions. */
-                SpritePreviewInfo pr = {};
-                bool have_pr = false;
-                if (r.src == ROW_CLASS)
-                    have_pr = decode_sprite_preview_at(p, r.bank, r.addr, &pr) != 0;
-
-                ImGui::PushID(row);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                if (ImGui::Selectable(addrstr, sel,
-                        ImGuiSelectableFlags_SpanAllColumns |
-                        ImGuiSelectableFlags_AllowOverlap)) {
-                    sprite_navigate(p, d, s, r.bank, r.addr);
-                }
-                if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenOverlappedByItem)) {
-                    if (r.src != ROW_CLASS)
-                        have_pr = decode_sprite_preview_at(p, r.bank, r.addr, &pr) != 0;
-                    if (have_pr) {
-                        ImGui::BeginTooltip();
-                        render_sprite_preview(pr, 6.0f);
-                        if (r.src == ROW_VSI) {
-                            char info[64];
-                            snprintf(info, sizeof(info), "T%d I%d  %ux%u  %s",
-                                     r.table_idx, r.image_idx,
-                                     (unsigned)r.w, (unsigned)r.h,
-                                     r.is_noheader ? "no-hdr" : "hdr");
-                            ImGui::TextUnformatted(info);
-                        }
-                        ImGui::EndTooltip();
-                    }
-                }
-                ImGui::TableSetColumnIndex(1);
-                if (r.src == ROW_CLASS) {
-                    if (have_pr) ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
-                    else         ImGui::TextDisabled("?");
-                } else {
-                    ImGui::Text("%ux%u", (unsigned)r.w, (unsigned)r.h);
-                }
-                ImGui::TableSetColumnIndex(2);
-                if (r.src == ROW_VSI) {
-                    if (r.classified)
-                        ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
-                                           r.is_noheader ? "vsi_nh*" : "vsi*");
-                    else
-                        ImGui::TextColored(ImVec4(0.6f, 1.0f, 0.6f, 1.0f),
-                                           r.is_noheader ? "vsi_nh" : "vsi");
-                } else if (r.src == ROW_CLASS) {
-                    ImGui::TextColored(ImVec4(0.47f, 0.86f, 1.00f, 1.0f),
-                                       r.class_noheader ? "spr_nh" : "sprite");
-                } else {
-                    /* Manual qualification: apply this scan candidate as a
-                       sprite only on explicit click (undoable single edit). */
-                    if (ImGui::SmallButton("Classify")) {
-                        do_classify  = true;
-                        cls_bank     = r.bank;
-                        cls_addr     = r.addr;
-                        cls_noheader = false;
-                    }
-                }
-                ImGui::TableSetColumnIndex(3);
-                if (r.src == ROW_VSI)
-                    ImGui::Text("T%d I%d", r.table_idx, r.image_idx);
-                ImGui::TableSetColumnIndex(4);
-                ImGui::TextUnformatted(lbl.c_str());
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-
-    if (do_classify) {
-        if (apex_project_set_kind(p, 1, cls_bank, cls_addr, APEX_KIND_DATA,
-                                  cls_noheader ? "sprite_noheader" : "sprite") == 0) {
-            rerender_and_reselect(p, dp, s, cls_bank, cls_addr);
-        }
-    }
-}
-
-/* Draw a decoded sprite image into a fixed (box_w × box_h) cell, scaled to fit
-   while preserving aspect ratio.  Reserves exactly the box so gallery table rows
-   stay uniform height (required by ImGuiListClipper).  Only lit pixels are
-   drawn over a dark background to keep the rect count down. */
-static void draw_sprite_thumbnail(const SpritePreviewInfo &pr, float box_w, float box_h, int zoom)
-{
-    ImVec2 origin = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(box_w, box_h)); /* fixed-size cell keeps clipper rows uniform */
-    if (!pr.valid || pr.width == 0 || pr.height == 0) {
-        return;
-    }
-    /* Render at original size times the zoom factor (top-left aligned), clipped
-       to the box, so sprites of different proportions are shown undistorted
-       rather than stretched to the row height. */
-    float z = zoom < 1 ? 1.0f : (float)zoom;
-    float img_w = (float)pr.width  * z < box_w ? (float)pr.width  * z : box_w;
-    float img_h = (float)pr.height * z < box_h ? (float)pr.height * z : box_h;
-    ImDrawList *draw = ImGui::GetWindowDrawList();
-    draw->AddRectFilled(origin, ImVec2(origin.x + img_w, origin.y + img_h),
-                        IM_COL32(6, 18, 28, 255));
-    uint8_t row_bytes = (uint8_t)((pr.width + 7u) / 8u);
-    for (uint8_t row = 0; row < pr.height && (float)row * z < box_h; row++) {
-        for (uint8_t col_byte = 0; col_byte < row_bytes; col_byte++) {
-            /* OR both planes for a clear silhouette. */
-            uint8_t bits = pr.pixels[row * row_bytes + col_byte] |
-                           (pr.two_plane ? pr.pixels1[row * row_bytes + col_byte] : 0u);
-            if (!bits) continue;
-            for (size_t bit = 0; bit < 8u; bit++) {
-                int px = (int)(col_byte * 8u + bit);
-                if (px >= (int)pr.width || (float)px * z >= box_w) break;
-                if (!((bits >> bit) & 1u)) continue;
-                ImVec2 p0(origin.x + (float)px * z, origin.y + (float)row * z);
-                draw->AddRectFilled(p0, ImVec2(p0.x + z, p0.y + z),
-                                    IM_COL32(120, 220, 255, 255));
-            }
-        }
-    }
-}
-
-/* Gallery view: every detected/defined sprite as a thumbnail image alongside its
-   address and label.  Sources (classified data ranges, VSI table entries, ROM
-   scan candidates) are merged and de-duplicated by address.  Virtualised with a
-   clipper so only the on-screen thumbnails are decoded and drawn each frame. */
-void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
-    const ApexRenderedDocument *d = *dp;
-
-    if (!s->vsi_table_scan_done) {
-        scan_vsi_table_candidates(p, s);
-    }
-    refresh_sprite_classified(p, s);
-
-    /* Merge + de-dup the three sources by (bank, addr); classified always shown,
-       VSI/scan respect the dimension filter (same as the Sprites list). */
-    std::vector<std::pair<uint8_t, uint32_t>> items;
-    for (size_t i = 0; i < p->data_ranges.count; i++) {
-        const DataRange *dr = &p->data_ranges.items[i];
-        if (dr->kind == DATA_SPRITE || dr->kind == DATA_SPRITE_NOHEADER)
-            items.push_back({dr->bank, dr->addr});
-    }
-    if (s->vsi_table_scan_done) {
-        for (auto &e : s->vsi_table_entries) {
-            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-            items.push_back({e.bank, e.cpu_addr});
-        }
-    }
-    if (s->sprite_scan_done) {
-        for (auto &e : s->sprite_candidates) {
-            if (e.classified) continue;
-            if (e.width  < s->sprite_filter_min_w || e.width  > s->sprite_filter_max_w) continue;
-            if (e.height < s->sprite_filter_min_h || e.height > s->sprite_filter_max_h) continue;
-            items.push_back({e.bank, e.cpu_addr});
-        }
-    }
-    std::sort(items.begin(), items.end());
-    items.erase(std::unique(items.begin(), items.end()), items.end());
-
-    ImGui::TextDisabled("%zu sprite(s) — scan VSI/ROM in the Sprites window to add more",
-                        items.size());
-    if (items.empty()) {
-        return;
-    }
-
-    if (s->sprite_gallery_zoom < 1) s->sprite_gallery_zoom = 1;
-    ImGui::TextUnformatted("Zoom:");
-    ImGui::SameLine();
-    ImGui::RadioButton("1x", &s->sprite_gallery_zoom, 1); ImGui::SameLine();
-    ImGui::RadioButton("2x", &s->sprite_gallery_zoom, 2); ImGui::SameLine();
-    ImGui::RadioButton("4x", &s->sprite_gallery_zoom, 4);
-
-    /* Rows sized to the DMD/sprite maximum (32px) times the zoom; sprites render
-       at original size * zoom inside, top-left aligned. */
-    const int   zoom = s->sprite_gallery_zoom;
-    const float kImgW = 132.0f * (float)zoom;
-    const float kImgH = 32.0f * (float)zoom;
-
-    bool     do_classify = false;
-    uint8_t  cls_bank = 0;
-    uint32_t cls_addr = 0;
-
-    if (ImGui::BeginTable("sprite_gallery", 4,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Image",   ImGuiTableColumnFlags_WidthFixed, kImgW + 6.0f);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Size",    ImGuiTableColumnFlags_WidthFixed,  55.0f);
-        ImGui::TableSetupColumn("Label",   ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-
-        ImGuiListClipper clipper;
-        clipper.Begin((int)items.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                uint8_t  bank = items[(size_t)row].first;
-                uint32_t addr = items[(size_t)row].second;
-
-                SpritePreviewInfo pr = {};
-                bool have_pr = decode_sprite_preview_at(p, bank, addr, &pr) != 0;
-
-                char addrstr[32];
-                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x",
-                         (unsigned)bank, (unsigned)addr & 0xffffu);
-                std::string lbl = label_at_address(d, s, bank, addr);
-                size_t li = 0;
-                bool found = apex_render_find_line_by_address(d, bank, addr, &li) != NULL;
-                bool sel = found && s->selected_line == li;
-
-                ImGui::PushID(row);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                draw_sprite_thumbnail(pr, kImgW, kImgH, zoom);
-                ImGui::TableSetColumnIndex(1);
-                if (ImGui::Selectable(addrstr, sel,
-                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
-                    sprite_navigate(p, d, s, bank, addr);
-                }
-                ImGui::TableSetColumnIndex(2);
-                if (have_pr) ImGui::Text("%ux%u", (unsigned)pr.width, (unsigned)pr.height);
-                else         ImGui::TextDisabled("?");
-                ImGui::TableSetColumnIndex(3);
-                ImGui::TextUnformatted(lbl.c_str());
-                if (!sprite_addr_classified(p, bank, addr)) {
-                    ImGui::SameLine();
-                    if (ImGui::SmallButton("Classify")) {
-                        do_classify = true;
-                        cls_bank = bank;
-                        cls_addr = addr;
-                    }
-                }
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-
-    if (do_classify) {
-        if (apex_project_set_kind(p, 1, cls_bank, cls_addr, APEX_KIND_DATA, "sprite") == 0) {
-            rerender_and_reselect(p, dp, s, cls_bank, cls_addr);
-        }
-    }
-}
-
-// ============================================================
-// ROM Info panel
-// ============================================================
-
-void render_rom_info(const ApexProject *p, UiState *state)
-{
-    RomInfoState &ri = state->rom_info;
-
-    if (!ri.computed) {
-        if (p->rom.data && p->rom.size >= 32768u) {
-            ApexRomInfo info;
-            apex_rominfo_compute(p->rom.data, p->rom.size, &info);
-            ri.os_valid    = info.os_valid;
-            ri.os_major    = info.os_major;
-            ri.os_minor    = info.os_minor;
-            ri.reset_addr  = info.reset_addr;
-            memcpy(ri.game_version, info.game_version, sizeof(ri.game_version));
-            ri.stored_csum  = info.stored_csum;
-            ri.computed_csum = info.computed_csum;
-            ri.stored_delta  = info.stored_delta;
-            ri.crc32_val     = info.crc32_val;
-            memcpy(ri.sha1,   info.sha1,   20);
-            memcpy(ri.sha256, info.sha256, 32);
-            ri.computed = true;
-        } else {
-            ImGui::TextDisabled("No ROM loaded.");
-            return;
-        }
-    }
-
-    const char *rom_name = p->rom_path ? p->rom_path : "(unknown)";
-    /* Show just the filename */
-    const char *base = strrchr(rom_name, '/');
-    if (!base) base = strrchr(rom_name, '\\');
-    if (!base) base = rom_name - 1;
-    ImGui::TextUnformatted(base + 1);
-
-    size_t rom_size = p->rom.size;
-    if (rom_size >= 1048576u)
-        ImGui::Text("%zu bytes (%zu MB)", rom_size, rom_size / 1048576u);
-    else
-        ImGui::Text("%zu bytes (%zu KB)", rom_size, rom_size / 1024u);
-
-    ImGui::Separator();
-
-    if (ImGui::BeginTable("##rominfo", 2,
-            ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX)) {
-        ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthStretch);
-
-        auto row = [&](const char *label, const char *value) {
-            ImGui::TableNextRow();
-            ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("%s", label);
-            ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(value);
-        };
-        auto rowf = [&](const char *label, const char *fmt, ...) {
-            char buf[128]; va_list ap; va_start(ap, fmt); vsnprintf(buf, sizeof(buf), fmt, ap); va_end(ap);
-            row(label, buf);
-        };
-
-        /* OS version */
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("OS Version");
-        ImGui::TableSetColumnIndex(1);
-        if (ri.os_valid)
-            ImGui::Text("%u.%u", (unsigned)ri.os_major, (unsigned)ri.os_minor);
-        else
-            ImGui::TextDisabled("unknown (reset 0x%04X)", ri.reset_addr);
-
-        /* Game version */
-        row("Game Version", ri.game_version[0] ? ri.game_version : "(not found)");
-
-        ImGui::TableNextRow(); /* spacer */
-
-        /* Checksum */
-        rowf("Checksum", "0x%04X (stored)  0x%04X (computed)",
-             ri.stored_csum, ri.computed_csum);
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Status");
-        ImGui::TableSetColumnIndex(1);
-        if (ri.computed_csum == ri.stored_csum)
-            ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "VALID");
-        else
-            ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "INVALID");
-
-        ImGui::TableNextRow();
-        ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("Delta");
-        ImGui::TableSetColumnIndex(1);
-        if (ri.stored_delta == APEX_ROMINFO_DISABLE_DELTA)
-            ImGui::Text("0x%04X  (check disabled)", ri.stored_delta);
-        else
-            ImGui::Text("0x%04X", ri.stored_delta);
-
-        ImGui::TableNextRow(); /* spacer */
-
-        /* Hashes */
-        rowf("CRC-32", "%08X", ri.crc32_val);
-
-        { char buf[48]; int i;
-          for (i = 0; i < 20; i++) snprintf(buf + i*2, 3, "%02x", ri.sha1[i]);
-          row("SHA-1", buf); }
-
-        { char buf[72]; int i;
-          for (i = 0; i < 32; i++) snprintf(buf + i*2, 3, "%02x", ri.sha256[i]);
-          ImGui::TableNextRow();
-          ImGui::TableSetColumnIndex(0); ImGui::TextDisabled("SHA-256");
-          ImGui::TableSetColumnIndex(1);
-          /* Split across two lines for readability */
-          char lo[36], hi[36];
-          memcpy(lo, buf,      32); lo[32] = '\0';
-          memcpy(hi, buf + 32, 32); hi[32] = '\0';
-          ImGui::TextUnformatted(lo);
-          ImGui::TableNextRow();
-          ImGui::TableSetColumnIndex(1); ImGui::TextUnformatted(hi);
-        }
-
-        ImGui::EndTable();
-    }
-
-    ImGui::Separator();
-    if (ImGui::Button("Refresh")) {
-        ri.computed = false;
-    }
-    if (ImGui::IsItemHovered())
-        ImGui::SetTooltip("Recompute hashes (takes ~1s for 1MB ROM)");
-}
-
-// ============================================================
-// Match from Reference window
-// ============================================================
-
-static void apply_one_match(ApexProject *dst, const ApexProject *src,
-                             const MatchWindowState::Result &r)
-{
-    int has_bank = (r.dst_bank != 0xffu) ? 1 : 0;
-    apex_project_begin_edit_group(dst, "apply match");
-    apex_project_set_label(dst, has_bank, r.dst_bank, r.dst_addr, r.label_name.c_str());
-    apex_project_set_kind(dst, has_bank, r.dst_bank, r.dst_addr, APEX_KIND_CODE, "code");
-
-    const InlineSignature *sig = inline_signature_for(&src->inline_sigs, r.src_bank, r.src_addr);
-    if (sig) {
-        std::string spec = inline_sig_spec_string(sig);
-        if (!spec.empty())
-            apex_project_set_inline(dst, has_bank, r.dst_bank, r.dst_addr, spec.c_str());
-    }
-    const char *doc = config_doc_at(&src->docs, r.src_bank, r.src_addr);
-    if (doc && doc[0])
-        apex_project_set_doc(dst, has_bank, r.dst_bank, r.dst_addr, doc);
-    apex_project_end_edit_group(dst);
-}
-
-/* Accept all results within [min_conf, max_conf], return count applied. */
-static int accept_tier(ApexProject *dst, MatchWindowState &ms, int min_conf, int max_conf)
-{
-    int n = 0;
-    apex_project_begin_edit_group(dst, "apply matches");
-    for (auto &r : ms.results) {
-        if (r.accepted) continue;
-        if (r.confidence < min_conf || r.confidence > max_conf) continue;
-        apply_one_match(dst, ms.src_project, r);
-        r.accepted = true;
-        n++;
-    }
-    apex_project_end_edit_group(dst);
-    return n;
-}
-
-void render_match_window(ApexProject *project,
-                         const ApexRenderedDocument **document_ptr,
-                         UiState *state)
-{
-    const ApexRenderedDocument *d = *document_ptr;
-    MatchWindowState &ms = state->match_state;
-
-    /* --- Path inputs with Browse buttons --- */
-    ImGui::SetNextItemWidth(-100.0f);
-    ImGui::InputText("Ref ROM", ms.ref_rom_path, sizeof(ms.ref_rom_path));
-    ImGui::SameLine();
-    if (ImGui::Button("Browse##brom")) {
-        IGFD::FileDialogConfig cfg;
-        cfg.path = ms.ref_rom_path[0] ? ms.ref_rom_path : ".";
-        ImGuiFileDialog::Instance()->OpenDialog("MatchRefRom", "Select Reference ROM",
-                                                ".rom,.bin", cfg);
-    }
-    if (ImGuiFileDialog::Instance()->Display("MatchRefRom",
-            ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
-        if (ImGuiFileDialog::Instance()->IsOk()) {
-            std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
-            strncpy(ms.ref_rom_path, p.c_str(), sizeof(ms.ref_rom_path) - 1);
-        }
-        ImGuiFileDialog::Instance()->Close();
-    }
-
-    ImGui::SetNextItemWidth(-100.0f);
-    ImGui::InputText("Ref INI", ms.ref_ini_path, sizeof(ms.ref_ini_path));
-    ImGui::SameLine();
-    if (ImGui::Button("Browse##bini")) {
-        IGFD::FileDialogConfig cfg;
-        cfg.path = ms.ref_ini_path[0] ? ms.ref_ini_path : ".";
-        ImGuiFileDialog::Instance()->OpenDialog("MatchRefIni", "Select Reference INI",
-                                                ".ini", cfg);
-    }
-    if (ImGuiFileDialog::Instance()->Display("MatchRefIni",
-            ImGuiWindowFlags_NoCollapse, ImVec2(600, 400))) {
-        if (ImGuiFileDialog::Instance()->IsOk()) {
-            std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
-            strncpy(ms.ref_ini_path, p.c_str(), sizeof(ms.ref_ini_path) - 1);
-        }
-        ImGuiFileDialog::Instance()->Close();
-    }
-
-    /* --- Options --- */
-    ImGui::Checkbox("System scan (--scan)", &ms.scan_enabled);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(50.0f);
-    ImGui::InputInt("Min conf%", &ms.min_confidence);
-    ms.min_confidence = std::max(0, std::min(100, ms.min_confidence));
-    ImGui::SameLine();
-
-    bool can_run = ms.ref_rom_path[0] != '\0' && ms.ref_ini_path[0] != '\0'
-                   && project->rom_path != NULL;
-    if (!can_run) ImGui::BeginDisabled();
-    bool run_clicked = ImGui::Button("Run Match");
-    if (!can_run) ImGui::EndDisabled();
-
-    if (!ms.run_status.empty())
-        ImGui::TextDisabled("%s", ms.run_status.c_str());
-
-    /* --- Execute match --- */
-    if (run_clicked && can_run) {
-        if (ms.src_project) {
-            apex_project_free(ms.src_project);
-            ms.src_project = nullptr;
-        }
-        ms.results.clear();
-        ms.has_results = false;
-        ms.run_status  = "Running...";
-
-        ApexProject *src = apex_project_open(ms.ref_rom_path, ms.ref_ini_path);
-        if (!src) {
-            ms.run_status = "Error: cannot open reference ROM/INI";
-            return;
-        }
-        if (apex_project_analyze(src)) {
-            apex_project_free(src);
-            ms.run_status = "Error: reference analysis failed";
-            return;
-        }
-
-        ApexProject *dst_tmp = apex_project_open(project->rom_path, NULL);
-        if (!dst_tmp) {
-            apex_project_free(src);
-            ms.run_status = "Error: cannot re-open target ROM";
-            return;
-        }
-        apex_match_inject_entries(dst_tmp, src, 1 /* system_only */);
-        if (apex_project_analyze(dst_tmp)) {
-            apex_project_free(dst_tmp);
-            apex_project_free(src);
-            ms.run_status = "Error: target analysis failed";
-            return;
-        }
-
-        ApexFingerprintDB *src_db = apex_fingerprint_build(src);
-        ApexFingerprintDB *dst_db = apex_fingerprint_build(dst_tmp);
-        if (!src_db || !dst_db) {
-            apex_fingerprint_free(src_db);
-            apex_fingerprint_free(dst_db);
-            apex_project_free(dst_tmp);
-            apex_project_free(src);
-            ms.run_status = "Error: out of memory";
-            return;
-        }
-
-        size_t result_count = 0;
-        ApexMatchResult *raw = apex_match_roms(src_db, dst_db,
-                                               ms.min_confidence, 5, &result_count);
-
-        if (ms.scan_enabled) {
-            size_t scan_count = 0;
-            ApexMatchResult *scan_raw = apex_match_scan_system_bank(
-                src_db, dst_db, dst_tmp, raw, result_count, 5, &scan_count);
-            if (scan_count > 0) {
-                ApexMatchResult *combined = (ApexMatchResult *)realloc(
-                    raw, (result_count + scan_count) * sizeof(*raw));
-                if (combined) {
-                    raw = combined;
-                    memcpy(raw + result_count, scan_raw, scan_count * sizeof(*scan_raw));
-                    result_count += scan_count;
-                }
-                apex_match_results_free(scan_raw, scan_count);
-            }
-        }
-
-        int n_exact = 0, n_high = 0, n_med = 0;
-        ms.results.reserve(result_count);
-        for (size_t i = 0; i < result_count; i++) {
-            const ApexMatchResult &rr = raw[i];
-            MatchWindowState::Result r;
-            r.label_name = rr.label_name ? rr.label_name : "";
-            r.src_addr   = rr.src_addr;
-            r.src_bank   = rr.src_bank;
-            r.dst_addr   = rr.dst_addr;
-            r.dst_bank   = rr.dst_bank;
-            r.confidence = rr.confidence;
-            r.accepted   = false;
-            if      (r.confidence >= APEX_MATCH_CONF_EXACT) n_exact++;
-            else if (r.confidence >= APEX_MATCH_CONF_HIGH)  n_high++;
-            else                                             n_med++;
-            ms.results.push_back(std::move(r));
-        }
-
-        apex_match_results_free(raw, result_count);
-        apex_fingerprint_free(src_db);
-        apex_fingerprint_free(dst_db);
-        apex_project_free(dst_tmp);
-        ms.src_project = src;
-        ms.has_results = true;
-
-        char buf[256];
-        snprintf(buf, sizeof(buf),
-                 "%zu matches: %d exact  %d high  %d medium",
-                 result_count, n_exact, n_high, n_med);
-        ms.run_status = buf;
-    }
-
-    if (!ms.has_results) return;
-
-    ImGui::Separator();
-
-    /* Pending counts per tier */
-    int p_exact = 0, p_high = 0, p_med = 0;
-    for (const auto &r : ms.results) {
-        if (r.accepted) continue;
-        if      (r.confidence >= APEX_MATCH_CONF_EXACT) p_exact++;
-        else if (r.confidence >= APEX_MATCH_CONF_HIGH)  p_high++;
-        else                                             p_med++;
-    }
-    int p_total = p_exact + p_high + p_med;
-
-    /* --- Accept All buttons --- */
-    {
-        char btn[64];
-
-        snprintf(btn, sizeof(btn), "Accept All Exact (%d)", p_exact);
-        if (p_exact == 0) ImGui::BeginDisabled();
-        if (ImGui::Button(btn)) {
-            accept_tier(project, ms, APEX_MATCH_CONF_EXACT, 100);
-            state->overlay_dirty = true;
-            uint8_t cb = 0xffu; uint32_t ca = 0u;
-            selected_address(d, state, &cb, &ca);
-            rerender_and_reselect(project, document_ptr, state, cb, ca);
-            d = *document_ptr;
-        }
-        if (p_exact == 0) ImGui::EndDisabled();
-
-        ImGui::SameLine();
-        snprintf(btn, sizeof(btn), "Accept All High (%d)", p_high);
-        if (p_high == 0) ImGui::BeginDisabled();
-        if (ImGui::Button(btn)) {
-            accept_tier(project, ms, APEX_MATCH_CONF_HIGH, APEX_MATCH_CONF_EXACT - 1);
-            state->overlay_dirty = true;
-            uint8_t cb = 0xffu; uint32_t ca = 0u;
-            selected_address(d, state, &cb, &ca);
-            rerender_and_reselect(project, document_ptr, state, cb, ca);
-            d = *document_ptr;
-        }
-        if (p_high == 0) ImGui::EndDisabled();
-
-        ImGui::SameLine();
-        snprintf(btn, sizeof(btn), "Accept All Med (%d)", p_med);
-        if (p_med == 0) ImGui::BeginDisabled();
-        if (ImGui::Button(btn)) {
-            accept_tier(project, ms, ms.min_confidence, APEX_MATCH_CONF_HIGH - 1);
-            state->overlay_dirty = true;
-            uint8_t cb = 0xffu; uint32_t ca = 0u;
-            selected_address(d, state, &cb, &ca);
-            rerender_and_reselect(project, document_ptr, state, cb, ca);
-            d = *document_ptr;
-        }
-        if (p_med == 0) ImGui::EndDisabled();
-
-        ImGui::SameLine();
-        snprintf(btn, sizeof(btn), "Accept All (%d)", p_total);
-        if (p_total == 0) ImGui::BeginDisabled();
-        if (ImGui::Button(btn)) {
-            accept_tier(project, ms, ms.min_confidence, 100);
-            state->overlay_dirty = true;
-            uint8_t cb = 0xffu; uint32_t ca = 0u;
-            selected_address(d, state, &cb, &ca);
-            rerender_and_reselect(project, document_ptr, state, cb, ca);
-            d = *document_ptr;
-        }
-        if (p_total == 0) ImGui::EndDisabled();
-    }
-
-    /* --- Filter bar --- */
-    ImGui::SetNextItemWidth(150.0f);
-    ImGui::InputText("##matchfilter", ms.filter, sizeof(ms.filter));
-    ImGui::SameLine();
-    ImGui::RadioButton("All",      &ms.show_mode, 0);
-    ImGui::SameLine();
-    ImGui::RadioButton("Pending",  &ms.show_mode, 1);
-    ImGui::SameLine();
-    ImGui::RadioButton("Accepted", &ms.show_mode, 2);
-
-    /* --- Results table --- */
-    static const ImGuiTableFlags kMatchTblFlags =
-        ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-        ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
-        ImGuiTableFlags_SizingFixedFit;
-
-    if (ImGui::BeginTable("match_results", 4, kMatchTblFlags)) {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("",       ImGuiTableColumnFlags_WidthFixed,   16.0f);
-        ImGui::TableSetupColumn("Conf",   ImGuiTableColumnFlags_WidthFixed,   52.0f);
-        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed,  105.0f);
-        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableHeadersRow();
-
-        int row_id = 0;
-        for (auto &r : ms.results) {
-            if (ms.show_mode == 1 && r.accepted)  continue;
-            if (ms.show_mode == 2 && !r.accepted) continue;
-            if (ms.filter[0] && !str_icontains(r.label_name.c_str(), ms.filter)) continue;
-
-            ImGui::PushID(row_id++);
-            ImGui::TableNextRow();
-
-            /* Col 0: accepted checkmark */
-            ImGui::TableSetColumnIndex(0);
-            if (r.accepted)
-                ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "\xe2\x9c\x93");
-
-            /* Col 1: confidence tier */
-            ImGui::TableSetColumnIndex(1);
-            if (r.confidence >= APEX_MATCH_CONF_EXACT)
-                ImGui::TextColored(ImVec4(0.47f, 0.86f, 0.47f, 1.0f), "Exact");
-            else if (r.confidence >= APEX_MATCH_CONF_HIGH)
-                ImGui::TextColored(ImVec4(0.47f, 0.70f, 0.95f, 1.0f), "High");
-            else
-                ImGui::TextColored(ImVec4(0.95f, 0.82f, 0.45f, 1.0f), "Med");
-
-            /* Col 2: destination address — click to navigate */
-            ImGui::TableSetColumnIndex(2);
-            char addrstr[32];
-            if (r.dst_bank == 0xffu)
-                snprintf(addrstr, sizeof(addrstr), "0x%04x", r.dst_addr);
-            else
-                snprintf(addrstr, sizeof(addrstr), "B%02x_A%04x", r.dst_bank, r.dst_addr);
-            size_t target_li = 0;
-            bool found = apex_render_find_line_by_address(d, r.dst_bank, r.dst_addr,
-                                                          &target_li) != NULL;
-            if (ImGui::SmallButton(addrstr) && found)
-                select_line(state, target_li, 1);
-
-            /* Col 3: label name + per-row Accept button */
-            ImGui::TableSetColumnIndex(3);
-            ImGui::TextUnformatted(r.label_name.c_str());
-            if (!r.accepted) {
-                ImGui::SameLine();
-                if (ImGui::SmallButton("Accept")) {
-                    apply_one_match(project, ms.src_project, r);
-                    r.accepted = true;
-                    state->overlay_dirty = true;
-                    rerender_and_reselect(project, document_ptr, state,
-                                         r.dst_bank, r.dst_addr);
-                    d = *document_ptr;
-                }
-            }
-
-            ImGui::PopID();
-        }
-        ImGui::EndTable();
-    }
-}
-
-// ============================================================
-// ROM Compare window
-// ============================================================
-
-static ImVec4 cmp_status_color(ApexCompareStatus s)
-{
-    switch (s) {
-    case APEX_CMP_IDENTICAL: return ImVec4(0.60f, 0.60f, 0.60f, 1.0f);
-    case APEX_CMP_MOVED:     return ImVec4(0.40f, 0.80f, 0.90f, 1.0f);
-    case APEX_CMP_CHANGED:   return ImVec4(0.95f, 0.80f, 0.30f, 1.0f);
-    case APEX_CMP_REMOVED:   return ImVec4(0.95f, 0.45f, 0.45f, 1.0f);
-    case APEX_CMP_ADDED:     return ImVec4(0.50f, 0.85f, 0.50f, 1.0f);
-    }
-    return ImVec4(1, 1, 1, 1);
-}
-
-static bool cmp_status_enabled(const CompareWindowState &cs, ApexCompareStatus s)
-{
-    switch (s) {
-    case APEX_CMP_IDENTICAL: return cs.show_identical;
-    case APEX_CMP_MOVED:     return cs.show_moved;
-    case APEX_CMP_CHANGED:   return cs.show_changed;
-    case APEX_CMP_REMOVED:   return cs.show_removed;
-    case APEX_CMP_ADDED:     return cs.show_added;
-    }
-    return true;
-}
-
-static void compare_run(ApexProject *project, CompareWindowState &cs)
-{
-    cs.reset();
-    cs.run_status = "Running...";
-
-    if (apex_project_analyze(project) != 0) {
-        cs.run_status = "Error: analysis of current ROM failed";
-        return;
-    }
-    ApexProject *bp = apex_project_open(cs.rom_b_path,
-                                        cs.ini_b_path[0] ? cs.ini_b_path : NULL);
-    if (!bp) {
-        cs.run_status = "Error: cannot open ROM B";
-        return;
-    }
-    apex_match_inject_entries(bp, project, cs.inject_paged ? 0 : 1);
-    if (apex_project_analyze(bp) != 0) {
-        apex_project_free(bp);
-        cs.run_status = "Error: analysis of ROM B failed";
-        return;
-    }
-
-    ApexCompareOptions opt;
-    apex_compare_default_options(&opt);
-    opt.include_code      = cs.inc_code;
-    opt.include_strings   = cs.inc_strings;
-    opt.include_tables    = cs.inc_tables;
-    opt.include_identical = cs.show_identical;
-    opt.min_instrs        = cs.min_instrs > 0 ? cs.min_instrs : 5;
-
-    ApexCompareReport rep;
-    if (apex_compare_run(project, bp, &opt, &rep) != 0) {
-        apex_project_free(bp);
-        cs.run_status = "Error: comparison failed";
-        return;
-    }
-
-    cs.results.assign(rep.items, rep.items + rep.count);
-    cs.n_identical = rep.n_identical;
-    cs.n_moved     = rep.n_moved;
-    cs.n_changed   = rep.n_changed;
-    cs.n_removed   = rep.n_removed;
-    cs.n_added     = rep.n_added;
-    apex_compare_report_free(&rep);
-
-    cs.b_project = bp;
-    cs.a_db = apex_fingerprint_build(project);
-    cs.b_db = apex_fingerprint_build(bp);
-    cs.has_results = true;
-    char buf[96];
-    snprintf(buf, sizeof(buf), "%zu changed, %zu moved, %zu removed, %zu added",
-             cs.n_changed, cs.n_moved, cs.n_removed, cs.n_added);
-    cs.run_status = buf;
-}
-
-static void compare_browse(const char *id, const char *title, const char *filters,
-                           char *target, size_t target_sz)
-{
-    ImGui::SameLine();
-    if (ImGui::Button(id)) {
-        IGFD::FileDialogConfig cfg;
-        cfg.path = target[0] ? target : ".";
-        ImGuiFileDialog::Instance()->OpenDialog(id, title, filters, cfg);
-    }
-    if (ImGuiFileDialog::Instance()->Display(id, ImGuiWindowFlags_NoCollapse,
-                                             ImVec2(600, 400))) {
-        if (ImGuiFileDialog::Instance()->IsOk()) {
-            std::string p = ImGuiFileDialog::Instance()->GetFilePathName();
-            strncpy(target, p.c_str(), target_sz - 1);
-            target[target_sz - 1] = '\0';
-        }
-        ImGuiFileDialog::Instance()->Close();
-    }
-}
-
-void render_rom_compare_window(ApexProject *project,
-                               const ApexRenderedDocument **document_ptr,
-                               UiState *state)
-{
-    const ApexRenderedDocument *d = *document_ptr;
-    CompareWindowState &cs = state->compare_state;
-
-    ImGui::TextDisabled("Compare the current ROM (A) against another version (B).");
-
-    ImGui::SetNextItemWidth(-160.0f);
-    ImGui::InputText("ROM B", cs.rom_b_path, sizeof(cs.rom_b_path));
-    compare_browse("CmpRomB", "Select ROM B", ".rom,.bin", cs.rom_b_path,
-                   sizeof(cs.rom_b_path));
-
-    ImGui::SetNextItemWidth(-160.0f);
-    ImGui::InputText("INI B (opt)", cs.ini_b_path, sizeof(cs.ini_b_path));
-    compare_browse("CmpIniB", "Select ROM B config", ".ini", cs.ini_b_path,
-                   sizeof(cs.ini_b_path));
-
-    ImGui::Checkbox("Code", &cs.inc_code);
-    ImGui::SameLine();
-    ImGui::Checkbox("Strings", &cs.inc_strings);
-    ImGui::SameLine();
-    ImGui::Checkbox("Tables", &cs.inc_tables);
-    ImGui::SameLine();
-    ImGui::Checkbox("Inject paged", &cs.inject_paged);
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f);
-    ImGui::InputInt("Min instrs", &cs.min_instrs, 0, 0);
-    if (cs.min_instrs < 1) cs.min_instrs = 1;
-
-    bool can_run = cs.rom_b_path[0] != '\0' && project->rom_path != NULL;
-    if (!can_run) ImGui::BeginDisabled();
-    if (ImGui::Button("Run Compare")) {
-        compare_run(project, cs);
-    }
-    if (!can_run) ImGui::EndDisabled();
-    if (!cs.run_status.empty()) {
-        ImGui::SameLine();
-        ImGui::TextDisabled("%s", cs.run_status.c_str());
-    }
-
-    /* ---- candidates for the currently-selected routine ---- */
-    if (cs.has_results && cs.a_db && cs.b_db) {
-        uint8_t sb = 0xffu;
-        uint32_t sa = 0;
-        if (selected_address(d, state, &sb, &sa)) {
-            ApexCompareCandidate cand[3];
-            size_t nc = apex_compare_candidates(cs.a_db, cs.b_db, sb, sa, cand, 3);
-            ImGui::SeparatorText("Candidates in B for selected routine");
-            ImGui::Text("A: B%02x_A%04x", sb, (unsigned)sa & 0xffffu);
-            if (nc == 0) {
-                ImGui::TextDisabled("  (no fingerprint / no candidates)");
-            }
-            for (size_t i = 0; i < nc; i++) {
-                ImGui::BulletText("B%02x_A%04x   %d%%   %s",
-                                  cand[i].bank, (unsigned)cand[i].addr & 0xffffu,
-                                  cand[i].confidence, cand[i].exact ? "(exact)" : "");
-            }
-        }
-    }
-
-    if (!cs.has_results) {
-        return;
-    }
-
-    ImGui::SeparatorText("Differences");
-    ImGui::Text("%zu identical | %zu moved | %zu changed | %zu removed | %zu added",
-                cs.n_identical, cs.n_moved, cs.n_changed, cs.n_removed, cs.n_added);
-    ImGui::Checkbox("identical", &cs.show_identical);
-    ImGui::SameLine(); ImGui::Checkbox("moved", &cs.show_moved);
-    ImGui::SameLine(); ImGui::Checkbox("changed", &cs.show_changed);
-    ImGui::SameLine(); ImGui::Checkbox("removed", &cs.show_removed);
-    ImGui::SameLine(); ImGui::Checkbox("added", &cs.show_added);
-    ImGui::TextDisabled("(identical entries are listed only when 'identical' was "
-                        "ticked before Run)");
-    ImGui::SetNextItemWidth(-1.0f);
-    ImGui::InputTextWithHint("##cmpfilter", "filter label / detail...", cs.filter,
-                             sizeof(cs.filter));
-
-    /* Build the filtered index list. */
-    static std::vector<size_t> visible;
-    visible.clear();
-    for (size_t i = 0; i < cs.results.size(); i++) {
-        const ApexCompareEntry &e = cs.results[i];
-        if (!cmp_status_enabled(cs, e.status)) continue;
-        if (cs.filter[0]) {
-            char hay[160];
-            snprintf(hay, sizeof(hay), "%s %s", e.label, e.detail);
-            if (!str_icontains(hay, cs.filter)) continue;
-        }
-        visible.push_back(i);
-    }
-
-    if (ImGui::BeginTable("##cmptbl", 6,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 72.0f, 0);
-        ImGui::TableSetupColumn("Kind",   ImGuiTableColumnFlags_WidthFixed, 50.0f, 1);
-        ImGui::TableSetupColumn("A",      ImGuiTableColumnFlags_WidthFixed, 86.0f, 2);
-        ImGui::TableSetupColumn("B",      ImGuiTableColumnFlags_WidthFixed, 86.0f, 3);
-        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthFixed, 200.0f, 4);
-        ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.0f, 5);
-        ImGui::TableHeadersRow();
-
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc)) {
-            const std::vector<ApexCompareEntry> &res = cs.results;
-            std::stable_sort(visible.begin(), visible.end(),
-                [&](size_t ia, size_t ib) {
-                    const ApexCompareEntry &a = res[ia];
-                    const ApexCompareEntry &b = res[ib];
-                    int c = 0;
-                    switch (sort_col) {
-                    case 0: c = ui_cmp_int(a.status, b.status); break;
-                    case 1: c = ui_cmp_int(a.kind, b.kind); break;
-                    case 2: c = a.has_a != b.has_a ? (a.has_a ? -1 : 1)
-                                : ui_cmp_u32((a.a_bank<<16)|a.a_addr, (b.a_bank<<16)|b.a_addr); break;
-                    case 3: c = a.has_b != b.has_b ? (a.has_b ? -1 : 1)
-                                : ui_cmp_u32((a.b_bank<<16)|a.b_addr, (b.b_bank<<16)|b.b_addr); break;
-                    case 4: c = strcmp(a.label, b.label); break;
-                    case 5: c = strcmp(a.detail, b.detail); break;
-                    }
-                    return sort_asc ? c < 0 : c > 0;
-                });
-        }
-
-        ImGuiListClipper clipper;
-        clipper.Begin((int)visible.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                const ApexCompareEntry &e = cs.results[visible[(size_t)row]];
-                char abuf[16] = "--", bbuf[16] = "--";
-                if (e.has_a)
-                    snprintf(abuf, sizeof(abuf), "B%02x_A%04x", e.a_bank,
-                             (unsigned)e.a_addr & 0xffffu);
-                if (e.has_b)
-                    snprintf(bbuf, sizeof(bbuf), "B%02x_A%04x", e.b_bank,
-                             (unsigned)e.b_addr & 0xffffu);
-
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                ImGui::PushID(row);
-                ImGui::TextColored(cmp_status_color(e.status), "%s",
-                                   apex_compare_status_name(e.status));
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(apex_compare_kind_name(e.kind));
-                ImGui::TableNextColumn();
-                if (e.has_a) {
-                    if (ImGui::Selectable(abuf, false,
-                            ImGuiSelectableFlags_SpanAllColumns)) {
-                        size_t li;
-                        if (d && apex_render_find_line_by_address(d, e.a_bank, e.a_addr,
-                                                                  &li)) {
-                            select_line(state, li, 1);
-                        }
-                    }
-                } else {
-                    ImGui::TextUnformatted(abuf);
-                }
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(bbuf);
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(e.label);
-                ImGui::TableNextColumn();
-                ImGui::TextUnformatted(e.detail);
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-}
-
-// ============================================================
-// Coverage / worklist window
-// ============================================================
-
-static void coverage_compute(ApexProject *project, const ApexRenderedDocument *doc,
-                             CoverageWindowState &cv)
-{
-    size_t rom_size = project->rom.size;
-    size_t i, fill;
-    std::vector<uint8_t> kinds(rom_size, (uint8_t)APEX_RENDER_BLOCK_UNKNOWN);
-
-    /* Forward pass: assign each ROM byte its block kind (mirrors apexini coverage). */
-    {
-        uint8_t cur = (uint8_t)APEX_RENDER_BLOCK_UNKNOWN;
-        fill = 0;
-        for (i = 0; i < doc->line_count && fill < rom_size; i++) {
-            const ApexRenderedLine *l = &doc->lines[i];
-            if (!l->has_location) continue;
-            if (l->rom_addr <= fill) {
-                cur = (uint8_t)l->block_kind;
-            } else {
-                size_t end = l->rom_addr < rom_size ? l->rom_addr : rom_size;
-                while (fill < end) kinds[fill++] = cur;
-                cur = (uint8_t)l->block_kind;
-            }
-        }
-        while (fill < rom_size) kinds[fill++] = cur;
-    }
-
-    for (i = 0; i < 7; i++) cv.totals[i] = 0;
-    for (i = 0; i < rom_size; i++) {
-        uint8_t k = kinds[i];
-        if (k < 7) cv.totals[k]++;
-    }
-
-    /* Build the worklist: runs of UNCLASSIFIED (and optionally UNKNOWN). */
-    cv.gaps.clear();
-    i = 0;
-    while (i < rom_size) {
-        uint8_t k = kinds[i];
-        int is_uncl = (k == APEX_RENDER_BLOCK_UNCLASSIFIED);
-        int is_unk  = (k == APEX_RENDER_BLOCK_UNKNOWN);
-        if (is_uncl || (is_unk && cv.include_unknown)) {
-            size_t start = i;
-            while (i < rom_size && kinds[i] == k) i++;
-            size_t len = i - start;
-            if (len >= (size_t)(cv.min_gap > 0 ? cv.min_gap : 1)) {
-                CoverageWindowState::Gap g;
-                g.off = start;
-                g.len = len;
-                g.unknown = is_unk;
-                if (!rom_offset_to_cpu_address(project, start, &g.bank, &g.addr)) {
-                    g.bank = 0xffu;
-                    g.addr = 0;
-                }
-                cv.gaps.push_back(g);
-            }
-        } else {
-            i++;
-        }
-    }
-
-    cv.rom_size = rom_size;
-    cv.doc_ptr = doc;
-    cv.computed = true;
-    cv.next_gap = 0;
-}
-
-static void coverage_bar(const char *label, size_t count, size_t total, ImVec4 col)
-{
-    float frac = total ? (float)count / (float)total : 0.0f;
-    char overlay[48];
-    snprintf(overlay, sizeof(overlay), "%s  %zu (%.1f%%)", label, count, frac * 100.0);
-    ImGui::PushStyleColor(ImGuiCol_PlotHistogram, col);
-    ImGui::ProgressBar(frac, ImVec2(-1.0f, 0.0f), overlay);
-    ImGui::PopStyleColor();
-}
-
-void render_coverage_window(ApexProject *project,
-                            const ApexRenderedDocument **document_ptr,
-                            UiState *state)
-{
-    const ApexRenderedDocument *d = *document_ptr;
-    CoverageWindowState &cv = state->coverage_state;
-
-    if (!d) {
-        ImGui::TextDisabled("No disassembly available.");
-        return;
-    }
-
-    bool refresh = ImGui::Button("Refresh");
-    ImGui::SameLine();
-    if (ImGui::Checkbox("include unreached (unknown)", &cv.include_unknown)) {
-        refresh = true;
-    }
-    ImGui::SameLine();
-    ImGui::SetNextItemWidth(70.0f);
-    if (ImGui::InputInt("min gap", &cv.min_gap, 1, 8)) {
-        if (cv.min_gap < 1) cv.min_gap = 1;
-        refresh = true;
-    }
-
-    if (refresh || !cv.computed || cv.doc_ptr != (const void *)d ||
-        cv.rom_size != project->rom.size) {
-        coverage_compute(project, d, cv);
-    }
-
-    size_t total = cv.rom_size;
-    ImGui::SeparatorText("Coverage");
-    coverage_bar("code",         cv.totals[APEX_RENDER_BLOCK_CODE],         total, ImVec4(0.40f,0.70f,0.95f,1));
-    coverage_bar("data",         cv.totals[APEX_RENDER_BLOCK_DATA],         total, ImVec4(0.55f,0.80f,0.55f,1));
-    coverage_bar("table",        cv.totals[APEX_RENDER_BLOCK_TABLE],        total, ImVec4(0.75f,0.65f,0.95f,1));
-    coverage_bar("sprite",       cv.totals[APEX_RENDER_BLOCK_SPRITE],       total, ImVec4(0.90f,0.65f,0.40f,1));
-    coverage_bar("unclassified", cv.totals[APEX_RENDER_BLOCK_UNCLASSIFIED], total, ImVec4(0.95f,0.80f,0.30f,1));
-    coverage_bar("unknown",      cv.totals[APEX_RENDER_BLOCK_UNKNOWN],      total, ImVec4(0.90f,0.45f,0.45f,1));
-    coverage_bar("free (0xff)",  cv.totals[APEX_RENDER_BLOCK_FREE],         total, ImVec4(0.50f,0.50f,0.50f,1));
-
-    {
-        size_t classified = cv.totals[APEX_RENDER_BLOCK_CODE] +
-                            cv.totals[APEX_RENDER_BLOCK_DATA] +
-                            cv.totals[APEX_RENDER_BLOCK_TABLE] +
-                            cv.totals[APEX_RENDER_BLOCK_SPRITE];
-        size_t denom = total - cv.totals[APEX_RENDER_BLOCK_FREE];
-        ImGui::Text("classified (excl. free): %.1f%%",
-                    denom ? classified * 100.0 / denom : 0.0);
-    }
-
-    ImGui::SeparatorText("Worklist");
-    ImGui::Text("%zu gap%s", cv.gaps.size(), cv.gaps.size() == 1 ? "" : "s");
-    ImGui::SameLine();
-    if (ImGui::Button("Jump to next gap") && !cv.gaps.empty()) {
-        if (cv.next_gap >= (int)cv.gaps.size()) cv.next_gap = 0;
-        const CoverageWindowState::Gap &g = cv.gaps[(size_t)cv.next_gap];
-        size_t li;
-        if (apex_render_find_line_by_address(d, g.bank, g.addr, &li))
-            select_line(state, li, 1);
-        cv.next_gap++;
-    }
-
-    if (ImGui::BeginTable("##covtbl", 4,
-            ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
-            ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable | APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
-        ImGui::TableSetupColumn("Bytes",   ImGuiTableColumnFlags_WidthFixed, 70.0f, 1);
-        ImGui::TableSetupColumn("Kind",    ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
-        ImGui::TableSetupColumn("ROM off", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
-        ImGui::TableHeadersRow();
-
-        int sort_col; bool sort_asc;
-        if (ui_table_sort(&sort_col, &sort_asc)) {
-            std::stable_sort(cv.gaps.begin(), cv.gaps.end(),
-                [&](const CoverageWindowState::Gap &a, const CoverageWindowState::Gap &b) {
-                    int c = 0;
-                    switch (sort_col) {
-                    case 0: c = ui_cmp_u32(((uint32_t)a.bank<<16)|a.addr,
-                                           ((uint32_t)b.bank<<16)|b.addr); break;
-                    case 1: c = ui_cmp_sz(a.len, b.len); break;
-                    case 2: c = ui_cmp_int(a.unknown, b.unknown); break;
-                    case 3: c = ui_cmp_sz(a.off, b.off); break;
-                    }
-                    return sort_asc ? c < 0 : c > 0;
-                });
-        }
-
-        ImGuiListClipper clipper;
-        clipper.Begin((int)cv.gaps.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                const CoverageWindowState::Gap &g = cv.gaps[(size_t)row];
-                char addrbuf[16];
-                snprintf(addrbuf, sizeof(addrbuf), "B%02x_A%04x", g.bank,
-                         (unsigned)g.addr & 0xffffu);
-                ImGui::TableNextRow();
-                ImGui::TableNextColumn();
-                ImGui::PushID(row);
-                if (ImGui::Selectable(addrbuf, false, ImGuiSelectableFlags_SpanAllColumns)) {
-                    size_t li;
-                    if (apex_render_find_line_by_address(d, g.bank, g.addr, &li))
-                        select_line(state, li, 1);
-                }
-                ImGui::TableNextColumn();
-                ImGui::Text("%zu", g.len);
-                ImGui::TableNextColumn();
-                ImGui::TextColored(g.unknown ? ImVec4(0.90f,0.45f,0.45f,1)
-                                             : ImVec4(0.95f,0.80f,0.30f,1),
-                                   "%s", g.unknown ? "unknown" : "unclassified");
-                ImGui::TableNextColumn();
-                ImGui::Text("0x%06zx", g.off);
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
-    }
-}

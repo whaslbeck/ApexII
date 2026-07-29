@@ -28,6 +28,15 @@ struct RomInfoState {
     uint8_t  os_minor;
     uint32_t reset_addr;
     char     game_version[32];
+    /* game identity (name / number / date via system-bank far pointers) */
+    int      game_id_found;
+    uint16_t game_id_ptr_addr;
+    char     game_name[32];
+    char     game_number[8];
+    char     game_date[16];
+    uint8_t  game_name_bank;    uint16_t game_name_addr;
+    uint8_t  game_number_bank;  uint16_t game_number_addr;
+    uint8_t  game_date_bank;    uint16_t game_date_addr;
     uint16_t stored_csum;
     uint16_t computed_csum;
     uint16_t stored_delta;
@@ -228,7 +237,12 @@ enum ApexLastClassifyOp {
 
 struct UiState {
     size_t selected_line;
-    size_t selection_end;
+    /* Explicit multi-line block (for copy / range ops), decoupled from the
+       cursor: plain clicks/navigation move the cursor only and never disturb it.
+       Set via shift-click or the A/E hotkeys, cleared with Esc. */
+    bool   block_active = false;
+    size_t block_a = 0;
+    size_t block_b = 0;
     size_t editor_bound_line;
     int request_scroll_to_selection;
     int request_focus_goto;
@@ -243,6 +257,21 @@ struct UiState {
     char filter_input[128];
     char label_filter_input[128];
     char strings_filter_input[128];
+
+    /* Inline label rename: double-click a label in the disassembly to edit it in
+       place. inline_edit_line is the document line being edited (or (size_t)-1). */
+    size_t   inline_edit_line  = (size_t)-1;
+    bool     inline_edit_focus = false;
+    uint8_t  inline_edit_bank  = 0;
+    uint32_t inline_edit_addr  = 0;
+    char     inline_edit_buf[128] = "";
+
+    /* Command palette (Ctrl+P): jump to any label or address by typing. */
+    bool request_command_palette = false;
+    bool cmd_palette_focus       = false;
+    bool cmd_palette_scroll      = false;
+    int  cmd_palette_sel         = 0;
+    char cmd_palette_input[128]  = "";
     char edit_label_input[128];
     char edit_doc_input[1024];
     char save_path_input[512];
@@ -268,9 +297,10 @@ struct UiState {
     std::vector<size_t> history_forward;
     int dmd_scrub_offset;
 
-    size_t hex_selected_offset;
-    size_t hex_anchor_offset;   /* range start — set on plain left-click */
-    bool hex_has_range;         /* true when a multi-byte range is selected */
+    size_t hex_selected_offset; /* the cursor byte (moves freely; never disturbs the block) */
+    size_t hex_anchor_offset;   /* block start */
+    size_t hex_block_end;       /* block end — decoupled from the cursor */
+    bool hex_has_range;         /* true when a byte block is marked (a..end) */
     bool hex_active;
     bool hex_is_edit_target;    /* hex view was the last view directly interacted with:
                                    classify/label edits target the hex byte, not the
@@ -283,6 +313,8 @@ struct UiState {
     char hex_search_input[64];
     int request_focus_hex_search;
     bool hex_search_bank_only;  /* restrict byte search to the cursor's current bank */
+    bool hex_search_ascii = false; /* interpret the query as ASCII text, not hex bytes */
+    bool hex_search_ci    = false; /* case-insensitive (ASCII mode only) */
 
     /* Last classification action, replayed by the "repeat" hotkey (1) so a run of
        individual classifications reduces to n,1,n,1,…  See repeat_last_classify(). */
@@ -309,6 +341,44 @@ struct UiState {
     std::vector<struct LabelIndexEntry> cached_labels;
     bool labels_valid;
     std::vector<Bookmark> bookmarks;
+
+    /* render_line_table's filtered row list, cached across frames — rebuilt only
+       when the document changes (generation) or the filter text changes. */
+    std::vector<size_t> cached_visible;
+    unsigned long       cached_visible_gen = (unsigned long)-1;
+    std::string         cached_visible_filter;
+
+    /* project->refs indices sorted by (source_bank, source_addr) so
+       find_outgoing_refs is O(log n) instead of a full scan every frame.
+       Rebuilt when the document generation changes (i.e. after a re-analysis). */
+    std::vector<uint32_t> cached_out_ref_order;
+    unsigned long         cached_out_ref_gen = (unsigned long)-1;
+
+    /* Transitions / Strings list rows, cached on (generation, filter) so the
+       O(line_count) scan runs only when the document or filter changes. */
+    std::vector<size_t> cached_transitions;
+    unsigned long       cached_transitions_gen = (unsigned long)-1;
+    std::string         cached_transitions_filter;
+    std::vector<size_t> cached_strings_rows;
+    unsigned long       cached_strings_gen = (unsigned long)-1;
+    std::string         cached_strings_filter;
+
+    /* Full per-ROM-byte extended block-kind map for the Hex view, cached on the
+       document generation so the O(line_count) forward-fill runs once per edit
+       instead of every frame. */
+    std::vector<uint8_t> cached_hex_kinds;
+    unsigned long        cached_hex_kinds_gen = (unsigned long)-1;
+
+    /* Async re-render: an edit sets async_pending; the main loop launches the
+       render on a worker thread and shows a busy overlay (rendering=true) until
+       it finishes, then reselects (async_b, async_a). */
+    bool    async_pending = false;
+    bool    rendering     = false;
+    uint8_t async_b       = 0;
+    uint32_t async_a      = 0;
+    /* Dock tab that was active when the render started; refocused afterwards so
+       hiding the panels behind the busy overlay doesn't reset the selected tab. */
+    std::string restore_focus;
 
     std::vector<GraphNode> graph_nodes;
     int graph_root_idx;
@@ -362,6 +432,12 @@ struct UiState {
     bool show_flow_breaks;
     std::vector<FlowBreakEntry> flow_breaks;
     bool flow_breaks_stale;
+    /* "Create type from a text table's strings" popup state. */
+    bool     tt_type_request = false;
+    uint8_t  tt_type_bank = 0;
+    uint32_t tt_type_addr = 0;
+    int      tt_type_word = 0;
+    char     tt_type_name[64] = "";
     bool show_nvram_import;
     std::vector<NvramImportRow> nvram_import_rows;
     char nvram_source_path[512];  /* last imported nvram JSON — reused as export template */
@@ -545,6 +621,7 @@ struct SpritePreviewInfo {
 
 // Core State & Navigation
 void select_line(UiState *state, size_t line_index, int request_scroll);
+void render_command_palette(const ApexRenderedDocument **document_ptr, UiState *state);
 void handle_line_selection(UiState *state, size_t line_index, bool shift_held);
 void history_jump(UiState *state, int backward);
 void set_status(UiState *state, const char *message);
@@ -607,6 +684,7 @@ void jump_primary_transition(const ApexRenderedDocument *document, UiState *stat
 void sync_editor_state(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 void auto_label_targets(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void rerender_and_reselect(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, uint8_t bank, uint32_t cpu_addr);
+void finish_async_rerender(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_code_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void apply_data_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state, const char *spec);
 void apply_string_at_selection(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
@@ -637,6 +715,7 @@ void load_rom_session(const char *rom_path, UiState *state, const ApexRenderedDo
 
 // Clipboard
 void copy_selection_to_clipboard(const ApexRenderedDocument *document, const UiState *state);
+void copy_hex_block_to_clipboard(const ApexProject *project, const UiState *state);
 
 struct HardwareAccess {
     const HardwareRegister *reg;
@@ -667,7 +746,7 @@ size_t hardware_register_count();
 const HardwareRegister *get_hardware_register(size_t index);
 
 // ROM Info
-void render_rom_info(const ApexProject *project, UiState *state);
+void render_rom_info(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
 
 // Match from Reference
 void render_match_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
@@ -693,6 +772,10 @@ void render_code_candidates(ApexProject *project, const ApexRenderedDocument **d
 void render_inline_candidates(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_warnings_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_flow_breaks_view(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* From a line inside a TABLE block, find the table's start (header) address.
+   Returns false if the line is not part of a table. */
+bool find_table_start(const ApexRenderedDocument *d, size_t line_idx,
+                      uint8_t *out_bank, uint32_t *out_addr);
 void render_nvram_import_window(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 /* Populate state->nvram_import_rows from parsed nvram locations, flagging
    collisions against the project's current symbols/docs. Returns 0 on success. */

@@ -32,6 +32,17 @@ typedef struct {
     char     game_version[32];
     size_t   game_version_offset;
 
+    /* Game identity: name / number / date, reached via three consecutive far
+       pointers in the system (prime) bank.  game_id_found is 0 if not located. */
+    int      game_id_found;
+    uint16_t game_id_ptr_addr;        /* system-bank CPU addr of the first (name) far ptr */
+    char     game_name[32];
+    char     game_number[8];
+    char     game_date[16];
+    uint8_t  game_name_bank;    uint16_t game_name_addr;
+    uint8_t  game_number_bank;  uint16_t game_number_addr;
+    uint8_t  game_date_bank;    uint16_t game_date_addr;
+
     /* WPC checksum */
     uint16_t stored_csum;
     uint16_t computed_csum;
@@ -151,6 +162,127 @@ static inline void ari_sha256(const uint8_t *data, size_t n, uint8_t out[32]) {
     for(i=0;i<8;i++) ARI_WB32(out+i*4,s.h[i]);
 }
 
+/* ── Game identity (name / number / date via far pointers) ──────────────*/
+
+/* Map a WPC (bank, cpu-addr) to a file offset, or (size_t)-1 if invalid.
+   banks = number of 16 KB paged banks = size/16384 - 2.  The system (prime)
+   bank is 0xFF at 0x8000-0xFFFF; paged banks are 0x4000-0x7FFF with id base
+   0x3E-banks (the stored id byte is not trusted for identity). */
+static inline size_t ari_bank_off(size_t size, size_t banks, uint8_t bank, uint16_t addr)
+{
+    if (bank == 0xFFu) {
+        if (addr < 0x8000u) return (size_t)-1;
+        return banks * 0x4000u + (size_t)(addr - 0x8000u);
+    } else {
+        uint8_t base = (uint8_t)(0x3Eu - banks);
+        size_t idx;
+        if (banks == 0 || bank < base || addr < 0x4000u || addr >= 0x8000u) return (size_t)-1;
+        idx = (size_t)(bank - base);
+        if (idx >= banks) return (size_t)-1;
+        return idx * 0x4000u + (size_t)(addr - 0x4000u);
+    }
+    (void)size;
+}
+
+/* Read a far pointer [addr_hi, addr_lo, bank] at system-bank CPU address A. */
+static inline int ari_far_at(const uint8_t *rom, size_t size, size_t banks,
+                             uint16_t A, uint8_t *tbank, uint16_t *taddr)
+{
+    size_t o = ari_bank_off(size, banks, 0xFFu, A);
+    if (o == (size_t)-1 || o + 3u > size) return 0;
+    *taddr = (uint16_t)(((uint16_t)rom[o] << 8) | rom[o + 1]);
+    *tbank = rom[o + 2];
+    return 1;
+}
+
+/* Read a NUL-terminated printable string; returns length, or -1 if it is not a
+   clean string (non-printable byte, or no terminator within max). */
+static inline int ari_read_string(const uint8_t *rom, size_t size, size_t banks,
+                                  uint8_t bank, uint16_t addr, char *out, int max)
+{
+    size_t o = ari_bank_off(size, banks, bank, addr);
+    int n = 0;
+    if (o == (size_t)-1) return -1;
+    while (n < max) {
+        uint8_t c;
+        if (o + (size_t)n >= size) return -1;
+        c = rom[o + n];
+        if (c == 0) { out[n] = '\0'; return n; }
+        if (c < 0x20u || c > 0x7Eu) return -1;
+        out[n] = (char)c; n++;
+    }
+    return -1;
+}
+
+static inline int ari_is_name(const char *s)
+{
+    int i, len = (int)strlen(s), letters = 0;
+    if (len < 2 || len > 30) return 0;
+    for (i = 0; i < len; i++) {
+        if ((s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z')) letters++;
+    }
+    return letters >= 2;
+}
+
+/* Exactly five decimal digits, followed by a terminator or non-digit. */
+static inline int ari_is_number5(const uint8_t *rom, size_t size, size_t banks,
+                                 uint8_t bank, uint16_t addr)
+{
+    size_t o = ari_bank_off(size, banks, bank, addr);
+    int i; uint8_t nx;
+    if (o == (size_t)-1 || o + 5u > size) return 0;
+    for (i = 0; i < 5; i++) if (rom[o + i] < '0' || rom[o + i] > '9') return 0;
+    nx = (o + 5u < size) ? rom[o + 5] : 0;
+    return (nx == 0) || (nx < '0' || nx > '9');
+}
+
+static inline int ari_is_date(const char *s)
+{
+    int i, len = (int)strlen(s), digits = 0, seps = 0;
+    if (len < 4 || len > 12) return 0;
+    for (i = 0; i < len; i++) {
+        char c = s[i];
+        if (c >= '0' && c <= '9') digits++;
+        else if (c == '/' || c == '-') seps++;
+        else if (c != ' ') return 0;
+    }
+    return digits >= 3 && seps >= 1;
+}
+
+/* Scan the system bank for three consecutive far pointers (name, number, date)
+   whose targets match the expected shapes.  The base shifts later across AppleOS
+   versions (new pointers are prepended), so we locate it by content. */
+static inline void apex_rominfo_find_game_id(const uint8_t *rom, size_t size, ApexRomInfo *info)
+{
+    size_t banks = size / 0x4000u;
+    uint32_t A;
+    if (banks < 2u) return;
+    banks -= 2u;
+    for (A = 0x8000u; A <= 0x8FFFu; A++) {
+        uint8_t nb, ub, db; uint16_t na, ua, da;
+        char nm[32], dt[16];
+        if (!ari_far_at(rom, size, banks, (uint16_t)A,       &nb, &na) ||
+            !ari_far_at(rom, size, banks, (uint16_t)(A + 3), &ub, &ua) ||
+            !ari_far_at(rom, size, banks, (uint16_t)(A + 6), &db, &da)) continue;
+        if (ari_read_string(rom, size, banks, nb, na, nm, (int)sizeof(nm)) < 0 || !ari_is_name(nm))
+            continue;
+        if (!ari_is_number5(rom, size, banks, ub, ua)) continue;
+        if (ari_read_string(rom, size, banks, db, da, dt, (int)sizeof(dt)) < 0 || !ari_is_date(dt))
+            continue;
+
+        info->game_id_found   = 1;
+        info->game_id_ptr_addr = (uint16_t)A;
+        strncpy(info->game_name, nm, sizeof(info->game_name) - 1);
+        ari_read_string(rom, size, banks, ub, ua, info->game_number, (int)sizeof(info->game_number) - 1);
+        info->game_number[5] = '\0';   /* number is exactly five digits */
+        strncpy(info->game_date, dt, sizeof(info->game_date) - 1);
+        info->game_name_bank = nb;   info->game_name_addr = na;
+        info->game_number_bank = ub; info->game_number_addr = ua;
+        info->game_date_bank = db;   info->game_date_addr = da;
+        return;
+    }
+}
+
 /* ── Metadata reader ────────────────────────────────────────────────────*/
 static inline void apex_rominfo_compute(const uint8_t *rom, size_t size, ApexRomInfo *info)
 {
@@ -189,6 +321,8 @@ static inline void apex_rominfo_compute(const uint8_t *rom, size_t size, ApexRom
             break;
         }
     }
+
+    apex_rominfo_find_game_id(rom, size, info);
 
     info->crc32_val = ari_crc32(rom, size);
     ari_sha1(rom, size, info->sha1);

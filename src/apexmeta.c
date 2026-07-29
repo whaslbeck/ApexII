@@ -97,6 +97,19 @@ int main(int argc, char **argv)
     else
         printf("Game Version:  not found\n");
 
+    if (info.game_id_found) {
+        printf("\n");
+        printf("Game Identity: (far pointers at Bff_A%04X)\n", info.game_id_ptr_addr);
+        printf("  Name:        %-18s -> B%02x_A%04x\n",
+               info.game_name,   info.game_name_bank,   info.game_name_addr);
+        printf("  Number:      %-18s -> B%02x_A%04x\n",
+               info.game_number, info.game_number_bank, info.game_number_addr);
+        printf("  Date:        %-18s -> B%02x_A%04x\n",
+               info.game_date,   info.game_date_bank,   info.game_date_addr);
+    } else {
+        printf("Game Identity: not found\n");
+    }
+
     printf("\n");
     printf("Checksum:\n");
     printf("  Stored:      0x%04X  (CPU 0xFFEE / file +0x%zX)\n",

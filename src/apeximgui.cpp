@@ -1,4 +1,5 @@
 #include "apeximgui_core.h"
+#include "apex_async_render.h"
 #include "imgui_internal.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "backends/imgui_impl_sdl2.h"
@@ -159,6 +160,66 @@ static bool startup_pick_file(SDL_Window *win, bool ini_mode,
         startup_frame_render(win);
     }
     return !user_quit;
+}
+
+/* Snapshot of the last full frame, redrawn while a re-render runs so the whole
+   UI (all panels) stays visually in place instead of vanishing. It is just a
+   texture copy of the framebuffer — no project state is read during the render. */
+static GLuint g_freeze_tex = 0;
+static int    g_freeze_w   = 0;
+static int    g_freeze_h   = 0;
+
+/* Copy the current back buffer into g_freeze_tex. Call after the frame is drawn
+   (after RenderDrawData) and before SwapWindow. */
+static void capture_frame_to_freeze_tex(int w, int h)
+{
+    if (w <= 0 || h <= 0) {
+        return;
+    }
+    if (g_freeze_tex == 0) {
+        glGenTextures(1, &g_freeze_tex);
+    }
+    glBindTexture(GL_TEXTURE_2D, g_freeze_tex);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glCopyTexImage2D(GL_TEXTURE_2D, 0, GL_RGB, 0, 0, w, h, 0);
+    glBindTexture(GL_TEXTURE_2D, 0);
+    g_freeze_w = w;
+    g_freeze_h = h;
+}
+
+/* Draw the frozen-frame snapshot over the whole viewport (behind the overlay). */
+static void draw_freeze_snapshot()
+{
+    if (g_freeze_tex == 0) {
+        return;
+    }
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    ImVec2 p0 = vp->Pos;
+    ImVec2 p1 = ImVec2(vp->Pos.x + vp->Size.x, vp->Pos.y + vp->Size.y);
+    /* glCopyTexImage2D captures with a bottom-left origin; flip V for ImGui. */
+    ImGui::GetBackgroundDrawList()->AddImage((ImTextureID)(intptr_t)g_freeze_tex,
+                                             p0, p1, ImVec2(0.0f, 1.0f), ImVec2(1.0f, 0.0f));
+}
+
+/* Centered overlay shown while a re-render runs on the worker thread. Draws
+   nothing that reads the project, so it is safe to be the only thing on screen
+   while the worker mutates project state. */
+static void render_busy_overlay()
+{
+    ImGuiViewport *vp = ImGui::GetMainViewport();
+    /* Top-centre banner so it doesn't cover the (now visible) frozen disassembly. */
+    ImVec2 top(vp->GetCenter().x, vp->WorkPos.y + 6.0f);
+    ImGui::SetNextWindowPos(top, ImGuiCond_Always, ImVec2(0.5f, 0.0f));
+    ImGui::SetNextWindowBgAlpha(0.85f);
+    if (ImGui::Begin("##rerendering", nullptr,
+                     ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_AlwaysAutoResize |
+                     ImGuiWindowFlags_NoSavedSettings | ImGuiWindowFlags_NoNav |
+                     ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoInputs)) {
+        static const char spin[] = {'|', '/', '-', '\\'};
+        ImGui::Text("Re-rendering disassembly  %c", spin[(ImGui::GetFrameCount() / 8) & 3]);
+    }
+    ImGui::End();
 }
 
 int main(int argc, char **argv)
@@ -403,6 +464,8 @@ int main(int argc, char **argv)
     signal(SIGFPE,  handle_fatal_signal);
     signal(SIGILL,  handle_fatal_signal);
 
+    AsyncRenderer renderer;  /* off-thread re-render (see the async pump below) */
+
     while (!done) {
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -442,6 +505,39 @@ int main(int argc, char **argv)
                 ImGui::MarkIniSettingsDirty();
             }
         }
+        /* ── async re-render pump ─────────────────────────────────────
+           An edit raises state.async_pending; we launch a DETACHED render on a
+           worker thread. While it runs, this thread keeps showing the previous
+           document through the project-free frozen disassembly (+ a busy overlay);
+           it never touches the project the worker is mutating. On completion we
+           install the freshly rendered document as the render cache. */
+        if (state.rendering && renderer.poll()) {
+            ApexRenderedDocument *nd = renderer.take();
+            if (nd) {
+                apex_project_adopt_render_cache(project, nd, 0, 0);
+                document = project->render_cache;   /* == nd */
+            }
+            finish_async_rerender(project, &document, &state);
+            state.rendering = false;
+        }
+        if (!state.rendering && state.async_pending) {
+            state.async_pending = false;
+            /* Remember the focused dock tab (e.g. "Edit"); hidden panels would
+               otherwise reset their dock node's selection. */
+            ImGuiContext *gctx = ImGui::GetCurrentContext();
+            ImGuiWindow  *nav  = gctx ? gctx->NavWindow : nullptr;
+            ImGuiWindow  *root = nav ? (nav->RootWindow ? nav->RootWindow : nav) : nullptr;
+            state.restore_focus = root ? root->Name : "";
+            renderer.start(project, 0, 0);
+            state.rendering = true;
+        }
+        if (state.rendering) {
+            /* Redraw the last full frame as a snapshot so the whole UI stays put
+               (no panels vanish) while the worker renders; nothing here reads the
+               project the worker is mutating. */
+            draw_freeze_snapshot();
+            render_busy_overlay();
+        } else {
         sync_editor_state(project, document, &state);
 
         if (ImGui::BeginMainMenuBar()) {
@@ -862,7 +958,7 @@ int main(int argc, char **argv)
         }
         if (state.show_rom_info) {
             ImGui::Begin("ROM Info", &state.show_rom_info);
-            render_rom_info(project, &state);
+            render_rom_info(project, document, &state);
             ImGui::End();
         }
         if (state.show_match_window) {
@@ -932,6 +1028,7 @@ int main(int argc, char **argv)
             ImGui::End();
         }
         render_xref_popup(project, document, &state);
+        render_command_palette(&document, &state);
         if (state.show_search_window) {
             ImGui::Begin("Global Search", &state.show_search_window);
             render_global_search(document, &state);
@@ -1054,6 +1151,7 @@ int main(int argc, char **argv)
                 krow("[ / ]",              "History back / forward");
                 krow("Alt+\xe2\x86\x90 / Alt+\xe2\x86\x92", "History back / forward (alt)");
                 krow("G",                  "Go to address");
+                krow("Ctrl+P",             "Command palette (jump to label / address)");
                 krow("/",                  "Focus filter bar");
                 ImGui::EndTable();
             }
@@ -1076,9 +1174,22 @@ int main(int argc, char **argv)
                 ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
                 ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
                 krow("L",         "Edit label");
+                krow("Double-click", "Rename a label in place (Enter commits, Esc cancels)");
                 krow("Shift+D",   "Edit comment / doc");
                 krow("B",         "Add bookmark");
-                krow("Shift+Click", "Extend selection range");
+                krow("Home",      "Jump to table header (inside a table)");
+                ImGui::EndTable();
+            }
+
+            ImGui::SeparatorText("Block selection (copy / range)");
+            if (ImGui::BeginTable("##blk", 2, kTableFlags)) {
+                ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
+                ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
+                krow("A",           "Set block start (at cursor)");
+                krow("E",           "Set block end (at cursor)");
+                krow("Esc",         "Clear block");
+                krow("Shift+Click", "Set / extend block");
+                krow("Ctrl+C",      "Copy block (disasm lines, or hex bytes in hex view)");
                 ImGui::EndTable();
             }
 
@@ -1117,6 +1228,11 @@ int main(int argc, char **argv)
             ImGui::BulletText("Double-click a label token in a ; referenced_by line to navigate.");
 
             ImGui::End();
+        }
+
+        /* Command palette — openable from anywhere, even while a field is focused. */
+        if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P)) {
+            state.request_command_palette = true;
         }
 
         if (!io.WantTextInput) {
@@ -1214,6 +1330,57 @@ int main(int argc, char **argv)
                 ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
                 history_jump(&state, 0);
             }
+            /* Explicit block selection (for copy / range ops), decoupled from the
+               cursor: A sets the start, E the end, Esc clears.  Handled centrally
+               (not in the hex child render) so ImGui keyboard-nav does not swallow
+               Escape.  Routes to the hex byte block or the disassembly line block
+               depending on which view is focused. */
+            if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+                if (state.hex_window_focused) {
+                    state.hex_anchor_offset = state.hex_selected_offset;
+                    if (!state.hex_has_range) state.hex_block_end = state.hex_anchor_offset;
+                    state.hex_has_range = true;
+                } else {
+                    state.block_a = state.selected_line;
+                    if (!state.block_active) state.block_b = state.block_a;
+                    state.block_active = true;
+                }
+                set_status(&state, "block start set (E = end, Esc = clear)");
+            }
+            if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E)) {
+                if (state.hex_window_focused) {
+                    state.hex_block_end = state.hex_selected_offset;
+                    if (!state.hex_has_range) state.hex_anchor_offset = state.hex_block_end;
+                    state.hex_has_range = true;
+                } else {
+                    state.block_b = state.selected_line;
+                    if (!state.block_active) state.block_a = state.block_b;
+                    state.block_active = true;
+                }
+                set_status(&state, "block end set (Ctrl+C copies the block)");
+            }
+            /* Raw key state (GetKeyData) bypasses ImGui key-ownership, which the
+               keyboard-nav system claims for Escape while a child window is
+               focused — that is why IsKeyPressed(Escape) was swallowed in hex. */
+            {
+                const ImGuiKeyData *esc = ImGui::GetKeyData(ImGuiKey_Escape);
+                bool esc_pressed = esc && esc->Down && esc->DownDuration == 0.0f;
+                if (esc_pressed) {
+                    /* Route to the hex block when hex is the active view. Use the
+                       sticky hex_is_edit_target rather than hex_window_focused:
+                       keyboard-nav consumes Escape to defocus the focused hex
+                       child that same frame, so hex_window_focused would already
+                       read false here (why Esc silently missed in the hex view). */
+                    if ((state.hex_is_edit_target || state.hex_window_focused) &&
+                        state.hex_has_range) {
+                        state.hex_has_range = false;
+                        set_status(&state, "block cleared");
+                    } else if (state.block_active) {
+                        state.block_active = false;
+                        set_status(&state, "block cleared");
+                    }
+                }
+            }
             if (ImGui::IsKeyPressed(ImGuiKey_B)) {
                 uint8_t b;
                 uint32_t a;
@@ -1253,7 +1420,12 @@ int main(int argc, char **argv)
             }
             if (ImGui::IsKeyPressed(ImGuiKey_C)) {
                 if (io.KeyCtrl) {
-                    copy_selection_to_clipboard(document, &state);
+                    if (state.hex_window_focused) {
+                        copy_hex_block_to_clipboard(project, &state);
+                        set_status(&state, "copied hex bytes");
+                    } else {
+                        copy_selection_to_clipboard(document, &state);
+                    }
                 } else {
                     apply_code_at_selection(project, &document, &state);
                 }
@@ -1294,6 +1466,19 @@ int main(int argc, char **argv)
                     } else {
                         follow_selected_link(document, &state);
                     }
+                }
+            }
+            /* Home inside a table: jump to the table header (start). */
+            if (ImGui::IsKeyPressed(ImGuiKey_Home) &&
+                state.selected_line < document->line_count) {
+                const auto *l = &document->lines[state.selected_line];
+                uint8_t tb;
+                uint32_t ta;
+                size_t tli;
+                if (l->has_location && l->block_kind == APEX_RENDER_BLOCK_TABLE &&
+                    find_table_start(document, state.selected_line, &tb, &ta) &&
+                    apex_render_find_line_by_address(document, tb, ta, &tli)) {
+                    select_line(&state, tli, 1);
                 }
             }
         }
@@ -1438,12 +1623,30 @@ int main(int argc, char **argv)
             ImGui::EndPopup();
         }
 
+        /* First normal frame after an async render: restore the dock tab that
+           was active before the panels were hidden behind the overlay. */
+        if (!state.rendering && !state.restore_focus.empty()) {
+            ImGui::SetWindowFocus(state.restore_focus.c_str());
+            state.restore_focus.clear();
+        }
+        }  /* end else: normal UI (skipped while a re-render is in flight) */
+
         ImGui::Render();
         glViewport(0, 0, (int)io.DisplaySize.x, (int)io.DisplaySize.y);
         glClearColor(0.10f, 0.10f, 0.12f, 1.0f);
         glClear(GL_COLOR_BUFFER_BIT);
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        /* An edit was just requested this frame: snapshot the fully-drawn UI so
+           the upcoming render frames can redraw it in place (no visual break). */
+        if (state.async_pending && !state.rendering) {
+            capture_frame_to_freeze_tex((int)io.DisplaySize.x, (int)io.DisplaySize.y);
+        }
         SDL_GL_SwapWindow(window);
+    }
+
+    /* Never free the project out from under a still-running render worker. */
+    if (renderer.running()) {
+        document = renderer.take();
     }
 
     ImGui_ImplOpenGL3_Shutdown();

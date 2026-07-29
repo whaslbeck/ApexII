@@ -6,6 +6,11 @@
 #include <cstdio>
 #include <cstdlib>
 
+/* Bounded substring search within a single rendered line (line->text is NOT
+   NUL-terminated — lines are '\n'-separated slices of one buffer, so strstr
+   would run past the line). Defined below; forward-declared for early use. */
+static bool line_contains(const ApexRenderedLine *l, const char *needle);
+
 static int is_symbol_boundary_char(char ch)
 {
     return !std::isalnum((unsigned char)ch) && ch != '_' && ch != '.' && ch != '$';
@@ -145,7 +150,7 @@ static void traverse_graph_outgoing(ApexProject *project, const ApexRenderedDocu
             }
         }
         if (l->kind == APEX_RENDER_LINE_INSTRUCTION &&
-            (strstr(l->text, "RTS") || strstr(l->text, "RTI"))) {
+            (line_contains(l, "RTS") || line_contains(l, "RTI"))) {
             break;
         }
     }
@@ -327,7 +332,6 @@ void select_line(UiState *s, size_t i, int r)
         s->history_forward.clear();
     }
     s->selected_line = i;
-    s->selection_end = i;
     if (!s->graph_pinned)
         s->graph_needs_rebuild = true;
 }
@@ -335,9 +339,16 @@ void select_line(UiState *s, size_t i, int r)
 void handle_line_selection(UiState *s, size_t i, bool sh)
 {
     if (sh) {
-        s->selection_end = i;
+        /* Shift-click sets/extends the explicit block, anchored at the cursor. */
+        if (!s->block_active) {
+            s->block_a = s->selected_line;
+            s->block_active = true;
+        }
+        s->block_b = i;
+        s->selected_line = i;              /* cursor follows the extend */
+        s->request_scroll_to_selection = 1;
     } else {
-        select_line(s, i, 0);
+        select_line(s, i, 0);              /* cursor only; block untouched */
     }
 }
 
@@ -579,6 +590,23 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
     return ts;
 }
 
+/* Whole-buffer strchr/strstr would overrun: ApexRenderedLine.text is NOT
+   NUL-terminated (lines are '\n'-separated slices of one buffer), so search
+   only within the line's own length. */
+static bool line_contains(const ApexRenderedLine *l, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (nl == 0 || nl > l->length) {
+        return false;
+    }
+    for (size_t i = 0; i + nl <= l->length; i++) {
+        if (memcmp(l->text + i, needle, nl) == 0) {
+            return true;
+        }
+    }
+    return false;
+}
+
 int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l,
                            uint8_t *tb, uint32_t *ta, int *f)
 {
@@ -587,19 +615,21 @@ int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l,
     if (!l->has_location) {
         return 0;
     }
-    if (strstr(l->text, "PTR") || strstr(l->text, "CODE")) {
+    if (line_contains(l, "PTR") || line_contains(l, "CODE")) {
         if (!project_locate_rom_bytes(p, l->bank, l->cpu_addr, &src, &len, NULL) || len < 2u) {
             return 0;
         }
         *ta = read_be16(src);
         *tb = l->bank;
         *f = 0;
-        if (strstr(l->text, "FAR")) {
+        if (line_contains(l, "FAR")) {
             if (len < 3u) {
                 return 0;
             }
             *tb = src[2];
             *f = 1;
+        } else if (*ta >= 0x8000u) {
+            *tb = 0xffu;  /* a 2-byte pointer into 0x8000+ targets the system bank */
         }
         return 1;
     }
@@ -665,11 +695,32 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
                                          UiState *s, uint8_t b, uint32_t a)
 {
     std::vector<RefEntry> rs;
-    for (size_t i = 0; i < p->refs.count; i++) {
-        const auto &r = p->refs.items[i];
+    /* Rebuild the (source_bank, source_addr) index when the analysis changed. */
+    if (s->cached_out_ref_gen != d->generation) {
+        std::vector<uint32_t> &ord = s->cached_out_ref_order;
+        ord.resize(p->refs.count);
+        for (size_t i = 0; i < p->refs.count; i++) ord[i] = (uint32_t)i;
+        std::sort(ord.begin(), ord.end(), [&](uint32_t x, uint32_t y) {
+            const auto &rx = p->refs.items[x], &ry = p->refs.items[y];
+            if (rx.source_bank != ry.source_bank) return rx.source_bank < ry.source_bank;
+            return rx.source_addr < ry.source_addr;
+        });
+        s->cached_out_ref_gen = d->generation;
+    }
+    const std::vector<uint32_t> &ord = s->cached_out_ref_order;
+    /* lower_bound for the first ref with (source_bank, source_addr) >= (b, a) */
+    size_t lo = 0, hi = ord.size();
+    while (lo < hi) {
+        size_t mid = lo + (hi - lo) / 2;
+        const auto &r = p->refs.items[ord[mid]];
+        if (r.source_bank < b || (r.source_bank == b && r.source_addr < a)) lo = mid + 1;
+        else hi = mid;
+    }
+    for (size_t k = lo; k < ord.size(); k++) {
+        const auto &r = p->refs.items[ord[k]];
         size_t li;
         if (r.source_bank != b || r.source_addr != a) {
-            continue;
+            break;
         }
         if (apex_render_find_line_by_address(d, r.bank, r.addr, &li)) {
             rs.push_back({li, r.bank, r.addr,
@@ -959,27 +1010,43 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     }
 }
 
+/* Request an asynchronous re-render. The config mutation has already been
+   applied by the caller; here we only record the reselect target and raise
+   async_pending. The main loop launches apex_project_render() on a worker
+   thread (showing a busy overlay meanwhile) and calls finish_async_rerender()
+   when it completes. Deferring to the main loop keeps the render off the UI
+   thread without any mid-frame project access from a button handler. */
 void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
                            uint8_t b, uint32_t a)
 {
+    (void)p;
+    (void)dp;
+    s->async_b = b;
+    s->async_a = a;
+    s->async_pending = true;
+    s->inline_edit_line = (size_t)-1;  /* line indices change on re-render */
+}
+
+/* Runs on the main thread after the worker finishes; *dp is the fresh document.
+   Mirrors the old post-render tail of rerender_and_reselect. */
+void finish_async_rerender(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
+{
+    const ApexRenderedDocument *doc = *dp;
     size_t li = 0;
-    apex_project_analyze(p);
-    *dp = apex_project_render(p, 0, 0);
     s->labels_valid = false;
     s->code_candidates_stale   = true;
     s->inline_candidates_stale = true;
     s->warnings_stale          = true;
     s->flow_breaks_stale       = true;
-    if (*dp && apex_render_find_line_by_address(*dp, b, a, &li)) {
+    if (doc && apex_render_find_line_by_address(doc, s->async_b, s->async_a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
-        s->selection_end = li;
         s->request_scroll_to_selection = 1;
         s->editor_bound_line = (size_t)-1;
         s->suppress_history_push = 0;
     }
     s->overlay_dirty = true;
-    sync_editor_state(p, *dp, s);
+    sync_editor_state(p, doc, s);
 }
 
 ApexRenderedBlockKind get_offset_kind(const ApexProject *project,
@@ -1024,7 +1091,7 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     uint32_t a;
     if (s->hex_is_edit_target) {
         size_t base = s->hex_has_range
-            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
+            ? std::min(s->hex_anchor_offset, s->hex_block_end)
             : s->hex_selected_offset;
         if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
@@ -1048,7 +1115,7 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
     uint32_t a;
     if (s->hex_is_edit_target) {
         size_t base = s->hex_has_range
-            ? std::min(s->hex_anchor_offset, s->hex_selected_offset)
+            ? std::min(s->hex_anchor_offset, s->hex_block_end)
             : s->hex_selected_offset;
         if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
@@ -1515,6 +1582,13 @@ void scan_table_candidates(ApexProject *p, UiState *s)
     s->table_scan_done = true;
     if (!p->rom.data || p->rom.size < 9u) return;
 
+    /* table_def_at() (used below for the 'already' flag) binary-searches the
+       table list, so it must be sorted. Accept appends via add_table_def and the
+       re-render is now async (no synchronous re-analysis to sort it first), so
+       sort here — otherwise a just-accepted table isn't found and its button
+       stays on "Accept". */
+    sort_table_defs(&p->tables);
+
     auto push_cand = [&](uint8_t bank, uint16_t addr, const char *spec, int rows,
                          const char *kind) {
         UiState::TableCandidate c;
@@ -1723,8 +1797,9 @@ std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,
 
 void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s)
 {
-    size_t st = std::min(s->selected_line, s->selection_end);
-    size_t en = std::max(s->selected_line, s->selection_end);
+    /* Copy the explicit block when set, otherwise just the cursor line. */
+    size_t st = s->block_active ? std::min(s->block_a, s->block_b) : s->selected_line;
+    size_t en = s->block_active ? std::max(s->block_a, s->block_b) : s->selected_line;
     std::string t;
     if (st >= d->line_count) {
         return;
@@ -1743,6 +1818,31 @@ void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s
         }
         t.append(l->text, l->length);
         t += "\n";
+    }
+    ImGui::SetClipboardText(t.c_str());
+}
+
+void copy_hex_block_to_clipboard(const ApexProject *p, const UiState *s)
+{
+    if (!p || !p->rom.data || p->rom.size == 0) {
+        return;
+    }
+    size_t lo = s->hex_has_range ? std::min(s->hex_anchor_offset, s->hex_block_end)
+                                 : s->hex_selected_offset;
+    size_t hi = s->hex_has_range ? std::max(s->hex_anchor_offset, s->hex_block_end)
+                                 : s->hex_selected_offset;
+    if (lo >= p->rom.size) {
+        return;
+    }
+    if (hi >= p->rom.size) {
+        hi = p->rom.size - 1;
+    }
+    std::string t;
+    char b[4];
+    for (size_t o = lo; o <= hi; o++) {
+        snprintf(b, sizeof(b), "%02X", p->rom.data[o]);
+        if (!t.empty()) t += ' ';
+        t += b;
     }
     ImGui::SetClipboardText(t.c_str());
 }

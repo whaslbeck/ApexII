@@ -58,7 +58,7 @@ void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count)
     }
 }
 
-Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
+static Label *add_label_impl(LabelSet *set, uint32_t addr, const char *name, int is_code, int owns)
 {
     size_t i;
     Label *first_at_addr = NULL;
@@ -74,6 +74,7 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
                 } else if (is_code && set->items[i].is_data) {
                     set->items[i].is_conflict = 1;
                 }
+                if (owns && name) free((char *)name); /* discarded duplicate */
                 return &set->items[i];
             }
             if (is_code && !set->items[i].is_data) {
@@ -84,6 +85,7 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
         }
     }
     if (first_at_addr && (!name || generated_any_label_name(name))) {
+        if (owns && name) free((char *)name); /* discarded generated duplicate */
         return first_at_addr;
     }
     if (set->count == set->cap) {
@@ -98,6 +100,7 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
     }
     set->items[set->count].addr = addr;
     set->items[set->count].name = name;
+    set->items[set->count].owns_name = owns;
     set->items[set->count].is_code = is_code;
     set->items[set->count].is_data = 0;
     set->items[set->count].is_string = 0;
@@ -110,6 +113,16 @@ Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
     set->sorted = 0;
     set->count++;
     return &set->items[set->count - 1];
+}
+
+Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
+{
+    return add_label_impl(set, addr, name, is_code, 0);
+}
+
+Label *add_owned_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
+{
+    return add_label_impl(set, addr, name, is_code, 1);
 }
 
 void explain_label(Label *label, const char *source)
@@ -273,6 +286,9 @@ size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
         Label *label = &labels->items[read_idx];
 
         if (!label_is_pinned(label) && !label_has_inbound_ref(bank, label->addr, refs)) {
+            if (label->owns_name && label->name) {
+                free((char *)label->name);
+            }
             removed++;
             continue;
         }
@@ -367,7 +383,17 @@ void apply_string_content_labels(LabelSet *labels, const uint8_t *data, size_t u
         if (string_len == 0) {
             continue;
         }
-        label->name = make_string_label(label->name, data + pos, string_len);
+        {
+            /* Upgrade the generated (owned) label to include the string content;
+               free the old owned base name after make_string_label has read it. */
+            const char *old = label->name;
+            int old_owns = label->owns_name;
+            label->name = make_string_label(old, data + pos, string_len);
+            label->owns_name = 1;
+            if (old_owns) {
+                free((char *)old);
+            }
+        }
     }
 }
 
@@ -514,6 +540,23 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
     if (!docs) {
         return NULL;
     }
+    if (docs->sorted) {
+        /* items sorted by addr: binary-search the first at `addr`, then scan the
+           (usually one) entries there.  O(log n) vs a full scan per emitted line. */
+        const char *unbanked = NULL;
+        size_t lo = 0, hi = docs->count;
+        while (lo < hi) {
+            size_t mid = lo + (hi - lo) / 2;
+            if (docs->items[mid].addr < addr) lo = mid + 1; else hi = mid;
+        }
+        for (i = lo; i < docs->count && docs->items[i].addr == addr; i++) {
+            if (docs->items[i].has_bank && docs->items[i].bank == bank) {
+                return docs->items[i].text;
+            }
+            if (!docs->items[i].has_bank) unbanked = docs->items[i].text;
+        }
+        return (bank == 0xffu) ? unbanked : NULL;
+    }
     for (i = 0; i < docs->count; i++) {
         if (docs->items[i].has_bank && docs->items[i].bank == bank &&
             docs->items[i].addr == addr) {
@@ -528,6 +571,26 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
         }
     }
     return NULL;
+}
+
+int doc_addr_cmp(const void *pa, const void *pb)
+{
+    const ConfigDoc *a = (const ConfigDoc *)pa, *b = (const ConfigDoc *)pb;
+    if (a->addr != b->addr) return a->addr < b->addr ? -1 : 1;
+    if (a->has_bank != b->has_bank) return b->has_bank - a->has_bank;
+    if (a->bank != b->bank) return (int)a->bank - (int)b->bank;
+    return 0;
+}
+
+void sort_config_docs(ConfigDocs *docs)
+{
+    if (!docs || docs->sorted) {
+        return;
+    }
+    if (docs->count > 1) {
+        qsort(docs->items, docs->count, sizeof(docs->items[0]), doc_addr_cmp);
+    }
+    docs->sorted = 1;
 }
 
 int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
@@ -659,6 +722,17 @@ const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *table
 {
     size_t lo = 0, hi = tables->count;
 
+    if (!tables->sorted) {
+        /* add_table_def appends without ordering; only binary-search once the
+           list has been sorted, else a just-added entry can be missed. */
+        size_t i;
+        for (i = 0; i < tables->count; i++) {
+            if (tables->items[i].bank == bank && tables->items[i].addr == addr)
+                return &tables->items[i];
+        }
+        return NULL;
+    }
+
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         const TableDef *t = &tables->items[mid];
@@ -762,7 +836,7 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
     Label *label;
 
     if (bank == 0xffu && in_system_addr(addr)) {
-        label = add_label(system_labels, addr, make_generated_label(addr), is_code);
+        label = add_owned_label(system_labels, addr, make_generated_label(addr), is_code);
         explain_label(label, source);
         explain_label_kind(label, source);
         if (!is_code) {
@@ -775,7 +849,7 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
     }
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-        label = add_label(&bank_labels[bank_index], addr,
+        label = add_owned_label(&bank_labels[bank_index], addr,
                           make_bank_label(bank_id_for_index(banks, bank_index), addr),
                           is_code);
         explain_label(label, source);
@@ -801,7 +875,7 @@ void apply_inline_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t ban
     if (ptr < APEX_PAGED_ORG || ptr >= 0x8000u) {
         return;
     }
-    target = add_label(labels, ptr, make_bank_label(bank, ptr), kind == TABLE_PTR16_CODE);
+    target = add_owned_label(labels, ptr, make_bank_label(bank, ptr), kind == TABLE_PTR16_CODE);
     explain_label(target, source);
     explain_label_kind(target, source);
     if (kind != TABLE_PTR16_CODE) {
@@ -834,7 +908,7 @@ void apply_system_ptr16_label(TableFieldKind kind, LabelSet *system_labels, uint
                  kind == TABLE_PTR16_DMD_FULLFRAME ? "table_ptr16_dmd_fullframe_ref" :
                              "table_ptr16_data_ref";
     }
-    target = add_label(system_labels, ptr, make_generated_label(ptr), is_code);
+    target = add_owned_label(system_labels, ptr, make_generated_label(ptr), is_code);
     explain_label(target, source);
     explain_label_kind(target, source);
     if (!is_code) {
@@ -1036,10 +1110,10 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                     if (!label_name_at(info.target, labels->items, labels->count, 0)) {
                         Label *target;
                         if (base_addr == APEX_SYSTEM_ORG) {
-                            target = add_label(labels, info.target,
+                            target = add_owned_label(labels, info.target,
                                                make_generated_label(info.target), 1);
                         } else {
-                            target = add_label(labels, info.target,
+                            target = add_owned_label(labels, info.target,
                                                make_bank_label(data[0], info.target), 1);
                         }
                         explain_label(target, "code_flow");
@@ -1062,7 +1136,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                     }
                 } else if (base_addr != APEX_SYSTEM_ORG && in_system_addr(info.target)) {
                     Label *target =
-                        add_label(system_labels, info.target, make_generated_label(info.target), 1);
+                        add_owned_label(system_labels, info.target, make_generated_label(info.target), 1);
 
                     explain_label(target, "code_flow");
                     explain_label_kind(target, "code_flow");
@@ -1076,7 +1150,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                                                             (uint16_t)info.target);
                     if (ub >= 0) {
                         uint8_t bid = bank_id_for_index(banks, ub);
-                        Label *target = add_label(&bank_labels[ub], info.target,
+                        Label *target = add_owned_label(&bank_labels[ub], info.target,
                                                   make_bank_label(bid, (uint16_t)info.target), 1);
                         explain_label(target, "code_flow");
                         explain_label_kind(target, "code_flow");
@@ -1103,7 +1177,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                     int tcode = (ttype == FAR_IMM_CODE);
                     if (tb == 0xffu && in_system_addr(info.addr_ref)) {
                         if (system_labels) {
-                            add_label(system_labels, info.addr_ref,
+                            add_owned_label(system_labels, info.addr_ref,
                                       make_generated_label(info.addr_ref), tcode);
                         }
                         add_reference(refs, 0xffu, info.addr_ref, current_bank, instr_addr,
@@ -1112,7 +1186,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                                info.addr_ref < 0x8000u && bank_labels) {
                         int bi = bank_index_for_id(paged_rom, banks, tb);
                         if (bi >= 0) {
-                            add_label(&bank_labels[bi], info.addr_ref,
+                            add_owned_label(&bank_labels[bi], info.addr_ref,
                                       make_bank_label(bank_id_for_index(banks, bi),
                                                       (uint16_t)info.addr_ref), tcode);
                             add_reference(refs, tb, info.addr_ref, current_bank, instr_addr,
@@ -1292,6 +1366,7 @@ void sort_table_defs(TableDefs *tables)
     if (tables->count > 1) {
         qsort(tables->items, tables->count, sizeof(tables->items[0]), table_def_cmp);
     }
+    tables->sorted = 1;
 }
 
 static int inline_sig_cmp(const void *a, const void *b)

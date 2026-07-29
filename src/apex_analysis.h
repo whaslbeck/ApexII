@@ -10,6 +10,7 @@
 typedef struct {
     uint32_t addr;
     const char *name;
+    int owns_name;          /* name was heap-allocated by a make_*_label (this set owns it) */
     int is_code;
     int is_data;
     int is_string;
@@ -77,6 +78,10 @@ int generated_string_label_name(const char *name);
 int generated_any_label_name(const char *name);
 void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count);
 Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code);
+/* Like add_label but the set takes ownership of `name` (a make_*_label heap
+   string), freeing it in free_label_set/prune — or immediately if the label
+   already exists and the name is discarded. */
+Label *add_owned_label(LabelSet *set, uint32_t addr, const char *name, int is_code);
 void explain_label(Label *label, const char *source);
 void explain_label_kind(Label *label, const char *source);
 void mark_label_data(Label *label);
@@ -110,6 +115,7 @@ size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sor
 int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
 const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ranges);
 const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr);
+void sort_config_docs(ConfigDocs *docs);
 int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
 const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count, int sorted);
 const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols);

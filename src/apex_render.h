@@ -60,11 +60,23 @@ typedef struct {
     size_t rom_addr;
 } ApexRenderedLine;
 
+/* Lookup index: has_location lines sorted by (bank, cpu_addr, line_index) so
+   apex_render_find_line_by_address is O(log n) instead of a full scan. */
+typedef struct {
+    uint8_t bank;
+    uint32_t cpu_addr;
+    size_t line_index;
+} ApexRenderedAddrIndex;
+
 typedef struct ApexRenderedDocument {
     char *text;
     size_t text_len;
     ApexRenderedLine *lines;
     size_t line_count;
+    ApexRenderedAddrIndex *addr_index;  /* sorted; NULL until built by build_line_index */
+    size_t addr_index_count;
+    unsigned long generation;  /* bumped on every (re)build; survives clear_document
+                                  so frontends can cache derived data keyed on it */
 } ApexRenderedDocument;
 
 int apex_render_project(const struct ApexProject *project, int emit_xrefs, int emit_explain,

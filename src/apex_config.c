@@ -167,6 +167,7 @@ static void add_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_
     docs->items[docs->count].addr = addr;
     docs->items[docs->count].text = dup_string(text);
     docs->count++;
+    docs->sorted = 0;
 }
 
 static int valid_symbol_name(const char *s)
@@ -539,6 +540,7 @@ static void add_table_def(TableDefs *tables, uint8_t bank, uint32_t addr, TableS
     tables->items[tables->count].has_header = has_header;
     tables->items[tables->count].rows = rows;
     tables->count++;
+    tables->sorted = 0; /* appended out of order; table_def_at re-sorts/linear-scans */
 }
 
 static int remove_table_def(TableDefs *tables, uint8_t bank, uint32_t addr)

@@ -79,6 +79,7 @@ typedef struct {
     ConfigDoc *items;
     size_t count;
     size_t cap;
+    int sorted;   /* items sorted by addr → config_doc_at binary-searches */
 } ConfigDocs;
 
 typedef struct {
@@ -146,6 +147,7 @@ typedef struct {
     TableDef *items;
     size_t count;
     size_t cap;
+    int sorted;   /* items sorted by (bank,addr) → table_def_at binary-searches */
 } TableDefs;
 
 typedef struct {

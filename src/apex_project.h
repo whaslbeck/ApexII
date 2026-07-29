@@ -80,6 +80,17 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
 int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr);
 const struct ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_xrefs,
                                                        int emit_explain);
+/* Render into a freshly allocated document instead of the project's render cache,
+   leaving the cache (and any document the caller is still displaying) untouched.
+   Runs analysis + config sorts, so it mutates the project and MUST NOT overlap
+   other project access. Caller owns the result; hand it to
+   apex_project_adopt_render_cache() or free it with apex_render_document_free()+free().
+   Used by the async renderer so the UI can keep showing the previous document. */
+struct ApexRenderedDocument *apex_project_render_detached(ApexProject *project, int emit_xrefs,
+                                                          int emit_explain);
+/* Install a detached document as the project's render cache, freeing the old one. */
+void apex_project_adopt_render_cache(ApexProject *project, struct ApexRenderedDocument *doc,
+                                     int emit_xrefs, int emit_explain);
 /* When nonzero (default) disassembly warnings are also printed to stderr; the GUI
    sets it to 0 and surfaces them in its Warnings panel instead. The warnings are
    always written into the output as "; WARNING ..." comment lines regardless. */

@@ -28,12 +28,15 @@ else
 APEXIMGUI_GL_LIBS := $(shell $(PKG_CONFIG) --libs gl 2>/dev/null)
 endif
 
-APEXIMGUI_CPPFLAGS := $(CPPFLAGS) -I$(SRC_DIR) -Ithird_party/imgui -Ithird_party/imgui/backends -Ithird_party/ImGuiFileDialog $(APEXIMGUI_SDL_CFLAGS)
-APEXIMGUI_LDLIBS := $(APEXIMGUI_SDL_LIBS) $(APEXIMGUI_GL_LIBS)
+APEXIMGUI_CPPFLAGS := $(CPPFLAGS) -I$(SRC_DIR) -Ithird_party/imgui -Ithird_party/imgui/backends -Ithird_party/ImGuiFileDialog $(APEXIMGUI_SDL_CFLAGS) -pthread
+APEXIMGUI_LDLIBS := $(APEXIMGUI_SDL_LIBS) $(APEXIMGUI_GL_LIBS) -pthread
 APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 	$(BUILD_DIR)/apeximgui_data.o \
 	$(BUILD_DIR)/apeximgui_analysis.o \
 	$(BUILD_DIR)/apeximgui_views.o \
+	$(BUILD_DIR)/apeximgui_views_compare.o \
+	$(BUILD_DIR)/apeximgui_views_scan.o \
+	$(BUILD_DIR)/apeximgui_views_media.o \
 	$(BUILD_DIR)/apex_match.o \
 	$(BUILD_DIR)/apex_compare.o \
 	$(BUILD_DIR)/ImGuiFileDialog.o \
@@ -87,13 +90,13 @@ $(BUILD_DIR)/imgui_impl_%.o: third_party/imgui/backends/imgui_impl_%.cpp | $(BUI
 $(BUILD_DIR)/ImGuiFileDialog.o: third_party/ImGuiFileDialog/ImGuiFileDialog.cpp | $(BUILD_DIR)
 	$(CXX) $(APEXIMGUI_CPPFLAGS) $(filter-out -std=%,$(CXXFLAGS)) -std=c++17 -c $< -o $@
 
-$(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_DIR)/apex_project.h | $(BUILD_DIR)
+$(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
-$(BUILD_DIR)/apexdmd_test.o: tests/apexdmd_test.c $(SRC_DIR)/apexdmd.h | $(BUILD_DIR)
+$(BUILD_DIR)/apexdmd_test.o: tests/apexdmd_test.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
-$(BUILD_DIR)/apexsprite_test.o: tests/apexsprite_test.c $(SRC_DIR)/apexsprite.h | $(BUILD_DIR)
+$(BUILD_DIR)/apexsprite_test.o: tests/apexsprite_test.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
 $(BUILD_DIR)/sprite_scope_test.o: tests/sprite_scope_test.c $(SRC_HEADERS) | $(BUILD_DIR)
