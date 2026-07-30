@@ -319,7 +319,7 @@ struct UiState {
     /* Last classification action, replayed by the "repeat" hotkey (1) so a run of
        individual classifications reduces to n,1,n,1,…  See repeat_last_classify(). */
     int  last_classify_op = APEX_LAST_CLASSIFY_NONE;  /* ApexLastClassifyOp */
-    char last_classify_spec[64] = {0};                /* spec for DATA/TABLE ops */
+    std::string last_classify_spec;                   /* spec for DATA/TABLE ops (unbounded: table row formats can be long) */
 
     bool show_flow_arrows = true;
     bool show_navigator;

@@ -872,7 +872,12 @@ static int parse_wrapped_table_format(char *value, const char *prefix, char **in
     }
     close = strrchr(value + prefix_len + 1u, ')');
     if (!close || *trim(close + 1) != '\0') {
-        die("invalid table format '%s'", value);
+        /* Malformed "counted(...)" (no closing paren, or trailing junk). Report
+           it as "not this format" rather than die(): config_set_table_spec then
+           returns failure so an interactive caller (GUI set_kind) can reject it
+           gracefully, while the config-file parser still die()s at its own
+           catch-all else with the full "key = value" context. */
+        return 0;
     }
     *close = '\0';
     *inner = trim(value + prefix_len + 1u);

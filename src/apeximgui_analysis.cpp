@@ -1086,7 +1086,7 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
                              const char *sp)
 {
     s->last_classify_op = APEX_LAST_CLASSIFY_DATA;
-    snprintf(s->last_classify_spec, sizeof(s->last_classify_spec), "%s", sp ? sp : "");
+    s->last_classify_spec = sp ? sp : "";
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1134,7 +1134,7 @@ void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, U
                               const char *sp)
 {
     s->last_classify_op = APEX_LAST_CLASSIFY_TABLE;
-    snprintf(s->last_classify_spec, sizeof(s->last_classify_spec), "%s", sp ? sp : "");
+    s->last_classify_spec = sp ? sp : "";
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
@@ -1177,14 +1177,13 @@ void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 void repeat_last_classify(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
 {
     /* Copy the spec into a local first: the apply_* helpers re-record into
-       s->last_classify_spec via snprintf("%s", sp), so passing the member
-       buffer directly would alias snprintf's source and destination (UB). */
-    char spec[sizeof(s->last_classify_spec)];
-    snprintf(spec, sizeof(spec), "%s", s->last_classify_spec);
+       s->last_classify_spec, so passing the member directly would let the
+       assignment mutate the string mid-use. */
+    std::string spec = s->last_classify_spec;
     switch (s->last_classify_op) {
-    case APEX_LAST_CLASSIFY_DATA:      apply_data_at_selection(p, dp, s, spec); break;
+    case APEX_LAST_CLASSIFY_DATA:      apply_data_at_selection(p, dp, s, spec.c_str()); break;
     case APEX_LAST_CLASSIFY_STRING:    apply_string_at_selection(p, dp, s); break;
-    case APEX_LAST_CLASSIFY_TABLE:     apply_table_at_selection(p, dp, s, spec); break;
+    case APEX_LAST_CLASSIFY_TABLE:     apply_table_at_selection(p, dp, s, spec.c_str()); break;
     case APEX_LAST_CLASSIFY_CODE:      apply_code_at_selection(p, dp, s); break;
     case APEX_LAST_CLASSIFY_CLEAR:     clear_kind_at_selection(p, dp, s); break;
     default:                           set_status(s, "no previous classification to repeat"); break;
