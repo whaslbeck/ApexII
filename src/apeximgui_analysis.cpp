@@ -1,4 +1,5 @@
 #include "apeximgui_core.h"
+#include "cpu6809.h"
 #include <algorithm>
 #include <cstring>
 #include <strings.h>
@@ -1273,6 +1274,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_dmd=%d\nshow_edit=%d\nshow_hex=%d\nshow_call_graph=%d\n"
             "show_hardware=%d\nshow_tables=%d\nshow_types=%d\nshow_inline_list=%d\n"
             "show_entries_list=%d\nshow_pattern_search=%d\nshow_ram_refs=%d\n"
+            "show_imm_loads=%d\nshow_change_log=%d\nshow_pinmame=%d\n"
             "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
@@ -1285,6 +1287,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
             s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
             s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
+            s->show_imm_loads, s->show_change_log, s->show_pinmame,
             s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
             s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor,
@@ -1292,6 +1295,9 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_strings_list, s->show_sprite_gallery,
             s->show_rom_info, s->show_match_window, s->show_rom_compare,
             s->show_coverage);
+    /* PinMAME integration config (paths/port kept as separate key=value lines). */
+    fprintf(f, "pinmame_bin=%s\npinmame_rompath=%s\npinmame_game=%s\npinmame_port=%d\n",
+            s->pinmame.bin_path, s->pinmame.rompath, s->pinmame.game, s->pinmame.port);
     fclose(f);
 }
 
@@ -1430,6 +1436,23 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {
             s->show_ram_refs = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_imm_loads=", 15) == 0) {
+            s->show_imm_loads = atoi(l + 15) != 0;
+        } else if (strncmp(l, "show_change_log=", 16) == 0) {
+            s->show_change_log = atoi(l + 16) != 0;
+        } else if (strncmp(l, "show_pinmame=", 13) == 0) {
+            s->show_pinmame = atoi(l + 13) != 0;
+        } else if (strncmp(l, "pinmame_bin=", 12) == 0) {
+            strncpy(s->pinmame.bin_path, l + 12, sizeof(s->pinmame.bin_path) - 1);
+            s->pinmame.bin_path[sizeof(s->pinmame.bin_path) - 1] = '\0';
+        } else if (strncmp(l, "pinmame_rompath=", 16) == 0) {
+            strncpy(s->pinmame.rompath, l + 16, sizeof(s->pinmame.rompath) - 1);
+            s->pinmame.rompath[sizeof(s->pinmame.rompath) - 1] = '\0';
+        } else if (strncmp(l, "pinmame_game=", 13) == 0) {
+            strncpy(s->pinmame.game, l + 13, sizeof(s->pinmame.game) - 1);
+            s->pinmame.game[sizeof(s->pinmame.game) - 1] = '\0';
+        } else if (strncmp(l, "pinmame_port=", 13) == 0) {
+            s->pinmame.port = atoi(l + 13);
         } else if (strncmp(l, "show_ref_exclusions=", 20) == 0) {
             s->show_ref_exclusions = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_search_window=", 19) == 0) {
@@ -3191,6 +3214,93 @@ std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *i
                 break;
             }
         }
+    }
+    return results;
+}
+
+/* Enumerate every 16-bit immediate-load instruction (LDX / LDD / LDU / LDY / LDS
+   and the CMPx / ADDD / SUBD immediate forms) in the rendered document.  These
+   are the only OPER_IMM16 opcodes, and IMM16 is the sole addr_ref operand that
+   renders with a '#' (OPER_EXT sets addr_ref but no '#'), so the '#'-in-buffer
+   test isolates them.  We re-decode the instruction bytes rather than text-parse,
+   which is robust; the "symbolic" flag comes from the rendered line, which
+   reflects the renderer's own label resolution. */
+/* Change listener registered on the ApexProject: appends one row per recorded
+   edit to the GUI's change log.  Runs on the main thread (mutations only happen
+   there), so touching the std::vector needs no locking. */
+void ui_change_listener(void *ctx, const ApexChangeEvent *ev)
+{
+    UiState *s = (UiState *)ctx;
+    if (!s || !ev) {
+        return;
+    }
+    ChangeLogEntry e;
+    e.seq = ev->seq;
+    e.action = ev->action ? ev->action : "";
+    e.has_addr = ev->has_addr != 0;
+    e.bank = ev->bank;
+    e.addr = ev->addr;
+    s->change_log.push_back(e);
+    /* Bound the log: trim a batch once it grows past a high-water mark so a long
+       session can't leak, without an O(n) erase on every edit. */
+    const size_t CAP = 2000, SLACK = 256;
+    if (s->change_log.size() > CAP + SLACK) {
+        s->change_log.erase(s->change_log.begin(),
+                            s->change_log.begin() + (s->change_log.size() - CAP));
+    }
+}
+
+std::vector<ImmLoadRef> find_imm_loads(const ApexProject *project,
+                                       const ApexRenderedDocument *document)
+{
+    std::vector<ImmLoadRef> results;
+    if (!project || !document) {
+        return results;
+    }
+    for (size_t li = 0; li < document->line_count; li++) {
+        const ApexRenderedLine *l = &document->lines[li];
+        if (l->kind != APEX_RENDER_LINE_INSTRUCTION || !l->has_location) {
+            continue;
+        }
+        const uint8_t *src;
+        size_t len;
+        if (!project_locate_rom_bytes(project, l->bank, l->cpu_addr, &src, &len, NULL)) {
+            continue;
+        }
+        char buf[64];
+        Cpu6809InstrInfo info =
+            cpu6809_disassemble_info(src, len, l->cpu_addr, buf, sizeof(buf));
+        if (!info.has_addr_ref || !strchr(buf, '#')) {
+            continue; /* not a 16-bit immediate operand */
+        }
+        ImmLoadRef r;
+        r.line_index = li;
+        r.bank = l->bank;
+        r.cpu_addr = l->cpu_addr;
+        r.imm = info.addr_ref & 0xffffu;
+        /* Where does the value point?  Paged window (0x4000-0x7fff) → the
+           instruction's own bank; system window (0x8000+) → the fixed bank; below
+           0x4000 → RAM / direct page, which is not in ROM (not navigable). */
+        if (r.imm >= 0x8000u) {
+            r.tgt_bank = 0xffu;
+            r.tgt_in_rom = 1;
+        } else if (r.imm >= 0x4000u) {
+            r.tgt_bank = l->bank;
+            r.tgt_in_rom = 1;
+        } else {
+            r.tgt_bank = 0;
+            r.tgt_in_rom = 0;
+        }
+        /* Already symbolic iff the rendered line shows a label rather than #0x.... */
+        r.symbolic = !line_contains(l, "#0x");
+        /* Mnemonic = first token of the freshly decoded text (no leading indent). */
+        size_t m = 0;
+        while (buf[m] && buf[m] != ' ' && buf[m] != '\t' && m + 1u < sizeof(r.mnem)) {
+            r.mnem[m] = buf[m];
+            m++;
+        }
+        r.mnem[m] = '\0';
+        results.push_back(r);
     }
     return results;
 }

@@ -326,6 +326,12 @@ int main(int argc, char **argv)
     }
 
     project = apex_project_open(rom_path, effective_config);
+    /* Feed the Change Log (registered before the first user edit; the initial
+       config load parses via apex_config, not these mutators, so it isn't
+       logged). */
+    if (project) {
+        apex_project_set_change_listener(project, ui_change_listener, &state);
+    }
     if (!project || apex_project_analyze(project) != 0) {
         fprintf(stderr, "failed to analyze\n");
         ImGui_ImplOpenGL3_Shutdown();
@@ -412,6 +418,14 @@ int main(int argc, char **argv)
 
     /* Restore session state after defaults are set so saved values win. */
     load_rom_session(rom_path, &state, document);
+
+    /* Default the PinMAME rom dir to ~/.pinmame if the session didn't restore one. */
+    if (state.pinmame.rompath[0] == '\0') {
+        const char *home = getenv("HOME");
+        if (home && *home) {
+            snprintf(state.pinmame.rompath, sizeof(state.pinmame.rompath), "%s/.pinmame", home);
+        }
+    }
 
     if (config_path[0]) {
         /* save_path_input is 512 bytes; ".apeximgui.ini" is 14 chars → cap path at 497 chars */
@@ -629,6 +643,9 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Types",          NULL, &state.show_types_editor);
                 ImGui::MenuItem("Pattern Search", NULL, &state.show_pattern_search);
                 ImGui::MenuItem("RAM References", NULL, &state.show_ram_refs);
+                ImGui::MenuItem("Immediate Loads", NULL, &state.show_imm_loads);
+                ImGui::MenuItem("Change Log",      NULL, &state.show_change_log);
+                ImGui::MenuItem("PinMAME (dynamic)", NULL, &state.show_pinmame);
                 ImGui::MenuItem("Ref Exclusions",    NULL, &state.show_ref_exclusions);
                 ImGui::MenuItem("Code Candidates",    NULL, &state.show_code_candidates);
                 ImGui::MenuItem("Inline Candidates", NULL, &state.show_inline_candidates);
@@ -712,6 +729,9 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Types",          dock_bottom_id);
             ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
             ImGui::DockBuilderDockWindow("RAM References", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Immediate Loads", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("Change Log",       dock_bottom_id);
+            ImGui::DockBuilderDockWindow("PinMAME (dynamic)", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Ref Exclusions",  dock_bottom_id);
             ImGui::DockBuilderDockWindow("Code Candidates",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Candidates", dock_bottom_id);
@@ -1001,6 +1021,21 @@ int main(int argc, char **argv)
             render_ram_refs(project, document, &state);
             ImGui::End();
         }
+        if (state.show_imm_loads) {
+            ImGui::Begin("Immediate Loads", &state.show_imm_loads);
+            render_imm_loads(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_change_log) {
+            ImGui::Begin("Change Log", &state.show_change_log);
+            render_change_log(document, &state);
+            ImGui::End();
+        }
+        if (state.show_pinmame) {
+            ImGui::Begin("PinMAME (dynamic)", &state.show_pinmame);
+            render_pinmame(project, &document, &state);
+            ImGui::End();
+        }
         if (state.show_ref_exclusions) {
             ImGui::Begin("Ref Exclusions", &state.show_ref_exclusions);
             render_ref_exclusions(project, &document, &state);
@@ -1225,6 +1260,9 @@ int main(int argc, char **argv)
             ImGui::BulletText("Hex View: click byte to inspect; syncs with disassembly.");
             ImGui::BulletText("Pattern Search: e.g.  BD ?? 7E  (?? = any byte).");
             ImGui::BulletText("RAM References: find all instructions accessing a RAM address.");
+            ImGui::BulletText("Immediate Loads: list LDX/LDD/... #imm16; jump to or label the target.");
+            ImGui::BulletText("Change Log: audit trail of every edit this session; click to jump.");
+            ImGui::BulletText("PinMAME: spawn a headless xpinmamed and import execution coverage.");
             ImGui::BulletText("Double-click a label token in a ; referenced_by line to navigate.");
 
             ImGui::End();
@@ -1649,6 +1687,7 @@ int main(int argc, char **argv)
         document = renderer.take();
     }
 
+    apex_pinmame_stop(state.pinmame.pm); /* don't leave a headless emulator running */
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();
     save_session(rom_path, config_path, &state, document);

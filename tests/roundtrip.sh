@@ -145,6 +145,24 @@ else
     exit 1
 fi
 
+# A classified string[N] (STRING_FIXED) range may contain carriage returns
+# (0x0d): they must emit with the \r escape rather than making the whole range
+# fall back to raw .DB, and must survive a full assemble→disassemble→assemble
+# byte roundtrip.  Regression for CR/LF-heavy strings rendering as .DB.
+string_cr_rom="$OUT/string_cr.rom"
+string_cr_asm="$OUT/string_cr.disasm"
+string_cr_rom2="$OUT/string_cr.rebuilt"
+"$ROOT/build/apexasm" "$string_cr_rom" "$ROOT/tests/string_cr.asm"
+"$ROOT/build/apexdis" "$string_cr_rom" "$string_cr_asm" "$ROOT/tests/string_cr.ini"
+"$ROOT/build/apexasm" "$string_cr_rom2" "$string_cr_asm"
+if grep -qF '    STRING_FIXED "\r\nA\r\nB"' "$string_cr_asm" &&
+    cmp -s "$string_cr_rom" "$string_cr_rom2"; then
+    printf 'PASS string_cr.asm\n'
+else
+    printf 'FAIL string_cr.asm\n' >&2
+    exit 1
+fi
+
 if "$ROOT/build/apexdis" "$data_range_rom" "$OUT/config_duplicate_label.disasm" \
     "$ROOT/tests/config_duplicate_label.ini" 2>"$OUT/config_duplicate_label.stderr"; then
     printf 'FAIL config_duplicate_label.ini\n' >&2

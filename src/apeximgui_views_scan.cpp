@@ -172,6 +172,1252 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
     }
 }
 
+/* Immediate Loads: every LDX / LDD / LDU / LDY / LDS immediate (and the CMPx /
+   ADDD / SUBD immediate forms).
+   The 6809 renders such an immediate symbolically only once a label exists at the
+   target address, and creating those labels by hand is tedious — this panel lists
+   the instructions and offers, per row: jump to the instruction, jump to the value
+   as a target (disassembly + hex), and create a label at that target. */
+void render_imm_loads(ApexProject *project,
+                      const ApexRenderedDocument **document_ptr,
+                      UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+
+    bool want_scan = ImGui::Button("Scan");
+    ImGui::SameLine();
+    if (!state->imm_loads_scanned)
+        ImGui::TextDisabled("no scan yet");
+    else
+        ImGui::Text("%lu immediate load(s)", (unsigned long)state->imm_load_results.size());
+    ImGui::SameLine();
+    ImGui::Checkbox("ROM targets only", &state->imm_only_rom);
+    ImGui::SameLine();
+    ImGui::Checkbox("Unlabeled only", &state->imm_only_unlabeled);
+
+    if (want_scan) {
+        state->imm_load_results = find_imm_loads(project, document);
+        state->imm_loads_scanned = true;
+        char msg[64];
+        snprintf(msg, sizeof(msg), "%lu immediate load(s)",
+                 (unsigned long)state->imm_load_results.size());
+        set_status(state, msg);
+    }
+    if (!state->imm_loads_scanned) {
+        ImGui::TextDisabled("Lists LDX/LDD/LDU/… #imm16 so you can label the value's target.");
+        return;
+    }
+
+    /* Apply the filters into a view of indices into imm_load_results. */
+    std::vector<size_t> view;
+    view.reserve(state->imm_load_results.size());
+    for (size_t i = 0; i < state->imm_load_results.size(); i++) {
+        const ImmLoadRef &r = state->imm_load_results[i];
+        if (state->imm_only_rom && !r.tgt_in_rom) continue;
+        if (state->imm_only_unlabeled && r.symbolic) continue;
+        view.push_back(i);
+    }
+    ImGui::Text("%lu shown", (unsigned long)view.size());
+
+    int label_idx = -1; /* index into imm_load_results; label action is deferred */
+
+    if (ImGui::BeginTable("imm_loads", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS)) {
+        ImGui::TableSetupColumn("Instr",  ImGuiTableColumnFlags_WidthFixed,   90.0f, 0);
+        ImGui::TableSetupColumn("Op",     ImGuiTableColumnFlags_WidthFixed,   48.0f, 1);
+        ImGui::TableSetupColumn("Imm",    ImGuiTableColumnFlags_WidthFixed,   72.0f, 2);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed,  110.0f, 3);
+        ImGui::TableSetupColumn("Label",  ImGuiTableColumnFlags_WidthStretch,  0.0f, 4);
+        ImGui::TableHeadersRow();
+
+        {
+            int sort_col; bool sort_asc;
+            if (ui_table_sort(&sort_col, &sort_asc)) {
+                auto &res = state->imm_load_results;
+                std::stable_sort(view.begin(), view.end(),
+                    [&](size_t ia, size_t ib) {
+                        const ImmLoadRef &a = res[ia];
+                        const ImmLoadRef &b = res[ib];
+                        int c = 0;
+                        if (sort_col == 0)
+                            c = ui_cmp_u32(((uint32_t)a.bank<<16)|(a.cpu_addr&0xffffu),
+                                           ((uint32_t)b.bank<<16)|(b.cpu_addr&0xffffu));
+                        else if (sort_col == 1)
+                            c = strcmp(a.mnem, b.mnem);
+                        else if (sort_col == 2)
+                            c = ui_cmp_u32(a.imm, b.imm);
+                        else if (sort_col == 3)
+                            c = ui_cmp_u32(((uint32_t)a.tgt_bank<<16)|(a.imm&0xffffu),
+                                           ((uint32_t)b.tgt_bank<<16)|(b.imm&0xffffu));
+                        else
+                            c = ui_cmp_int(a.symbolic, b.symbolic);
+                        return sort_asc ? c < 0 : c > 0;
+                    });
+            }
+        }
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)view.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const ImmLoadRef &r = state->imm_load_results[view[(size_t)row]];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+
+                ImGui::TableSetColumnIndex(0);
+                char addr_buf[40];
+                /* "##i" keeps this ID distinct from the target button's, which
+                   would otherwise collide when an instruction's immediate points
+                   at its own address (same "Bxx_Ayyyy" string). */
+                snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x##i",
+                         r.bank, (unsigned)r.cpu_addr & 0xffff);
+                bool sel = (r.line_index == state->selected_line);
+                if (ImGui::Selectable(addr_buf, sel,
+                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                    /* Navigate by address, not the stored line index: creating a
+                       label re-renders and shifts line indices, so the index can
+                       go stale between scans. */
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, r.bank, r.cpu_addr, &li))
+                        select_line(state, li, 1);
+                    else if (r.line_index < document->line_count)
+                        select_line(state, r.line_index, 1);
+                }
+
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(r.mnem);
+
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("#0x%04x", (unsigned)r.imm);
+
+                ImGui::TableSetColumnIndex(3);
+                if (r.tgt_in_rom) {
+                    char tbuf[40];
+                    snprintf(tbuf, sizeof(tbuf), "B%02x_A%04x##t", r.tgt_bank, (unsigned)r.imm);
+                    if (ImGui::SmallButton(tbuf)) {
+                        size_t tli;
+                        if (apex_render_find_line_by_address(document, r.tgt_bank, r.imm, &tli))
+                            select_line(state, tli, 1);
+                        const uint8_t *tsrc; size_t tlen, tro = 0;
+                        if (project_locate_rom_bytes(project, r.tgt_bank, r.imm,
+                                                     &tsrc, &tlen, &tro)) {
+                            state->hex_selected_offset = tro;
+                            state->hex_active         = true;
+                            state->hex_request_follow = 1;
+                        }
+                    }
+                } else {
+                    ImGui::TextDisabled("(ram $%04x)", (unsigned)r.imm);
+                }
+
+                ImGui::TableSetColumnIndex(4);
+                if (r.symbolic) {
+                    ImGui::TextDisabled("symbolic");
+                } else if (r.tgt_in_rom) {
+                    if (ImGui::SmallButton("Label"))
+                        label_idx = (int)view[(size_t)row];
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    /* Deferred label creation (mutates the project and triggers an async
+       re-render, so it must run after the table is closed and the view indices
+       are no longer being read). */
+    if (label_idx >= 0) {
+        ImmLoadRef &r = state->imm_load_results[(size_t)label_idx];
+        int has_bank = (r.tgt_bank != 0xffu);
+        /* Name the target by its block kind, matching the auto-label convention. */
+        const char *prefix = has_bank ? "Loc_" : "Ram_";
+        size_t tli;
+        if (apex_render_find_line_by_address(document, r.tgt_bank, r.imm, &tli)) {
+            switch (document->lines[tli].block_kind) {
+            case APEX_RENDER_BLOCK_CODE:         prefix = "Sub_"; break;
+            case APEX_RENDER_BLOCK_DATA:         prefix = "Dat_"; break;
+            case APEX_RENDER_BLOCK_SPRITE:       prefix = "Spr_"; break;
+            case APEX_RENDER_BLOCK_TABLE:        prefix = "Tab_"; break;
+            case APEX_RENDER_BLOCK_UNCLASSIFIED: prefix = "Unc_"; break;
+            default:                             prefix = "Loc_"; break;
+            }
+        }
+        char name[32];
+        snprintf(name, sizeof(name), "%s%04X", prefix, (unsigned)r.imm);
+        if (apex_project_set_label(project, has_bank, r.tgt_bank, r.imm, name) == 0) {
+            uint8_t nb = r.tgt_bank; uint32_t na = r.imm;
+            uint8_t ib = r.bank; uint32_t ia = r.cpu_addr;
+            /* Optimistically flag every immediate that points at this target as
+               symbolic — the async re-render will show the new label; we can't
+               re-scan against the freshly rendered document yet. */
+            for (auto &e : state->imm_load_results)
+                if (e.tgt_in_rom && e.tgt_bank == nb && e.imm == na) e.symbolic = 1;
+            rerender_and_reselect(project, document_ptr, state, ib, ia);
+            set_status(state, name);
+        }
+    }
+}
+
+/* Change Log: a session audit trail of every recorded edit (classify, label,
+   clear, doc, …), newest first, fed by the ApexProject change listener.  Clicking
+   an address jumps the disassembly there. */
+void render_change_log(const ApexRenderedDocument *document, UiState *state)
+{
+    ImGui::Text("%lu change(s)", (unsigned long)state->change_log.size());
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Clear")) state->change_log.clear();
+    ImGui::SameLine();
+    ImGui::TextDisabled("(this session; not saved)");
+
+    if (state->change_log.empty()) {
+        ImGui::TextDisabled("No edits yet — classify, label or clear something.");
+        return;
+    }
+
+    if (ImGui::BeginTable("change_log", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("#",      ImGuiTableColumnFlags_WidthFixed,   54.0f);
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed,  120.0f);
+        ImGui::TableSetupColumn("Where",  ImGuiTableColumnFlags_WidthStretch,  0.0f);
+        ImGui::TableHeadersRow();
+
+        ImGuiListClipper clipper;
+        clipper.Begin((int)state->change_log.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                /* newest first */
+                size_t idx = state->change_log.size() - 1u - (size_t)row;
+                const ChangeLogEntry &e = state->change_log[idx];
+                ImGui::PushID((int)idx);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("%lu", e.seq);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(e.action.c_str());
+                ImGui::TableSetColumnIndex(2);
+                if (e.has_addr) {
+                    char b[32];
+                    snprintf(b, sizeof(b), "B%02x_A%04x", e.bank, (unsigned)e.addr & 0xffff);
+                    if (ImGui::SmallButton(b)) {
+                        size_t li;
+                        if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
+                            select_line(state, li, 1);
+                    }
+                } else {
+                    ImGui::TextDisabled("-");
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* Pull the full coverage bitmap from xpinmamed and group reached bytes into
+   contiguous runs, tagging each with whether ApexII currently classifies its
+   start as CODE.  Non-code runs are dynamic evidence of missed code. */
+static void pinmame_import_coverage(ApexProject *p, const ApexRenderedDocument *doc,
+                                    PinmameState &pm)
+{
+    pm.cov_runs.clear();
+    pm.cov_reached.clear();
+    apex_pinmame_coverage_summary(pm.port, pm.cov_executed, pm.cov_addressable);
+
+    /* Reached (bank, addr), collected per bank in ascending address order so
+       contiguous runs are already adjacent. */
+    std::vector<std::pair<uint8_t, uint32_t>> reached;
+    for (size_t i = 0; i < p->banks; i++) {
+        uint8_t bid = bank_id_for_index(p->banks, (int)i);
+        std::vector<uint8_t> f;
+        if (apex_pinmame_coverage_window(pm.port, bid, 0x4000u, 0x4000u, f)) {
+            for (size_t o = 0; o < f.size(); o++) {
+                if (f[o]) reached.push_back({bid, 0x4000u + (uint32_t)o});
+            }
+        }
+    }
+    std::vector<uint8_t> sysf;
+    if (apex_pinmame_coverage_window(pm.port, -1, 0x8000u, 0x8000u, sysf)) {
+        for (size_t o = 0; o < sysf.size(); o++) {
+            if (sysf[o]) reached.push_back({0xffu, 0x8000u + (uint32_t)o});
+        }
+    }
+
+    for (size_t i = 0; i < reached.size();) {
+        uint8_t b = reached[i].first;
+        uint32_t start = reached[i].second, prev = start;
+        size_t j = i + 1;
+        while (j < reached.size() && reached[j].first == b && reached[j].second == prev + 1) {
+            prev = reached[j].second;
+            j++;
+        }
+        PinmameRun r;
+        r.bank = b;
+        r.addr = start;
+        r.len = prev - start + 1u;
+        size_t li;
+        r.is_code = (apex_render_find_line_by_address(doc, b, start, &li) &&
+                     doc->lines[li].block_kind == APEX_RENDER_BLOCK_CODE) ? 1 : 0;
+        pm.cov_runs.push_back(r);
+        i = j;
+    }
+    /* Per-address reached set for the disassembly overlay (O(1) lookup). */
+    for (const std::pair<uint8_t, uint32_t> &pr : reached) {
+        pm.cov_reached.insert(((uint32_t)pr.first << 16) | (pr.second & 0xffff));
+    }
+    char msg[128];
+    snprintf(msg, sizeof(msg), "coverage: %ld executed, %zu run(s)",
+             pm.cov_executed, pm.cov_runs.size());
+    pm.status = msg;
+}
+
+/* Name of the routine containing `addr` — the nearest code label at or before it
+   in the same bank.  Empty if none.  Shared by the RAM-xref, backtrace and
+   call-stack features. */
+static std::string pm_routine_name(const ApexRenderedDocument *doc, uint8_t bank, uint32_t addr)
+{
+    size_t li;
+    if (!doc || !apex_render_find_line_by_address(doc, bank, addr, &li)) {
+        return "";
+    }
+    for (size_t j = li + 1; j-- > 0;) {
+        const ApexRenderedLine *l = &doc->lines[j];
+        if (l->has_location && l->bank != bank) break; /* left the bank */
+        if (l->kind == APEX_RENDER_LINE_LABEL && l->has_location && l->bank == bank) {
+            std::string nm(l->text, l->length);
+            size_t c = nm.find(':');
+            if (c != std::string::npos) nm.erase(c);
+            return nm;
+        }
+    }
+    return "";
+}
+
+/* Bounded substring test within one rendered line (text is not NUL-terminated). */
+static bool pm_line_has(const ApexRenderedLine *l, const char *needle)
+{
+    size_t nl = strlen(needle);
+    if (l->length < nl) return false;
+    for (size_t i = 0; i + nl <= l->length; i++) {
+        if (memcmp(l->text + i, needle, nl) == 0) return true;
+    }
+    return false;
+}
+
+/* True if (bank,v) is a return address: an instruction boundary whose preceding
+   instruction is a JSR/BSR call. */
+static bool pm_is_return_addr(const ApexRenderedDocument *doc, uint8_t bank, uint32_t v)
+{
+    size_t li;
+    if (!apex_render_find_line_by_address(doc, bank, v, &li)) return false;
+    /* A label/comment line may sit at v before the instruction — find the instr. */
+    bool is_instr = false;
+    for (size_t j = li; j < doc->line_count &&
+         doc->lines[j].bank == bank && doc->lines[j].cpu_addr == v; j++) {
+        if (doc->lines[j].kind == APEX_RENDER_LINE_INSTRUCTION) { is_instr = true; break; }
+    }
+    if (!is_instr) return false;
+    const ApexRenderedLine *prev = nullptr;
+    for (size_t j = li; j-- > 0;) {
+        const ApexRenderedLine *l = &doc->lines[j];
+        if (l->has_location && l->bank != bank) break;
+        if (l->kind == APEX_RENDER_LINE_INSTRUCTION && l->bank == bank) { prev = l; break; }
+    }
+    return prev && (pm_line_has(prev, "JSR") || pm_line_has(prev, "BSR"));
+}
+
+/* Heuristic call stack: scan the S stack for 16-bit values that are return
+   addresses (see pm_is_return_addr).  Innermost first (closest to S).  A paged
+   return (0x4000-0x7fff) has an ambiguous bank, so try the live bank first then
+   every bank — the WPC task loop keeps stacks shallow, so this is best-effort. */
+static void pm_build_callstack(const ApexProject *p, const ApexRenderedDocument *doc,
+                               PinmameState &pm)
+{
+    pm.callstack.clear();
+    unsigned sp = (unsigned)pm.cpu.sp & 0xffffu;
+    if (!doc || sp == 0) return;
+    std::vector<uint8_t> buf;
+    if (!apex_pinmame_memory(pm.port, sp, 64, -1, buf)) return;
+    int frames = 0;
+    for (size_t off = 0; off + 1 < buf.size() && frames < 16; off++) {
+        unsigned v = ((unsigned)buf[off] << 8) | buf[off + 1];
+        if (v < 0x4000u) continue; /* RAM — not a code return address */
+        uint8_t hit = 0;
+        bool found = false;
+        if (v >= 0x8000u) {
+            found = pm_is_return_addr(doc, 0xffu, v);
+            hit = 0xffu;
+        } else {
+            uint8_t cur = (uint8_t)pm.info.wpc_bank;
+            if (pm_is_return_addr(doc, cur, v)) { found = true; hit = cur; }
+            for (size_t bi = 0; !found && bi < p->banks; bi++) {
+                uint8_t b = bank_id_for_index(p->banks, (int)bi);
+                if (b == cur) continue;
+                if (pm_is_return_addr(doc, b, v)) { found = true; hit = b; }
+            }
+        }
+        if (!found) continue;
+        pm.callstack.push_back({hit, v, 0, pm_routine_name(doc, hit, v)});
+        frames++;
+        off++; /* consumed a 2-byte return address */
+    }
+}
+
+/* Add or bump an accessor/PC entry (bank,addr) in a PmHotEntry list. */
+static void pm_bump(std::vector<PmHotEntry> &v, uint8_t bank, uint32_t addr,
+                    const std::string &name)
+{
+    for (PmHotEntry &e : v) {
+        if (e.bank == bank && e.addr == addr) { e.count++; return; }
+    }
+    v.push_back({bank, addr, 1, name});
+}
+
+/* Parse the switch-control mini-script (one op per line) into PmScriptOp[]. */
+static void pm_parse_script(const char *src, std::vector<PmScriptOp> &ops)
+{
+    ops.clear();
+    std::string s(src);
+    size_t i = 0;
+    while (i < s.size()) {
+        size_t e = s.find('\n', i);
+        std::string line = s.substr(i, (e == std::string::npos) ? std::string::npos : e - i);
+        i = (e == std::string::npos) ? s.size() : e + 1;
+        char kw[16] = {0};
+        int a = 0, b = 0;
+        if (sscanf(line.c_str(), " %15s %d %d", kw, &a, &b) < 1) continue;
+        for (char *c = kw; *c; c++) {
+            if (*c >= 'A' && *c <= 'Z') *c = (char)(*c + 32);
+        }
+        if (kw[0] == '#' || kw[0] == 0) continue;
+        PmScriptOp op{};
+        if      (!strcmp(kw, "press"))   { op.kind = PM_OP_PRESS;   op.a = a; }
+        else if (!strcmp(kw, "release")) { op.kind = PM_OP_RELEASE; op.a = a; }
+        else if (!strcmp(kw, "pulse"))   { op.kind = PM_OP_PULSE;   op.a = a; op.b = b; }
+        else if (!strcmp(kw, "wait"))    { op.kind = PM_OP_WAIT;    op.b = a; }
+        else if (!strcmp(kw, "resume"))  { op.kind = PM_OP_RESUME; }
+        else if (!strcmp(kw, "pause"))   { op.kind = PM_OP_PAUSE; }
+        else continue;
+        ops.push_back(op);
+    }
+}
+
+/* Optional PinMAME dynamic-analysis panel: configure & spawn a headless
+   xpinmamed, watch live CPU/bank state, import execution coverage as a
+   missed-code worklist, set bank-aware breakpoints/watchpoints, and drive
+   switches (incl. a mini-script) to reach code paths. */
+void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                    UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+    PinmameState &pm = state->pinmame;
+
+    /* ---- Config ---- */
+    if (ImGui::CollapsingHeader("Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
+        ImGui::InputText("xpinmamed binary", pm.bin_path, sizeof(pm.bin_path));
+        ImGui::InputText("PinMAME rom dir",  pm.rompath,  sizeof(pm.rompath));
+        ImGui::InputText("Game (romset)",    pm.game,     sizeof(pm.game));
+        ImGui::SameLine();
+        if (ImGui::Button("Browse…")) {
+            IGFD::FileDialogConfig cfg;
+            cfg.path = pm.rompath[0] ? pm.rompath : ".";
+            ImGuiFileDialog::Instance()->OpenDialog("PmRomZip", "Select PinMAME rom (.zip)",
+                                                    ".zip", cfg);
+        }
+        ImGui::InputInt("HTTP port",         &pm.port);
+        if (pm.port < 1 || pm.port > 65535) pm.port = 8080;
+    }
+    /* Rom-zip picker: derive rom dir + game name (basename without .zip). */
+    if (ImGuiFileDialog::Instance()->Display("PmRomZip", ImGuiWindowFlags_NoCollapse,
+                                             ImVec2(560, 360))) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            std::string dir  = ImGuiFileDialog::Instance()->GetCurrentPath();
+            std::string name = ImGuiFileDialog::Instance()->GetCurrentFileName();
+            snprintf(pm.rompath, sizeof(pm.rompath), "%s", dir.c_str());
+            size_t dot = name.rfind(".zip");
+            if (dot != std::string::npos) name.erase(dot);
+            snprintf(pm.game, sizeof(pm.game), "%s", name.c_str());
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+
+    ImGui::Separator();
+
+    /* ---- Process control ---- */
+    bool alive = apex_pinmame_is_alive(pm.pm);
+    if (!alive) {
+        if (ImGui::Button("Launch")) {
+            if (apex_pinmame_launch(pm.pm, pm.bin_path, pm.rompath, pm.game, pm.port)) {
+                pm.status = "launched — waiting for debugger…";
+                pm.next_poll = 0.0;
+                pm.connected = false;
+                pm.launching = true;
+            } else {
+                pm.status = "launch failed: " + pm.pm.last_error;
+                pm.launching = false;
+            }
+        }
+    } else {
+        if (ImGui::Button("Stop")) {
+            apex_pinmame_stop(pm.pm);
+            pm.connected = false;
+            pm.resumed = false;
+            pm.status = "stopped";
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Resume")) { apex_pinmame_control(pm.port, "resume"); pm.resumed = true; }
+        ImGui::SameLine();
+        if (ImGui::Button("Pause"))  { apex_pinmame_control(pm.port, "pause");  pm.resumed = false; }
+        ImGui::SameLine();
+        if (ImGui::Button("Step"))   apex_pinmame_control(pm.port, "step");
+    }
+
+    /* ---- Poll live status ~2 Hz while running ---- */
+    if (alive) {
+        if (pm.connected && !pm.pm.ev_running) apex_pinmame_events_start(pm.pm);
+        /* Per-frame halt check (cheap mutex read) for snappy break detection. */
+        ApexPinmameHalt h;
+        if (apex_pinmame_get_halt(pm.pm, h) && h.seq != pm.last_halt_seq) {
+            pm.last_halt = h;
+            pm.last_halt_seq = h.seq;
+            if (pm.xref_collecting && h.reason == "wp") {
+                /* Record the accessing PC and immediately resume to keep collecting
+                   the set of code sites that touch the watched variable. */
+                uint8_t b = (h.pc >= 0x8000) ? 0xffu : (uint8_t)(h.bank & 0xff);
+                pm_bump(pm.xref_accessors, b, (uint32_t)h.pc,
+                        pm_routine_name(document, b, (uint32_t)h.pc));
+                apex_pinmame_control(pm.port, "resume");
+            } else if (pm.jmp_collecting && h.reason == "bp" &&
+                       (uint32_t)h.pc == pm.jmp_pc) {
+                /* Halted at the indexed jump: step once so the emulator computes the
+                   target, read the new PC (= real destination), record it, resume. */
+                apex_pinmame_control(pm.port, "step");
+                ApexPinmameCpu c;
+                ApexPinmameInfo ni;
+                if (apex_pinmame_get_cpu0(pm.port, c)) {
+                    uint32_t tgt = (uint32_t)c.pc & 0xffff;
+                    /* Ignore a target equal to the jump's own address — either a
+                       stale read (step's PC update lags a hair) or a self-loop. */
+                    if (tgt != 0 && tgt != pm.jmp_pc) {
+                        uint8_t tb = 0xffu;
+                        if (tgt < 0x8000u && apex_pinmame_get_info(pm.port, ni))
+                            tb = (uint8_t)ni.wpc_bank;
+                        pm_bump(pm.jmp_targets, tb, tgt, pm_routine_name(document, tb, tgt));
+                    }
+                }
+                apex_pinmame_control(pm.port, "resume");
+            } else {
+                pm.resumed = true;   /* it halted → it had been running */
+                pm.next_poll = 0.0;  /* refresh registers/points immediately */
+                if (pm.trace_enabled) {
+                    pm.trace.clear();
+                    apex_pinmame_exectrace(pm.port, pm.trace);
+                }
+            }
+        }
+        double now = ImGui::GetTime();
+        if (now >= pm.next_poll) {
+            pm.next_poll = now + 0.5;
+            pm.connected = apex_pinmame_get_info(pm.port, pm.info);
+            if (pm.connected) {
+                apex_pinmame_get_cpu0(pm.port, pm.cpu);
+                pm.points.clear();   apex_pinmame_points(pm.port, pm.points);
+                pm.switches.clear(); apex_pinmame_switches(pm.port, pm.switches);
+                for (PmWatch &w : pm.watches) {
+                    w.val.clear();
+                    apex_pinmame_memory(pm.port, w.addr, w.size, -1, w.val); /* RAM: no bank */
+                }
+                if (pm.info.paused) pm_build_callstack(project, document, pm);
+                else pm.callstack.clear();
+                if (pm.launching) {
+                    pm.launching = false;
+                    pm.status = "connected";
+                }
+            }
+        }
+    } else {
+        /* Child died.  If we were still waiting for it to come up, surface why. */
+        if (pm.launching) {
+            std::string tail = apex_pinmame_log_tail(pm.pm);
+            pm.status = "xpinmamed exited before responding" +
+                        (tail.empty() ? std::string(" (no log output)")
+                                      : (": " + tail));
+            pm.launching = false;
+        }
+        pm.connected = false;
+    }
+
+    if (alive && pm.connected) {
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "connected: %s (%s)",
+                           pm.info.game.c_str(), pm.info.description.c_str());
+        ImGui::Text("state: %s   wpc_bank: 0x%02x",
+                    pm.info.paused ? "paused" : "running", pm.info.wpc_bank & 0xff);
+        /* Full 6809 register set (frozen & accurate while halted at a breakpoint). */
+        const ApexPinmameCpu &c = pm.cpu;
+        unsigned d = ((unsigned)(c.a & 0xff) << 8) | (unsigned)(c.b & 0xff);
+        char cc[9];
+        const char *bits = "EFHINZVC"; /* 6809 CC: E F H I N Z V C (bit 7..0) */
+        for (int i = 0; i < 8; i++) cc[i] = (c.cc & (0x80 >> i)) ? bits[i] : '.';
+        cc[8] = '\0';
+        ImGui::TextUnformatted("registers:");
+        ImGui::Text("  PC %04lx  S %04lx  U %04lx  X %04lx  Y %04lx",
+                    (unsigned long)c.pc & 0xffff, (unsigned long)c.sp & 0xffff,
+                    (unsigned long)c.u & 0xffff, (unsigned long)c.x & 0xffff,
+                    (unsigned long)c.y & 0xffff);
+        ImGui::Text("  A %02lx  B %02lx  D %04x  DP %02lx  CC %02lx [%s]",
+                    (unsigned long)c.a & 0xff, (unsigned long)c.b & 0xff, d,
+                    (unsigned long)c.dp & 0xff, (unsigned long)c.cc & 0xff, cc);
+    } else if (alive) {
+        ImGui::TextColored(ImVec4(0.9f, 0.8f, 0.3f, 1.0f), "process up, connecting…");
+    }
+    if (!pm.status.empty()) {
+        bool err = pm.status.find("fail") != std::string::npos ||
+                   pm.status.find("exited") != std::string::npos ||
+                   pm.status.find("in use") != std::string::npos ||
+                   pm.status.find("not found") != std::string::npos;
+        if (err) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.45f, 0.45f, 1.0f));
+            ImGui::TextWrapped("%s", pm.status.c_str());
+            ImGui::PopStyleColor();
+        } else {
+            ImGui::TextDisabled("%s", pm.status.c_str());
+        }
+    }
+
+    /* ---- Coverage ---- */
+    ImGui::SeparatorText("Code coverage");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    if (ImGui::Button("Start"))  apex_pinmame_coverage_cmd(pm.port, "start");
+    ImGui::SameLine();
+    if (ImGui::Button("Clear"))  apex_pinmame_coverage_cmd(pm.port, "clear");
+    ImGui::SameLine();
+    if (ImGui::Button("Import")) pinmame_import_coverage(project, document, pm);
+    ImGui::EndDisabled();
+
+    if (pm.cov_addressable > 0) {
+        ImGui::Text("executed %ld / %ld bytes (%.1f%%)", pm.cov_executed, pm.cov_addressable,
+                    100.0 * (double)pm.cov_executed / (double)pm.cov_addressable);
+    }
+    ImGui::Checkbox("Only runs not classified as code (missed code)", &pm.cov_only_noncode);
+    ImGui::SameLine();
+    ImGui::Checkbox("overlay in disasm", &pm.cov_overlay);
+    if (pm.cov_overlay && !pm.cov_reached.empty())
+        ImGui::TextDisabled("disasm: green = executed, red = never executed (import first)");
+
+    std::vector<size_t> view;
+    for (size_t i = 0; i < pm.cov_runs.size(); i++) {
+        if (pm.cov_only_noncode && pm.cov_runs[i].is_code) continue;
+        view.push_back(i);
+    }
+    ImGui::Text("%zu run(s) shown", view.size());
+
+    if (ImGui::BeginTable("pm_cov", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
+        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed,   90.0f);
+        ImGui::TableSetupColumn("Len",   ImGuiTableColumnFlags_WidthFixed,   56.0f);
+        ImGui::TableSetupColumn("Kind",  ImGuiTableColumnFlags_WidthFixed,   64.0f);
+        ImGui::TableSetupColumn("Go",    ImGuiTableColumnFlags_WidthStretch,  0.0f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin((int)view.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const PinmameRun &r = pm.cov_runs[view[(size_t)row]];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("B%02x_A%04x", r.bank, (unsigned)r.addr & 0xffff);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%u", r.len);
+                ImGui::TableSetColumnIndex(2);
+                if (r.is_code) ImGui::TextDisabled("code");
+                else ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "not code");
+                ImGui::TableSetColumnIndex(3);
+                char b[32];
+                snprintf(b, sizeof(b), "jump##%d", row);
+                if (ImGui::SmallButton(b)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, r.bank, r.addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    /* ---- Breakpoints & watchpoints (bank-aware, from the disassembly) ---- */
+    ImGui::SeparatorText("Breakpoints & watchpoints");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    if (ImGui::Button("Break at selection")) {
+        if (state->selected_line < document->line_count) {
+            const ApexRenderedLine *l = &document->lines[state->selected_line];
+            if (l->has_location) {
+                int bank = (l->cpu_addr >= 0x8000u) ? -1 : (int)l->bank; /* system takes no bank */
+                if (apex_pinmame_breakpoint(pm.port, "add", l->cpu_addr, bank,
+                                            pm.bp_cond[0] ? pm.bp_cond : nullptr))
+                    pm.status = "breakpoint added at selection";
+            }
+        }
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Clear BPs")) apex_pinmame_breakpoint(pm.port, "clear", 0, -1, nullptr);
+    ImGui::SetNextItemWidth(160);
+    ImGui::InputTextWithHint("##bpcond", "condition e.g. A==7F", pm.bp_cond, sizeof(pm.bp_cond));
+    ImGui::SameLine();
+    ImGui::TextDisabled("(applies to new breakpoints; REG ==/!=/</> HEX)");
+    {
+        static char wp_addr[16] = "";
+        const char *modes[] = {"read", "write", "rw"};
+        int mi = pm.wp_mode - 1;
+        if (mi < 0 || mi > 2) mi = 1;
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputText("RAM addr (hex)", wp_addr, sizeof(wp_addr));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::Combo("##wpmode", &mi, modes, 3);
+        pm.wp_mode = mi + 1;
+        ImGui::SameLine();
+        if (ImGui::Button("Add watch") && wp_addr[0]) {
+            unsigned a = (unsigned)strtoul(wp_addr, nullptr, 16);
+            apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.wp_mode);
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Clear WPs")) apex_pinmame_watchpoint(pm.port, "clear", 0, -1, 1, 2);
+    }
+    ImGui::EndDisabled();
+
+    /* Halt banner: the SSE event tells us which breakpoint/watchpoint fired. */
+    if (pm.connected && pm.info.paused && pm.resumed && !pm.xref_collecting &&
+        !pm.jmp_collecting) {
+        const ApexPinmameHalt &h = pm.last_halt;
+        bool have = pm.last_halt_seq != 0;
+        uint32_t pc = (uint32_t)(have ? h.pc : pm.cpu.pc);
+        uint8_t pcbank = (pc >= 0x8000u) ? 0xffu
+                       : (uint8_t)(have ? (h.bank & 0xff) : pm.info.wpc_bank);
+        ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.6f, 0.4f, 1.0f));
+        if (have && h.reason == "wp") {
+            ImGui::Text("HALTED — watchpoint hit: accessed 0x%04lx   PC B%02x_A%04x",
+                        (unsigned long)h.addr & 0xffff, pcbank, (unsigned)pc & 0xffff);
+        } else if (have && h.reason == "bp") {
+            ImGui::Text("HALTED — breakpoint at B%02x_A%04x", pcbank, (unsigned)pc & 0xffff);
+        } else {
+            ImGui::Text("HALTED — PC B%02x_A%04x", pcbank, (unsigned)pc & 0xffff);
+        }
+        ImGui::PopStyleColor();
+        ImGui::SameLine();
+        if (ImGui::SmallButton("jump PC")) {
+            size_t li;
+            if (apex_render_find_line_by_address(document, pcbank, pc, &li))
+                select_line(state, li, 1);
+        }
+        /* For a watchpoint hit, offer to jump to the accessed address when it's
+           in ROM (RAM accesses aren't in the disassembly). */
+        if (have && h.reason == "wp" && h.addr >= 0x4000) {
+            ImGui::SameLine();
+            if (ImGui::SmallButton("jump accessed")) {
+                uint8_t ab = (h.addr >= 0x8000) ? 0xffu : (uint8_t)(h.bank & 0xff);
+                size_t li;
+                if (apex_render_find_line_by_address(document, ab, (uint32_t)h.addr, &li))
+                    select_line(state, li, 1);
+            }
+        }
+    }
+
+    if (!pm.points.empty() && ImGui::BeginTable("pm_points", 5,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV, ImVec2(0, 90))) {
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableSetupColumn("Info", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+        ImGui::TableSetupColumn("",     ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableHeadersRow();
+        const char *wpmode[] = {"?", "read", "write", "rw"};
+        int del_wp = -1, del_idx = -1;
+        int prow = 0;
+        for (const ApexPinmamePoint &pt : pm.points) {
+            ImGui::PushID(prow++);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::TextUnformatted(pt.is_wp ? "WP" : "BP");
+            ImGui::TableSetColumnIndex(1);
+            uint8_t db = (pt.bank < 0) ? 0xffu : (uint8_t)pt.bank;
+            ImGui::Text("B%02x_A%04x", db, (unsigned)pt.addr & 0xffff);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::Text("%ld", pt.hits);
+            ImGui::TableSetColumnIndex(3);
+            if (pt.is_wp) ImGui::TextDisabled("%s", wpmode[(pt.mode >= 1 && pt.mode <= 3) ? pt.mode : 0]);
+            ImGui::TableSetColumnIndex(4);
+            if (ImGui::SmallButton("del")) { del_wp = pt.is_wp; del_idx = pt.idx; }
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (del_idx >= 0) {
+            apex_pinmame_point_delete(pm.port, del_wp, del_idx);
+            pm.next_poll = 0.0; /* refresh the list immediately */
+        }
+    }
+
+    /* ---- Live RAM watch (values resolved to NVRAM symbols) ---- */
+    ImGui::SeparatorText("RAM watch");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputText("addr (hex)##watch", pm.watch_addr, sizeof(pm.watch_addr));
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::Combo("##wsize", &pm.watch_size, "1 byte\0" "2 bytes\0");
+    ImGui::SameLine();
+    if (ImGui::Button("Watch##ram") && pm.watch_addr[0]) {
+        PmWatch w;
+        w.addr = (uint32_t)strtoul(pm.watch_addr, nullptr, 16);
+        w.size = (pm.watch_size == 1) ? 2 : 1;
+        const char *nm = symbol_name_at(w.addr, &project->symbols);
+        w.name = nm ? nm : "";
+        pm.watches.push_back(w);
+    }
+    ImGui::EndDisabled();
+    if (!pm.watches.empty() && ImGui::BeginTable("pm_watch", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV, ImVec2(0, 110))) {
+        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch, 0.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, 34.0f);
+        ImGui::TableHeadersRow();
+        int del = -1;
+        for (size_t i = 0; i < pm.watches.size(); i++) {
+            const PmWatch &w = pm.watches[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            ImGui::Text("%04x", w.addr & 0xffff);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(w.name.c_str());
+            ImGui::TableSetColumnIndex(2);
+            if (w.val.size() >= (size_t)w.size) {
+                unsigned v = w.val[0];
+                if (w.size == 2) v = ((unsigned)w.val[0] << 8) | w.val[1]; /* big-endian */
+                ImGui::Text(w.size == 2 ? "0x%04x (%u)" : "0x%02x (%u)", v, v);
+            } else {
+                ImGui::TextDisabled("…");
+            }
+            ImGui::TableSetColumnIndex(3);
+            if (ImGui::SmallButton("x")) del = (int)i;
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+        if (del >= 0) pm.watches.erase(pm.watches.begin() + del);
+    }
+
+    /* ---- Heuristic call stack (return addresses on the S stack) ---- */
+    if (pm.connected && pm.info.paused && !pm.callstack.empty()) {
+        ImGui::SeparatorText("Call stack (heuristic)");
+        if (ImGui::BeginTable("pm_stack", 2,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+                ImVec2(0, 110))) {
+            ImGui::TableSetupColumn("Return", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < pm.callstack.size(); i++) {
+                const PmHotEntry &e = pm.callstack[i];
+                ImGui::PushID((int)i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char rb[24];
+                snprintf(rb, sizeof(rb), "B%02x_A%04x", e.bank, e.addr & 0xffff);
+                if (ImGui::Selectable(rb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(e.name.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    /* ---- Execution backtrace (recent instructions before the halt) ---- */
+    ImGui::SeparatorText("Backtrace");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    if (ImGui::Checkbox("record trace", &pm.trace_enabled)) {
+        apex_pinmame_exectrace_cmd(pm.port, pm.trace_enabled ? "start" : "stop");
+    }
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!pm.trace_enabled);
+    if (ImGui::Button("Refresh")) {
+        pm.trace.clear();
+        apex_pinmame_exectrace(pm.port, pm.trace);
+    }
+    ImGui::EndDisabled();
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::TextDisabled("newest first; captured at each halt");
+    if (!pm.trace.empty() && ImGui::BeginTable("pm_bt", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, 150))) {
+        ImGui::TableSetupColumn("PC",   ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("A B X", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+        ImGui::TableHeadersRow();
+        int shown = (int)pm.trace.size();
+        if (shown > 200) shown = 200; /* the immediate lead-up is what matters */
+        ImGuiListClipper clip;
+        clip.Begin(shown);
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                /* newest last in the ring → reverse for newest-first display */
+                const ApexPinmameTrace &t = pm.trace[pm.trace.size() - 1 - (size_t)row];
+                uint8_t b = (t.pc >= 0x8000) ? 0xffu : (uint8_t)(t.bank & 0xff);
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char pb[24];
+                snprintf(pb, sizeof(pb), "B%02x_A%04x", b, (unsigned)t.pc & 0xffff);
+                if (ImGui::Selectable(pb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, b, (uint32_t)t.pc, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%02lx %02lx %04lx", t.a & 0xff, t.b & 0xff, t.x & 0xffff);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(pm_routine_name(document, b, (uint32_t)t.pc).c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    /* ---- Dynamic RAM xref: which code accesses a variable ---- */
+    ImGui::SeparatorText("RAM xref (who accesses X)");
+    {
+        const char *modes[] = {"read", "write", "rw"};
+        int mi = pm.xref_mode - 1;
+        if (mi < 0 || mi > 2) mi = 2;
+        ImGui::BeginDisabled(!alive || !pm.connected || pm.xref_collecting);
+        ImGui::SetNextItemWidth(90);
+        ImGui::InputText("addr (hex)##xref", pm.xref_addr, sizeof(pm.xref_addr));
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(70);
+        ImGui::Combo("##xrefmode", &mi, modes, 3);
+        pm.xref_mode = mi + 1;
+        ImGui::EndDisabled();
+        ImGui::SameLine();
+        if (!pm.xref_collecting) {
+            ImGui::BeginDisabled(!alive || !pm.connected || pm.xref_addr[0] == 0);
+            if (ImGui::Button("Collect accessors")) {
+                unsigned a = (unsigned)strtoul(pm.xref_addr, nullptr, 16);
+                apex_pinmame_watchpoint(pm.port, "clear", 0, -1, 1, 2);
+                apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.xref_mode);
+                pm.xref_accessors.clear();
+                pm.xref_collecting = true;
+                apex_pinmame_control(pm.port, "resume");
+            }
+            ImGui::EndDisabled();
+        } else {
+            if (ImGui::Button("Stop")) {
+                pm.xref_collecting = false;
+                apex_pinmame_control(pm.port, "pause");
+                apex_pinmame_watchpoint(pm.port, "clear", 0, -1, 1, 2);
+            }
+            ImGui::SameLine();
+            ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "collecting… %zu site(s)",
+                               pm.xref_accessors.size());
+        }
+        if (!pm.xref_accessors.empty() && ImGui::BeginTable("pm_xref", 3,
+                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+                ImVec2(0, 110))) {
+            ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 56.0f);
+            ImGui::TableSetupColumn("PC",   ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+            ImGui::TableHeadersRow();
+            for (size_t i = 0; i < pm.xref_accessors.size(); i++) {
+                const PmHotEntry &e = pm.xref_accessors[i];
+                ImGui::PushID((int)i);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char cb[24];
+                snprintf(cb, sizeof(cb), "%ld", e.count);
+                if (ImGui::Selectable(cb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(e.name.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    /* ---- Computed-jump resolver: discover the targets of an indexed JMP/JSR ---- */
+    ImGui::SeparatorText("Computed-jump resolver");
+    ImGui::BeginDisabled(!alive || !pm.connected || pm.jmp_collecting);
+    if (ImGui::Button("From selection##jmp") && state->selected_line < document->line_count) {
+        const ApexRenderedLine *l = &document->lines[state->selected_line];
+        if (l->has_location)
+            snprintf(pm.jmp_addr, sizeof(pm.jmp_addr), "%04x", l->cpu_addr & 0xffff);
+    }
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(90);
+    ImGui::InputText("jump addr (hex)", pm.jmp_addr, sizeof(pm.jmp_addr));
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!pm.jmp_collecting) {
+        ImGui::BeginDisabled(!alive || !pm.connected || pm.jmp_addr[0] == 0);
+        if (ImGui::Button("Resolve targets")) {
+            pm.jmp_pc = (uint32_t)strtoul(pm.jmp_addr, nullptr, 16);
+            /* Bank the breakpoint like the disasm: system >=0x8000 → none. */
+            uint8_t selb = 0xffu;
+            if (state->selected_line < document->line_count &&
+                document->lines[state->selected_line].cpu_addr == pm.jmp_pc)
+                selb = document->lines[state->selected_line].bank;
+            pm.jmp_bank = (pm.jmp_pc >= 0x8000u) ? -1 : (int)selb;
+            apex_pinmame_breakpoint(pm.port, "clear", 0, -1, nullptr);
+            apex_pinmame_breakpoint(pm.port, "add", pm.jmp_pc, pm.jmp_bank, nullptr);
+            pm.jmp_targets.clear();
+            pm.jmp_collecting = true;
+            apex_pinmame_control(pm.port, "resume");
+        }
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop##jmp")) {
+            pm.jmp_collecting = false;
+            apex_pinmame_control(pm.port, "pause");
+            apex_pinmame_breakpoint(pm.port, "clear", 0, -1, nullptr);
+        }
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "resolving… %zu target(s)",
+                           pm.jmp_targets.size());
+    }
+    if (!pm.jmp_targets.empty() && ImGui::BeginTable("pm_jmp", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, 110))) {
+        ImGui::TableSetupColumn("Hits",   ImGuiTableColumnFlags_WidthFixed, 56.0f);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < pm.jmp_targets.size(); i++) {
+            const PmHotEntry &e = pm.jmp_targets[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            char cb[24];
+            snprintf(cb, sizeof(cb), "%ld", e.count);
+            if (ImGui::Selectable(cb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                size_t li;
+                if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
+                    select_line(state, li, 1);
+            }
+            ImGui::TableSetColumnIndex(1);
+            ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(e.name.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+
+    /* ---- Switches & mini-script (drive inputs to reach code paths) ---- */
+    ImGui::SeparatorText("Switches & script");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    if (!pm.switches.empty() && ImGui::BeginTable("pm_sw", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
+            ImVec2(0, 120))) {
+        ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed, 34.0f);
+        ImGui::TableSetupColumn("Col/Row", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+        ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch, 0.0f);
+        ImGui::TableSetupColumn("",        ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin((int)pm.switches.size());
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                const ApexPinmameSwitch &sw = pm.switches[(size_t)row];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                if (sw.active) ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "%d", sw.num);
+                else ImGui::Text("%d", sw.num);
+                ImGui::TableSetColumnIndex(1);
+                if (sw.col >= 0 && sw.row >= 0) ImGui::Text("%d/%d", sw.col, sw.row);
+                else ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(2);
+                if (!sw.name.empty()) ImGui::TextUnformatted(sw.name.c_str());
+                else ImGui::TextDisabled("(unnamed)");
+                ImGui::TableSetColumnIndex(3);
+                if (ImGui::SmallButton("pulse")) apex_pinmame_input(pm.port, sw.num, 1, 100);
+                ImGui::SameLine();
+                if (ImGui::SmallButton(sw.active ? "off" : "on"))
+                    apex_pinmame_input(pm.port, sw.num, sw.active ? 0 : 1, 0);
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    ImGui::TextDisabled("script: press/release/pulse <sw> [ms], wait <ms>, resume, pause  (# = comment)");
+    ImGui::InputTextMultiline("##pmscript", pm.script, sizeof(pm.script), ImVec2(-1, 80));
+    if (!pm.script_running) {
+        if (ImGui::Button("Run script")) {
+            pm_parse_script(pm.script, pm.script_ops);
+            pm.script_ip = 0;
+            pm.script_next = 0.0;
+            pm.script_running = !pm.script_ops.empty();
+            pm.script_status = pm.script_running ? "started" : "empty script";
+        }
+    } else if (ImGui::Button("Stop script")) {
+        pm.script_running = false;
+        pm.script_status = "stopped";
+    }
+    ImGui::EndDisabled();
+    if (!pm.script_status.empty()) {
+        ImGui::SameLine();
+        ImGui::TextDisabled("%s", pm.script_status.c_str());
+    }
+    ImGui::TextDisabled("Keep this panel open while connected — polling & scripts run on its frames.");
+
+    /* ---- Call hotlist: how often each routine executed (instrument counters) ---- */
+    ImGui::SeparatorText("Call hotlist");
+    ImGui::BeginDisabled(!alive || !pm.connected);
+    if (ImGui::Button("Instrument routines")) {
+        apex_pinmame_instrument(pm.port, "clear", 0, -1);
+        const int CAP = 2000;
+        int n = 0;
+        for (size_t i = 0; i < document->line_count && n < CAP; i++) {
+            const ApexRenderedLine *l = &document->lines[i];
+            if (l->kind == APEX_RENDER_LINE_LABEL &&
+                l->block_kind == APEX_RENDER_BLOCK_CODE && l->has_location) {
+                int bank = (l->cpu_addr >= 0x8000u) ? -1 : (int)l->bank;
+                apex_pinmame_instrument(pm.port, "add", l->cpu_addr, bank);
+                n++;
+            }
+        }
+        pm.hot_instrumented = n;
+        char m[64];
+        snprintf(m, sizeof(m), "instrumented %d routine(s)%s", n, n >= CAP ? " (capped)" : "");
+        pm.status = m;
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Read hotlist")) {
+        std::vector<ApexPinmameCount> cs;
+        apex_pinmame_instrument_read(pm.port, cs);
+        pm.hotlist.clear();
+        for (const ApexPinmameCount &c : cs) {
+            if (c.count <= 0) continue;
+            PmHotEntry e;
+            e.bank = (c.bank < 0) ? 0xffu : (uint8_t)c.bank;
+            e.addr = (uint32_t)c.addr;
+            e.count = c.count;
+            size_t li;
+            if (apex_render_find_line_by_address(document, e.bank, e.addr, &li)) {
+                for (size_t j = li; j < document->line_count &&
+                     document->lines[j].bank == e.bank &&
+                     document->lines[j].cpu_addr == e.addr; j++) {
+                    if (document->lines[j].kind == APEX_RENDER_LINE_LABEL) {
+                        std::string nm(document->lines[j].text, document->lines[j].length);
+                        size_t colon = nm.find(':');
+                        if (colon != std::string::npos) nm.erase(colon);
+                        e.name = nm;
+                        break;
+                    }
+                }
+            }
+            pm.hotlist.push_back(e);
+        }
+        std::sort(pm.hotlist.begin(), pm.hotlist.end(),
+                  [](const PmHotEntry &a, const PmHotEntry &b) { return a.count > b.count; });
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Reset counts")) apex_pinmame_instrument(pm.port, "clear", 0, -1);
+    ImGui::EndDisabled();
+    if (pm.hot_instrumented)
+        ImGui::TextDisabled("%d routine(s) instrumented; run the game, then Read hotlist",
+                            pm.hot_instrumented);
+
+    if (!pm.hotlist.empty() && ImGui::BeginTable("pm_hot", 3,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
+            ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS, ImVec2(0, 160))) {
+        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
+        ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed, 90.0f, 1);
+        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
+        ImGui::TableHeadersRow();
+        int sc; bool asc;
+        if (ui_table_sort(&sc, &asc)) {
+            std::stable_sort(pm.hotlist.begin(), pm.hotlist.end(),
+                [&](const PmHotEntry &a, const PmHotEntry &b) {
+                    int c = 0;
+                    if (sc == 0) c = ui_cmp_int(a.count, b.count);
+                    else if (sc == 1) c = ui_cmp_u32(((uint32_t)a.bank << 16) | (a.addr & 0xffff),
+                                                     ((uint32_t)b.bank << 16) | (b.addr & 0xffff));
+                    else c = a.name.compare(b.name);
+                    return asc ? c < 0 : c > 0;
+                });
+        }
+        ImGuiListClipper clip;
+        clip.Begin((int)pm.hotlist.size());
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                const PmHotEntry &e = pm.hotlist[(size_t)row];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char cb[24];
+                snprintf(cb, sizeof(cb), "%ld", e.count);
+                if (ImGui::Selectable(cb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(e.name.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    /* Frame-stepped script executor: one op per frame; `wait` schedules ahead so
+       the UI thread never blocks. */
+    if (pm.script_running) {
+        if (!alive || !pm.connected) {
+            pm.script_running = false;
+            pm.script_status = "stopped (disconnected)";
+        } else {
+            double now = ImGui::GetTime();
+            if (now >= pm.script_next) {
+                if (pm.script_ip >= pm.script_ops.size()) {
+                    pm.script_running = false;
+                    pm.script_status = "done";
+                } else {
+                    PmScriptOp op = pm.script_ops[pm.script_ip++];
+                    switch (op.kind) {
+                    case PM_OP_PRESS:   apex_pinmame_input(pm.port, op.a, 1, 0); break;
+                    case PM_OP_RELEASE: apex_pinmame_input(pm.port, op.a, 0, 0); break;
+                    case PM_OP_PULSE:   apex_pinmame_input(pm.port, op.a, 1, op.b > 0 ? op.b : 100); break;
+                    case PM_OP_WAIT:    pm.script_next = now + (op.b > 0 ? op.b : 0) / 1000.0; break;
+                    case PM_OP_RESUME:  apex_pinmame_control(pm.port, "resume"); pm.resumed = true; break;
+                    case PM_OP_PAUSE:   apex_pinmame_control(pm.port, "pause"); break;
+                    }
+                    char s[48];
+                    snprintf(s, sizeof(s), "op %zu/%zu", pm.script_ip, pm.script_ops.size());
+                    pm.script_status = s;
+                }
+            }
+        }
+    }
+}
+
 void render_code_candidates(ApexProject *project,
                             const ApexRenderedDocument **document_ptr,
                             UiState *state)

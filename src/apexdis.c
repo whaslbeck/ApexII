@@ -1086,6 +1086,16 @@ static void emit_string(FILE *out, const uint8_t *data, size_t len)
     fprintf(out, "\"\n");
 }
 
+/* Bytes STRING_FIXED can represent: printable ASCII plus the \a \t \n \r escapes
+   understood by emit_string_fixed below and apexasm's parse_string_fixed. The
+   emit_data_range gate uses this so a classified fixed string is only rejected
+   (→ .DB) for a byte it genuinely cannot round-trip, not for CR/LF/BEL. */
+static int string_fixed_encodable(uint8_t c)
+{
+    return c == 0x07u || c == 0x09u || c == 0x0au || c == 0x0du ||
+           (c >= 0x20u && c <= 0x7fu);
+}
+
 /* Emits STRING_FIXED "…" (data[0..len-1] are the chars, no extra byte). */
 static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
 {
@@ -1093,6 +1103,7 @@ static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
     fprintf(out, "    STRING_FIXED \"");
     for (i = 0; i < len; i++) {
         if (data[i] == '\n') { fputs("\\n", out); continue; }
+        if (data[i] == '\r') { fputs("\\r", out); continue; }
         if (data[i] == '\t') { fputs("\\t", out); continue; }
         if (data[i] == 0x07) { fputs("\\a", out); continue; }
         if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
@@ -1540,10 +1551,8 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             return 0;
         }
         for (i = 0; i < n; i++) {
-            uint8_t c = data[*pos + i];
-            if (c == 0x09u) continue; /* tab, escaped as \t on emit */
-            if (c < 0x20u || c > 0x7fu) {
-                return 0;
+            if (!string_fixed_encodable(data[*pos + i])) {
+                return 0; /* byte STRING_FIXED can't round-trip → fall back to .DB */
             }
         }
         emit_string_fixed(out, data + *pos, n);

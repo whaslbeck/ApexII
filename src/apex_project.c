@@ -1503,7 +1503,12 @@ static void undo_clear_redo(struct ApexUndo *u)
 
 /* Record a pre-edit checkpoint. Called at the top of every mutator. Inside an
    edit group only the first mutation captures (so the group is one undo step). */
-static void project_record_edit(ApexProject *p, const char *action)
+/* Record one edit for undo and notify the change listener. `has_addr`/`bank`/
+   `addr` describe the affected location for the listener's log (pass has_addr=0
+   for name-scoped edits like set type / set symbol). Edits grouped via
+   begin/end_edit_group capture — and log — only once, under the group label. */
+static void project_record_edit_at(ApexProject *p, const char *action,
+                                   int has_addr, int has_bank, uint8_t bank, uint32_t addr)
 {
     struct ApexUndo *u;
     ApexConfigSnapshot snap;
@@ -1524,6 +1529,32 @@ static void project_record_edit(ApexProject *p, const char *action)
     snapshot_capture(p, action, &snap);
     undo_stack_push(u->undo, &u->undo_count, &snap);
     undo_clear_redo(u);
+
+    if (p->change_cb) {
+        ApexChangeEvent ev;
+        ev.seq = ++p->change_seq;
+        ev.action = action;
+        ev.has_addr = has_addr;
+        ev.has_bank = has_bank;
+        ev.bank = bank;
+        ev.addr = addr;
+        p->change_cb(p->change_ctx, &ev);
+    }
+}
+
+/* Back-compat shim for name-scoped edits with no address. */
+static void project_record_edit(ApexProject *p, const char *action)
+{
+    project_record_edit_at(p, action, 0, 0, 0, 0);
+}
+
+void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx)
+{
+    if (!project) {
+        return;
+    }
+    project->change_cb = fn;
+    project->change_ctx = ctx;
 }
 
 void apex_project_begin_edit_group(ApexProject *project, const char *label)
@@ -2069,7 +2100,7 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
     if (!labels) {
         return 1;
     }
-    project_record_edit(project, "set label");
+    project_record_edit_at(project, "set label", 1, has_bank, bank, addr);
     config_label = upsert_config_label(&project->config_labels, has_bank, bank, addr, name, &old_name);
     /* Rename an existing runtime label at this address rather than adding a
        second one: when renaming match the previous config name, otherwise take
@@ -2136,7 +2167,7 @@ int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, u
     if (!labels) {
         return 1;
     }
-    project_record_edit(project, "clear label");
+    project_record_edit_at(project, "clear label", 1, has_bank, bank, addr);
     removed_name = remove_config_label(&project->config_labels, has_bank, bank, addr);
     if (!removed_name) {
         return 1;
@@ -2153,7 +2184,7 @@ int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
     if (!project || !text || !*text) {
         return 1;
     }
-    project_record_edit(project, "set doc");
+    project_record_edit_at(project, "set doc", 1, has_bank, bank, addr);
     upsert_config_doc(&project->docs, has_bank, bank, addr, text);
     apex_project_invalidate(project, APEX_DIRTY_DOCS | APEX_DIRTY_RENDER);
     return 0;
@@ -2165,7 +2196,7 @@ int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear doc");
+    project_record_edit_at(project, "clear doc", 1, has_bank, bank, addr);
     if (!remove_config_doc(&project->docs, has_bank, bank, addr)) {
         return 1;
     }
@@ -2199,7 +2230,7 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "set kind");
+    project_record_edit_at(project, "set kind", 1, has_bank, bank, addr);
     config_clear_entry(&project->config_entries, has_bank, bank, addr);
     config_clear_data(&project->data_ranges, bank, addr);
     config_clear_table(&project->tables, bank, addr);
@@ -2257,7 +2288,7 @@ int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear kind");
+    project_record_edit_at(project, "clear kind", 1, has_bank, bank, addr);
     /* Detect a far-pointer classification before removing it: the target data in
        another bank must be reclassified, which a bank-scoped re-analysis misses. */
     const DataRange *dr = data_range_at(bank, addr, &project->data_ranges);
@@ -2284,7 +2315,7 @@ int apex_project_set_inline(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project || !spec || !*spec) {
         return 1;
     }
-    project_record_edit(project, "set inline");
+    project_record_edit_at(project, "set inline", 1, has_bank, bank, addr);
     if (config_set_inline_spec(&project->inline_sigs, has_bank, bank, addr, spec,
                                &project->config_types) != 0) {
         return 1;
@@ -2305,7 +2336,7 @@ int apex_project_clear_inline(ApexProject *project, int has_bank, uint8_t bank, 
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear inline");
+    project_record_edit_at(project, "clear inline", 1, has_bank, bank, addr);
     if (config_clear_inline(&project->inline_sigs, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -2325,7 +2356,7 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
     if (!project || !spec || !*spec) {
         return 1;
     }
-    project_record_edit(project, "set table");
+    project_record_edit_at(project, "set table", 1, (bank != 0xffu), bank, addr);
     if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, spec,
                                &project->config_types) != 0) {
         return 1;
@@ -2350,7 +2381,7 @@ int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr)
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear table");
+    project_record_edit_at(project, "clear table", 1, (bank != 0xffu), bank, addr);
     if (config_clear_table(&project->tables, bank, addr) != 0) {
         return 1;
     }
@@ -2616,7 +2647,7 @@ int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t b
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "add exclusion");
+    project_record_edit_at(project, "add exclusion", 1, has_bank, bank, addr);
     config_set_entry(&project->ref_exclusions, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
@@ -2629,7 +2660,7 @@ int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "remove exclusion");
+    project_record_edit_at(project, "remove exclusion", 1, has_bank, bank, addr);
     if (config_clear_entry(&project->ref_exclusions, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -2644,7 +2675,7 @@ int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "mark literal");
+    project_record_edit_at(project, "mark literal", 1, has_bank, bank, addr);
     config_set_entry(&project->literals, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
@@ -2657,7 +2688,7 @@ int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear literal");
+    project_record_edit_at(project, "clear literal", 1, has_bank, bank, addr);
     if (config_clear_entry(&project->literals, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -2689,7 +2720,7 @@ int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint3
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "ack warning");
+    project_record_edit_at(project, "ack warning", 1, has_bank, bank, addr);
     config_set_entry(&project->ack_warnings, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_RENDER;
     return 0;
@@ -2700,7 +2731,7 @@ int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, ui
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "un-ack warning");
+    project_record_edit_at(project, "un-ack warning", 1, has_bank, bank, addr);
     if (config_clear_entry(&project->ack_warnings, has_bank, bank, addr) != 0) {
         return 1;
     }
@@ -2733,7 +2764,7 @@ int apex_project_set_far_imm(ApexProject *project, int has_bank, uint8_t bank, u
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "set far immediate");
+    project_record_edit_at(project, "set far immediate", 1, has_bank, bank, addr);
     config_set_far_imm(&project->far_imms, has_bank, bank, addr, target_bank, type,
                        bank_load_addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
@@ -2746,7 +2777,7 @@ int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank,
     if (!project) {
         return 1;
     }
-    project_record_edit(project, "clear far immediate");
+    project_record_edit_at(project, "clear far immediate", 1, has_bank, bank, addr);
     if (config_clear_entry(&project->far_imms, has_bank, bank, addr) != 0) {
         return 1;
     }

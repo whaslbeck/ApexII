@@ -25,6 +25,20 @@ typedef enum {
     APEX_ANALYZE_SCOPE_BANK_ONLY
 } ApexAnalyzeScope;
 
+/* Change listener: fired once per recorded edit (the undo-capture point), so a
+   frontend can keep a log of everything the user changed. `action` is a short
+   static label ("set kind", "set label", …); the address fields are meaningful
+   only when `has_addr`. The CLI leaves the listener null (no-op). */
+typedef struct {
+    unsigned long seq;      /* monotonic edit counter for this project */
+    const char   *action;   /* short label; valid only during the callback */
+    int           has_addr; /* address fields identify an on-ROM location */
+    int           has_bank;
+    uint8_t       bank;
+    uint32_t      addr;
+} ApexChangeEvent;
+typedef void (*ApexChangeFn)(void *ctx, const ApexChangeEvent *ev);
+
 typedef struct ApexProject {
     const char *rom_path;
     const char *config_path;
@@ -57,10 +71,15 @@ typedef struct ApexProject {
     int render_cache_emit_xrefs;
     int render_cache_emit_explain;
     struct ApexUndo *undo;   /* config edit history (lazily allocated) */
+    ApexChangeFn change_cb;  /* optional per-edit change listener (frontend log) */
+    void        *change_ctx;
+    unsigned long change_seq; /* monotonic edit counter passed to the listener */
 } ApexProject;
 
 ApexProject *apex_project_open(const char *rom_path, const char *config_path);
 void apex_project_free(ApexProject *project);
+/* Register (or clear, with fn=NULL) a listener fired once per recorded edit. */
+void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx);
 int apex_project_analyze(ApexProject *project);
 void apex_project_invalidate(ApexProject *project, unsigned dirty_flags);
 int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,

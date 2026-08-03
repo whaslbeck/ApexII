@@ -7,6 +7,7 @@
 #include <string>
 #include <vector>
 #include <map>
+#include <unordered_set>
 
 extern "C" {
 #include "apexdmd.h"
@@ -17,6 +18,8 @@ extern "C" {
 #include "apex_match.h"
 #include "apex_compare.h"
 }
+
+#include "apex_pinmame.h"  /* C++ client for the PinMAME remote debugger (dynamic analysis) */
 
 // --- ROM Info State ---
 
@@ -225,6 +228,140 @@ struct NvramImportRow {
     std::string conflict;     /* human description of the collision, if any */
 };
 
+/* One 16-bit immediate-load instruction (LDX/LDD/LDU/… #imm16, CMPX/… #imm16)
+   surfaced by the Immediate Loads panel so the user can jump to the instruction,
+   jump to the value as a target address, and label that target. */
+struct ImmLoadRef {
+    size_t   line_index;  /* the instruction's document line (jump-to-instruction) */
+    uint8_t  bank;        /* instruction bank */
+    uint32_t cpu_addr;    /* instruction address */
+    uint32_t imm;         /* the 16-bit immediate value */
+    uint8_t  tgt_bank;    /* resolved target bank (valid only when tgt_in_rom) */
+    int      tgt_in_rom;  /* immediate lands in ROM address space (paged or system) */
+    int      symbolic;    /* the immediate currently renders as a label, not #0x.... */
+    char     mnem[8];     /* mnemonic, e.g. "LDX" */
+};
+
+/* One entry in the change log (View > Change Log): a single recorded edit, fed by
+   the ApexProject change listener.  Address fields are navigable when has_addr. */
+struct ChangeLogEntry {
+    unsigned long seq;
+    std::string   action;
+    bool          has_addr;
+    uint8_t       bank;
+    uint32_t      addr;
+};
+
+/* One contiguous run of executed bytes reported by PinMAME coverage, mapped to
+   ApexII's (bank, cpu_addr) model.  is_code = the run start is currently
+   classified as CODE; runs that are NOT code are the actionable "missed code"
+   worklist (real execution proves they are code). */
+struct PinmameRun {
+    uint8_t  bank;
+    uint32_t addr;
+    uint32_t len;
+    int      is_code;
+};
+
+/* One parsed op of the switch-control mini-script.  Grammar (one op per line):
+     press <sw> | release <sw> | pulse <sw> [ms] | wait <ms> | resume | pause
+   Frame-stepped so a `wait` never blocks the UI thread. */
+enum PmScriptKind {
+    PM_OP_PRESS, PM_OP_RELEASE, PM_OP_PULSE, PM_OP_WAIT, PM_OP_RESUME, PM_OP_PAUSE
+};
+struct PmScriptOp {
+    int kind; /* PmScriptKind */
+    int a;    /* switch number */
+    int b;    /* ms (pulse/wait) */
+};
+
+/* One routine in the call-frequency hotlist (execution count from instrument). */
+struct PmHotEntry {
+    uint8_t     bank;
+    uint32_t    addr;
+    long        count;
+    std::string name;
+};
+
+/* One live-watched RAM variable (value refreshed from the emulator each poll). */
+struct PmWatch {
+    uint32_t             addr;
+    int                  size;   /* 1 or 2 bytes */
+    std::string          name;   /* resolved NVRAM symbol, if any */
+    std::vector<uint8_t> val;    /* last read */
+};
+
+/* State for the optional PinMAME dynamic-analysis integration: user config
+   (persisted), the live process handle, and the last coverage import. */
+struct PinmameState {
+    char bin_path[512] = "/usr/local/bin/xpinmamed.x11"; /* config: xpinmamed binary */
+    char rompath[512]  = "";     /* config: PinMAME rom dir (defaulted at startup) */
+    char game[64]      = "";     /* config: romset name, e.g. "hurr_l2" */
+    int  port          = 8080;   /* config: remote-debugger HTTP port */
+
+    ApexPinmame     pm;          /* spawned child + port */
+    bool            connected = false;
+    bool            launching = false; /* spawned, waiting for the HTTP server */
+    ApexPinmameInfo info;
+    ApexPinmameCpu  cpu;
+    double          next_poll = 0.0;
+
+    long                    cov_executed = 0;
+    long                    cov_addressable = 0;
+    std::vector<PinmameRun> cov_runs;
+    bool                    cov_only_noncode = true; /* worklist filter */
+    std::unordered_set<uint32_t> cov_reached; /* (bank<<16)|addr, for the disasm overlay */
+    bool                    cov_overlay = false;      /* tint executed/dead code in the disasm */
+    std::string             status;
+
+    /* breakpoints / watchpoints / halt */
+    std::vector<ApexPinmamePoint>  points;
+    std::vector<ApexPinmameSwitch> switches;
+    bool   resumed = false;   /* we issued resume; watch for a breakpoint halt */
+    int    wp_mode = 2;       /* default watchpoint mode: write */
+    ApexPinmameHalt last_halt;      /* last SSE halt event (which bp/wp fired) */
+    unsigned long   last_halt_seq = 0;
+    char   bp_cond[64] = "";        /* optional condition for new breakpoints (e.g. A==7F) */
+
+    /* call-frequency hotlist (via instrument counters) */
+    std::vector<PmHotEntry> hotlist;
+    int    hot_instrumented = 0;
+
+    /* dynamic RAM xref: collect the code sites that access a variable */
+    char   xref_addr[16] = "";
+    int    xref_mode = 3;             /* 1=r 2=w 3=rw */
+    bool   xref_collecting = false;
+    std::vector<PmHotEntry> xref_accessors;
+
+    /* execution backtrace (recent-instruction ring, fetched on halt) */
+    bool   trace_enabled = false;
+    std::vector<ApexPinmameTrace> trace;
+
+    /* live RAM watch */
+    std::vector<PmWatch> watches;
+    char   watch_addr[16] = "";
+    int    watch_size = 0;   /* combo index: 0 = 1 byte, 1 = 2 bytes */
+
+    /* heuristic call stack (return addresses found on the S stack at a halt) */
+    std::vector<PmHotEntry> callstack;
+
+    /* computed-jump resolver: break at an indexed JMP/JSR, step, record the real
+       target across hits */
+    char     jmp_addr[16] = "";
+    bool     jmp_collecting = false;
+    uint32_t jmp_pc = 0;      /* the jump instruction's address */
+    int      jmp_bank = -1;   /* its bank (system = -1) */
+    std::vector<PmHotEntry> jmp_targets;
+
+    /* switch-control mini-script (frame-stepped, no UI blocking) */
+    char   script[4096] = "";
+    std::vector<PmScriptOp> script_ops;
+    size_t script_ip = 0;
+    bool   script_running = false;
+    double script_next = 0.0;
+    std::string script_status;
+};
+
 /* Which classification action the "repeat last classification" hotkey replays. */
 enum ApexLastClassifyOp {
     APEX_LAST_CLASSIFY_NONE = 0,
@@ -407,6 +544,18 @@ struct UiState {
     char ram_ref_input[32];
     std::vector<size_t> ram_ref_results;
     int request_focus_ram_refs;
+
+    bool show_imm_loads;
+    std::vector<ImmLoadRef> imm_load_results;
+    bool imm_loads_scanned;
+    bool imm_only_unlabeled;  /* filter: hide immediates already resolved to a label */
+    bool imm_only_rom;        /* filter: only immediates whose value lands in ROM space */
+
+    bool show_change_log;
+    std::vector<ChangeLogEntry> change_log; /* fed by the ApexProject change listener */
+
+    bool show_pinmame;
+    PinmameState pinmame;
 
     bool show_ref_exclusions;
     bool show_symbols_editor;
@@ -765,6 +914,17 @@ std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *i
 std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const char *addr_input);
 void render_pattern_search(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *document, UiState *state);
+
+// Analysis: Immediate Loads (LDX/LDD/… #imm16 that may reference an address)
+std::vector<ImmLoadRef> find_imm_loads(const ApexProject *project, const ApexRenderedDocument *document);
+void render_imm_loads(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+
+// Change Log: audit trail of every recorded edit, fed by the project change listener
+void ui_change_listener(void *ctx, const ApexChangeEvent *ev);
+void render_change_log(const ApexRenderedDocument *document, UiState *state);
+
+// PinMAME: optional dynamic-analysis integration (spawn xpinmamed, import coverage)
+void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // Analysis: Ref Exclusions
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);

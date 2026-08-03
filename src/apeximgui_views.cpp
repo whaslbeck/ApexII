@@ -801,6 +801,18 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 bool in_range = is_cursor; /* the Selectable highlights the cursor line */
                 ImGui::PushID((int)line_idx);
                 ImGui::TableNextRow();
+                /* PinMAME coverage overlay (lowest priority — later tints win): tint
+                   executed code green, never-executed code red. */
+                if (state->pinmame.cov_overlay && !state->pinmame.cov_reached.empty() &&
+                    line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location) {
+                    uint32_t ckey = ((uint32_t)line->bank << 16) | (line->cpu_addr & 0xffff);
+                    bool reached = state->pinmame.cov_reached.count(ckey) != 0;
+                    ImU32 bg = reached
+                        ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.20f, 0.70f, 0.30f, 0.16f))
+                        : ImGui::ColorConvertFloat4ToU32(ImVec4(0.70f, 0.25f, 0.20f, 0.14f));
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                }
                 if (in_block && !is_cursor) {
                     /* distinct translucent-blue background for the marked block */
                     ImU32 bg = ImGui::ColorConvertFloat4ToU32(ImVec4(0.20f, 0.45f, 0.85f, 0.28f));
@@ -1265,6 +1277,32 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         state->request_xref_popup = true;
                         state->xref_popup_bank = pop_bank;
                         state->xref_popup_addr = pop_cpu_addr;
+                    }
+                    if (pop_has_loc && state->pinmame.connected &&
+                        ImGui::MenuItem("Set PinMAME breakpoint")) {
+                        /* System addresses (>=0x8000) take no bank; paged use the
+                           line's bank — a bank-aware breakpoint. */
+                        int bpbank = (pop_cpu_addr >= 0x8000u) ? -1 : (int)pop_bank;
+                        const char *cond = state->pinmame.bp_cond[0] ? state->pinmame.bp_cond
+                                                                     : nullptr;
+                        if (apex_pinmame_breakpoint(state->pinmame.port, "add",
+                                                    pop_cpu_addr, bpbank, cond))
+                            set_status(state, cond ? "PinMAME conditional breakpoint set"
+                                                   : "PinMAME breakpoint set");
+                    }
+                    if (pop_has_loc && state->pinmame.connected &&
+                        ImGui::BeginMenu("Set PinMAME watchpoint")) {
+                        int wbank = (pop_cpu_addr >= 0x8000u) ? -1 : (int)pop_bank;
+                        struct { const char *label; int mode; } wm[] = {
+                            {"read", 1}, {"write", 2}, {"read+write", 3}};
+                        for (auto &w : wm) {
+                            if (ImGui::MenuItem(w.label)) {
+                                if (apex_pinmame_watchpoint(state->pinmame.port, "add",
+                                                            pop_cpu_addr, wbank, 1, w.mode))
+                                    set_status(state, "PinMAME watchpoint set");
+                            }
+                        }
+                        ImGui::EndMenu();
                     }
                     ImGui::Separator();
                     if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {

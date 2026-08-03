@@ -569,6 +569,8 @@ static void parse_string_fixed(AsmState *st, char *args)
                 ch = (unsigned char)*p++;
             } else if (*p == 'n') {
                 ch = 0x0au; p++;
+            } else if (*p == 'r') {
+                ch = 0x0du; p++;
             } else if (*p == 't') {
                 ch = 0x09u; p++;
             } else if (*p == 'a') {
@@ -579,7 +581,8 @@ static void parse_string_fixed(AsmState *st, char *args)
         } else {
             ch = (unsigned char)*p++;
         }
-        if (ch != 0x0au && ch != 0x09u && ch != 0x07u && (ch < 0x20u || ch > 0x7fu)) {
+        if (ch != 0x0au && ch != 0x0du && ch != 0x09u && ch != 0x07u &&
+            (ch < 0x20u || ch > 0x7fu)) {
             die("STRING_FIXED byte out of supported ASCII range");
         }
         emit_byte(st, ch);

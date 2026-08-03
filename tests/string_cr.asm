@@ -1,0 +1,18 @@
+.ROM_SIZE 524288
+
+.BANK SYSTEM
+.ORG 0x8000
+START:
+    NOP
+
+.ORG 0x8002
+    STRING_FIXED "\r\nA\r\nB"
+
+.ORG 0xfff2
+    .DW START
+    .DW START
+    .DW START
+    .DW START
+    .DW START
+    .DW START
+    .DW START
