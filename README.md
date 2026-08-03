@@ -204,6 +204,23 @@ Transfers labels and inline signatures from an already-annotated reference ROM t
 
 Accepted matches write labels, code entries, inline signatures, and routine docs to the active overlay. The panel stays open so results can be accepted incrementally.
 
+#### PinMAME dynamic analysis (optional)
+
+`apeximgui` can drive a running game for **dynamic** analysis by spawning a headless [PinMAME](https://github.com/vpinball/pinmame) and talking to its remote-debugger HTTP API. It is entirely optional — nothing runs until you configure and launch it, and the CLI tools are unaffected.
+
+**Requirements:** a PinMAME build with the remote debugger enabled (`REMOTE_DEBUG = 1` in `makefile.unix`, producing an `xpinmamed.*` binary that supports `-headless`), plus your PinMAME roms (e.g. `~/.pinmame/hurr_l2.zip`).
+
+**Setup:** in the **PinMAME (dynamic)** window (Windows menu) set the `xpinmamed` binary path, the PinMAME rom directory (or pick the `.zip` via Browse — it fills in the rom set), and the HTTP port, then **Launch**. Config persists in the session.
+
+The panel is split into four dockable windows so live views can sit side by side:
+
+- **PinMAME (dynamic)** — launch/exec control (resume/pause/step); live status with the full 6809 register set (frozen at a halt, CC flags decoded); breakpoints & watchpoints (bank-aware, also settable from the disassembly right-click menu, optionally conditional, e.g. `A==7F`); an SSE halt banner reporting **which** breakpoint/watchpoint fired (and, for a watchpoint, the accessed address); a heuristic call stack; an execution backtrace; a live **RAM watch** resolved to NVRAM symbols; a **dynamic RAM xref** ("who accesses X" — collects the code sites that touch a variable); and a **computed-jump resolver** that steps an indexed `JMP`/`JSR` to enumerate its real targets.
+- **PinMAME · DMD** — the live dot-matrix display.
+- **PinMAME · Switches** — the switch matrix (with col/row) with per-switch on/off/pulse, plus a mini-script (`press`/`release`/`pulse`/`wait`/`resume`/`pause`) to drive inputs and reach a target state.
+- **PinMAME · Coverage** — import execution **coverage** (overlay executed/never-executed code in the disassembly, plus a "missed code" worklist) and a **call hotlist** (per-routine execution counts, sortable).
+
+All polling, halt handling, collection loops and scripts run once per frame from the app's main loop, so the live views keep updating even when a PinMAME window is on a background tab.
+
 #### Screenshots
 
 ![Main Interface](docs/screenshots/screenshot-01.png)
@@ -214,6 +231,9 @@ Accepted matches write labels, code entries, inline signatures, and routine docs
 
 ![Hardware Mapping](docs/screenshots/screenshot-03.png)
 *Figure 3: Call Graph*
+
+![PinMAME Debugger](docs/screenshots/screenshot-04.png)
+*Figure 4: Integrated PinMAME Debugger
 
 
 ### `apexdis`
@@ -365,6 +385,28 @@ Rewrites each file in-place, replacing the legacy `[routine_docs]` and `[table_d
 build/apexini migrate tests/myconfig.ini
 # migrated tests/myconfig.ini  (12 doc entries → [docs])
 ```
+
+#### `nvram-import` / `nvram-export`
+
+Exchange a documented RAM map with the [PinMAME NVRAM-maps](https://github.com/tomlogic/pinmame-nvram-maps) JSON format. A memory-location *descriptor* (any JSON object with a `start` field, at any nesting depth) maps to a `[symbols]` name plus a `[docs]` string at that CPU address; `start` is treated as a CPU address (fileformat v0.7+).
+
+```sh
+# JSON RAM map -> config ([symbols] + [docs])
+build/apexini nvram-import game.nv.json ram_map.ini [base_addr]
+
+# config RAM symbols/docs (addresses below 0x4000) -> JSON RAM map
+build/apexini nvram-export config.ini ram_map.json
+
+# zero-loss: merge names/docs back into the original map, preserving every
+# other field (encoding, mask, min/max, values, wpc_rtc, …)
+build/apexini nvram-export config.ini ram_map.json original.nv.json
+```
+
+`nvram-import` derives each symbol name from the descriptor's `short_label` (falling back to `label`), sanitized to a valid identifier and de-duplicated; the `label` becomes the doc. Pass an optional `base_addr` (added to every `start`) for older maps whose `start` is an `.nv` file offset rather than a CPU address.
+
+`nvram-export` without a template writes a fresh minimal map (name + doc + address). With a **template** (typically the map you imported), it rewrites that map in place — updating only each descriptor's `short_label`/`label` from the config and appending any new locations — so all the fields ApexII does not model (`encoding`, `length`, `mask`, `scale`, `values`, `min`/`max`, `wpc_rtc`, …) survive a round-trip untouched.
+
+In `apeximgui`, **File → Import RAM Map** shows the parsed locations in a preview window — each row selectable, with a warning on any that would overwrite an existing symbol/doc — before applying; **File → Export RAM Map** writes the current RAM map back out, automatically merging into the last-imported map when one is present (zero loss).
 
 ### `apexmatch`
 

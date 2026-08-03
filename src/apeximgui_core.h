@@ -301,7 +301,14 @@ struct PinmameState {
 
     ApexPinmame     pm;          /* spawned child + port */
     bool            connected = false;
+    bool            alive = false;     /* child process is running (set by the pump) */
     bool            launching = false; /* spawned, waiting for the HTTP server */
+
+    /* live DMD framebuffer */
+    bool                 show_dmd = false;
+    std::vector<uint8_t> dmd_lum;
+    int                  dmd_w = 0, dmd_h = 0;
+    double               dmd_next = 0.0;
     ApexPinmameInfo info;
     ApexPinmameCpu  cpu;
     double          next_poll = 0.0;
@@ -555,6 +562,9 @@ struct UiState {
     std::vector<ChangeLogEntry> change_log; /* fed by the ApexProject change listener */
 
     bool show_pinmame;
+    bool show_pinmame_dmd;
+    bool show_pinmame_switches;
+    bool show_pinmame_coverage;
     PinmameState pinmame;
 
     bool show_ref_exclusions;
@@ -924,7 +934,13 @@ void ui_change_listener(void *ctx, const ApexChangeEvent *ev);
 void render_change_log(const ApexRenderedDocument *document, UiState *state);
 
 // PinMAME: optional dynamic-analysis integration (spawn xpinmamed, import coverage)
+// pinmame_pump runs the per-frame work (poll, halt, script, DMD fetch) once from the
+// main loop, so the live views stay updated regardless of which window is visible.
+void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_pinmame_switches(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 
 // Analysis: Ref Exclusions
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);

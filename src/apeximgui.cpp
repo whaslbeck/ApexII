@@ -646,6 +646,9 @@ int main(int argc, char **argv)
                 ImGui::MenuItem("Immediate Loads", NULL, &state.show_imm_loads);
                 ImGui::MenuItem("Change Log",      NULL, &state.show_change_log);
                 ImGui::MenuItem("PinMAME (dynamic)", NULL, &state.show_pinmame);
+                ImGui::MenuItem("PinMAME · DMD",      NULL, &state.show_pinmame_dmd);
+                ImGui::MenuItem("PinMAME · Switches", NULL, &state.show_pinmame_switches);
+                ImGui::MenuItem("PinMAME · Coverage", NULL, &state.show_pinmame_coverage);
                 ImGui::MenuItem("Ref Exclusions",    NULL, &state.show_ref_exclusions);
                 ImGui::MenuItem("Code Candidates",    NULL, &state.show_code_candidates);
                 ImGui::MenuItem("Inline Candidates", NULL, &state.show_inline_candidates);
@@ -732,6 +735,9 @@ int main(int argc, char **argv)
             ImGui::DockBuilderDockWindow("Immediate Loads", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Change Log",       dock_bottom_id);
             ImGui::DockBuilderDockWindow("PinMAME (dynamic)", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("PinMAME · DMD",      dock_bottom_id);
+            ImGui::DockBuilderDockWindow("PinMAME · Switches", dock_bottom_id);
+            ImGui::DockBuilderDockWindow("PinMAME · Coverage", dock_bottom_id);
             ImGui::DockBuilderDockWindow("Ref Exclusions",  dock_bottom_id);
             ImGui::DockBuilderDockWindow("Code Candidates",   dock_bottom_id);
             ImGui::DockBuilderDockWindow("Inline Candidates", dock_bottom_id);
@@ -1031,9 +1037,26 @@ int main(int argc, char **argv)
             render_change_log(document, &state);
             ImGui::End();
         }
+        /* Per-frame PinMAME work runs once, regardless of which windows are open. */
+        pinmame_pump(project, &document, &state);
         if (state.show_pinmame) {
             ImGui::Begin("PinMAME (dynamic)", &state.show_pinmame);
             render_pinmame(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_pinmame_dmd) {
+            ImGui::Begin("PinMAME · DMD", &state.show_pinmame_dmd);
+            render_pinmame_dmd(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_pinmame_switches) {
+            ImGui::Begin("PinMAME · Switches", &state.show_pinmame_switches);
+            render_pinmame_switches(project, &document, &state);
+            ImGui::End();
+        }
+        if (state.show_pinmame_coverage) {
+            ImGui::Begin("PinMAME · Coverage", &state.show_pinmame_coverage);
+            render_pinmame_coverage(project, &document, &state);
             ImGui::End();
         }
         if (state.show_ref_exclusions) {

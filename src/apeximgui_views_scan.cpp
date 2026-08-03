@@ -609,11 +609,126 @@ static void pm_parse_script(const char *src, std::vector<PmScriptOp> &ops)
    xpinmamed, watch live CPU/bank state, import execution coverage as a
    missed-code worklist, set bank-aware breakpoints/watchpoints, and drive
    switches (incl. a mini-script) to reach code paths. */
+/* Per-frame PinMAME work, independent of which windows are open: process
+   liveness, the SSE halt handler (incl. xref / jump-resolver collection), the
+   ~2 Hz status poll, the DMD fetch and the switch-script executor.  Called once
+   per frame from the main loop so the live views stay updated regardless of which
+   PinMAME window (if any) is on a foreground dock tab. */
+void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                  UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+    PinmameState &pm = state->pinmame;
+
+    pm.alive = apex_pinmame_is_alive(pm.pm);
+    if (pm.alive) {
+        if (pm.connected && !pm.pm.ev_running) apex_pinmame_events_start(pm.pm);
+        ApexPinmameHalt h;
+        if (apex_pinmame_get_halt(pm.pm, h) && h.seq != pm.last_halt_seq) {
+            pm.last_halt = h;
+            pm.last_halt_seq = h.seq;
+            if (pm.xref_collecting && h.reason == "wp") {
+                uint8_t b = (h.pc >= 0x8000) ? 0xffu : (uint8_t)(h.bank & 0xff);
+                pm_bump(pm.xref_accessors, b, (uint32_t)h.pc,
+                        pm_routine_name(document, b, (uint32_t)h.pc));
+                apex_pinmame_control(pm.port, "resume");
+            } else if (pm.jmp_collecting && h.reason == "bp" &&
+                       (uint32_t)h.pc == pm.jmp_pc) {
+                apex_pinmame_control(pm.port, "step");
+                ApexPinmameCpu c;
+                ApexPinmameInfo ni;
+                if (apex_pinmame_get_cpu0(pm.port, c)) {
+                    uint32_t tgt = (uint32_t)c.pc & 0xffff;
+                    if (tgt != 0 && tgt != pm.jmp_pc) {
+                        uint8_t tb = 0xffu;
+                        if (tgt < 0x8000u && apex_pinmame_get_info(pm.port, ni))
+                            tb = (uint8_t)ni.wpc_bank;
+                        pm_bump(pm.jmp_targets, tb, tgt, pm_routine_name(document, tb, tgt));
+                    }
+                }
+                apex_pinmame_control(pm.port, "resume");
+            } else {
+                pm.resumed = true;
+                pm.next_poll = 0.0;
+                if (pm.trace_enabled) {
+                    pm.trace.clear();
+                    apex_pinmame_exectrace(pm.port, pm.trace);
+                }
+            }
+        }
+        double now = ImGui::GetTime();
+        if (now >= pm.next_poll) {
+            pm.next_poll = now + 0.5;
+            pm.connected = apex_pinmame_get_info(pm.port, pm.info);
+            if (pm.connected) {
+                apex_pinmame_get_cpu0(pm.port, pm.cpu);
+                pm.points.clear();   apex_pinmame_points(pm.port, pm.points);
+                pm.switches.clear(); apex_pinmame_switches(pm.port, pm.switches);
+                for (PmWatch &w : pm.watches) {
+                    w.val.clear();
+                    apex_pinmame_memory(pm.port, w.addr, w.size, -1, w.val); /* RAM: no bank */
+                }
+                if (pm.info.paused) pm_build_callstack(project, document, pm);
+                else pm.callstack.clear();
+                if (pm.launching) { pm.launching = false; pm.status = "connected"; }
+            }
+        }
+        if (pm.show_dmd && pm.connected) {
+            double dnow = ImGui::GetTime();
+            if (dnow >= pm.dmd_next) {
+                pm.dmd_next = dnow + 0.12; /* ~8 Hz refresh */
+                apex_pinmame_dmd(pm.port, pm.dmd_w, pm.dmd_h, pm.dmd_lum);
+            }
+        }
+    } else {
+        if (pm.launching) {
+            std::string tail = apex_pinmame_log_tail(pm.pm);
+            pm.status = "xpinmamed exited before responding" +
+                        (tail.empty() ? std::string(" (no log output)")
+                                      : (": " + tail));
+            pm.launching = false;
+        }
+        pm.connected = false;
+    }
+
+    /* Frame-stepped switch script: one op per frame; `wait` schedules ahead. */
+    if (pm.script_running) {
+        if (!pm.alive || !pm.connected) {
+            pm.script_running = false;
+            pm.script_status = "stopped (disconnected)";
+        } else {
+            double now = ImGui::GetTime();
+            if (now >= pm.script_next) {
+                if (pm.script_ip >= pm.script_ops.size()) {
+                    pm.script_running = false;
+                    pm.script_status = "done";
+                } else {
+                    PmScriptOp op = pm.script_ops[pm.script_ip++];
+                    switch (op.kind) {
+                    case PM_OP_PRESS:   apex_pinmame_input(pm.port, op.a, 1, 0); break;
+                    case PM_OP_RELEASE: apex_pinmame_input(pm.port, op.a, 0, 0); break;
+                    case PM_OP_PULSE:   apex_pinmame_input(pm.port, op.a, 1, op.b > 0 ? op.b : 100); break;
+                    case PM_OP_WAIT:    pm.script_next = now + (op.b > 0 ? op.b : 0) / 1000.0; break;
+                    case PM_OP_RESUME:  apex_pinmame_control(pm.port, "resume"); pm.resumed = true; break;
+                    case PM_OP_PAUSE:   apex_pinmame_control(pm.port, "pause"); break;
+                    }
+                    char s[48];
+                    snprintf(s, sizeof(s), "op %zu/%zu", pm.script_ip, pm.script_ops.size());
+                    pm.script_status = s;
+                }
+            }
+        }
+    }
+}
+
+/* PinMAME control hub: config, launch / exec control, live status + registers,
+   the halt banner, and the breakpoint / inspection tools. */
 void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_ptr,
                     UiState *state)
 {
     const ApexRenderedDocument *document = *document_ptr;
     PinmameState &pm = state->pinmame;
+    bool alive = pm.alive;
 
     /* ---- Config ---- */
     if (ImGui::CollapsingHeader("Configuration", ImGuiTreeNodeFlags_DefaultOpen)) {
@@ -647,8 +762,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
     ImGui::Separator();
 
     /* ---- Process control ---- */
-    bool alive = apex_pinmame_is_alive(pm.pm);
-    if (!alive) {
+    if (!pm.alive) {
         if (ImGui::Button("Launch")) {
             if (apex_pinmame_launch(pm.pm, pm.bin_path, pm.rompath, pm.game, pm.port)) {
                 pm.status = "launched — waiting for debugger…";
@@ -675,82 +789,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         if (ImGui::Button("Step"))   apex_pinmame_control(pm.port, "step");
     }
 
-    /* ---- Poll live status ~2 Hz while running ---- */
-    if (alive) {
-        if (pm.connected && !pm.pm.ev_running) apex_pinmame_events_start(pm.pm);
-        /* Per-frame halt check (cheap mutex read) for snappy break detection. */
-        ApexPinmameHalt h;
-        if (apex_pinmame_get_halt(pm.pm, h) && h.seq != pm.last_halt_seq) {
-            pm.last_halt = h;
-            pm.last_halt_seq = h.seq;
-            if (pm.xref_collecting && h.reason == "wp") {
-                /* Record the accessing PC and immediately resume to keep collecting
-                   the set of code sites that touch the watched variable. */
-                uint8_t b = (h.pc >= 0x8000) ? 0xffu : (uint8_t)(h.bank & 0xff);
-                pm_bump(pm.xref_accessors, b, (uint32_t)h.pc,
-                        pm_routine_name(document, b, (uint32_t)h.pc));
-                apex_pinmame_control(pm.port, "resume");
-            } else if (pm.jmp_collecting && h.reason == "bp" &&
-                       (uint32_t)h.pc == pm.jmp_pc) {
-                /* Halted at the indexed jump: step once so the emulator computes the
-                   target, read the new PC (= real destination), record it, resume. */
-                apex_pinmame_control(pm.port, "step");
-                ApexPinmameCpu c;
-                ApexPinmameInfo ni;
-                if (apex_pinmame_get_cpu0(pm.port, c)) {
-                    uint32_t tgt = (uint32_t)c.pc & 0xffff;
-                    /* Ignore a target equal to the jump's own address — either a
-                       stale read (step's PC update lags a hair) or a self-loop. */
-                    if (tgt != 0 && tgt != pm.jmp_pc) {
-                        uint8_t tb = 0xffu;
-                        if (tgt < 0x8000u && apex_pinmame_get_info(pm.port, ni))
-                            tb = (uint8_t)ni.wpc_bank;
-                        pm_bump(pm.jmp_targets, tb, tgt, pm_routine_name(document, tb, tgt));
-                    }
-                }
-                apex_pinmame_control(pm.port, "resume");
-            } else {
-                pm.resumed = true;   /* it halted → it had been running */
-                pm.next_poll = 0.0;  /* refresh registers/points immediately */
-                if (pm.trace_enabled) {
-                    pm.trace.clear();
-                    apex_pinmame_exectrace(pm.port, pm.trace);
-                }
-            }
-        }
-        double now = ImGui::GetTime();
-        if (now >= pm.next_poll) {
-            pm.next_poll = now + 0.5;
-            pm.connected = apex_pinmame_get_info(pm.port, pm.info);
-            if (pm.connected) {
-                apex_pinmame_get_cpu0(pm.port, pm.cpu);
-                pm.points.clear();   apex_pinmame_points(pm.port, pm.points);
-                pm.switches.clear(); apex_pinmame_switches(pm.port, pm.switches);
-                for (PmWatch &w : pm.watches) {
-                    w.val.clear();
-                    apex_pinmame_memory(pm.port, w.addr, w.size, -1, w.val); /* RAM: no bank */
-                }
-                if (pm.info.paused) pm_build_callstack(project, document, pm);
-                else pm.callstack.clear();
-                if (pm.launching) {
-                    pm.launching = false;
-                    pm.status = "connected";
-                }
-            }
-        }
-    } else {
-        /* Child died.  If we were still waiting for it to come up, surface why. */
-        if (pm.launching) {
-            std::string tail = apex_pinmame_log_tail(pm.pm);
-            pm.status = "xpinmamed exited before responding" +
-                        (tail.empty() ? std::string(" (no log output)")
-                                      : (": " + tail));
-            pm.launching = false;
-        }
-        pm.connected = false;
-    }
-
-    if (alive && pm.connected) {
+    if (pm.alive && pm.connected) {
         ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "connected: %s (%s)",
                            pm.info.game.c_str(), pm.info.description.c_str());
         ImGui::Text("state: %s   wpc_bank: 0x%02x",
@@ -785,69 +824,6 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         } else {
             ImGui::TextDisabled("%s", pm.status.c_str());
         }
-    }
-
-    /* ---- Coverage ---- */
-    ImGui::SeparatorText("Code coverage");
-    ImGui::BeginDisabled(!alive || !pm.connected);
-    if (ImGui::Button("Start"))  apex_pinmame_coverage_cmd(pm.port, "start");
-    ImGui::SameLine();
-    if (ImGui::Button("Clear"))  apex_pinmame_coverage_cmd(pm.port, "clear");
-    ImGui::SameLine();
-    if (ImGui::Button("Import")) pinmame_import_coverage(project, document, pm);
-    ImGui::EndDisabled();
-
-    if (pm.cov_addressable > 0) {
-        ImGui::Text("executed %ld / %ld bytes (%.1f%%)", pm.cov_executed, pm.cov_addressable,
-                    100.0 * (double)pm.cov_executed / (double)pm.cov_addressable);
-    }
-    ImGui::Checkbox("Only runs not classified as code (missed code)", &pm.cov_only_noncode);
-    ImGui::SameLine();
-    ImGui::Checkbox("overlay in disasm", &pm.cov_overlay);
-    if (pm.cov_overlay && !pm.cov_reached.empty())
-        ImGui::TextDisabled("disasm: green = executed, red = never executed (import first)");
-
-    std::vector<size_t> view;
-    for (size_t i = 0; i < pm.cov_runs.size(); i++) {
-        if (pm.cov_only_noncode && pm.cov_runs[i].is_code) continue;
-        view.push_back(i);
-    }
-    ImGui::Text("%zu run(s) shown", view.size());
-
-    if (ImGui::BeginTable("pm_cov", 4,
-            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
-            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed,   90.0f);
-        ImGui::TableSetupColumn("Len",   ImGuiTableColumnFlags_WidthFixed,   56.0f);
-        ImGui::TableSetupColumn("Kind",  ImGuiTableColumnFlags_WidthFixed,   64.0f);
-        ImGui::TableSetupColumn("Go",    ImGuiTableColumnFlags_WidthStretch,  0.0f);
-        ImGui::TableHeadersRow();
-        ImGuiListClipper clipper;
-        clipper.Begin((int)view.size());
-        while (clipper.Step()) {
-            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
-                const PinmameRun &r = pm.cov_runs[view[(size_t)row]];
-                ImGui::PushID(row);
-                ImGui::TableNextRow();
-                ImGui::TableSetColumnIndex(0);
-                ImGui::Text("B%02x_A%04x", r.bank, (unsigned)r.addr & 0xffff);
-                ImGui::TableSetColumnIndex(1);
-                ImGui::Text("%u", r.len);
-                ImGui::TableSetColumnIndex(2);
-                if (r.is_code) ImGui::TextDisabled("code");
-                else ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "not code");
-                ImGui::TableSetColumnIndex(3);
-                char b[32];
-                snprintf(b, sizeof(b), "jump##%d", row);
-                if (ImGui::SmallButton(b)) {
-                    size_t li;
-                    if (apex_render_find_line_by_address(document, r.bank, r.addr, &li))
-                        select_line(state, li, 1);
-                }
-                ImGui::PopID();
-            }
-        }
-        ImGui::EndTable();
     }
 
     /* ---- Breakpoints & watchpoints (bank-aware, from the disassembly) ---- */
@@ -1226,12 +1202,50 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         ImGui::EndTable();
     }
 
-    /* ---- Switches & mini-script (drive inputs to reach code paths) ---- */
-    ImGui::SeparatorText("Switches & script");
-    ImGui::BeginDisabled(!alive || !pm.connected);
+}
+
+/* ---- PinMAME · DMD window ---- */
+void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state)
+{
+    (void)project; (void)document_ptr;
+    PinmameState &pm = state->pinmame;
+    ImGui::BeginDisabled(!pm.alive || !pm.connected);
+    ImGui::Checkbox("live DMD", &pm.show_dmd);
+    ImGui::EndDisabled();
+    if (pm.show_dmd && pm.dmd_w > 0 && (int)pm.dmd_lum.size() >= pm.dmd_w * pm.dmd_h) {
+        float availw = ImGui::GetContentRegionAvail().x;
+        float scale = std::max(1.0f, std::min(8.0f, availw / (float)pm.dmd_w));
+        ImVec2 pos = ImGui::GetCursorScreenPos();
+        ImVec2 sz(pm.dmd_w * scale, pm.dmd_h * scale);
+        ImGui::InvisibleButton("pm_dmd_canvas", sz);
+        ImDrawList *dl = ImGui::GetWindowDrawList();
+        dl->AddRectFilled(pos, ImVec2(pos.x + sz.x, pos.y + sz.y), IM_COL32(14, 10, 2, 255));
+        for (int y = 0; y < pm.dmd_h; y++) {
+            for (int x = 0; x < pm.dmd_w; x++) {
+                uint8_t l = pm.dmd_lum[(size_t)y * pm.dmd_w + x];
+                if (!l) continue;
+                float f = l / 255.0f;
+                ImU32 col = IM_COL32((int)(255 * f), (int)(150 * f), (int)(20 * f), 255); /* amber */
+                ImVec2 a(pos.x + x * scale, pos.y + y * scale);
+                dl->AddRectFilled(a, ImVec2(a.x + scale - 0.4f, a.y + scale - 0.4f), col);
+            }
+        }
+    } else {
+        ImGui::TextDisabled("enable 'live DMD' while connected");
+    }
+}
+
+/* ---- PinMAME · Switches window (matrix + mini-script) ---- */
+void render_pinmame_switches(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                             UiState *state)
+{
+    (void)project; (void)document_ptr;
+    PinmameState &pm = state->pinmame;
+    ImGui::BeginDisabled(!pm.alive || !pm.connected);
     if (!pm.switches.empty() && ImGui::BeginTable("pm_sw", 4,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_BordersInnerV,
-            ImVec2(0, 120))) {
+            ImVec2(0, 200))) {
         ImGui::TableSetupColumn("#",       ImGuiTableColumnFlags_WidthFixed, 34.0f);
         ImGui::TableSetupColumn("Col/Row", ImGuiTableColumnFlags_WidthFixed, 54.0f);
         ImGui::TableSetupColumn("Name",    ImGuiTableColumnFlags_WidthStretch, 0.0f);
@@ -1263,7 +1277,6 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         }
         ImGui::EndTable();
     }
-
     ImGui::TextDisabled("script: press/release/pulse <sw> [ms], wait <ms>, resume, pause  (# = comment)");
     ImGui::InputTextMultiline("##pmscript", pm.script, sizeof(pm.script), ImVec2(-1, 80));
     if (!pm.script_running) {
@@ -1283,11 +1296,79 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         ImGui::SameLine();
         ImGui::TextDisabled("%s", pm.script_status.c_str());
     }
-    ImGui::TextDisabled("Keep this panel open while connected — polling & scripts run on its frames.");
+}
 
-    /* ---- Call hotlist: how often each routine executed (instrument counters) ---- */
+/* ---- PinMAME · Coverage window (coverage import/overlay + call hotlist) ---- */
+void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                             UiState *state)
+{
+    const ApexRenderedDocument *document = *document_ptr;
+    PinmameState &pm = state->pinmame;
+
+    ImGui::SeparatorText("Code coverage");
+    ImGui::BeginDisabled(!pm.alive || !pm.connected);
+    if (ImGui::Button("Start"))  apex_pinmame_coverage_cmd(pm.port, "start");
+    ImGui::SameLine();
+    if (ImGui::Button("Clear"))  apex_pinmame_coverage_cmd(pm.port, "clear");
+    ImGui::SameLine();
+    if (ImGui::Button("Import")) pinmame_import_coverage(project, document, pm);
+    ImGui::EndDisabled();
+
+    if (pm.cov_addressable > 0) {
+        ImGui::Text("executed %ld / %ld bytes (%.1f%%)", pm.cov_executed, pm.cov_addressable,
+                    100.0 * (double)pm.cov_executed / (double)pm.cov_addressable);
+    }
+    ImGui::Checkbox("Only runs not classified as code (missed code)", &pm.cov_only_noncode);
+    ImGui::SameLine();
+    ImGui::Checkbox("overlay in disasm", &pm.cov_overlay);
+    if (pm.cov_overlay && !pm.cov_reached.empty())
+        ImGui::TextDisabled("disasm: green = executed, red = never executed (import first)");
+
+    std::vector<size_t> view;
+    for (size_t i = 0; i < pm.cov_runs.size(); i++) {
+        if (pm.cov_only_noncode && pm.cov_runs[i].is_code) continue;
+        view.push_back(i);
+    }
+    ImGui::Text("%zu run(s) shown", view.size());
+
+    if (ImGui::BeginTable("pm_cov", 4,
+            ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+            ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV, ImVec2(0, 150))) {
+        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed,   90.0f);
+        ImGui::TableSetupColumn("Len",   ImGuiTableColumnFlags_WidthFixed,   56.0f);
+        ImGui::TableSetupColumn("Kind",  ImGuiTableColumnFlags_WidthFixed,   64.0f);
+        ImGui::TableSetupColumn("Go",    ImGuiTableColumnFlags_WidthStretch,  0.0f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clipper;
+        clipper.Begin((int)view.size());
+        while (clipper.Step()) {
+            for (int row = clipper.DisplayStart; row < clipper.DisplayEnd; row++) {
+                const PinmameRun &r = pm.cov_runs[view[(size_t)row]];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                ImGui::Text("B%02x_A%04x", r.bank, (unsigned)r.addr & 0xffff);
+                ImGui::TableSetColumnIndex(1);
+                ImGui::Text("%u", r.len);
+                ImGui::TableSetColumnIndex(2);
+                if (r.is_code) ImGui::TextDisabled("code");
+                else ImGui::TextColored(ImVec4(0.9f, 0.7f, 0.3f, 1.0f), "not code");
+                ImGui::TableSetColumnIndex(3);
+                char b[32];
+                snprintf(b, sizeof(b), "jump##%d", row);
+                if (ImGui::SmallButton(b)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, r.bank, r.addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
     ImGui::SeparatorText("Call hotlist");
-    ImGui::BeginDisabled(!alive || !pm.connected);
+    ImGui::BeginDisabled(!pm.alive || !pm.connected);
     if (ImGui::Button("Instrument routines")) {
         apex_pinmame_instrument(pm.port, "clear", 0, -1);
         const int CAP = 2000;
@@ -1345,7 +1426,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
 
     if (!pm.hotlist.empty() && ImGui::BeginTable("pm_hot", 3,
             ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
-            ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS, ImVec2(0, 160))) {
+            ImGuiTableFlags_BordersInnerV | APEX_TABLE_SORT_FLAGS, ImVec2(0, 200))) {
         ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
         ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed, 90.0f, 1);
         ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
@@ -1385,36 +1466,6 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             }
         }
         ImGui::EndTable();
-    }
-
-    /* Frame-stepped script executor: one op per frame; `wait` schedules ahead so
-       the UI thread never blocks. */
-    if (pm.script_running) {
-        if (!alive || !pm.connected) {
-            pm.script_running = false;
-            pm.script_status = "stopped (disconnected)";
-        } else {
-            double now = ImGui::GetTime();
-            if (now >= pm.script_next) {
-                if (pm.script_ip >= pm.script_ops.size()) {
-                    pm.script_running = false;
-                    pm.script_status = "done";
-                } else {
-                    PmScriptOp op = pm.script_ops[pm.script_ip++];
-                    switch (op.kind) {
-                    case PM_OP_PRESS:   apex_pinmame_input(pm.port, op.a, 1, 0); break;
-                    case PM_OP_RELEASE: apex_pinmame_input(pm.port, op.a, 0, 0); break;
-                    case PM_OP_PULSE:   apex_pinmame_input(pm.port, op.a, 1, op.b > 0 ? op.b : 100); break;
-                    case PM_OP_WAIT:    pm.script_next = now + (op.b > 0 ? op.b : 0) / 1000.0; break;
-                    case PM_OP_RESUME:  apex_pinmame_control(pm.port, "resume"); pm.resumed = true; break;
-                    case PM_OP_PAUSE:   apex_pinmame_control(pm.port, "pause"); break;
-                    }
-                    char s[48];
-                    snprintf(s, sizeof(s), "op %zu/%zu", pm.script_ip, pm.script_ops.size());
-                    pm.script_status = s;
-                }
-            }
-        }
     }
 }
 

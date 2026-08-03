@@ -1275,6 +1275,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_hardware=%d\nshow_tables=%d\nshow_types=%d\nshow_inline_list=%d\n"
             "show_entries_list=%d\nshow_pattern_search=%d\nshow_ram_refs=%d\n"
             "show_imm_loads=%d\nshow_change_log=%d\nshow_pinmame=%d\n"
+            "show_pinmame_dmd=%d\nshow_pinmame_switches=%d\nshow_pinmame_coverage=%d\n"
             "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
@@ -1288,6 +1289,7 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
             s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
             s->show_imm_loads, s->show_change_log, s->show_pinmame,
+            s->show_pinmame_dmd, s->show_pinmame_switches, s->show_pinmame_coverage,
             s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
             s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor,
@@ -1442,6 +1444,12 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_change_log = atoi(l + 16) != 0;
         } else if (strncmp(l, "show_pinmame=", 13) == 0) {
             s->show_pinmame = atoi(l + 13) != 0;
+        } else if (strncmp(l, "show_pinmame_dmd=", 17) == 0) {
+            s->show_pinmame_dmd = atoi(l + 17) != 0;
+        } else if (strncmp(l, "show_pinmame_switches=", 22) == 0) {
+            s->show_pinmame_switches = atoi(l + 22) != 0;
+        } else if (strncmp(l, "show_pinmame_coverage=", 22) == 0) {
+            s->show_pinmame_coverage = atoi(l + 22) != 0;
         } else if (strncmp(l, "pinmame_bin=", 12) == 0) {
             strncpy(s->pinmame.bin_path, l + 12, sizeof(s->pinmame.bin_path) - 1);
             s->pinmame.bin_path[sizeof(s->pinmame.bin_path) - 1] = '\0';

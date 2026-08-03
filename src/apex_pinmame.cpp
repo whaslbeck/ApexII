@@ -436,6 +436,30 @@ bool apex_pinmame_memory(int port, unsigned addr, int size, int bank,
     return true;
 }
 
+bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum)
+{
+    std::string info;
+    if (!apex_pinmame_http_get(port, "/api/dmd/info", info)) {
+        return false;
+    }
+    long lw, lh;
+    if (!apex_json_int(info, "width", lw) || !apex_json_int(info, "height", lh) ||
+        lw <= 0 || lh <= 0 || lw * lh > (1 << 20)) {
+        return false;
+    }
+    std::string raw;
+    if (!apex_pinmame_http_get(port, "/api/dmd/raw", raw)) {
+        return false;
+    }
+    if ((long)raw.size() < lw * lh) {
+        return false; /* short/blank frame */
+    }
+    w = (int)lw;
+    h = (int)lh;
+    lum.assign(raw.begin(), raw.begin() + (size_t)(lw * lh));
+    return true;
+}
+
 void apex_pinmame_stop(ApexPinmame &pm)
 {
     apex_pinmame_events_stop(pm);

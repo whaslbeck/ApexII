@@ -150,6 +150,10 @@ bool apex_pinmame_exectrace(int port, std::vector<ApexPinmameTrace> &out);
 /* Read `size` bytes from CPU address `addr` (bank < 0 = no bank param). */
 bool apex_pinmame_memory(int port, unsigned addr, int size, int bank,
                          std::vector<uint8_t> &out);
+
+/* Fetch the live DMD framebuffer: /api/dmd/info for w/h, /api/dmd/raw for one
+   luminance byte per pixel (w*h bytes). */
+bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum);
 bool apex_pinmame_coverage_cmd(int port, const char *cmd);
 bool apex_pinmame_coverage_summary(int port, long &executed, long &addressable);
 
