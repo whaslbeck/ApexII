@@ -267,14 +267,15 @@ void render_imm_loads(ApexProject *project,
 
                 ImGui::TableSetColumnIndex(0);
                 char addr_buf[40];
-                /* "##i" keeps this ID distinct from the target button's, which
-                   would otherwise collide when an instruction's immediate points
-                   at its own address (same "Bxx_Ayyyy" string). */
+                /* Plain column-0 selectable (no SpanAllColumns/AllowOverlap): the
+                   Target and Label buttons live in their own cells, so nothing
+                   overlaps the selectable — this avoids the ImGui duplicate-ID
+                   warning that AllowOverlap produced when hovering those buttons.
+                   "##i" still distinguishes it from the target button's id. */
                 snprintf(addr_buf, sizeof(addr_buf), "B%02x_A%04x##i",
                          r.bank, (unsigned)r.cpu_addr & 0xffff);
                 bool sel = (r.line_index == state->selected_line);
-                if (ImGui::Selectable(addr_buf, sel,
-                        ImGuiSelectableFlags_SpanAllColumns | ImGuiSelectableFlags_AllowOverlap)) {
+                if (ImGui::Selectable(addr_buf, sel)) {
                     /* Navigate by address, not the stored line index: creating a
                        label re-renders and shifts line indices, so the index can
                        go stale between scans. */
@@ -315,7 +316,9 @@ void render_imm_loads(ApexProject *project,
                 if (r.symbolic) {
                     ImGui::TextDisabled("symbolic");
                 } else if (r.tgt_in_rom) {
-                    if (ImGui::SmallButton("Label"))
+                    /* "##mk" keeps this button's id distinct from the "Label"
+                       column header, which is also hashed from "Label". */
+                    if (ImGui::SmallButton("Label##mk"))
                         label_idx = (int)view[(size_t)row];
                 } else {
                     ImGui::TextDisabled("-");
@@ -650,6 +653,20 @@ void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_pt
             } else {
                 pm.resumed = true;
                 pm.next_poll = 0.0;
+                if (h.reason == "wp") {
+                    /* The API gives no watchpoint hit count — tally it ourselves,
+                       keyed by the watchpoint whose range contains the accessed
+                       address (fall back to the raw address). */
+                    uint32_t key = (uint32_t)h.addr & 0xffffu;
+                    for (const ApexPinmamePoint &pt : pm.points) {
+                        if (pt.is_wp && (uint32_t)h.addr >= (uint32_t)pt.addr &&
+                            (uint32_t)h.addr < (uint32_t)pt.addr + (uint32_t)(pt.len > 0 ? pt.len : 1)) {
+                            key = (uint32_t)pt.addr & 0xffffu;
+                            break;
+                        }
+                    }
+                    pm.wp_hits[key]++;
+                }
                 if (pm.trace_enabled) {
                     pm.trace.clear();
                     apex_pinmame_exectrace(pm.port, pm.trace);
@@ -673,11 +690,26 @@ void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_pt
                 if (pm.launching) { pm.launching = false; pm.status = "connected"; }
             }
         }
-        if (pm.show_dmd && pm.connected) {
+        if ((pm.show_dmd || pm.dmd_recording) && pm.connected) {
             double dnow = ImGui::GetTime();
             if (dnow >= pm.dmd_next) {
                 pm.dmd_next = dnow + 0.12; /* ~8 Hz refresh */
-                apex_pinmame_dmd(pm.port, pm.dmd_w, pm.dmd_h, pm.dmd_lum);
+                bool got = apex_pinmame_dmd(pm.port, pm.dmd_w, pm.dmd_h, pm.dmd_lum);
+                /* Append to the GIF only when the frame actually changed; write the
+                   PREVIOUS frame with the time it was on screen (one-frame delay). */
+                if (got && pm.dmd_recording && pm.dmd_gif && !pm.dmd_lum.empty() &&
+                    pm.dmd_lum != pm.dmd_pending) {
+                    if (pm.dmd_has_pending) {
+                        int delay = (int)((dnow - pm.dmd_pending_time) * 100.0 + 0.5);
+                        if (delay < 2) delay = 2;
+                        if (delay > 6000) delay = 6000;
+                        apex_gif_add_frame(pm.dmd_gif, pm.dmd_pending.data(), delay);
+                        pm.dmd_rec_frames++;
+                    }
+                    pm.dmd_pending = pm.dmd_lum;
+                    pm.dmd_pending_time = dnow;
+                    pm.dmd_has_pending = true;
+                }
             }
         }
     } else {
@@ -861,9 +893,13 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         if (ImGui::Button("Add watch") && wp_addr[0]) {
             unsigned a = (unsigned)strtoul(wp_addr, nullptr, 16);
             apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.wp_mode);
+            pm.wp_hits[a & 0xffff] = 0; /* fresh hit count */
         }
         ImGui::SameLine();
-        if (ImGui::Button("Clear WPs")) apex_pinmame_watchpoint(pm.port, "clear", 0, -1, 1, 2);
+        if (ImGui::Button("Clear WPs")) {
+            apex_pinmame_watchpoint(pm.port, "clear", 0, -1, 1, 2);
+            pm.wp_hits.clear();
+        }
     }
     ImGui::EndDisabled();
 
@@ -924,7 +960,12 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             uint8_t db = (pt.bank < 0) ? 0xffu : (uint8_t)pt.bank;
             ImGui::Text("B%02x_A%04x", db, (unsigned)pt.addr & 0xffff);
             ImGui::TableSetColumnIndex(2);
-            ImGui::Text("%ld", pt.hits);
+            long hits = pt.hits;
+            if (pt.is_wp) {  /* watchpoints have no API hit count — use our SSE tally */
+                auto it = pm.wp_hits.find((uint32_t)pt.addr & 0xffffu);
+                hits = (it != pm.wp_hits.end()) ? it->second : 0;
+            }
+            ImGui::Text("%ld", hits);
             ImGui::TableSetColumnIndex(3);
             if (pt.is_wp) ImGui::TextDisabled("%s", wpmode[(pt.mode >= 1 && pt.mode <= 3) ? pt.mode : 0]);
             ImGui::TableSetColumnIndex(4);
@@ -961,8 +1002,9 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         ImGui::TableSetupColumn("Addr",  ImGuiTableColumnFlags_WidthFixed, 64.0f);
         ImGui::TableSetupColumn("Name",  ImGuiTableColumnFlags_WidthStretch, 0.0f);
         ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-        ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, 34.0f);
+        ImGui::TableSetupColumn("",      ImGuiTableColumnFlags_WidthFixed, 80.0f);
         ImGui::TableHeadersRow();
+        const char *wml = (pm.wp_mode == 1) ? "r" : (pm.wp_mode == 3) ? "rw" : "w";
         int del = -1;
         for (size_t i = 0; i < pm.watches.size(); i++) {
             const PmWatch &w = pm.watches[i];
@@ -981,6 +1023,16 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
                 ImGui::TextDisabled("…");
             }
             ImGui::TableSetColumnIndex(3);
+            ImGui::BeginDisabled(!pm.alive || !pm.connected);
+            char wpl[16];
+            snprintf(wpl, sizeof(wpl), "wp:%s", wml);  /* set a watchpoint (current mode) */
+            if (ImGui::SmallButton(wpl)) {
+                apex_pinmame_watchpoint(pm.port, "add", w.addr, -1, w.size, pm.wp_mode);
+                pm.wp_hits[w.addr & 0xffff] = 0;
+                pm.status = "watchpoint set on RAM";
+            }
+            ImGui::EndDisabled();
+            ImGui::SameLine();
             if (ImGui::SmallButton("x")) del = (int)i;
             ImGui::PopID();
         }
@@ -1204,6 +1256,33 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
 
 }
 
+/* The DMD amber palette: luminance byte -> RGB, matching the live view. */
+static void pm_dmd_palette(uint8_t pal[256 * 3])
+{
+    for (int i = 0; i < 256; i++) {
+        pal[i * 3 + 0] = (uint8_t)i;
+        pal[i * 3 + 1] = (uint8_t)(i * 150 / 255);
+        pal[i * 3 + 2] = (uint8_t)(i * 20 / 255);
+    }
+}
+
+/* Finalise an in-progress GIF recording (writes the last pending frame). */
+void pinmame_stop_gif(UiState *state)
+{
+    PinmameState &pm = state->pinmame;
+    if (pm.dmd_gif) {
+        if (pm.dmd_has_pending) {
+            apex_gif_add_frame(pm.dmd_gif, pm.dmd_pending.data(), 50);
+            pm.dmd_rec_frames++;
+        }
+        apex_gif_end(pm.dmd_gif);
+        pm.dmd_gif = nullptr;
+    }
+    pm.dmd_recording = false;
+    pm.dmd_has_pending = false;
+    pm.dmd_pending.clear();
+}
+
 /* ---- PinMAME · DMD window ---- */
 void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **document_ptr,
                         UiState *state)
@@ -1213,6 +1292,76 @@ void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **docum
     ImGui::BeginDisabled(!pm.alive || !pm.connected);
     ImGui::Checkbox("live DMD", &pm.show_dmd);
     ImGui::EndDisabled();
+
+    /* ---- export: single PNG + animated GIF ---- */
+    bool have_frame = pm.dmd_w > 0 && (int)pm.dmd_lum.size() >= pm.dmd_w * pm.dmd_h;
+    ImGui::SameLine();
+    ImGui::BeginDisabled(!have_frame);
+    if (ImGui::Button("Save PNG")) {
+        IGFD::FileDialogConfig cfg;
+        cfg.path = ".";
+        cfg.fileName = "dmd.png";
+        ImGuiFileDialog::Instance()->OpenDialog("PmDmdPng", "Save DMD frame (.png)", ".png", cfg);
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    if (!pm.dmd_recording) {
+        ImGui::BeginDisabled(!pm.alive || !pm.connected);
+        if (ImGui::Button("Record GIF")) {
+            IGFD::FileDialogConfig cfg;
+            cfg.path = ".";
+            cfg.fileName = "dmd.gif";
+            ImGuiFileDialog::Instance()->OpenDialog("PmDmdGif", "Record DMD to (.gif)", ".gif", cfg);
+        }
+        ImGui::EndDisabled();
+    } else {
+        if (ImGui::Button("Stop recording")) pinmame_stop_gif(state);
+        ImGui::SameLine();
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "REC  %ld frame(s)", pm.dmd_rec_frames);
+    }
+    /* Save-PNG dialog */
+    if (ImGuiFileDialog::Instance()->Display("PmDmdPng", ImGuiWindowFlags_NoCollapse,
+                                             ImVec2(560, 360))) {
+        if (ImGuiFileDialog::Instance()->IsOk() && have_frame) {
+            std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+            uint8_t pal[256 * 3];
+            pm_dmd_palette(pal);
+            std::vector<uint8_t> rgb((size_t)pm.dmd_w * pm.dmd_h * 3);
+            for (size_t i = 0; i < (size_t)pm.dmd_w * pm.dmd_h; i++) {
+                uint8_t l = pm.dmd_lum[i];
+                rgb[i * 3 + 0] = pal[l * 3 + 0];
+                rgb[i * 3 + 1] = pal[l * 3 + 1];
+                rgb[i * 3 + 2] = pal[l * 3 + 2];
+            }
+            pm.status = apex_png_write_rgb(path.c_str(), pm.dmd_w, pm.dmd_h, rgb.data())
+                            ? "DMD PNG saved" : "PNG save failed";
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+    /* Record-GIF dialog */
+    if (ImGuiFileDialog::Instance()->Display("PmDmdGif", ImGuiWindowFlags_NoCollapse,
+                                             ImVec2(560, 360))) {
+        if (ImGuiFileDialog::Instance()->IsOk()) {
+            std::string path = ImGuiFileDialog::Instance()->GetFilePathName();
+            uint8_t pal[256 * 3];
+            pm_dmd_palette(pal);
+            int w = pm.dmd_w > 0 ? pm.dmd_w : 128;
+            int h = pm.dmd_h > 0 ? pm.dmd_h : 32;
+            pm.dmd_gif = apex_gif_begin(path.c_str(), w, h, pal);
+            if (pm.dmd_gif) {
+                pm.dmd_recording = true;
+                pm.dmd_has_pending = false;
+                pm.dmd_pending.clear();
+                pm.dmd_rec_frames = 0;
+                pm.show_dmd = true; /* ensure frames are fetched */
+                pm.status = "recording DMD → GIF";
+            } else {
+                pm.status = "GIF open failed";
+            }
+        }
+        ImGuiFileDialog::Instance()->Close();
+    }
+
     if (pm.show_dmd && pm.dmd_w > 0 && (int)pm.dmd_lum.size() >= pm.dmd_w * pm.dmd_h) {
         float availw = ImGui::GetContentRegionAvail().x;
         float scale = std::max(1.0f, std::min(8.0f, availw / (float)pm.dmd_w));

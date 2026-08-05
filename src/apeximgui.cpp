@@ -1710,6 +1710,7 @@ int main(int argc, char **argv)
         document = renderer.take();
     }
 
+    pinmame_stop_gif(&state);            /* finalise any in-progress DMD GIF */
     apex_pinmame_stop(state.pinmame.pm); /* don't leave a headless emulator running */
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplSDL2_Shutdown();

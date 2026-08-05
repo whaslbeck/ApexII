@@ -38,6 +38,7 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 	$(BUILD_DIR)/apeximgui_views_scan.o \
 	$(BUILD_DIR)/apeximgui_views_media.o \
 	$(BUILD_DIR)/apex_pinmame.o \
+	$(BUILD_DIR)/apex_imgexport.o \
 	$(BUILD_DIR)/apex_match.o \
 	$(BUILD_DIR)/apex_compare.o \
 	$(BUILD_DIR)/ImGuiFileDialog.o \

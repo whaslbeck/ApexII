@@ -20,6 +20,7 @@ extern "C" {
 }
 
 #include "apex_pinmame.h"  /* C++ client for the PinMAME remote debugger (dynamic analysis) */
+#include "apex_imgexport.h" /* minimal PNG / animated-GIF writers (DMD export) */
 
 // --- ROM Info State ---
 
@@ -309,6 +310,13 @@ struct PinmameState {
     std::vector<uint8_t> dmd_lum;
     int                  dmd_w = 0, dmd_h = 0;
     double               dmd_next = 0.0;
+    /* animated-GIF recorder (one-frame lookahead for correct per-frame timing) */
+    bool                 dmd_recording = false;
+    ApexGif             *dmd_gif = nullptr;
+    std::vector<uint8_t> dmd_pending;      /* last captured frame not yet written */
+    double               dmd_pending_time = 0.0;
+    bool                 dmd_has_pending = false;
+    long                 dmd_rec_frames = 0;
     ApexPinmameInfo info;
     ApexPinmameCpu  cpu;
     double          next_poll = 0.0;
@@ -329,6 +337,7 @@ struct PinmameState {
     ApexPinmameHalt last_halt;      /* last SSE halt event (which bp/wp fired) */
     unsigned long   last_halt_seq = 0;
     char   bp_cond[64] = "";        /* optional condition for new breakpoints (e.g. A==7F) */
+    std::map<uint32_t, long> wp_hits; /* watchpoint hit counts (API gives none), keyed by addr */
 
     /* call-frequency hotlist (via instrument counters) */
     std::vector<PmHotEntry> hotlist;
@@ -941,6 +950,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
 void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_pinmame_switches(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
 void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+void pinmame_stop_gif(UiState *state); /* finalise an in-progress DMD GIF recording */
 
 // Analysis: Ref Exclusions
 void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
