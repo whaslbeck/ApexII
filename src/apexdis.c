@@ -1719,46 +1719,6 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
     return 1;
 }
 
-/* Fixed byte width of a non-variable inline field kind. */
-static size_t inline_fixed_field_width(TableFieldKind kind)
-{
-    return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
-}
-
-/* Actual bytes an inline payload consumes at this call site, resolving any
-   variable-length fields against the ROM.  Sets *ok = 0 (and returns 0) if the
-   payload would run past the available bytes. */
-static size_t inline_payload_length(const InlineSignature *sig, const uint8_t *data, size_t len,
-                                    size_t pos, int *ok)
-{
-    size_t start = pos, i, n;
-
-    *ok = 1;
-    for (i = 0; i < sig->schema.count; i++) {
-        const TableField *f = &sig->schema.items[i];
-        for (n = 0; n < f->count; n++) {
-            if (f->kind == TABLE_BYTES_UNTIL) {
-                uint8_t term = (uint8_t)f->param;
-                for (;;) {
-                    if (pos >= len) { *ok = 0; return 0; }
-                    if (data[pos++] == term) break;
-                }
-            } else if (f->kind == TABLE_COUNTED_BYTES) {
-                uint8_t cnt;
-                if (pos >= len) { *ok = 0; return 0; }
-                cnt = data[pos++];
-                if (pos + cnt > len) { *ok = 0; return 0; }
-                pos += cnt;
-            } else {
-                size_t w = inline_fixed_field_width(f->kind);
-                if (pos + w > len) { *ok = 0; return 0; }
-                pos += w;
-            }
-        }
-    }
-    return pos - start;
-}
-
 /* Emit a raw byte list (count bytes from data[*pos]) as `pseudo b0, b1, ...`. */
 static void emit_inline_byte_list(FILE *out, const char *pseudo, const uint8_t *data, size_t *pos,
                                   size_t count, const char *inst)
@@ -2120,7 +2080,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                         int fits;
                         if (table_schema_is_variable(&inline_sig->schema)) {
                             int ok;
-                            inline_payload_length(inline_sig, data, len, pos, &ok);
+                            inline_actual_length(inline_sig, data, pos, len, &ok);
                             fits = ok;
                         } else {
                             fits = pos + inline_sig->length <= len;

@@ -136,7 +136,12 @@ int scannable_code_addr(uint32_t addr, size_t used);
 uint32_t detect_inline_dispatcher(const uint8_t *data, size_t used, const VectorInfo *vectors,
                                   size_t vector_count);
 unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatures *sigs,
-                               uint8_t current_bank, size_t pos, size_t used);
+                               uint8_t current_bank, size_t pos, size_t used, const uint8_t *data);
+/* Bytes an inline payload consumes at a call site, resolving variable-length
+   fields (bytes_until / counted_bytes) against `data`.  *ok = 0 if the payload
+   would run past `used`. */
+size_t inline_actual_length(const InlineSignature *sig, const uint8_t *data, size_t pos,
+                            size_t used, int *ok);
 int valid_far_code_target(uint16_t addr, uint8_t bank, const uint8_t *paged_rom, size_t banks);
 void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_t banks,
                             LabelSet *bank_labels, LabelSet *system_labels, uint16_t addr,

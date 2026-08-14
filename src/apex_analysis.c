@@ -833,8 +833,44 @@ uint32_t detect_inline_dispatcher(const uint8_t *data, size_t used, const Vector
     return 0;
 }
 
+static size_t inline_fixed_field_width(TableFieldKind kind)
+{
+    return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
+}
+
+size_t inline_actual_length(const InlineSignature *sig, const uint8_t *data, size_t pos,
+                            size_t used, int *ok)
+{
+    size_t start = pos, i, n;
+
+    *ok = 1;
+    for (i = 0; i < sig->schema.count; i++) {
+        const TableField *f = &sig->schema.items[i];
+        for (n = 0; n < f->count; n++) {
+            if (f->kind == TABLE_BYTES_UNTIL) {
+                uint8_t term = (uint8_t)f->param;
+                for (;;) {
+                    if (pos >= used) { *ok = 0; return 0; }
+                    if (data[pos++] == term) break;
+                }
+            } else if (f->kind == TABLE_COUNTED_BYTES) {
+                uint8_t cnt;
+                if (pos >= used) { *ok = 0; return 0; }
+                cnt = data[pos++];
+                if (pos + cnt > used) { *ok = 0; return 0; }
+                pos += cnt;
+            } else {
+                size_t w = inline_fixed_field_width(f->kind);
+                if (pos + w > used) { *ok = 0; return 0; }
+                pos += w;
+            }
+        }
+    }
+    return pos - start;
+}
+
 unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatures *sigs,
-                               uint8_t current_bank, size_t pos, size_t used)
+                               uint8_t current_bank, size_t pos, size_t used, const uint8_t *data)
 {
     const InlineSignature *sig;
 
@@ -845,7 +881,15 @@ unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatu
         return 0;
     }
     sig = inline_signature_for(sigs, current_bank, info->target);
-    if (!sig || pos + info->size + sig->length > used) {
+    if (!sig) {
+        return 0;
+    }
+    if (table_schema_is_variable(&sig->schema)) {
+        int ok;
+        size_t len = inline_actual_length(sig, data, pos + info->size, used, &ok);
+        return ok ? (unsigned)len : 0u;
+    }
+    if (pos + info->size + sig->length > used) {
         return 0;
     }
     return sig->length;
@@ -971,7 +1015,27 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
         for (n = 0; n < sig->schema.items[i].count; n++) {
             TableFieldKind kind = sig->schema.items[i].kind;
 
-            if (kind == TABLE_BYTE) {
+            if (kind == TABLE_BYTES_UNTIL) {
+                /* Opaque byte list up to the terminator — no address refs. */
+                uint8_t term = (uint8_t)sig->schema.items[i].param;
+                while (*pos < used && data[*pos] != term) {
+                    (*pos)++;
+                }
+                if (*pos < used) {
+                    (*pos)++;  /* consume the terminator */
+                }
+            } else if (kind == TABLE_COUNTED_BYTES) {
+                /* Leading count byte + that many opaque bytes — no address refs. */
+                uint8_t cnt;
+                if (*pos >= used) {
+                    return;
+                }
+                cnt = data[(*pos)++];
+                *pos += cnt;
+                if (*pos > used) {
+                    *pos = used;
+                }
+            } else if (kind == TABLE_BYTE) {
                 (*pos)++;
             } else if (kind == TABLE_WORD) {
                 *pos += 2u;
@@ -1259,7 +1323,8 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                 }
             }
             pos += info.size;
-            pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used);
+            pos += inline_bytes_consumed(&info, inline_sigs, current_bank, pos - info.size, used,
+                                         data);
             if (info.has_target && (info.flags & CPU6809_CALL)) {
                 const InlineSignature *fs =
                     inline_signature_for(inline_sigs, current_bank, info.target);

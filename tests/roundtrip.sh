@@ -371,6 +371,22 @@ else
     exit 1
 fi
 
+# Regression: the ANALYSIS pass must consume a variable payload whole — a payload
+# byte pair that looks like an address (0x80 0x30) must NOT plant a spurious
+# label/ref at 0x8030 (the Dr. Who B31_A64f4 failure).
+ivr_rom="$OUT/inline_var_ref.rom"
+"$ROOT/build/apexasm" "$ivr_rom" "$ROOT/tests/inline_var_ref.asm"
+"$ROOT/build/apexdis" "$ivr_rom" "$OUT/ivr.asm" "$ROOT/tests/inline_var_ref.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/ivr_rt.rom" "$OUT/ivr.asm" 2>/dev/null
+if grep -q 'INLINE_BYTES_UNTIL 0x80, 0x30, 0x80, 0x30, 0x00' "$OUT/ivr.asm" &&
+    ! grep -q '_A8030:' "$OUT/ivr.asm" &&
+    cmp -s "$ivr_rom" "$OUT/ivr_rt.rom"; then
+    printf 'PASS inline_variable_analysis_consume\n'
+else
+    printf 'FAIL inline_variable_analysis_consume\n' >&2
+    exit 1
+fi
+
 inline_truncated_rom="$OUT/inline_truncated.rom"
 inline_truncated_asm="$OUT/inline_truncated.disasm"
 inline_truncated_err="$OUT/inline_truncated.stderr"
