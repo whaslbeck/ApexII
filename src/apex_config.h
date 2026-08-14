@@ -18,7 +18,11 @@ typedef enum {
     TABLE_FAR_DMD_FULLFRAME,
     TABLE_FAR_SPRITE,
     TABLE_BYTE,
-    TABLE_WORD
+    TABLE_WORD,
+    /* Variable-length inline-only kinds (invalid in [tables], which need a fixed
+       row stride).  Their byte length is determined per call site from the ROM. */
+    TABLE_BYTES_UNTIL,   /* bytes up to and including a terminator byte (in .param) */
+    TABLE_COUNTED_BYTES  /* a leading count byte, then that many payload bytes */
 } TableFieldKind;
 
 typedef struct {
@@ -133,6 +137,20 @@ typedef struct {
 
 typedef struct {
     int labels_are_entries;
+    /* All fields below default to 0 = current behavior; they are opt-in switches
+       for features suggested by reverse-engineering sessions.  See
+       docs/config-format.md, section [options]. */
+    uint32_t min_immediate_symbol; /* suppress [symbols] resolution in immediate
+                                      operands whose value < this (0 = resolve all) */
+    int reference_counts;          /* annotate `; referenced_by` with the site count */
+    int hex_index_offsets;         /* render 5-bit indexed offsets in hex, like 8/16-bit */
+    int instruction_addresses;     /* prefix each instruction line with `; addr Bxx_Ayyyy` */
+    int far_code_allow_null;       /* treat a 0x0000 inline far-code target as the empty
+                                      case (render 0, no warning) instead of invalid */
+    int report_code_in_data;       /* scan [data] ranges for JSR/JMP to a known routine and
+                                      emit `; WARNING code_in_data` hints (report only) */
+    int check_inline_length;       /* warn when an [inline] length disagrees with the
+                                      routine's LDU/LEAU/STU return-address fixup */
 } ConfigOptions;
 
 typedef struct {
@@ -205,6 +223,10 @@ typedef enum {
 void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count);
 size_t table_schema_width(const TableSchema *schema);
 int table_kind_is_far(TableFieldKind kind);
+/* Variable-length kinds whose byte size is only known at each call site. */
+int table_kind_is_variable(TableFieldKind kind);
+/* True if any field of the schema is variable-length. */
+int table_schema_is_variable(const TableSchema *schema);
 
 void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
                                  uint32_t addr, const TableSchema *schema, int flow_stop);
@@ -217,6 +239,10 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                  DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
                  ConfigEntries *ref_exclusions, ConfigEntries *literals,
                  ConfigEntries *ack_warnings, ConfigEntries *far_imms);
+/* When enabled, a conflicting later [symbols]/[labels] definition (same name,
+   different value/address) overrides the earlier one instead of aborting the
+   load.  Off by default. */
+void config_set_override(int enabled);
 void free_config_types(ConfigTypes *types);
 const ConfigType *find_config_type(const ConfigTypes *types, const char *name);
 const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value);

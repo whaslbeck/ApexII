@@ -5,6 +5,7 @@
  */
 #include "apex.h"
 #include "apex_config.h"
+#include "apex_analysis.h"
 #include "apex_project.h"
 #include "apex_render.h"
 #include "apex_nvram.h"
@@ -183,6 +184,8 @@ static const char *kind_name(TableFieldKind k)
     case TABLE_FAR_SPRITE:          return "far_sprite";
     case TABLE_BYTE:                return "byte";
     case TABLE_WORD:                return "word";
+    case TABLE_BYTES_UNTIL:         return "bytes_until";
+    case TABLE_COUNTED_BYTES:       return "counted_bytes";
     }
     return "byte";
 }
@@ -198,6 +201,8 @@ static void w_schema(FILE *f, const TableSchema *s)
         if (!s->items[i].type_name && s->items[i].param &&
             (s->items[i].kind == TABLE_PTR16_SPRITE || s->items[i].kind == TABLE_FAR_SPRITE))
             fprintf(f, "(%u)", s->items[i].param);
+        if (!s->items[i].type_name && s->items[i].kind == TABLE_BYTES_UNTIL)
+            fprintf(f, "(0x%02x)", s->items[i].param & 0xffu);
         if (s->items[i].count != 1u)
             fprintf(f, "[%lu]", (unsigned long)s->items[i].count);
     }
@@ -478,6 +483,21 @@ static void write_cfg(FILE *f, Cfg *c)
 
 /* ── check command ──────────────────────────────────────────────────────── */
 
+/* Run validate_config_classification (which die()s on a conflict) under the
+   die-catch guard, so a purely-static [entries]↔[data]/[tables] contradiction
+   is reported by `check` rather than only surfacing later inside apexdis.
+   Returns 0 on OK, 1 on conflict (message left in s_err). */
+static int cfg_check_classification(const Cfg *c)
+{
+    int failed;
+    s_catching = 1;
+    failed = setjmp(s_jmp);
+    if (!failed)
+        validate_config_classification(&c->entries, &c->tables, &c->data);
+    s_catching = 0;
+    return failed;
+}
+
 static int cmd_check(int argc, char **argv)
 {
     int any_err = 0;
@@ -491,6 +511,9 @@ static int cmd_check(int argc, char **argv)
         Cfg c;
         memset(&c, 0, sizeof(c));
         if (cfg_load(&c, argv[i])) {
+            fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
+            any_err = 1;
+        } else if (cfg_check_classification(&c)) {
             fprintf(stderr, "%s: error: %s\n", argv[i], s_err);
             any_err = 1;
         } else {
@@ -721,32 +744,59 @@ static int cmd_merge(int argc, char **argv)
 {
     Cfg c;
     FILE *out;
-    memset(&c, 0, sizeof(c));
+    const char *outpath = NULL;
+    int override = 0;
+    int nfiles = 0;
     int i;
 
-    if (argc < 2) {
-        fputs("usage: apexini merge <out.ini> <file.ini> ...\n", stderr);
+    memset(&c, 0, sizeof(c));
+
+    /* Collect flags and positional args (out.ini + inputs) in any order. */
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--override") == 0 || strcmp(argv[i], "-o") == 0) {
+            override = 1;
+        } else if (!outpath) {
+            outpath = argv[i];
+        } else {
+            nfiles++;
+        }
+    }
+
+    if (!outpath || nfiles < 1) {
+        fputs("usage: apexini merge [--override] <out.ini> <file.ini> ...\n"
+              "  --override, -o   later definition wins on a name conflict "
+              "(default: abort)\n", stderr);
         return 2;
     }
 
-    for (i = 1; i < argc; i++) {
+    config_set_override(override);
+
+    for (i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--override") == 0 || strcmp(argv[i], "-o") == 0)
+            continue;
+        if (argv[i] == outpath)
+            continue;
         if (cfg_load(&c, argv[i])) {
             fprintf(stderr, "%s: merge conflict: %s\n", argv[i], s_err);
+            if (!override)
+                fprintf(stderr, "  (retry with --override to let the later value win)\n");
+            config_set_override(0);
             cfg_free(&c);
             return 1;
         }
     }
+    config_set_override(0);
 
-    out = fopen(argv[0], "w");
+    out = fopen(outpath, "w");
     if (!out) {
-        perror(argv[0]);
+        perror(outpath);
         cfg_free(&c);
         return 1;
     }
     write_cfg(out, &c);
     fclose(out);
 
-    printf("merged %d file(s) into %s\n", argc - 1, argv[0]);
+    printf("merged %d file(s) into %s\n", nfiles, outpath);
     cfg_free(&c);
     return 0;
 }
@@ -1018,13 +1068,27 @@ static int cmd_coverage(int argc, char **argv)
     size_t rom_size, i;
     /* per-kind totals */
     size_t tot[6] = {0, 0, 0, 0, 0, 0}; /* UNKNOWN, CODE, DATA, TABLE, UNCL, FREE */
+    const char *rom_path = NULL, *ini_path = NULL;
+    int only_bank = -1;   /* -1 = all banks; 0..0xff = single bank filter */
 
-    if (argc < 2) {
-        fputs("usage: apexini coverage <rom> <file.ini>\n", stderr);
+    for (i = 0; i < (size_t)argc; i++) {
+        if (strcmp(argv[i], "--bank") == 0 && i + 1 < (size_t)argc) {
+            only_bank = (int)strtol(argv[++i], NULL, 0) & 0xff;
+        } else if (!rom_path) {
+            rom_path = argv[i];
+        } else if (!ini_path) {
+            ini_path = argv[i];
+        }
+    }
+
+    if (!rom_path || !ini_path) {
+        fputs("usage: apexini coverage <rom> <file.ini> [--bank N]\n"
+              "  --bank N   restrict the report to a single bank "
+              "(paged bank id, or 0xff for the system bank)\n", stderr);
         return 2;
     }
 
-    doc = open_and_render(argv[0], argv[1], &p);
+    doc = open_and_render(rom_path, ini_path, &p);
     if (!doc) return 1;
 
     rom_size = p->rom.size;
@@ -1070,6 +1134,8 @@ static int cmd_coverage(int argc, char **argv)
         }
 
         size_t total = end <= rom_size ? APEX_BANK_SIZE : rom_size - base;
+        for (j = 0; j < 6; j++) tot[j] += cnt[j];
+        if (only_bank >= 0 && bank_id != (uint8_t)only_bank) continue;
         printf("0x%02x    %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
                bank_id, total,
                cnt[1], total ? cnt[1]*100.0/total : 0.0,
@@ -1078,8 +1144,6 @@ static int cmd_coverage(int argc, char **argv)
                cnt[4], total ? cnt[4]*100.0/total : 0.0,
                cnt[5], total ? cnt[5]*100.0/total : 0.0,
                cnt[0], total ? cnt[0]*100.0/total : 0.0);
-
-        for (j = 0; j < 6; j++) tot[j] += cnt[j];
     }
 
     /* System bank */
@@ -1094,6 +1158,8 @@ static int cmd_coverage(int argc, char **argv)
         }
 
         size_t total = rom_size - sys_start;
+        for (j = 0; j < 6; j++) tot[j] += cnt[j];
+        if (only_bank < 0 || only_bank == 0xff)
         printf("0xff    %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
                total,
                cnt[1], total ? cnt[1]*100.0/total : 0.0,
@@ -1102,11 +1168,10 @@ static int cmd_coverage(int argc, char **argv)
                cnt[4], total ? cnt[4]*100.0/total : 0.0,
                cnt[5], total ? cnt[5]*100.0/total : 0.0,
                cnt[0], total ? cnt[0]*100.0/total : 0.0);
-
-        for (j = 0; j < 6; j++) tot[j] += cnt[j];
     }
 
-    /* Total */
+    /* Total (suppressed when a single bank was requested) */
+    if (only_bank < 0)
     printf("%-6s  %6zu  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)  %6zu(%3.0f%%)  %5zu(%3.0f%%)  %5zu(%3.0f%%)\n",
            "total", rom_size,
            tot[1], rom_size ? tot[1]*100.0/rom_size : 0.0,
@@ -1605,7 +1670,9 @@ static void print_help(FILE *out)
 "Commands:\n"
 "  check <file.ini>...              Syntax-check configs; non-zero exit on any error.\n"
 "  overlaps <file.ini>             Report address conflicts and overlapping data/table ranges.\n"
-"  merge <out.ini> <in.ini>...     Merge configs into one sorted file; reports conflicts.\n"
+"  merge [--override] <out.ini> <in.ini>...  Merge configs into one sorted file.\n"
+"                                  --override: a later definition wins on a name\n"
+"                                  conflict (default: abort).\n"
 "  migrate <file.ini>...           Upgrade old syntax to the current format in place\n"
 "                                  (writes a .bak backup first).\n"
 "  normalize <file.ini> [out.ini]  Rewrite canonically: fixed section order, sorted entries,\n"
@@ -1613,7 +1680,9 @@ static void print_help(FILE *out)
 "                                  out.ini is omitted.\n"
 "  find-redundant <rom> <file.ini> List [entries] already reached by code flow (removable).\n"
 "  strip-redundant <rom> <file.ini> Remove those redundant [entries] in place.\n"
-"  coverage <rom> <file.ini>       Report ROM classification coverage (code/data/unknown/...).\n"
+"  coverage <rom> <file.ini> [--bank N]  Report ROM classification coverage per bank\n"
+"                                  (code/data/table/unclassified/free/unknown); --bank N\n"
+"                                  restricts to one bank (id, or 0xff = system).\n"
 "  orphan-labels <rom> <file.ini>  List [labels] whose address is absent from the disassembly.\n"
 "  check-bounds <rom> <file.ini>   Verify data/table ranges stay within bank/ROM bounds.\n"
 "  nvram-export <in.ini> <out.json> [template.json]  Export RAM [symbols]/[docs] as PinMAME\n"

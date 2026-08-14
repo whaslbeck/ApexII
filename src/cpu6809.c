@@ -454,9 +454,16 @@ static int parse_signed_number(char *s, int32_t *value)
 static size_t indexed_forced_offset_size(char *s)
 {
     size_t digits = 0;
+    int negative = 0;
+    const char *hex;
+    uint32_t mag = 0;
+    int32_t value;
 
     s = trim(s);
-    if (*s == '-' || *s == '+') {
+    if (*s == '-') {
+        negative = 1;
+        s = trim(s + 1);
+    } else if (*s == '+') {
         s = trim(s + 1);
     }
     if (*s == '$') {
@@ -466,8 +473,21 @@ static size_t indexed_forced_offset_size(char *s)
     } else {
         return 0;
     }
-    while (isxdigit((unsigned char)s[digits])) {
+    hex = s;
+    while (isxdigit((unsigned char)hex[digits])) {
+        int c = (unsigned char)hex[digits];
+        int d = (c <= '9') ? c - '0' : (c <= 'F') ? c - 'A' + 10 : c - 'a' + 10;
+        mag = mag * 16u + (uint32_t)d;
         digits++;
+    }
+    value = negative ? -(int32_t)mag : (int32_t)mag;
+    /* A *minimal* (no leading-zero) hex offset that fits the signed 5-bit range is
+       treated as unforced, so it re-encodes to the compact 5-bit postbyte — this is
+       what the hex_index_offsets disassembly emits (0x2,U / -0x10,U).  A leading
+       zero (0x02) still forces 8-bit, so the redundant 8-bit encodings the ROMs
+       actually contain keep round-tripping byte-for-byte. */
+    if (!(digits > 1 && hex[0] == '0') && value >= -16 && value <= 15) {
+        return 0;
     }
     if (digits > 2u) {
         return 2;
@@ -615,6 +635,16 @@ static int parse_indexed_pretty(void *ctx, Cpu6809ResolveFn resolve, int resolve
     return 1;
 }
 
+/* When set, 5-bit indexed offsets are rendered in (minimal, no-leading-zero) hex
+   like the 8/16-bit forms instead of signed decimal.  Off by default; toggled per
+   write pass from the hex_index_offsets [options] switch. */
+static int s_hex_index_offsets;
+
+void cpu6809_set_hex_index_offsets(int enabled)
+{
+    s_hex_index_offsets = enabled ? 1 : 0;
+}
+
 static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte, const uint8_t *extra)
 {
     unsigned reg = (postbyte >> 5) & 0x03u;
@@ -627,7 +657,15 @@ static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte,
         if (offset & 0x10) {
             offset -= 0x20;
         }
-        snprintf(body, sizeof(body), "%d,%s", offset, index_reg_name(reg));
+        if (s_hex_index_offsets) {
+            if (offset < 0) {
+                snprintf(body, sizeof(body), "-0x%x,%s", -offset, index_reg_name(reg));
+            } else {
+                snprintf(body, sizeof(body), "0x%x,%s", offset, index_reg_name(reg));
+            }
+        } else {
+            snprintf(body, sizeof(body), "%d,%s", offset, index_reg_name(reg));
+        }
     } else if (mode == 0x00) {
         snprintf(body, sizeof(body), ",%s+", index_reg_name(reg));
     } else if (mode == 0x01) {
@@ -877,7 +915,8 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
             }
             if (!parse_operand(ctx, resolve, resolve_symbols, skip_hash(operand), &value) ||
                 value > 0xffu) {
-                die("invalid %s immediate operand", mnemonic);
+                die("invalid %s immediate operand '%s' at 0x%04x", mnemonic, trim(operand),
+                    (unsigned)pc & 0xffffu);
             }
             emit_opcode(op, emit, ctx);
             emit(ctx, (uint8_t)value);
@@ -888,7 +927,8 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
             }
             if (!parse_operand(ctx, resolve, resolve_symbols, skip_hash(operand), &value) ||
                 value > 0xffffu) {
-                die("invalid %s immediate operand", mnemonic);
+                die("invalid %s immediate operand '%s' at 0x%04x", mnemonic, trim(operand),
+                    (unsigned)pc & 0xffffu);
             }
             emit_opcode(op, emit, ctx);
             emit(ctx, (uint8_t)(value >> 8));
@@ -1082,9 +1122,9 @@ static void format_indexed_raw(char *out, size_t out_size, uint8_t postbyte, con
     }
 }
 
-Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, uint32_t pc,
+Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, uint32_t pc,
                                               char *out, size_t out_size, Cpu6809LabelFn label,
-                                              void *label_ctx)
+                                              void *label_ctx, Cpu6809LabelFn label_imm)
 {
     size_t i;
     uint8_t prefix = 0;
@@ -1145,7 +1185,8 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, ui
                    checks in collect_code_targets filter out non-ROM values. */
                 info.has_addr_ref = 1;
                 info.addr_ref     = imm;
-                format_addr(value, sizeof(value), label, label_ctx, imm);
+                format_addr(value, sizeof(value), label_imm ? label_imm : label,
+                            label_ctx, imm);
                 snprintf(out, out_size, "%s #%s", op->mnemonic, value);
             }
             info.size = op_len + 2u;
@@ -1263,10 +1304,18 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, ui
     return info;
 }
 
+Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, uint32_t pc,
+                                              char *out, size_t out_size, Cpu6809LabelFn label,
+                                              void *label_ctx)
+{
+    /* Immediates resolve through the same callback as address operands. */
+    return cpu6809_disassemble_info_ex2(data, len, pc, out, out_size, label, label_ctx, label);
+}
+
 Cpu6809InstrInfo cpu6809_disassemble_info(const uint8_t *data, size_t len, uint32_t pc, char *out,
                                            size_t out_size)
 {
-    return cpu6809_disassemble_info_ex(data, len, pc, out, out_size, NULL, NULL);
+    return cpu6809_disassemble_info_ex2(data, len, pc, out, out_size, NULL, NULL, NULL);
 }
 
 size_t cpu6809_disassemble(const uint8_t *data, size_t len, uint32_t pc, char *out, size_t out_size)

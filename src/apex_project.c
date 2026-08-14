@@ -437,6 +437,10 @@ static const char *table_field_kind_name(TableFieldKind kind)
         return "byte";
     case TABLE_WORD:
         return "word";
+    case TABLE_BYTES_UNTIL:
+        return "bytes_until";
+    case TABLE_COUNTED_BYTES:
+        return "counted_bytes";
     }
     return "byte";
 }
@@ -455,6 +459,9 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
             (schema->items[i].kind == TABLE_PTR16_SPRITE ||
              schema->items[i].kind == TABLE_FAR_SPRITE)) {
             fprintf(out, "(%u)", schema->items[i].param);
+        }
+        if (!schema->items[i].type_name && schema->items[i].kind == TABLE_BYTES_UNTIL) {
+            fprintf(out, "(0x%02x)", schema->items[i].param & 0xffu);
         }
         if (schema->items[i].count != 1u) {
             fprintf(out, "[%lu]", (unsigned long)schema->items[i].count);

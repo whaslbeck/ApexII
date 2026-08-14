@@ -5,7 +5,7 @@
 
 static void usage(void)
 {
-    die("usage: apexdis [--xref] [--explain] <input-rom> <output-asm> [config.ini]");
+    die("usage: apexdis [--xref] [--explain] [--addr] <input-rom> <output-asm> [config.ini]");
 }
 
 int main(int argc, char **argv)
@@ -19,6 +19,8 @@ int main(int argc, char **argv)
             options.emit_xrefs = 1;
         } else if (strcmp(argv[argi], "--explain") == 0) {
             options.emit_explain = 1;
+        } else if (strcmp(argv[argi], "--addr") == 0) {
+            options.emit_addrs = 1;
         } else {
             usage();
         }

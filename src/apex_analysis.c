@@ -341,14 +341,28 @@ const char *make_bank_label(uint8_t bank, uint16_t addr)
     return name;
 }
 
+/* Cap the text taken from a string's contents into its generated label.  The
+   `base` (Bxx_Ayyyy) already makes the name unique by address, so truncating the
+   readable suffix is safe — and it MUST be capped identically here (used for both
+   the definition and every operand reference) or a name longer than the 63-char
+   operand buffer would be silently cut only at the reference and break round-trip.
+   See docs/config-format.md and apexasm's clearer operand error. */
+#define APEX_STRING_LABEL_TEXT_MAX 40u
+
 const char *make_string_label(const char *base, const uint8_t *data, size_t len)
 {
     size_t text_len = len > 0 ? len - 1u : 0;
     size_t suffix_cap = text_len == 0 ? 5u : text_len;
-    size_t cap = strlen(base) + strlen("_STRING_") + suffix_cap + 1u;
-    char *name = xmalloc(cap);
+    size_t cap;
+    char *name;
     size_t out = 0;
     size_t i;
+
+    if (suffix_cap > APEX_STRING_LABEL_TEXT_MAX) {
+        suffix_cap = APEX_STRING_LABEL_TEXT_MAX;
+    }
+    cap = strlen(base) + strlen("_STRING_") + suffix_cap + 1u;
+    name = xmalloc(cap);
 
     out += (size_t)snprintf(name + out, cap - out, "%s_STRING_", base);
     if (text_len == 0) {
@@ -672,15 +686,12 @@ int label_between(uint32_t start, uint32_t end, const Label *labels, size_t labe
     return 0;
 }
 
-const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
+/* Label-only resolution (no [symbols] equates): the shared tail of the CPU and
+   immediate lookups. */
+static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr)
 {
-    const LabelLookup *lookup = (const LabelLookup *)ctx;
     const char *name;
 
-    name = symbol_name_at(addr, lookup->symbols);
-    if (name) {
-        return name;
-    }
     name = label_name_at(addr, lookup->labels, lookup->label_count, lookup->sorted);
     if (name) {
         return name;
@@ -716,6 +727,34 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
         return found;
     }
     return NULL;
+}
+
+const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
+{
+    const LabelLookup *lookup = (const LabelLookup *)ctx;
+    const char *name = symbol_name_at(addr, lookup->symbols);
+
+    if (name) {
+        return name;
+    }
+    return lookup_labels_only(lookup, addr);
+}
+
+/* Immediate-operand variant: honours min_immediate_symbol so a small [symbols]
+   equate (a RAM/ASIC field whose value collides with a count, mask, or text
+   number) is not resolved inside an immediate like `LDX #0x0014`.  Labels (ROM
+   addresses) still resolve, and address operands keep using lookup_label_for_cpu. */
+const char *lookup_label_for_imm(void *ctx, uint32_t addr)
+{
+    const LabelLookup *lookup = (const LabelLookup *)ctx;
+
+    if (!(lookup->min_immediate_symbol && addr < lookup->min_immediate_symbol)) {
+        const char *name = symbol_name_at(addr, lookup->symbols);
+        if (name) {
+            return name;
+        }
+    }
+    return lookup_labels_only(lookup, addr);
 }
 
 const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables)

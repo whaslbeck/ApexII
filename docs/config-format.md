@@ -47,8 +47,15 @@ labels_are_entries = false
 | Option | Default | Meaning |
 |---|---|---|
 | `labels_are_entries` | `false` | When `true`, every `[labels]` entry is also treated as a code entry point. Leave `false` for fine-grained control via `[entries]`. |
+| `min_immediate_symbol` | `0x0000` | When non-zero, a `[symbols]` equate whose value is **below** this threshold is not resolved inside an **immediate** operand (`LDX #0x0014` stays a literal instead of showing `LDX #TEXT_FIELD`). Address operands (`LDA <SYM`) still resolve. Use it when small RAM/ASIC field symbols collide with counts, masks, or text numbers. |
+| `reference_counts` | `false` | Prefix each `; referenced_by` comment with the number of referencing sites — `; referenced_by (2105) …` — for prioritising the busiest routines. |
+| `hex_index_offsets` | `false` | Render 5-bit indexed offsets in hex (`LDD 0xf,U`, `-0x10,U`) to match the 8/16-bit forms, instead of signed decimal (`LDD 15,U`). The hex is emitted in minimal (no-leading-zero) form so it still re-assembles to the compact 5-bit postbyte. |
+| `instruction_addresses` | `false` | Emit a `; addr Bxx_Ayyyy` comment before every instruction, so `[literals]` / `[far_imm]` / `[imm_types]` entries can be keyed by exact address. (`apexdis --addr` forces this on for one run.) |
+| `far_code_allow_null` | `false` | Treat a `0x0000` inline far-code pointer as the regular "no body" case — emit it plainly with no `inline_far_code_invalid` warning. |
+| `report_code_in_data` | `false` | Report-only: scan every `[data]` range for a `JSR`/`JMP`-extended opcode whose operand lands on a known routine (mislabelled code the flow analysis never reached), emitting `; WARNING code_in_data …`. See [Warnings](#warnings). |
+| `check_inline_length` | `false` | Warn when an `[inline]` length disagrees with the routine's `LDU ,S` / `LEAU N,U` / `STU ,S` return-address fixup (`; WARNING inline_length_mismatch …`) — catches a wrong inline length that would silently hide code. |
 
-Recommended: keep the default (`false`) so that labels and code classification are independent.
+Recommended: keep the defaults so that labels and code classification are independent and existing output is unchanged. Every option above is opt-in and off by default; the GUI toggles them under **Analysis options** in the Symbols panel, persisting them to the `.apexgui.ini` overlay.
 
 ### `[labels]`
 
@@ -189,6 +196,23 @@ Banked addresses work the same as in `[labels]`:
 B20_A4006 = byte
 ```
 
+**Variable-length payloads.** Two field kinds describe a payload whose length is
+only known at each call site (see the [Field Kind Reference](#field-kind-reference)):
+
+```ini
+[inline]
+0x8100 = bytes_until(0x00)   ; a byte list terminated by 0x00 (terminator included)
+0x8200 = counted_bytes       ; a leading count byte, then that many bytes
+```
+
+`bytes_until(0xTT)` consumes bytes up to **and including** the first `0xTT`
+(default `0x00` if the `(…)` is omitted); `counted_bytes` reads a leading count
+byte and then that many payload bytes. The disassembler resolves the actual
+length from the ROM at every call and emits `INLINE_BYTES_UNTIL` /
+`INLINE_COUNTED_BYTES` (which re-assemble byte-for-byte). These kinds are
+**inline-only** — a `[tables]` row needs a fixed stride and rejects them. A
+signature that contains one renders `; inline length=variable`.
+
 ### `[schemas]`
 
 Named row schemas for reuse in `[tables]` and `[inline]`.
@@ -317,6 +341,19 @@ B3c_A4001 = Classic WPC counted string pointer table.
 
 Values may be unquoted (everything after `=` up to the end-of-line comment) or quoted. Inside quotes: `\;`, `\#`, `\\`, `\"`, and `\n` are recognized.
 
+**Per-row / per-element docs.** A doc attaches to whatever line owns its address, so to annotate a single row of a table (or one element of a data array), give the doc the **address of that row**, not the table header:
+
+```ini
+[tables]
+B39_A4422 = rows[8](byte, far_data)
+
+[docs]
+B39_A4422 = "Adjustment descriptor table."   ; on the table header
+B39_A4426 = "Row 1: replay level."            ; on the row at 0x4426 (header + 1 row of 4 bytes)
+```
+
+The row doc renders as a `; doc …` comment on that row's `TABLE_*` line.
+
 **RAM / ASIC addresses.** A doc on an address that is not part of the ROM (RAM and ASIC I/O, `0x0000`–`0x3fff`) would otherwise have no disassembly line to attach to. Such docs are emitted near the top of the output instead:
 
 - If a `[symbols]` equate names the address, the doc is emitted directly above that equate:
@@ -401,8 +438,10 @@ Used in `[inline]`, `[schemas]`, and `[tables]` row definitions.
 | `far_sprite` | 3 | Far pointer to a sprite |
 | `far_dmd_fullframe` | 3 | Far pointer to a DMD frame |
 | `TypeName` | 1 or 2 | Named type from `[types]`; inherits its base kind |
+| `bytes_until(0xTT)` | variable | **`[inline]` only.** Bytes up to and including the first `0xTT` terminator (default `0x00`). |
+| `counted_bytes` | variable | **`[inline]` only.** A leading count byte, then that many payload bytes. |
 
-Repeat counts (`byte[N]`, `word[N]`) expand to N consecutive fields of that kind and are emitted as N separate lines.
+Repeat counts (`byte[N]`, `word[N]`) expand to N consecutive fields of that kind and are emitted as N separate lines. The two variable-length kinds may not take a repeat count and are valid only in `[inline]` (a `[tables]` row needs a fixed byte width).
 
 ## Validation
 
@@ -414,6 +453,9 @@ The config loader aborts with an error for:
 - An `[entries]` address that also appears in `[data]` at the same location.
 - An `[entries]` address that also appears in `[tables]` at the same location.
 - Invalid syntax in any section.
+- A variable-length field (`bytes_until` / `counted_bytes`) used in `[tables]`.
+
+`apexini check <file.ini>` reports these purely-static contradictions (including the code-entry-vs-data conflict) without needing the ROM, so they can be caught in a pre-commit hook.
 
 ## Warnings
 
@@ -431,5 +473,7 @@ Beyond hard errors, the disassembler flags suspect-but-recoverable situations wi
 | `sprite_invalid` | A range classified as `sprite` failed to decode. |
 | `sprite_noheader_invalid` | A `sprite_noheader` range failed to decode. |
 | `label_name_collision` | A `[labels]` name matches the generated `Bxx_Ayyyy` form but decodes to a different address (e.g. `Bcd_Add16` → `0xdd16`). A defined symbol still wins in the assembler, but rename it to avoid ambiguity. |
+| `code_in_data` | (opt-in, `report_code_in_data`) A `JSR`/`JMP`-extended opcode inside a `[data]` range targets a known routine — almost always mislabelled code. Reported at the end of the disassembly. |
+| `inline_length_mismatch` | (opt-in, `check_inline_length`) An `[inline]` length disagrees with the routine's `LEAU N,U` return-address fixup. |
 
 Acknowledge a warning you have reviewed with [`[ack_warnings]`](#ack_warnings): it is then emitted as `; WARNING_ACK …` and no longer counts as active or prints to the console.

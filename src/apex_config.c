@@ -16,6 +16,17 @@
 
 static int parse_table_field(char *value, TableField *field, const ConfigTypes *types);
 
+/* When set, a later [symbols]/[labels] definition that conflicts with an earlier
+   one (same name, different value/address) replaces it instead of aborting.
+   Used by `apexini merge --override` for iterative config refinement; off by
+   default so ordinary loads still catch genuine contradictions. */
+static int g_config_override;
+
+void config_set_override(int enabled)
+{
+    g_config_override = enabled ? 1 : 0;
+}
+
 static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t item_addr,
                                int has_bank, uint8_t bank, uint32_t addr)
 {
@@ -226,7 +237,10 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
     for (i = 0; i < symbols->count; i++) {
         if (strcmp(symbols->items[i].name, name) == 0) {
             if (symbols->items[i].value != value) {
-                die("symbol '%s' is defined more than once", name);
+                if (!g_config_override) {
+                    die("symbol '%s' is defined more than once", name);
+                }
+                symbols->items[i].value = value;   /* later definition wins */
             }
             return;
         }
@@ -314,7 +328,14 @@ static void add_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, u
         if (strcmp(labels->items[i].name, name) == 0 &&
             (labels->items[i].has_bank != has_bank || labels->items[i].bank != bank ||
              labels->items[i].addr != addr)) {
-            die("label '%s' is defined at more than one address", name);
+            if (!g_config_override) {
+                die("label '%s' is defined at more than one address", name);
+            }
+            /* later definition wins: rebind the name to the new address */
+            labels->items[i].has_bank = has_bank;
+            labels->items[i].bank = bank;
+            labels->items[i].addr = addr;
+            return;
         }
         if (labels->items[i].has_bank == has_bank && labels->items[i].bank == bank &&
             labels->items[i].addr == addr) {
@@ -515,6 +536,9 @@ static void add_table_def(TableDefs *tables, uint8_t bank, uint32_t addr, TableS
 {
     size_t i;
 
+    if (table_schema_is_variable(&schema)) {
+        die("bytes_until/counted_bytes are inline-only (a table needs a fixed row width)");
+    }
     for (i = 0; i < tables->count; i++) {
         if (tables->items[i].bank == bank && tables->items[i].addr == addr) {
             free(tables->items[i].schema.items);
@@ -772,6 +796,10 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
         *kind = TABLE_FAR_DMD_FULLFRAME;
     } else if (strcmp(value, "far_sprite") == 0) {
         *kind = TABLE_FAR_SPRITE;
+    } else if (strcmp(value, "bytes_until") == 0) {
+        *kind = TABLE_BYTES_UNTIL;
+    } else if (strcmp(value, "counted_bytes") == 0) {
+        *kind = TABLE_COUNTED_BYTES;
     } else {
         return 0;
     }
@@ -819,6 +847,17 @@ static int parse_table_field(char *value, TableField *field, const ConfigTypes *
     field->type_name = NULL;
     field->param = 0;
     if (parse_table_kind(value, &field->kind)) {
+        if (table_kind_is_variable(field->kind)) {
+            if (count != 1u) {
+                die("variable-length field '%s' cannot take a repeat count", value);
+            }
+            if (field->kind == TABLE_BYTES_UNTIL && param > 0xffu) {
+                die("bytes_until terminator '%s' out of range (0x00-0xff)", value);
+            }
+            if (field->kind == TABLE_COUNTED_BYTES && param != 0u) {
+                die("counted_bytes takes no parameter");
+            }
+        }
         field->count = count;
         field->param = param;
         return 1;
@@ -1026,8 +1065,27 @@ int table_kind_is_far(TableFieldKind kind)
            kind == TABLE_FAR_CODE || kind == TABLE_FAR_DMD_FULLFRAME || kind == TABLE_FAR_SPRITE;
 }
 
+int table_kind_is_variable(TableFieldKind kind)
+{
+    return kind == TABLE_BYTES_UNTIL || kind == TABLE_COUNTED_BYTES;
+}
+
+int table_schema_is_variable(const TableSchema *schema)
+{
+    size_t i;
+    for (i = 0; i < schema->count; i++) {
+        if (table_kind_is_variable(schema->items[i].kind)) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static size_t table_field_width(TableFieldKind kind)
 {
+    if (table_kind_is_variable(kind)) {
+        return 1u;  /* minimum footprint; real size is resolved per call site */
+    }
     return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
 }
 
@@ -1315,6 +1373,36 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
 
             if (strcmp(key, "labels_are_entries") == 0) {
                 if (!parse_config_bool(value, &options->labels_are_entries)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "min_immediate_symbol") == 0) {
+                uint32_t v;
+                if (!parse_u32(value, &v) || v > 0xffffu) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+                options->min_immediate_symbol = v;
+            } else if (strcmp(key, "reference_counts") == 0) {
+                if (!parse_config_bool(value, &options->reference_counts)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "hex_index_offsets") == 0) {
+                if (!parse_config_bool(value, &options->hex_index_offsets)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "instruction_addresses") == 0) {
+                if (!parse_config_bool(value, &options->instruction_addresses)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "far_code_allow_null") == 0) {
+                if (!parse_config_bool(value, &options->far_code_allow_null)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "report_code_in_data") == 0) {
+                if (!parse_config_bool(value, &options->report_code_in_data)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
+            } else if (strcmp(key, "check_inline_length") == 0) {
+                if (!parse_config_bool(value, &options->check_inline_length)) {
                     die("invalid option '%s = %s'", key, value);
                 }
             } else {

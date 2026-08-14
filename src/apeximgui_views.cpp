@@ -3015,7 +3015,7 @@ void render_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s
    Clicking a button appends a field to `fields`/`count` if there is room.
    Returns true if any button was clicked. */
 static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *count,
-                                 int add_count, int *sprite_height)
+                                 int add_count, int *sprite_height, bool allow_variable = false)
 {
     /* Row 1: primitive and 16-bit pointer kinds */
     static const struct { int kind; const char *label; } kRow1[] = {
@@ -3061,6 +3061,24 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
     for (int i = 0; i < (int)(sizeof(kRow2)/sizeof(kRow2[0])); i++) {
         if (i > 0) ImGui::SameLine();
         push_kind(kRow2[i].kind, kRow2[i].label);
+    }
+    /* Variable-length kinds are inline-only (a table needs a fixed row width). */
+    if (allow_variable) {
+        push_kind(TABLE_BYTES_UNTIL, "bytes_until(0x00)");
+        ImGui::SameLine();
+        push_kind(TABLE_COUNTED_BYTES, "counted_bytes");
+        ImGui::SameLine();
+        ImGui::TextDisabled("(?)");
+        if (ImGui::IsItemHovered()) {
+            ImGui::BeginTooltip();
+            ImGui::PushTextWrapPos(ImGui::GetFontSize() * 24.0f);
+            ImGui::TextUnformatted(
+                "Variable-length inline payloads. bytes_until uses a 0x00 terminator; for a "
+                "different terminator edit the config line to bytes_until(0xNN). counted_bytes "
+                "reads a leading count byte, then that many bytes.");
+            ImGui::PopTextWrapPos();
+            ImGui::EndTooltip();
+        }
     }
     /* No-header sprite image height applied to ptr16_spr / far_spr fields. */
     if (sprite_height) {
@@ -3142,6 +3160,8 @@ static void render_field_chips(ApexEditField *fields, int *count)
                 { TABLE_FAR_CODE,          "far_code"      },
                 { TABLE_FAR_DMD_FULLFRAME, "far_dmd"       },
                 { TABLE_FAR_SPRITE,        "far_spr"       },
+                { TABLE_BYTES_UNTIL,       "bytes_until"   },
+                { TABLE_COUNTED_BYTES,     "counted_bytes" },
             };
             kname = "?";
             for (int k = 0; k < (int)(sizeof(kN)/sizeof(kN[0])); k++) {
@@ -3152,6 +3172,9 @@ static void render_field_chips(ApexEditField *fields, int *count)
         if (fields[i].param > 0 &&
             (fields[i].kind == TABLE_PTR16_SPRITE || fields[i].kind == TABLE_FAR_SPRITE)) {
             snprintf(hbuf, sizeof(hbuf), "(%d)", fields[i].param);
+        }
+        if (fields[i].kind == TABLE_BYTES_UNTIL) {
+            snprintf(hbuf, sizeof(hbuf), "(0x%02x)", fields[i].param & 0xff);
         }
         if (fields[i].count > 1) {
             snprintf(chip, sizeof(chip), "%s%s[%d]##chip%d", kname, hbuf, fields[i].count, i);
@@ -3305,7 +3328,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp,
     if (ImGui::IsItemHovered()) ImGui::SetTooltip("repeat count for next added field");
     ImGui::PushID("inl");
     render_field_buttons(p, s->edit_inline_fields, &s->edit_inline_count,
-                         s->edit_field_add_count, NULL);
+                         s->edit_field_add_count, NULL, /*allow_variable=*/true);
     render_field_chips(s->edit_inline_fields, &s->edit_inline_count);
     ImGui::PopID();
     ImGui::Checkbox("flow_stop (tail-call: never returns)", &s->edit_inline_flow_stop);
@@ -3932,6 +3955,36 @@ static std::vector<size_t> find_symbol_usages(const ApexRenderedDocument *d, con
 
 void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document, UiState *s)
 {
+    /* ---- Analysis options (opt-in; persisted to the .apexgui.ini overlay) ---- */
+    if (ImGui::CollapsingHeader("Analysis options")) {
+        ConfigOptions *op = &p->options;
+        bool changed = false;
+        bool b;
+
+        b = op->min_immediate_symbol != 0;
+        if (ImGui::Checkbox("Suppress small symbols in immediates (< 0x200)", &b)) {
+            op->min_immediate_symbol = b ? 0x200u : 0u;
+            changed = true;
+        }
+        b = op->reference_counts != 0;
+        if (ImGui::Checkbox("Reference counts at labels", &b)) { op->reference_counts = b; changed = true; }
+        b = op->hex_index_offsets != 0;
+        if (ImGui::Checkbox("Hex index offsets", &b)) { op->hex_index_offsets = b; changed = true; }
+        b = op->instruction_addresses != 0;
+        if (ImGui::Checkbox("Instruction address comments", &b)) { op->instruction_addresses = b; changed = true; }
+        b = op->far_code_allow_null != 0;
+        if (ImGui::Checkbox("far_code tolerates null (0x0000)", &b)) { op->far_code_allow_null = b; changed = true; }
+        b = op->report_code_in_data != 0;
+        if (ImGui::Checkbox("Report code in [data] ranges", &b)) { op->report_code_in_data = b; changed = true; }
+        b = op->check_inline_length != 0;
+        if (ImGui::Checkbox("Check inline length vs stack fixup", &b)) { op->check_inline_length = b; changed = true; }
+
+        if (changed) {
+            s->overlay_dirty = true;
+            apex_project_invalidate(p, APEX_DIRTY_RENDER);
+        }
+    }
+
     /* ---- Add / Edit form ---- */
     bool name_ok = config_valid_symbol_name(s->sym_edit_name) != 0;
     unsigned long parsed_val = 0;

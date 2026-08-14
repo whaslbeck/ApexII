@@ -149,6 +149,7 @@ static int reserved_label_name(const char *s)
         "INLINE_FAR_STRING", "INLINE_FAR_PTR", "INLINE_FAR_TABLE",
         "INLINE_PTR_DMD_FULLFRAME", "INLINE_FAR_DMD_FULLFRAME",
         "INLINE_PTR_SPRITE", "INLINE_FAR_SPRITE",
+        "INLINE_BYTES_UNTIL", "INLINE_COUNTED_BYTES",
         "TABLE_PTR", "TABLE_FAR_CODE", "TABLE_FAR_STRING", "TABLE_FAR_PTR",
         "TABLE_FAR_TABLE", "TABLE_PTR_DMD_FULLFRAME", "TABLE_FAR_DMD_FULLFRAME",
         "TABLE_PTR_SPRITE", "TABLE_FAR_SPRITE",
@@ -788,6 +789,15 @@ static void parse_line(AsmState *st, char *line)
         }
         emit_byte(st, (uint8_t)(value >> 8));
         emit_byte(st, (uint8_t)value);
+    } else if (starts_with_word(s, "INLINE_BYTES_UNTIL")) {
+        /* Variable-length inline payload: a terminated byte list.  The bytes
+           (including the terminator) are carried verbatim, so it assembles like
+           .DB. */
+        parse_db(st, trim(s + strlen("INLINE_BYTES_UNTIL")));
+    } else if (starts_with_word(s, "INLINE_COUNTED_BYTES")) {
+        /* Variable-length inline payload: leading count byte then that many
+           bytes, carried verbatim. */
+        parse_db(st, trim(s + strlen("INLINE_COUNTED_BYTES")));
     } else if (starts_with_word(s, "INLINE_STRING_PTR")) {
         parse_table_ptr(st, trim(s + strlen("INLINE_STRING_PTR")));
     } else if (starts_with_word(s, "INLINE_CODE_PTR")) {

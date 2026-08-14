@@ -271,6 +271,8 @@ static const char *table_field_kind_name(TableFieldKind k)
     case TABLE_FAR_DMD_FULLFRAME: return "far_dmd_fullframe";
     case TABLE_BYTE:              return "byte";
     case TABLE_WORD:              return "word";
+    case TABLE_BYTES_UNTIL:       return "bytes_until";
+    case TABLE_COUNTED_BYTES:     return "counted_bytes";
     default:                      return "byte";
     }
 }
@@ -289,6 +291,11 @@ static std::string table_schema_to_string(const TableSchema *s)
             (s->items[i].kind == TABLE_PTR16_SPRITE ||
              s->items[i].kind == TABLE_FAR_SPRITE)) {
             t += "(" + std::to_string(s->items[i].param) + ")";
+        }
+        if (!s->items[i].type_name && s->items[i].kind == TABLE_BYTES_UNTIL) {
+            char pb[8];
+            snprintf(pb, sizeof(pb), "(0x%02x)", s->items[i].param & 0xffu);
+            t += pb;
         }
         if (s->items[i].count != 1u) {
             t += "[" + std::to_string(s->items[i].count) + "]";
@@ -2331,6 +2338,8 @@ static const struct { int kind; const char *name; } kKindNames[] = {
     { TABLE_FAR_CODE,          "far_code"     },
     { TABLE_FAR_DMD_FULLFRAME, "far_dmd_fullframe" },
     { TABLE_FAR_SPRITE,        "far_sprite"   },
+    { TABLE_BYTES_UNTIL,       "bytes_until"  },
+    { TABLE_COUNTED_BYTES,     "counted_bytes" },
 };
 static const int kKindCount = (int)(sizeof(kKindNames) / sizeof(kKindNames[0]));
 
@@ -2361,6 +2370,10 @@ void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int coun
         if (fields[i].param > 0 &&
             (fields[i].kind == TABLE_PTR16_SPRITE || fields[i].kind == TABLE_FAR_SPRITE)) {
             int written = snprintf(buf + pos, cap - pos, "(%d)", fields[i].param);
+            if (written > 0) { pos += (size_t)written; }
+        }
+        if (fields[i].kind == TABLE_BYTES_UNTIL) {
+            int written = snprintf(buf + pos, cap - pos, "(0x%02x)", fields[i].param & 0xff);
             if (written > 0) { pos += (size_t)written; }
         }
         if (fields[i].count > 1) {
@@ -2403,7 +2416,7 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
             char *close = strchr(paren, ')');
             if (close) {
                 *paren = '\0';
-                param = atoi(paren + 1);
+                param = (int)strtol(paren + 1, NULL, 0);  /* base 0: decimal or 0x hex */
                 if (param < 0) { param = 0; }
                 end = paren;
                 while (end > tok && end[-1] == ' ') { *--end = '\0'; }
@@ -3047,8 +3060,23 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         return -1;
     }
     fputs("; Apex ImGui config\n", o);
-    if (p->options.labels_are_entries)
-        fputs("\n[options]\nlabels_are_entries = true\n", o);
+    {
+        const ConfigOptions *op = &p->options;
+        if (op->labels_are_entries || op->min_immediate_symbol || op->reference_counts ||
+            op->hex_index_offsets || op->instruction_addresses || op->far_code_allow_null ||
+            op->report_code_in_data || op->check_inline_length) {
+            fputs("\n[options]\n", o);
+            if (op->labels_are_entries)     fputs("labels_are_entries = true\n", o);
+            if (op->min_immediate_symbol)
+                fprintf(o, "min_immediate_symbol = 0x%04x\n", op->min_immediate_symbol);
+            if (op->reference_counts)       fputs("reference_counts = true\n", o);
+            if (op->hex_index_offsets)      fputs("hex_index_offsets = true\n", o);
+            if (op->instruction_addresses)  fputs("instruction_addresses = true\n", o);
+            if (op->far_code_allow_null)    fputs("far_code_allow_null = true\n", o);
+            if (op->report_code_in_data)    fputs("report_code_in_data = true\n", o);
+            if (op->check_inline_length)    fputs("check_inline_length = true\n", o);
+        }
+    }
     if (p->config_types.count > 0) {
         fputs("\n[types]\n", o);
         for (size_t i = 0; i < p->config_types.count; i++) {

@@ -27,6 +27,29 @@ static const ConfigEntries *g_render_acks = NULL;
    immediate operand is resolved against that bank instead of the current one. */
 static const ConfigEntries *g_render_far_imms = NULL;
 
+/* Opt-in render switches for the current write pass (set in write_asm_stream from
+   project->options; NULL = all defaults).  See ConfigOptions in apex_config.h. */
+static const ConfigOptions *g_render_options = NULL;
+
+static uint32_t render_min_immediate_symbol(void)
+{
+    return g_render_options ? g_render_options->min_immediate_symbol : 0u;
+}
+static int render_reference_counts(void)
+{
+    return g_render_options ? g_render_options->reference_counts : 0;
+}
+static int render_instruction_addresses(void)
+{
+    return g_render_options ? g_render_options->instruction_addresses : 0;
+}
+/* A 0x0000 inline far-code pointer is the regular "no body" case for some effect
+   descriptors; with far_code_allow_null it is emitted plainly (no warning). */
+static int render_far_code_null_ok(uint16_t target)
+{
+    return target == 0u && g_render_options && g_render_options->far_code_allow_null;
+}
+
 static int far_imm_render_bank(uint8_t bank, uint32_t addr, uint8_t *out_target)
 {
     size_t i;
@@ -253,9 +276,29 @@ static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t 
 {
     size_t i;
     int emitted = 0;
+    const char *header = "; referenced_by ";
+    char header_buf[48];
 
     if (!refs) {
         return;
+    }
+    /* Opt-in: prefix with the number of referencing sites, for prioritising which
+       routines matter most (`; referenced_by (2105) ...`). */
+    if (render_reference_counts()) {
+        size_t n = 0;
+        size_t j = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
+        for (; j < refs->count; j++) {
+            if (refs->items[j].bank != bank || refs->items[j].addr != addr) {
+                if (refs->sorted) break;
+                continue;
+            }
+            n++;
+        }
+        if (n == 0) {
+            return;
+        }
+        snprintf(header_buf, sizeof(header_buf), "; referenced_by (%zu) ", n);
+        header = header_buf;
     }
     /* refs are sorted+deduped by sort_and_dedup_refs; use binary search when sorted */
     i = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
@@ -268,11 +311,11 @@ static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t 
             uint32_t rc = refs->items[i].row_cpu_addr;
             uint8_t rb = refs->items[i].source_bank;
             fprintf(out, "%stable:%s line:%d[B%02x_A%04x]",
-                    emitted ? ", " : "; referenced_by ",
+                    emitted ? ", " : header,
                     refs->items[i].source, refs->items[i].row_index,
                     (unsigned)rb, (unsigned)rc & 0xffffu);
         } else {
-            fprintf(out, "%s%s:%s", emitted ? ", " : "; referenced_by ",
+            fprintf(out, "%s%s:%s", emitted ? ", " : header,
                     refs->items[i].kind, refs->items[i].source);
         }
         emitted = 1;
@@ -322,6 +365,12 @@ static const char *table_field_name(TableFieldKind kind)
     }
     if (kind == TABLE_FAR_SPRITE) {
         return "far_sprite";
+    }
+    if (kind == TABLE_BYTES_UNTIL) {
+        return "bytes_until";
+    }
+    if (kind == TABLE_COUNTED_BYTES) {
+        return "counted_bytes";
     }
     return "far_code";
 }
@@ -571,7 +620,11 @@ static void emit_routine_comment_block(FILE *out, uint8_t bank, uint32_t addr, u
         char schema_text[128];
 
         format_table_schema(&inline_sig->schema, schema_text, sizeof(schema_text));
-        fprintf(out, "; inline length=%u\n", inline_sig->length);
+        if (table_schema_is_variable(&inline_sig->schema)) {
+            fprintf(out, "; inline length=variable\n");
+        } else {
+            fprintf(out, "; inline length=%u\n", inline_sig->length);
+        }
         fprintf(out, "; inline params=%s\n", schema_text);
     }
     emit_doc_comment(out, doc);
@@ -1666,6 +1719,59 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
     return 1;
 }
 
+/* Fixed byte width of a non-variable inline field kind. */
+static size_t inline_fixed_field_width(TableFieldKind kind)
+{
+    return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
+}
+
+/* Actual bytes an inline payload consumes at this call site, resolving any
+   variable-length fields against the ROM.  Sets *ok = 0 (and returns 0) if the
+   payload would run past the available bytes. */
+static size_t inline_payload_length(const InlineSignature *sig, const uint8_t *data, size_t len,
+                                    size_t pos, int *ok)
+{
+    size_t start = pos, i, n;
+
+    *ok = 1;
+    for (i = 0; i < sig->schema.count; i++) {
+        const TableField *f = &sig->schema.items[i];
+        for (n = 0; n < f->count; n++) {
+            if (f->kind == TABLE_BYTES_UNTIL) {
+                uint8_t term = (uint8_t)f->param;
+                for (;;) {
+                    if (pos >= len) { *ok = 0; return 0; }
+                    if (data[pos++] == term) break;
+                }
+            } else if (f->kind == TABLE_COUNTED_BYTES) {
+                uint8_t cnt;
+                if (pos >= len) { *ok = 0; return 0; }
+                cnt = data[pos++];
+                if (pos + cnt > len) { *ok = 0; return 0; }
+                pos += cnt;
+            } else {
+                size_t w = inline_fixed_field_width(f->kind);
+                if (pos + w > len) { *ok = 0; return 0; }
+                pos += w;
+            }
+        }
+    }
+    return pos - start;
+}
+
+/* Emit a raw byte list (count bytes from data[*pos]) as `pseudo b0, b1, ...`. */
+static void emit_inline_byte_list(FILE *out, const char *pseudo, const uint8_t *data, size_t *pos,
+                                  size_t count, const char *inst)
+{
+    size_t k;
+    fprintf(out, "        %s ", pseudo);
+    for (k = 0; k < count; k++) {
+        fprintf(out, "%s0x%02x", k ? ", " : "", data[*pos + k]);
+    }
+    fprintf(out, " ; for %s\n", inst);
+    *pos += count;
+}
+
 static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint8_t *data,
                                size_t len, size_t *pos, uint8_t current_bank, const char *inst,
                                const Label *labels, size_t label_count,
@@ -1683,7 +1789,17 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
         for (n = 0; n < field->count; n++) {
             TableFieldKind kind = field->kind;
 
-            if (kind == TABLE_BYTE) {
+            if (kind == TABLE_BYTES_UNTIL) {
+                uint8_t term = (uint8_t)field->param;
+                size_t span = 0;
+                while (*pos + span < len && data[*pos + span] != term) span++;
+                if (*pos + span < len) span++;   /* include the terminator */
+                emit_inline_byte_list(out, "INLINE_BYTES_UNTIL", data, pos, span, inst);
+            } else if (kind == TABLE_COUNTED_BYTES) {
+                size_t span = 1u + (size_t)data[*pos];   /* count byte + payload */
+                if (*pos + span > len) span = len - *pos;
+                emit_inline_byte_list(out, "INLINE_COUNTED_BYTES", data, pos, span, inst);
+            } else if (kind == TABLE_BYTE) {
                 uint8_t byte_val = data[*pos];
 
                 fprintf(out, "        INLINE_BYTE 0x%02x ; for %s", byte_val, inst);
@@ -1718,7 +1834,8 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 uint8_t bank = data[*pos + 2u];
 
                 if (kind == TABLE_FAR_CODE && !valid_far_code_target(target, bank, paged_rom,
-                                                                     banks)) {
+                                                                     banks) &&
+                    !render_far_code_null_ok(target)) {
                     emit_inline_far_warning(out, current_bank, base_addr + (uint32_t)*pos,
                                             rom_base + *pos, inst, target, bank);
                 }
@@ -1810,6 +1927,7 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
     lookup.bank_labels = bank_labels;
     lookup.banks = banks;
     lookup.current_bank = current_bank;
+    lookup.min_immediate_symbol = render_min_immediate_symbol();
 
     while (pos < len) {
         size_t col = 0;
@@ -1916,12 +2034,14 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                     }
                 }
                 lookup.current_bank = far_tb;
-                info = cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
-                                                   sizeof(inst), lookup_label_for_cpu, &lookup);
+                info = cpu6809_disassemble_info_ex2(data + pos, len - pos, instr_addr, inst,
+                                                    sizeof(inst), lookup_label_for_cpu, &lookup,
+                                                    lookup_label_for_imm);
                 lookup = saved;
             } else {
-                info = cpu6809_disassemble_info_ex(data + pos, len - pos, instr_addr, inst,
-                                                   sizeof(inst), lookup_label_for_cpu, &lookup);
+                info = cpu6809_disassemble_info_ex2(data + pos, len - pos, instr_addr, inst,
+                                                    sizeof(inst), lookup_label_for_cpu, &lookup,
+                                                    lookup_label_for_imm);
             }
             if (info.size > 0) {
                 const InlineSignature *inline_sig = NULL;
@@ -1972,6 +2092,12 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                        address (label-address docs are already in the label header). */
                     const char *idoc = has_code_label ? NULL
                         : config_doc_at(docs, current_bank, base_addr + (uint32_t)pos);
+                    /* Opt-in: a per-instruction address comment so [literals] /
+                       [far_imm] / [imm_types] entries can be keyed by exact address. */
+                    if (render_instruction_addresses()) {
+                        fprintf(out, "    ; addr B%02x_A%04x\n", (unsigned)current_bank,
+                                (unsigned)(base_addr + (uint32_t)pos) & 0xffffu);
+                    }
                     if (idoc) {
                         const char *nl = strchr(idoc, '\n');
                         if (nl)
@@ -1991,7 +2117,15 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                         inline_sig = inline_signature_for(inline_sigs, current_bank, info.target);
                     }
                     if (inline_sig) {
-                        if (pos + inline_sig->length > len) {
+                        int fits;
+                        if (table_schema_is_variable(&inline_sig->schema)) {
+                            int ok;
+                            inline_payload_length(inline_sig, data, len, pos, &ok);
+                            fits = ok;
+                        } else {
+                            fits = pos + inline_sig->length <= len;
+                        }
+                        if (!fits) {
                             emit_inline_truncated_warning(
                                 out, current_bank, base_addr + (uint32_t)pos, rom_base + pos, inst,
                                 inline_sig->length, len - pos);
@@ -2825,6 +2959,211 @@ static void emit_preamble(FILE *out, const ApexProject *project)
     fputc('\n', out);
 }
 
+/* Number of bytes of a [data] range worth scanning for a mislabelled JSR/JMP.
+   Only ranges with a known byte span are scanned; pointer/sprite kinds are too
+   short or self-describing to hide a call, so they are skipped (span 0). */
+static size_t code_scan_span(const DataRange *r, const uint8_t *src, size_t avail)
+{
+    size_t span;
+    switch (r->kind) {
+    case DATA_BYTES:
+    case DATA_STRING_FIXED:
+    case DATA_BCD:            span = r->length; break;
+    case DATA_DMD_FULLFRAME:  span = 512u; break;
+    case DATA_STRING:         span = valid_string_len(src, avail); break;
+    default:                  return 0u;
+    }
+    return span < avail ? span : avail;
+}
+
+/* Report-only pass (report_code_in_data option): a JSR/JMP-extended opcode inside
+   a [data] range whose 16-bit operand lands on a known routine is almost always
+   mislabelled code — the far-pointer-reached bodies the flow analysis never sees.
+   Emits `; WARNING code_in_data ...` (and a stderr line) per hit.  Returns the
+   count. */
+static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
+{
+    const uint8_t *rom = project->rom.data;
+    size_t banks = project->banks;
+    size_t found = 0;
+    size_t ri;
+
+    for (ri = 0; ri < project->data_ranges.count; ri++) {
+        const DataRange *r = &project->data_ranges.items[ri];
+        const uint8_t *src;
+        size_t avail, span, i;
+
+        if (!locate_bank_bytes(rom, banks, r->bank, (uint16_t)r->addr, &src, &avail)) {
+            continue;
+        }
+        span = code_scan_span(r, src, avail);
+        if (span < 3u) {
+            continue;
+        }
+        for (i = 0; i + 3u <= span; i++) {
+            uint8_t op = src[i];
+            uint16_t target;
+            const LabelSet *ls = NULL;
+            uint8_t tbank;
+            const char *name;
+
+            if (op != 0xBDu && op != 0x7Eu) {  /* JSR / JMP extended */
+                continue;
+            }
+            target = (uint16_t)((src[i + 1] << 8) | src[i + 2]);
+            if (target >= 0x8000u) {
+                ls = &project->system_labels;
+                tbank = 0xffu;
+            } else if (target >= APEX_PAGED_ORG && r->bank != 0xffu) {
+                int bi = bank_index_for_id(rom, banks, r->bank);
+                if (bi < 0) {
+                    continue;  /* target bank-ambiguous */
+                }
+                ls = &project->bank_labels[bi];
+                tbank = r->bank;
+            } else {
+                continue;  /* RAM / bank-ambiguous system-window operand */
+            }
+            if (!code_label_at(target, ls->items, ls->count, ls->sorted)) {
+                continue;
+            }
+            name = label_name_at(target, ls->items, ls->count, ls->sorted);
+            {
+                uint32_t cpu = (uint32_t)(r->addr + i) & 0xffffu;
+                unsigned long rom_off = (unsigned long)(size_t)(src - rom) + (unsigned long)i;
+                if (apex_warn_to_stderr) {
+                    fprintf(stderr,
+                            "warning: code_in_data at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
+                            "%s B%02x_A%04x (%s) inside a [data] range\n",
+                            r->bank, (unsigned)cpu, rom_off, op == 0xBDu ? "JSR" : "JMP",
+                            tbank, (unsigned)target, name ? name : "?");
+                }
+                fprintf(out,
+                        "; WARNING code_in_data bank=0x%02x cpu=0x%04x rom=0x%06lx op=%s "
+                        "target=B%02x_A%04x name=%s\n",
+                        r->bank, (unsigned)cpu, rom_off, op == 0xBDu ? "JSR" : "JMP",
+                        tbank, (unsigned)target, name ? name : "?");
+            }
+            found++;
+        }
+    }
+    return found;
+}
+
+/* Parse the signed offset of an "N,REG" indexed operand (decimal or 0x hex),
+   returning it and the index register letter.  Returns 0 if not that shape. */
+static int parse_index_offset(const char *operand, long *out_off, char *out_reg)
+{
+    const char *p = operand;
+    long sign = 1, val = 0;
+    const char *comma;
+
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == ',') {            /* ",REG" — zero offset (top of stack) */
+        *out_reg = p[1];
+        *out_off = 0;
+        return 1;
+    }
+    if (*p == '-') { sign = -1; p++; }
+    else if (*p == '+') { p++; }
+    if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
+        p += 2;
+        if (!isxdigit((unsigned char)*p)) return 0;
+        for (; isxdigit((unsigned char)*p); p++) {
+            int d = (*p <= '9') ? *p - '0' : (toupper((unsigned char)*p) - 'A' + 10);
+            val = val * 16 + d;
+        }
+    } else if (isdigit((unsigned char)*p)) {
+        for (; isdigit((unsigned char)*p); p++) val = val * 10 + (*p - '0');
+    } else {
+        return 0;
+    }
+    comma = strchr(p, ',');
+    if (!comma || comma != p) return 0;   /* offset must be immediately followed by ",REG" */
+    *out_reg = comma[1];
+    *out_off = sign * val;
+    return 1;
+}
+
+/* If a routine reads its return address off the stack (LD{U,X,Y} n,S), advances
+   it (LEA{U,X,Y} N,same), the N is the inline-parameter length.  Scans the
+   routine prologue and returns that N, or -1 if the pattern is absent. */
+static long inline_stack_adjust_len(const uint8_t *src, size_t avail)
+{
+    uint32_t pc = 0;
+    size_t pos = 0;
+    int steps;
+    char loaded_reg = 0;
+
+    for (steps = 0; steps < 48 && pos < avail; steps++) {
+        char text[128];
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(src + pos, avail - pos, pc + (uint32_t)pos,
+                                                         text, sizeof(text));
+        char mnem[8];
+        const char *sp;
+        size_t m = 0;
+
+        if (info.size == 0) break;
+        while (text[m] && text[m] != ' ' && m + 1 < sizeof(mnem)) { mnem[m] = text[m]; m++; }
+        mnem[m] = '\0';
+        sp = text[m] ? text + m + 1 : text + m;
+
+        if ((strcmp(mnem, "LDU") == 0 || strcmp(mnem, "LDX") == 0 || strcmp(mnem, "LDY") == 0)) {
+            long off; char reg;
+            if (parse_index_offset(sp, &off, &reg) && reg == 'S') {
+                loaded_reg = mnem[2];  /* the register now holding the return address */
+            }
+        } else if (loaded_reg &&
+                   (strcmp(mnem, "LEAU") == 0 || strcmp(mnem, "LEAX") == 0 ||
+                    strcmp(mnem, "LEAY") == 0)) {
+            long off; char reg;
+            if (mnem[3] == loaded_reg && parse_index_offset(sp, &off, &reg) &&
+                reg == loaded_reg && off > 0) {
+                return off;  /* return address advanced by the parameter length */
+            }
+        }
+        if (info.flags & CPU6809_FLOW_STOP) break;
+        pos += info.size;
+    }
+    return -1;
+}
+
+/* check_inline_length option: warn when an [inline] length disagrees with the
+   LDU/LEAU/STU stack fixup detectable in the routine.  Returns the mismatch count. */
+static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
+{
+    size_t i, found = 0;
+
+    for (i = 0; i < project->inline_sigs.count; i++) {
+        const InlineSignature *sig = &project->inline_sigs.items[i];
+        uint8_t bank = sig->has_bank ? sig->bank : 0xffu;
+        const uint8_t *src;
+        size_t avail;
+        long adj;
+
+        if (!locate_bank_bytes(project->rom.data, project->banks, bank, (uint16_t)sig->addr,
+                               &src, &avail)) {
+            continue;
+        }
+        adj = inline_stack_adjust_len(src, avail);
+        if (adj < 0 || (unsigned)adj == sig->length) {
+            continue;
+        }
+        if (apex_warn_to_stderr) {
+            fprintf(stderr,
+                    "warning: inline_length_mismatch at bank=0x%02x cpu=0x%04x: configured %u, "
+                    "routine advances the return address by %ld\n",
+                    bank, (unsigned)sig->addr & 0xffffu, sig->length, adj);
+        }
+        fprintf(out,
+                "; WARNING inline_length_mismatch bank=0x%02x cpu=0x%04x configured=%u "
+                "stack_adjust=%ld\n",
+                bank, (unsigned)sig->addr & 0xffffu, sig->length, adj);
+        found++;
+    }
+    return found;
+}
+
 int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
                                   int emit_explain)
 {
@@ -2832,6 +3171,8 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
 
     g_render_acks = &project->ack_warnings;
     g_render_far_imms = &project->far_imms;
+    g_render_options = &project->options;
+    cpu6809_set_hex_index_offsets(project->options.hex_index_offsets);
     emit_preamble(out, project);
     fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols, &project->docs);
@@ -2864,8 +3205,18 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
         emit_xref_index(out, project->rom.data, project->bank_labels, project->banks,
                         &project->system_labels, &project->refs);
     }
+    if (project->options.report_code_in_data) {
+        fputs("\n; ---- code_in_data report (JSR/JMP into [data] ranges) ----\n", out);
+        emit_code_in_data_report(out, project);
+    }
+    if (project->options.check_inline_length) {
+        fputs("\n; ---- inline_length report (config vs stack fixup) ----\n", out);
+        emit_inline_length_report(out, project);
+    }
     g_render_acks = NULL;
     g_render_far_imms = NULL;
+    g_render_options = NULL;
+    cpu6809_set_hex_index_offsets(0);
     return 0;
 }
 
@@ -2894,6 +3245,9 @@ int apexdis_run(const ApexDisOptions *run_options)
 
     rc = apex_project_analyze(project);
     if (rc == 0) {
+        if (run_options->emit_addrs) {
+            project->options.instruction_addresses = 1;  /* CLI --addr forces it on */
+        }
         rc = apex_project_write_asm(project, run_options->output_path, run_options->emit_xrefs,
                                     run_options->emit_explain);
     }

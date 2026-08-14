@@ -30,5 +30,15 @@ Cpu6809InstrInfo cpu6809_disassemble_info(const uint8_t *data, size_t len, uint3
 Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, uint32_t pc,
                                               char *out, size_t out_size, Cpu6809LabelFn label,
                                               void *label_ctx);
+/* Like _ex, but resolves immediate operands (LDX/LDD/... #imm16) through a
+   separate callback (sharing label_ctx), so callers can suppress or restrict
+   symbol resolution in immediates independently of address operands.  When
+   label_imm is NULL, immediates fall back to `label`. */
+Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, uint32_t pc,
+                                              char *out, size_t out_size, Cpu6809LabelFn label,
+                                              void *label_ctx, Cpu6809LabelFn label_imm);
+
+/* Render 5-bit indexed offsets in hex (opt-in; default off). */
+void cpu6809_set_hex_index_offsets(int enabled);
 
 #endif

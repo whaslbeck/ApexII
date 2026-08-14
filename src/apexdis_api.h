@@ -7,6 +7,7 @@ typedef struct {
     const char *config_path;
     int emit_xrefs;
     int emit_explain;
+    int emit_addrs;   /* --addr: force the instruction_addresses [options] switch on */
 } ApexDisOptions;
 
 int apexdis_run(const ApexDisOptions *options);

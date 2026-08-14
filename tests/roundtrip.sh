@@ -187,6 +187,190 @@ else
     exit 1
 fi
 
+# apexini check must also catch the static [entries]<->[data] conflict.
+if "$ROOT/build/apexini" check "$ROOT/tests/config_class_conflict.ini" \
+    2>"$OUT/apexini_check_conflict.stderr"; then
+    printf 'FAIL apexini_check_conflict\n' >&2
+    exit 1
+elif grep -q "config classifies 0x8002 as both code entry and data" \
+    "$OUT/apexini_check_conflict.stderr"; then
+    printf 'PASS apexini_check_conflict\n'
+else
+    printf 'FAIL apexini_check_conflict\n' >&2
+    exit 1
+fi
+
+# apexini merge conflict handling and --override.
+printf '[symbols]\n_SHADOW = 0x0011\n' > "$OUT/merge_a.ini"
+printf '[symbols]\n_SHADOW = 0x0013\n' > "$OUT/merge_b.ini"
+if "$ROOT/build/apexini" merge "$OUT/merge_out.ini" "$OUT/merge_a.ini" \
+    "$OUT/merge_b.ini" 2>/dev/null; then
+    printf 'FAIL apexini_merge_conflict\n' >&2
+    exit 1
+else
+    printf 'PASS apexini_merge_conflict\n'
+fi
+if "$ROOT/build/apexini" merge --override "$OUT/merge_out.ini" "$OUT/merge_a.ini" \
+    "$OUT/merge_b.ini" >/dev/null 2>&1 &&
+    grep -q '_SHADOW = 0x0013' "$OUT/merge_out.ini"; then
+    printf 'PASS apexini_merge_override\n'
+else
+    printf 'FAIL apexini_merge_override\n' >&2
+    exit 1
+fi
+
+# apexini coverage --bank restricts output to one bank plus totals.
+if "$ROOT/build/apexini" coverage "$data_range_rom" "$ROOT/tests/data_ranges.ini" \
+    --bank 0xff >"$OUT/coverage_bank.out" 2>/dev/null &&
+    grep -q '^0xff' "$OUT/coverage_bank.out" &&
+    ! grep -q '^total' "$OUT/coverage_bank.out"; then
+    printf 'PASS apexini_coverage_bank\n'
+else
+    printf 'FAIL apexini_coverage_bank\n' >&2
+    exit 1
+fi
+
+# Opt-in render switches: default config and options-enabled config must BOTH
+# round-trip byte-identically, and the options must have the documented effect.
+opt_rom="$OUT/opt_features.rom"
+"$ROOT/build/apexasm" "$opt_rom" "$ROOT/tests/opt_features.asm"
+"$ROOT/build/apexdis" "$opt_rom" "$OUT/opt_default.asm" "$ROOT/tests/opt_features.ini" \
+    2>/dev/null
+"$ROOT/build/apexdis" "$opt_rom" "$OUT/opt_on.asm" "$ROOT/tests/opt_features_on.ini" \
+    2>/dev/null
+"$ROOT/build/apexasm" "$OUT/opt_default_rt.rom" "$OUT/opt_default.asm" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/opt_on_rt.rom" "$OUT/opt_on.asm" 2>/dev/null
+if cmp -s "$opt_rom" "$OUT/opt_default_rt.rom" &&
+    cmp -s "$opt_rom" "$OUT/opt_on_rt.rom"; then
+    printf 'PASS opt_features_roundtrip\n'
+else
+    printf 'FAIL opt_features_roundtrip\n' >&2
+    exit 1
+fi
+# Default resolves the small symbol in the immediate; the option leaves it raw
+# while the address operand still resolves.
+if grep -q 'LDX #TEXT_FIELD' "$OUT/opt_default.asm" &&
+    grep -q 'LDX #0x0014' "$OUT/opt_on.asm" &&
+    grep -q 'LDA <TEXT_FIELD' "$OUT/opt_on.asm"; then
+    printf 'PASS opt_min_immediate_symbol\n'
+else
+    printf 'FAIL opt_min_immediate_symbol\n' >&2
+    exit 1
+fi
+# 5-bit index offset: decimal by default, minimal hex with the option.
+if grep -q 'LDD 15,U' "$OUT/opt_default.asm" &&
+    grep -q 'LDD 0xf,U' "$OUT/opt_on.asm"; then
+    printf 'PASS opt_hex_index_offsets\n'
+else
+    printf 'FAIL opt_hex_index_offsets\n' >&2
+    exit 1
+fi
+# reference_counts and instruction_addresses annotations appear only with the option.
+if ! grep -q 'referenced_by (' "$OUT/opt_default.asm" &&
+    grep -q 'referenced_by (' "$OUT/opt_on.asm" &&
+    ! grep -q '^    ; addr B' "$OUT/opt_default.asm" &&
+    grep -q '^    ; addr B' "$OUT/opt_on.asm"; then
+    printf 'PASS opt_reference_counts_and_addr\n'
+else
+    printf 'FAIL opt_reference_counts_and_addr\n' >&2
+    exit 1
+fi
+
+# far_code_allow_null: default warns on a 0x0000 inline far-code pointer; the
+# option suppresses the warning.  Both configs round-trip byte-identically.
+fcn_rom="$OUT/far_code_null.rom"
+"$ROOT/build/apexasm" "$fcn_rom" "$ROOT/tests/far_code_null.asm"
+"$ROOT/build/apexdis" "$fcn_rom" "$OUT/fcn_default.asm" "$ROOT/tests/far_code_null.ini" \
+    2>/dev/null
+"$ROOT/build/apexdis" "$fcn_rom" "$OUT/fcn_ok.asm" "$ROOT/tests/far_code_null_ok.ini" \
+    2>/dev/null
+"$ROOT/build/apexasm" "$OUT/fcn_default_rt.rom" "$OUT/fcn_default.asm" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/fcn_ok_rt.rom" "$OUT/fcn_ok.asm" 2>/dev/null
+if grep -q 'WARNING inline_far_code_invalid' "$OUT/fcn_default.asm" &&
+    ! grep -q 'WARNING inline_far_code_invalid' "$OUT/fcn_ok.asm" &&
+    grep -q 'INLINE_FAR_CODE' "$OUT/fcn_ok.asm" &&
+    cmp -s "$fcn_rom" "$OUT/fcn_default_rt.rom" &&
+    cmp -s "$fcn_rom" "$OUT/fcn_ok_rt.rom"; then
+    printf 'PASS far_code_allow_null\n'
+else
+    printf 'FAIL far_code_allow_null\n' >&2
+    exit 1
+fi
+
+# Long generated string label: the capped name must be used identically at the
+# definition and the operand reference (no operand-buffer truncation), so it
+# round-trips.  Also assert the label stayed within the 63-char operand buffer.
+lsl_rom="$OUT/long_string_label.rom"
+"$ROOT/build/apexasm" "$lsl_rom" "$ROOT/tests/long_string_label.asm"
+"$ROOT/build/apexdis" "$lsl_rom" "$OUT/lsl.asm" "$ROOT/tests/long_string_label.ini" \
+    2>/dev/null
+"$ROOT/build/apexasm" "$OUT/lsl_rt.rom" "$OUT/lsl.asm" 2>/dev/null
+lsl_maxlen=$(grep -oE '\bB[0-9a-f]{2}_A[0-9a-f]{4}_STRING_[A-Z0-9_]*' "$OUT/lsl.asm" \
+    | awk '{ if (length > m) m = length } END { print m + 0 }')
+if cmp -s "$lsl_rom" "$OUT/lsl_rt.rom" && [ "$lsl_maxlen" -gt 0 ] && [ "$lsl_maxlen" -le 63 ]; then
+    printf 'PASS long_string_label\n'
+else
+    printf 'FAIL long_string_label (maxlen=%s)\n' "$lsl_maxlen" >&2
+    exit 1
+fi
+
+# report_code_in_data: a JSR hidden in a [data] range is flagged only with the
+# option, is silent by default, and neither config changes the round-trip.
+cid_rom="$OUT/code_in_data.rom"
+"$ROOT/build/apexasm" "$cid_rom" "$ROOT/tests/code_in_data.asm"
+"$ROOT/build/apexdis" "$cid_rom" "$OUT/cid_default.asm" "$ROOT/tests/code_in_data.ini" \
+    2>/dev/null
+"$ROOT/build/apexdis" "$cid_rom" "$OUT/cid_on.asm" "$ROOT/tests/code_in_data_on.ini" \
+    2>/dev/null
+"$ROOT/build/apexasm" "$OUT/cid_default_rt.rom" "$OUT/cid_default.asm" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/cid_on_rt.rom" "$OUT/cid_on.asm" 2>/dev/null
+if ! grep -q 'code_in_data bank' "$OUT/cid_default.asm" &&
+    grep -q 'WARNING code_in_data bank=0xff cpu=0x8001 .* target=Bff_A8010 name=ROUTINE' \
+        "$OUT/cid_on.asm" &&
+    cmp -s "$cid_rom" "$OUT/cid_default_rt.rom" &&
+    cmp -s "$cid_rom" "$OUT/cid_on_rt.rom"; then
+    printf 'PASS report_code_in_data\n'
+else
+    printf 'FAIL report_code_in_data\n' >&2
+    exit 1
+fi
+
+# check_inline_length: no warning when the [inline] length matches the routine's
+# stack fixup, a warning when it disagrees.  The correct config round-trips.
+il_rom="$OUT/inline_length.rom"
+"$ROOT/build/apexasm" "$il_rom" "$ROOT/tests/inline_length.asm"
+"$ROOT/build/apexdis" "$il_rom" "$OUT/il_ok.asm" "$ROOT/tests/inline_length_ok.ini" 2>/dev/null
+"$ROOT/build/apexdis" "$il_rom" "$OUT/il_bad.asm" "$ROOT/tests/inline_length_bad.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/il_ok_rt.rom" "$OUT/il_ok.asm" 2>/dev/null
+if ! grep -q 'inline_length_mismatch' "$OUT/il_ok.asm" &&
+    grep -q 'WARNING inline_length_mismatch bank=0xff cpu=0x8009 configured=3 stack_adjust=5' \
+        "$OUT/il_bad.asm" &&
+    cmp -s "$il_rom" "$OUT/il_ok_rt.rom"; then
+    printf 'PASS check_inline_length\n'
+else
+    printf 'FAIL check_inline_length\n' >&2
+    exit 1
+fi
+
+# Variable-length inline payloads (bytes_until / counted_bytes): the disassembler
+# resolves each length from the ROM, emits the new pseudo-ops, and re-assembles
+# byte-for-byte.  `apexini normalize` must preserve the field kinds.
+iv_rom="$OUT/inline_variable.rom"
+"$ROOT/build/apexasm" "$iv_rom" "$ROOT/tests/inline_variable.asm"
+"$ROOT/build/apexdis" "$iv_rom" "$OUT/iv.asm" "$ROOT/tests/inline_variable.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/iv_rt.rom" "$OUT/iv.asm" 2>/dev/null
+"$ROOT/build/apexini" normalize "$ROOT/tests/inline_variable.ini" "$OUT/iv_norm.ini" 2>/dev/null
+if grep -q 'INLINE_BYTES_UNTIL 0x05, 0xf0, 0x03, 0x00' "$OUT/iv.asm" &&
+    grep -q 'INLINE_COUNTED_BYTES 0x03, 0xaa, 0xbb, 0xcc' "$OUT/iv.asm" &&
+    cmp -s "$iv_rom" "$OUT/iv_rt.rom" &&
+    grep -q 'bytes_until(0x00)' "$OUT/iv_norm.ini" &&
+    grep -q 'counted_bytes' "$OUT/iv_norm.ini"; then
+    printf 'PASS inline_variable\n'
+else
+    printf 'FAIL inline_variable\n' >&2
+    exit 1
+fi
+
 inline_truncated_rom="$OUT/inline_truncated.rom"
 inline_truncated_asm="$OUT/inline_truncated.disasm"
 inline_truncated_err="$OUT/inline_truncated.stderr"
