@@ -529,18 +529,44 @@ static int decode_dmd_fullframe_metadata(const uint8_t *src, size_t len, uint8_t
     return 1;
 }
 
+static void emit_dmd_fullframe_comment_planes(FILE *out, const uint8_t *src, size_t len,
+                                              size_t planes)
+{
+    size_t total = 0;
+    size_t p;
+    uint8_t first_type = 0;
+
+    if (planes == 0u) {
+        planes = 1u;
+    }
+    for (p = 0; p < planes; p++) {
+        uint8_t type = 0;
+        size_t consumed = 0;
+        if (!decode_dmd_fullframe_metadata(src + total, len - total, &type, &consumed) ||
+            consumed == 0u) {
+            fputs(" ; dmd type=fullframe invalid=1", out);
+            return;
+        }
+        if (p == 0) {
+            first_type = type;
+        }
+        total += consumed;
+    }
+    if (planes > 1u) {
+        fprintf(out, " ; dmd type=fullframe planes=%lu decoder=0x%02x consumed=%lu"
+                     " width=%u height=%u",
+                (unsigned long)planes, (unsigned)first_type, (unsigned long)total,
+                (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
+    } else {
+        fprintf(out, " ; dmd type=fullframe decoder=0x%02x consumed=%lu width=%u height=%u",
+                (unsigned)first_type, (unsigned long)total, (unsigned)APEX_DMD_WIDTH,
+                (unsigned)APEX_DMD_HEIGHT);
+    }
+}
+
 static void emit_dmd_fullframe_comment(FILE *out, const uint8_t *src, size_t len)
 {
-    uint8_t type = 0;
-    size_t consumed = 0;
-
-    if (decode_dmd_fullframe_metadata(src, len, &type, &consumed)) {
-        fprintf(out, " ; dmd type=fullframe decoder=0x%02x consumed=%lu width=%u height=%u",
-                (unsigned)type, (unsigned long)consumed, (unsigned)APEX_DMD_WIDTH,
-                (unsigned)APEX_DMD_HEIGHT);
-    } else {
-        fputs(" ; dmd type=fullframe invalid=1", out);
-    }
+    emit_dmd_fullframe_comment_planes(out, src, len, 1u);
 }
 
 static void emit_dmd_fullframe_target_comment(FILE *out, const uint8_t *paged_rom, size_t banks,
@@ -657,7 +683,7 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
         size_t len;
 
         if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
-            emit_dmd_fullframe_comment(out, src, len);
+            emit_dmd_fullframe_comment_planes(out, src, len, range->length);
             fputc('\n', out);
         }
     }
@@ -1672,14 +1698,22 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         return 1;
     }
     if (range->kind == DATA_DMD_FULLFRAME) {
-        size_t consumed = 0;
-        uint8_t type = 0;
+        size_t total = 0;
+        size_t planes = range->length ? range->length : 1u;  /* bit-plane count */
+        size_t p;
 
-        if (!decode_dmd_fullframe_metadata(data + *pos, len - *pos, &type, &consumed) ||
-            consumed == 0u) {
-            consumed = 1u;
+        for (p = 0; p < planes; p++) {
+            size_t consumed = 0;
+            uint8_t type = 0;
+            if (!decode_dmd_fullframe_metadata(data + *pos + total, len - *pos - total, &type,
+                                               &consumed) || consumed == 0u) {
+                total += 1u;  /* undecodable plane: emit 1 byte, stop expanding */
+                planes = p + 1u;
+                break;
+            }
+            total += consumed;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, consumed);
+        emit_data_bytes(out, data, len, base_addr, pos, total);
         return 1;
     }
     if (range->kind == DATA_SPRITE) {
@@ -3124,6 +3158,90 @@ static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
     return found;
 }
 
+/* report_dmd_short option: a dmd_fullframe frame is flagged when its configured
+   bit-planes leave a gap to the next data range in the bank AND that gap is filled
+   *exactly* by further valid planes — i.e. a 4-colour frame stored as two planes
+   but classified as one.  Requiring an exact fill avoids flagging the normal case
+   where a frame is simply followed by unrelated data/code.  Emits `; WARNING
+   dmd_decode_short`.  Returns the count. */
+static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
+{
+    size_t i, found = 0;
+
+    for (i = 0; i < project->data_ranges.count; i++) {
+        const DataRange *r = &project->data_ranges.items[i];
+        const uint8_t *src;
+        size_t avail, total = 0, planes, p, j, extra = 0, t2;
+        uint32_t next = 0;
+        int have_next = 0;
+
+        if (r->kind != DATA_DMD_FULLFRAME) {
+            continue;
+        }
+        if (!locate_bank_bytes(project->rom.data, project->banks, r->bank, (uint16_t)r->addr,
+                               &src, &avail)) {
+            continue;
+        }
+        planes = r->length ? r->length : 1u;
+        for (p = 0; p < planes; p++) {
+            size_t consumed = 0;
+            uint8_t type = 0;
+            if (!decode_dmd_fullframe_metadata(src + total, avail - total, &type, &consumed) ||
+                consumed == 0u) {
+                total = 0;  /* undecodable — not a short-decode case */
+                break;
+            }
+            total += consumed;
+        }
+        if (total == 0u) {
+            continue;
+        }
+        /* nearest data range at a higher address in the same bank */
+        for (j = 0; j < project->data_ranges.count; j++) {
+            const DataRange *o = &project->data_ranges.items[j];
+            if (o->bank == r->bank && o->addr > r->addr && (!have_next || o->addr < next)) {
+                next = o->addr;
+                have_next = 1;
+            }
+        }
+        if (!have_next || (size_t)(next - r->addr) <= total) {
+            continue;
+        }
+        /* Does the gap decode as further whole planes, ending exactly at `next`? */
+        t2 = total;
+        while (r->addr + t2 < next) {
+            size_t consumed = 0;
+            uint8_t type = 0;
+            if (!decode_dmd_fullframe_metadata(src + t2, avail - t2, &type, &consumed) ||
+                consumed == 0u) {
+                break;
+            }
+            t2 += consumed;
+            extra++;
+        }
+        if (extra == 0u || r->addr + t2 != next) {
+            continue;  /* the gap is not simply more planes — leave it alone */
+        }
+        {
+            uint32_t cpu = r->addr & 0xffffu;
+            if (apex_warn_to_stderr) {
+                fprintf(stderr,
+                        "warning: dmd_decode_short at bank=0x%02x cpu=0x%04x: %lu plane(s) "
+                        "decode %lu bytes but %lu planes fill %lu to the next frame\n",
+                        r->bank, (unsigned)cpu, (unsigned long)planes, (unsigned long)total,
+                        (unsigned long)(planes + extra), (unsigned long)(next - r->addr));
+            }
+            fprintf(out,
+                    "; WARNING dmd_decode_short bank=0x%02x cpu=0x%04x planes=%lu decoded=%lu "
+                    "suggest_planes=%lu full=%lu\n",
+                    r->bank, (unsigned)cpu, (unsigned long)planes, (unsigned long)total,
+                    (unsigned long)(planes + extra), (unsigned long)(next - r->addr));
+            found++;
+        }
+    }
+    return found;
+}
+
 int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
                                   int emit_explain)
 {
@@ -3172,6 +3290,10 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
     if (project->options.check_inline_length) {
         fputs("\n; ---- inline_length report (config vs stack fixup) ----\n", out);
         emit_inline_length_report(out, project);
+    }
+    if (project->options.report_dmd_short) {
+        fputs("\n; ---- dmd_decode_short report (frame shorter than next) ----\n", out);
+        emit_dmd_short_report(out, project);
     }
     g_render_acks = NULL;
     g_render_far_imms = NULL;

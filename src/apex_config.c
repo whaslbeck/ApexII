@@ -1019,8 +1019,15 @@ const char *data_range_spec(const DataRange *r, char *buf, size_t bufsz)
         snprintf(buf, bufsz, "bcd[%lu]", (unsigned long)r->length);        return buf;
     case DATA_SPRITE_NOHEADER:
         snprintf(buf, bufsz, "sprite_noheader[%lu]", (unsigned long)r->length); return buf;
+    case DATA_DMD_FULLFRAME:
+        /* r->length holds the bit-plane count; omit [1] for the common case. */
+        if (r->length > 1u) {
+            snprintf(buf, bufsz, "dmd_fullframe[%lu]", (unsigned long)r->length);
+        } else {
+            snprintf(buf, bufsz, "dmd_fullframe");
+        }
+        return buf;
     case DATA_STRING:            name = "string";           break;
-    case DATA_DMD_FULLFRAME:     name = "dmd_fullframe";     break;
     case DATA_PTR16_STRING:      name = "ptr16_string";     break;
     case DATA_PTR16_DATA:        name = "ptr16_data";       break;
     case DATA_PTR16_CODE:        name = "ptr16_code";       break;
@@ -1405,6 +1412,10 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
                 if (!parse_config_bool(value, &options->check_inline_length)) {
                     die("invalid option '%s = %s'", key, value);
                 }
+            } else if (strcmp(key, "report_dmd_short") == 0) {
+                if (!parse_config_bool(value, &options->report_dmd_short)) {
+                    die("invalid option '%s = %s'", key, value);
+                }
             } else {
                 die("unknown option '%s'", key);
             }
@@ -1517,7 +1528,13 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             } else if (parse_count_format(value, "bcd", &length)) {
                 add_data_range(data_ranges, bank, addr, DATA_BCD, length);
             } else if (strcmp(value, "dmd_fullframe") == 0) {
-                add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
+                add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, 1);
+            } else if (parse_count_format(value, "dmd_fullframe", &length)) {
+                /* dmd_fullframe[N]: N bit-planes (4-colour frames use 2). */
+                if (length == 0u) {
+                    die("dmd_fullframe plane count must be >= 1");
+                }
+                add_data_range(data_ranges, bank, addr, DATA_DMD_FULLFRAME, length);
             } else if (strcmp(value, "ptr16_string") == 0) {
                 add_data_range(data_ranges, bank, addr, DATA_PTR16_STRING, 2);
             } else if (strcmp(value, "ptr16_data") == 0) {
@@ -1805,7 +1822,10 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
     } else if (strcmp(value, "string") == 0) {
         add_data_range(ranges, bank, addr, DATA_STRING, 0);
     } else if (strcmp(value, "dmd_fullframe") == 0) {
-        add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 0);
+        add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 1);
+    } else if (parse_count_format(value, "dmd_fullframe", &length)) {
+        if (length == 0u) { free(value); return 1; }
+        add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, length);
     } else if (strcmp(value, "ptr16_string") == 0) {
         add_data_range(ranges, bank, addr, DATA_PTR16_STRING, 2);
     } else if (strcmp(value, "ptr16_data") == 0) {

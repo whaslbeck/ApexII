@@ -130,9 +130,15 @@ void render_dmd_preview(const DmdPreviewInfo &preview, float max_scale)
     ImGui::Text("Address: B%02x_A%04x  ROM: 0x%06lx",
                 preview.bank, (unsigned)preview.cpu_addr & 0xffffu,
                 (unsigned long)preview.rom_offset);
-    ImGui::Text("Decoder: 0x%02x  Consumed: %lu  Size: %ux%u",
-                (unsigned)preview.decoder_type, (unsigned long)preview.consumed,
-                (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
+    if (preview.two_plane) {
+        ImGui::Text("Decoder: 0x%02x  Planes: 2 (4-colour)  Consumed: %lu  Size: %ux%u",
+                    (unsigned)preview.decoder_type, (unsigned long)preview.consumed,
+                    (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
+    } else {
+        ImGui::Text("Decoder: 0x%02x  Consumed: %lu  Size: %ux%u",
+                    (unsigned)preview.decoder_type, (unsigned long)preview.consumed,
+                    (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
+    }
     ImGui::Separator();
     ImVec2 canvas_pos = ImGui::GetCursorScreenPos();
     ImGui::InvisibleButton("dmd_canvas", ImVec2(APEX_DMD_WIDTH * scale, APEX_DMD_HEIGHT * scale));
@@ -141,16 +147,28 @@ void render_dmd_preview(const DmdPreviewInfo &preview, float max_scale)
                         ImVec2(canvas_pos.x + APEX_DMD_WIDTH * scale,
                                canvas_pos.y + APEX_DMD_HEIGHT * scale),
                         IM_COL32(8, 8, 8, 255));
+    /* 4-level amber ramp for 4-colour (two-plane) frames; index 0 = off. */
+    static const ImU32 kAmber4[4] = {
+        IM_COL32(28, 18, 6, 255), IM_COL32(120, 76, 20, 255),
+        IM_COL32(190, 120, 30, 255), IM_COL32(255, 160, 40, 255)
+    };
     for (size_t row = 0; row < APEX_DMD_HEIGHT; row++) {
         for (size_t col_byte = 0; col_byte < APEX_DMD_ROW_BYTES; col_byte++) {
             uint8_t bits = preview.plane[row * APEX_DMD_ROW_BYTES + col_byte];
+            uint8_t bits1 = preview.two_plane
+                                ? preview.plane1[row * APEX_DMD_ROW_BYTES + col_byte] : 0u;
             for (size_t bit = 0; bit < 8u; bit++) {
-                bool lit = ((bits >> bit) & 1u) != 0u;
                 ImVec2 p0(canvas_pos.x + (col_byte * 8 + bit) * scale,
                           canvas_pos.y + row * scale);
-                draw->AddRectFilled(p0,
-                                    ImVec2(p0.x + scale - 1.0f, p0.y + scale - 1.0f),
-                                    lit ? IM_COL32(255, 160, 40, 255) : IM_COL32(28, 18, 6, 255));
+                ImU32 col;
+                if (preview.two_plane) {
+                    unsigned level = ((bits >> bit) & 1u) | (((bits1 >> bit) & 1u) << 1);
+                    col = kAmber4[level];
+                } else {
+                    col = ((bits >> bit) & 1u) ? IM_COL32(255, 160, 40, 255)
+                                               : IM_COL32(28, 18, 6, 255);
+                }
+                draw->AddRectFilled(p0, ImVec2(p0.x + scale - 1.0f, p0.y + scale - 1.0f), col);
             }
         }
     }
@@ -683,6 +701,15 @@ static void classify_kind_submenu(ApexProject *p, const ApexRenderedDocument **d
     }
     if (ImGui::MenuItem("sprite"))             apply_data_at_selection(p, dp, s, "sprite");
     if (ImGui::MenuItem("dmd_fullframe"))      apply_data_at_selection(p, dp, s, "dmd_fullframe");
+    {
+        /* dmd_fullframe[N]: N bit-planes (4-colour frames are 2).  Uses the Edit
+           panel's N (min 2) so the label shows it. */
+        int n = s->edit_data_length > 1 ? s->edit_data_length : 2;
+        char label[28], spec[28];
+        snprintf(label, sizeof(label), "dmd_fullframe[%d]", n);
+        snprintf(spec, sizeof(spec), "dmd_fullframe[%d]", n);
+        if (ImGui::MenuItem(label)) apply_data_at_selection(p, dp, s, spec);
+    }
     {
         /* bcd needs a length; use the Edit panel's current N so the label shows it. */
         int n = s->edit_data_length > 0 ? s->edit_data_length : 1;
@@ -3978,6 +4005,8 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
         if (ImGui::Checkbox("Report code in [data] ranges", &b)) { op->report_code_in_data = b; changed = true; }
         b = op->check_inline_length != 0;
         if (ImGui::Checkbox("Check inline length vs stack fixup", &b)) { op->check_inline_length = b; changed = true; }
+        b = op->report_dmd_short != 0;
+        if (ImGui::Checkbox("Report short DMD frames (missing bit-plane)", &b)) { op->report_dmd_short = b; changed = true; }
 
         if (changed) {
             s->overlay_dirty = true;

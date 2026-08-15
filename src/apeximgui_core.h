@@ -762,8 +762,11 @@ struct DmdPreviewInfo {
     size_t rom_offset;
     uint8_t decoder_type;
     size_t consumed;
+    size_t planes;                            /* bit-plane count (1, or 2 for 4-colour) */
+    bool    two_plane;                        /* plane1 holds the second bit-plane */
     char title[128];
     uint8_t plane[APEX_DMD_PAGE_BYTES];
+    uint8_t plane1[APEX_DMD_PAGE_BYTES];      /* second bit-plane (two_plane only) */
 };
 
 struct SpritePreviewInfo {

@@ -151,6 +151,8 @@ typedef struct {
                                       emit `; WARNING code_in_data` hints (report only) */
     int check_inline_length;       /* warn when an [inline] length disagrees with the
                                       routine's LDU/LEAU/STU return-address fixup */
+    int report_dmd_short;          /* warn when a dmd_fullframe decodes to fewer bytes than
+                                      the gap to the next data range (a missed bit-plane) */
 } ConfigOptions;
 
 typedef struct {

@@ -333,8 +333,31 @@ static void decode_0aor0b(DmdReader *r, uint8_t *dest, uint8_t type)
     }
 }
 
+/* Type 0x04 is a wrapper, not a leaf format: the game's decoder (Dr. Who
+   Bff_Af0e6) recursively decodes the image that begins right after the 0x04 byte
+   — which carries its own type byte — and then reflects the top half of the
+   128x32 buffer onto the bottom (rows 0..15 copied to rows 31..16), yielding a
+   vertically symmetric frame.  So length(0x04) = 1 + length(inner). */
+static void dmd_reflect_top_to_bottom(uint8_t *dest)
+{
+    unsigned i;
+    for (i = 0; i < APEX_DMD_HEIGHT / 2u; i++) {
+        memcpy(dest + (APEX_DMD_HEIGHT - 1u - i) * APEX_DMD_ROW_BYTES,
+               dest + i * APEX_DMD_ROW_BYTES, APEX_DMD_ROW_BYTES);
+    }
+}
+
+static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *dest,
+                                 size_t *consumed, uint8_t *type_out, int depth);
+
 int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
                              size_t *consumed, uint8_t *type_out)
+{
+    return decode_fullframe_impl(src, src_size, dest, consumed, type_out, 0);
+}
+
+static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *dest,
+                                 size_t *consumed, uint8_t *type_out, int depth)
 {
     DmdReader r;
     uint8_t type;
@@ -344,11 +367,31 @@ int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
         return 0;
     }
 
-    memset(dest, 0, APEX_DMD_PAGE_BYTES);
     type = (uint8_t)(src[0] & 0x0fu);
     if (type_out) {
         *type_out = type;
     }
+
+    /* 0x04: wrapper — decode the nested image then reflect (see above). */
+    if (type == 0x04u) {
+        size_t inner_consumed = 0;
+        uint8_t inner_type = 0;
+        if (depth >= 8 ||
+            !decode_fullframe_impl(src + 1, src_size - 1u, dest, &inner_consumed, &inner_type,
+                                   depth + 1)) {
+            return 0;
+        }
+        dmd_reflect_top_to_bottom(dest);
+        if (consumed) {
+            *consumed = 1u + inner_consumed;
+        }
+        if (type_out) {
+            *type_out = 0x04u;  /* the recursion set it to the inner type; this frame is 0x04 */
+        }
+        return 1;
+    }
+
+    memset(dest, 0, APEX_DMD_PAGE_BYTES);
 
     r.src = src;
     r.size = src_size;
@@ -365,10 +408,6 @@ int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
         break;
     case 0x02u:
         decode_01or02(&r, dest, WRITE_TYPE_ROWS);
-        break;
-    case 0x04u:
-        decode_04or05(&r, dest, WRITE_TYPE_COLUMNS);
-        bitstream = 1;
         break;
     case 0x05u:
         decode_04or05(&r, dest, WRITE_TYPE_ROWS);

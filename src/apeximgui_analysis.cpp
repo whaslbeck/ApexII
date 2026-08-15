@@ -1928,6 +1928,23 @@ int decode_dmd_preview_at(const ApexProject *p, uint8_t b, uint32_t a, DmdPrevie
     pr->rom_offset = ro;
     pr->decoder_type = type;
     pr->consumed = con;
+    pr->planes = 1;
+    pr->two_plane = false;
+    /* A dmd_fullframe[N] range (N>=2) is a 4-colour frame: decode the second
+       bit-plane so the preview can render it in grey levels. */
+    {
+        const DataRange *dr = data_range_at(b, a, &p->data_ranges);
+        if (dr && dr->kind == DATA_DMD_FULLFRAME && dr->length >= 2) {
+            size_t con1 = 0;
+            uint8_t type1 = 0;
+            if (con < len &&
+                apexdmd_decode_fullframe(src + con, len - con, pr->plane1, &con1, &type1)) {
+                pr->two_plane = true;
+                pr->planes = 2;
+                pr->consumed = con + con1;
+            }
+        }
+    }
     return 1;
 }
 
@@ -3064,7 +3081,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         const ConfigOptions *op = &p->options;
         if (op->labels_are_entries || op->min_immediate_symbol || op->reference_counts ||
             op->hex_index_offsets || op->instruction_addresses || op->far_code_allow_null ||
-            op->report_code_in_data || op->check_inline_length) {
+            op->report_code_in_data || op->check_inline_length || op->report_dmd_short) {
             fputs("\n[options]\n", o);
             if (op->labels_are_entries)     fputs("labels_are_entries = true\n", o);
             if (op->min_immediate_symbol)
@@ -3075,6 +3092,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
             if (op->far_code_allow_null)    fputs("far_code_allow_null = true\n", o);
             if (op->report_code_in_data)    fputs("report_code_in_data = true\n", o);
             if (op->check_inline_length)    fputs("check_inline_length = true\n", o);
+            if (op->report_dmd_short)       fputs("report_dmd_short = true\n", o);
         }
     }
     if (p->config_types.count > 0) {

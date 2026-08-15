@@ -54,6 +54,7 @@ labels_are_entries = false
 | `far_code_allow_null` | `false` | Treat a `0x0000` inline far-code pointer as the regular "no body" case — emit it plainly with no `inline_far_code_invalid` warning. |
 | `report_code_in_data` | `false` | Report-only: scan every `[data]` range for a `JSR`/`JMP`-extended opcode whose operand lands on a known routine (mislabelled code the flow analysis never reached), emitting `; WARNING code_in_data …`. See [Warnings](#warnings). |
 | `check_inline_length` | `false` | Warn when an `[inline]` length disagrees with the routine's `LDU ,S` / `LEAU N,U` / `STU ,S` return-address fixup (`; WARNING inline_length_mismatch …`) — catches a wrong inline length that would silently hide code. |
+| `report_dmd_short` | `false` | Warn when a `dmd_fullframe` range decodes to fewer bytes than the gap to the next data range **and** that gap is filled exactly by further whole planes (`; WARNING dmd_decode_short …`) — flags a 4-colour frame classified with too few planes (fix it with `dmd_fullframe[N]`). |
 
 Recommended: keep the defaults so that labels and code classification are independent and existing output is unchanged. Every option above is opt-in and off by default; the GUI toggles them under **Analysis options** in the Symbols panel, persisting them to the `.apexgui.ini` overlay.
 
@@ -299,7 +300,8 @@ Supported data kinds:
 | `string` | Null-terminated ASCII string |
 | `string[N]` | Fixed-length ASCII string, exactly N bytes (no terminator) |
 | `bcd[N]` | Binary-coded decimal, N bytes = 2N decimal digits (e.g. scores). Renders as `BCD 0001234500`. |
-| `dmd_fullframe` | DMD full-frame bitmap |
+| `dmd_fullframe` | DMD full-frame bitmap (one bit-plane) |
+| `dmd_fullframe[N]` | DMD full-frame bitmap of **N bit-planes** (4-colour/grayscale frames are `dmd_fullframe[2]`: two independently-compressed planes, each with its own type byte, stored back-to-back). The disassembler decodes all N planes and sizes the range as their total; the GUI renders two planes as 4 grey levels. |
 | `sprite` | Sprite image (self-describing header) |
 | `sprite_noheader[N]` | Headerless sprite, height N pixels (width byte read from ROM) |
 | `ptr16_string` | 16-bit (same-bank) pointer to a string |
@@ -475,5 +477,6 @@ Beyond hard errors, the disassembler flags suspect-but-recoverable situations wi
 | `label_name_collision` | A `[labels]` name matches the generated `Bxx_Ayyyy` form but decodes to a different address (e.g. `Bcd_Add16` → `0xdd16`). A defined symbol still wins in the assembler, but rename it to avoid ambiguity. |
 | `code_in_data` | (opt-in, `report_code_in_data`) A `JSR`/`JMP`-extended opcode inside a `[data]` range targets a known routine — almost always mislabelled code. Reported at the end of the disassembly. |
 | `inline_length_mismatch` | (opt-in, `check_inline_length`) An `[inline]` length disagrees with the routine's `LEAU N,U` return-address fixup. |
+| `dmd_decode_short` | (opt-in, `report_dmd_short`) A `dmd_fullframe` frame decodes to fewer bytes than the exact gap of whole planes to the next data range — a 4-colour frame stored as more planes than configured. |
 
 Acknowledge a warning you have reviewed with [`[ack_warnings]`](#ack_warnings): it is then emitted as `; WARNING_ACK …` and no longer counts as active or prints to the console.
