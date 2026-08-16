@@ -3031,7 +3031,8 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
             {
                 uint32_t cpu = (uint32_t)(r->addr + i) & 0xffffu;
                 unsigned long rom_off = (unsigned long)(size_t)(src - rom) + (unsigned long)i;
-                if (apex_warn_to_stderr) {
+                int acked = warning_is_acked(r->bank, cpu);
+                if (apex_warn_to_stderr && !acked) {
                     fprintf(stderr,
                             "warning: code_in_data at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
                             "%s B%02x_A%04x (%s) inside a [data] range\n",
@@ -3039,10 +3040,10 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
                             tbank, (unsigned)target, name ? name : "?");
                 }
                 fprintf(out,
-                        "; WARNING code_in_data bank=0x%02x cpu=0x%04x rom=0x%06lx op=%s "
+                        "; %s code_in_data bank=0x%02x cpu=0x%04x rom=0x%06lx op=%s "
                         "target=B%02x_A%04x name=%s\n",
-                        r->bank, (unsigned)cpu, rom_off, op == 0xBDu ? "JSR" : "JMP",
-                        tbank, (unsigned)target, name ? name : "?");
+                        warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, rom_off,
+                        op == 0xBDu ? "JSR" : "JMP", tbank, (unsigned)target, name ? name : "?");
             }
             found++;
         }
@@ -3149,16 +3150,20 @@ static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
         if (adj < 0 || (unsigned)adj == sig->length) {
             continue;
         }
-        if (apex_warn_to_stderr) {
-            fprintf(stderr,
-                    "warning: inline_length_mismatch at bank=0x%02x cpu=0x%04x: configured %u, "
-                    "routine advances the return address by %ld\n",
-                    bank, (unsigned)sig->addr & 0xffffu, sig->length, adj);
+        {
+            uint32_t cpu = sig->addr & 0xffffu;
+            int acked = warning_is_acked(bank, cpu);
+            if (apex_warn_to_stderr && !acked) {
+                fprintf(stderr,
+                        "warning: inline_length_mismatch at bank=0x%02x cpu=0x%04x: configured %u, "
+                        "routine advances the return address by %ld\n",
+                        bank, (unsigned)cpu, sig->length, adj);
+            }
+            fprintf(out,
+                    "; %s inline_length_mismatch bank=0x%02x cpu=0x%04x configured=%u "
+                    "stack_adjust=%ld\n",
+                    warning_keyword(bank, cpu), bank, (unsigned)cpu, sig->length, adj);
         }
-        fprintf(out,
-                "; WARNING inline_length_mismatch bank=0x%02x cpu=0x%04x configured=%u "
-                "stack_adjust=%ld\n",
-                bank, (unsigned)sig->addr & 0xffffu, sig->length, adj);
         found++;
     }
     return found;
@@ -3230,7 +3235,8 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
         }
         {
             uint32_t cpu = r->addr & 0xffffu;
-            if (apex_warn_to_stderr) {
+            int acked = warning_is_acked(r->bank, cpu);
+            if (apex_warn_to_stderr && !acked) {
                 fprintf(stderr,
                         "warning: dmd_decode_short at bank=0x%02x cpu=0x%04x: %lu plane(s) "
                         "decode %lu bytes but %lu planes fill %lu to the next frame\n",
@@ -3238,10 +3244,11 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
                         (unsigned long)(planes + extra), (unsigned long)(next - r->addr));
             }
             fprintf(out,
-                    "; WARNING dmd_decode_short bank=0x%02x cpu=0x%04x planes=%lu decoded=%lu "
+                    "; %s dmd_decode_short bank=0x%02x cpu=0x%04x planes=%lu decoded=%lu "
                     "suggest_planes=%lu full=%lu\n",
-                    r->bank, (unsigned)cpu, (unsigned long)planes, (unsigned long)total,
-                    (unsigned long)(planes + extra), (unsigned long)(next - r->addr));
+                    warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, (unsigned long)planes,
+                    (unsigned long)total, (unsigned long)(planes + extra),
+                    (unsigned long)(next - r->addr));
             found++;
         }
     }

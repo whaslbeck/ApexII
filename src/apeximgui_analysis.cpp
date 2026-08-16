@@ -3549,7 +3549,12 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
         }
 
         char name[32];
-        snprintf(name, sizeof(name), "%s%04X", prefix, addr_val);
+        /* Include the bank for paged targets so the name is unique across banks. */
+        if (has_bank) {
+            snprintf(name, sizeof(name), "%s%02X_%04X", prefix, (unsigned)tgt_bank, addr_val);
+        } else {
+            snprintf(name, sizeof(name), "%s%04X", prefix, addr_val);
+        }
         apex_project_set_label(p, has_bank, tgt_bank, (uint32_t)addr_val, name);
         labeled++;
     }

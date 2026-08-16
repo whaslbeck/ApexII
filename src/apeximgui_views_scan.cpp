@@ -349,7 +349,14 @@ void render_imm_loads(ApexProject *project,
             }
         }
         char name[32];
-        snprintf(name, sizeof(name), "%s%04X", prefix, (unsigned)r.imm);
+        /* Include the bank for paged targets so the name is unique across banks
+           (the same CPU address exists in every paged bank). */
+        if (has_bank) {
+            snprintf(name, sizeof(name), "%s%02X_%04X", prefix, (unsigned)r.tgt_bank,
+                     (unsigned)r.imm);
+        } else {
+            snprintf(name, sizeof(name), "%s%04X", prefix, (unsigned)r.imm);
+        }
         if (apex_project_set_label(project, has_bank, r.tgt_bank, r.imm, name) == 0) {
             uint8_t nb = r.tgt_bank; uint32_t na = r.imm;
             uint8_t ib = r.bank; uint32_t ia = r.cpu_addr;
