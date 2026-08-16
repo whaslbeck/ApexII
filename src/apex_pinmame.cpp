@@ -1,18 +1,78 @@
+/* Winsock headers must precede anything that might pull in <windows.h> (some
+   MinGW <thread> implementations do), or windows.h drags in the legacy winsock.h
+   and clashes with winsock2.h.  So include them first, before apex_pinmame.h. */
+#ifdef _WIN32
+#  ifndef WIN32_LEAN_AND_MEAN
+#    define WIN32_LEAN_AND_MEAN
+#  endif
+#  include <winsock2.h>
+#  include <ws2tcpip.h>
+#endif
+
 #include "apex_pinmame.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <thread>
 
-#include <errno.h>
-#include <fcntl.h>
-#include <signal.h>
-#include <unistd.h>
-#include <sys/socket.h>
-#include <sys/wait.h>
-#include <netinet/in.h>
-#include <arpa/inet.h>
+/* ---- platform abstraction (POSIX sockets/process vs Winsock) --------------
+   The socket transport works on both; the process auto-spawn is POSIX-only
+   (xpinmamed is a Linux binary), so on Windows launch/stop are compiled as
+   graceful stubs and the user starts the emulator manually. */
+#ifdef _WIN32
+typedef SOCKET apex_sock_t;
+static inline bool sock_valid(apex_sock_t s) { return s != INVALID_SOCKET; }
+static inline void sock_close(apex_sock_t s) { closesocket(s); }
+static inline void sock_startup(void)
+{
+    static bool done = false;
+    if (!done) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) == 0) done = true; }
+}
+static inline void sock_set_timeout(apex_sock_t s, int ms)
+{
+    DWORD t = (DWORD)ms;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t));
+}
+static inline bool sock_recv_timed_out(void)
+{
+    int e = WSAGetLastError();
+    return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
+}
+#else
+#  include <errno.h>
+#  include <fcntl.h>
+#  include <signal.h>
+#  include <unistd.h>
+#  include <sys/socket.h>
+#  include <sys/wait.h>
+#  include <netinet/in.h>
+#  include <arpa/inet.h>
+typedef int apex_sock_t;
+static inline bool sock_valid(apex_sock_t s) { return s >= 0; }
+static inline void sock_close(apex_sock_t s) { close(s); }
+static inline void sock_startup(void) {}
+static inline void sock_set_timeout(apex_sock_t s, int ms)
+{
+    struct timeval tv;
+    tv.tv_sec = ms / 1000;
+    tv.tv_usec = (ms % 1000) * 1000;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+}
+static inline bool sock_recv_timed_out(void)
+{
+    return errno == EAGAIN || errno == EWOULDBLOCK;
+}
+#endif
+
+static inline void apex_sleep_ms(int ms)
+{
+    std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+}
 
 /* Split each flat {...} object inside the named JSON array (defined below). */
 static std::vector<std::string> json_objects(const std::string &json, const char *key);
@@ -96,15 +156,12 @@ bool apex_json_int_array(const std::string &json, const char *key, std::vector<l
 
 bool apex_pinmame_http_get(int port, const std::string &path, std::string &body, int timeout_ms)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    sock_startup();
+    apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (!sock_valid(fd)) {
         return false;
     }
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sock_set_timeout(fd, timeout_ms);
 
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
@@ -112,23 +169,23 @@ bool apex_pinmame_http_get(int port, const std::string &path, std::string &body,
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-        close(fd);
+        sock_close(fd);
         return false;
     }
 
     std::string req = "GET " + path + " HTTP/1.0\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
-    if (send(fd, req.data(), req.size(), 0) < 0) {
-        close(fd);
+    if (send(fd, req.data(), (int)req.size(), 0) < 0) {
+        sock_close(fd);
         return false;
     }
 
     std::string resp;
     char buf[8192];
-    ssize_t n;
-    while ((n = recv(fd, buf, sizeof(buf), 0)) > 0) {
+    long n;
+    while ((n = (long)recv(fd, buf, (int)sizeof(buf), 0)) > 0) {
         resp.append(buf, (size_t)n);
     }
-    close(fd);
+    sock_close(fd);
     if (resp.empty()) {
         return false;
     }
@@ -148,20 +205,19 @@ bool apex_pinmame_http_get(int port, const std::string &path, std::string &body,
 
 bool apex_pinmame_port_in_use(int port)
 {
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) {
+    sock_startup();
+    apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (!sock_valid(fd)) {
         return false;
     }
-    struct timeval tv = {0, 200000}; /* 200 ms */
-    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    sock_set_timeout(fd, 200); /* 200 ms */
     struct sockaddr_in sa;
     memset(&sa, 0, sizeof(sa));
     sa.sin_family = AF_INET;
     sa.sin_port = htons((uint16_t)port);
     sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     bool listening = (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) == 0);
-    close(fd);
+    sock_close(fd);
     return listening;
 }
 
@@ -197,10 +253,12 @@ bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
         pm.last_error = "binary path and game name are required";
         return false;
     }
+#ifndef _WIN32
     if (access(bin.c_str(), X_OK) != 0) {
         pm.last_error = "xpinmamed binary not found or not executable: " + bin;
         return false;
     }
+#endif
     if (apex_pinmame_is_alive(pm)) {
         pm.last_error = "already running";
         return false;
@@ -229,6 +287,14 @@ bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
     argv.push_back(const_cast<char *>(game.c_str()));
     argv.push_back(nullptr);
 
+#ifdef _WIN32
+    (void)argv;
+    /* xpinmamed is a Linux/X11 binary; we cannot spawn it here.  The HTTP
+       transport still works, so a user can start it manually and connect. */
+    pm.last_error = "auto-launch is not supported on Windows; start xpinmamed "
+                    "manually and connect to the port";
+    return false;
+#else
     pid_t pid = fork();
     if (pid < 0) {
         pm.last_error = "fork failed";
@@ -256,6 +322,7 @@ bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
     pm.running = true;
     pm.last_error.clear();
     return true;
+#endif
 }
 
 bool apex_pinmame_is_alive(ApexPinmame &pm)
@@ -263,6 +330,9 @@ bool apex_pinmame_is_alive(ApexPinmame &pm)
     if (pm.pid <= 0) {
         return false;
     }
+#ifdef _WIN32
+    return false;  /* no child is ever spawned on Windows */
+#else
     int st;
     pid_t r = waitpid(pm.pid, &st, WNOHANG);
     if (r == 0) {
@@ -272,6 +342,7 @@ bool apex_pinmame_is_alive(ApexPinmame &pm)
     pm.pid = -1;
     pm.running = false;
     return false;
+#endif
 }
 
 /* ---- /api/events SSE reader (halt notifications) ---- */
@@ -280,29 +351,29 @@ static void events_loop(ApexPinmame *pm)
 {
     int fails = 0;
     while (!pm->ev_stop.load()) {
-        int fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) break;
-        struct timeval tv = {0, 400000}; /* 400 ms recv timeout → checks ev_stop */
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+        sock_startup();
+        apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
+        if (!sock_valid(fd)) break;
+        sock_set_timeout(fd, 400); /* 400 ms recv timeout → checks ev_stop */
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof(sa));
         sa.sin_family = AF_INET;
         sa.sin_port = htons((uint16_t)pm->port);
         sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
-            close(fd);
+            sock_close(fd);
             if (++fails > 25) break; /* emulator gone: stop retrying (~8s) */
-            usleep(300000);
+            apex_sleep_ms(300);
             continue;
         }
         fails = 0;
         std::string req = "GET /api/events HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
-        send(fd, req.data(), req.size(), 0);
+        send(fd, req.data(), (int)req.size(), 0);
 
         std::string buf;
         while (!pm->ev_stop.load()) {
             char tmp[2048];
-            ssize_t n = recv(fd, tmp, sizeof(tmp), 0);
+            long n = (long)recv(fd, tmp, (int)sizeof(tmp), 0);
             if (n > 0) {
                 buf.append(tmp, (size_t)n);
                 size_t nl;
@@ -325,11 +396,11 @@ static void events_loop(ApexPinmame *pm)
                 }
             } else if (n == 0) {
                 break; /* server closed */
-            } else if (errno != EAGAIN && errno != EWOULDBLOCK) {
+            } else if (!sock_recv_timed_out()) {
                 break; /* real error (not the recv timeout) */
             }
         }
-        close(fd);
+        sock_close(fd);
     }
 }
 
@@ -463,6 +534,7 @@ bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum)
 void apex_pinmame_stop(ApexPinmame &pm)
 {
     apex_pinmame_events_stop(pm);
+#ifndef _WIN32
     if (pm.pid > 0) {
         kill(pm.pid, SIGTERM);
         for (int i = 0; i < 20; i++) {
@@ -470,7 +542,7 @@ void apex_pinmame_stop(ApexPinmame &pm)
                 pm.pid = -1;
                 break;
             }
-            usleep(50000); /* up to ~1s for a graceful exit */
+            apex_sleep_ms(50); /* up to ~1s for a graceful exit */
         }
         if (pm.pid > 0) {
             kill(pm.pid, SIGKILL);
@@ -478,6 +550,7 @@ void apex_pinmame_stop(ApexPinmame &pm)
             pm.pid = -1;
         }
     }
+#endif
     pm.running = false;
 }
 

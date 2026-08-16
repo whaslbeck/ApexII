@@ -4,8 +4,11 @@
 /* Client for PinMAME's remote debugger (src/remote_debug in vpinball/pinmame):
    spawns a headless `xpinmamed` process and talks to its HTTP/JSON REST API
    (all GET, loopback).  This is the transport for ApexII's dynamic analysis
-   (code coverage, live CPU/RAM, banking).  Pure POSIX + C++ — no ImGui — so it
-   can be unit-tested headless against a live emulator.
+   (code coverage, live CPU/RAM, banking).  Portable C++ — no ImGui — so it can be
+   unit-tested headless against a live emulator.  The HTTP transport works on both
+   POSIX (BSD sockets) and Windows (Winsock); the process auto-spawn is POSIX-only
+   (xpinmamed is a Linux binary), so on Windows launch/stop are graceful no-ops and
+   the emulator is started manually.
 
    API responses use DECIMAL numbers (verified against xpinmamed): e.g. /state
    gives {"cpus":[{"pc":35939,...}]}, coverage gives {"addr":16384,"bank":30,

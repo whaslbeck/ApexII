@@ -20,8 +20,10 @@ APEXCOMPARE_OBJS := $(BUILD_DIR)/apexcompare.o $(BUILD_DIR)/apex_compare.o $(BUI
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
 APEXIMGUI_SDL_LIBS := $(shell $(PKG_CONFIG) --libs sdl2 2>/dev/null)
 
+APEXIMGUI_PLATFORM_LIBS :=
 ifeq ($(OS),Windows_NT)
 APEXIMGUI_GL_LIBS := -lopengl32
+APEXIMGUI_PLATFORM_LIBS := -lws2_32   # Winsock, for the PinMAME remote-debugger client
 else ifeq ($(UNAME_S),Darwin)
 APEXIMGUI_GL_LIBS := -framework OpenGL
 else
@@ -29,7 +31,7 @@ APEXIMGUI_GL_LIBS := $(shell $(PKG_CONFIG) --libs gl 2>/dev/null)
 endif
 
 APEXIMGUI_CPPFLAGS := $(CPPFLAGS) -I$(SRC_DIR) -Ithird_party/imgui -Ithird_party/imgui/backends -Ithird_party/ImGuiFileDialog $(APEXIMGUI_SDL_CFLAGS) -pthread
-APEXIMGUI_LDLIBS := $(APEXIMGUI_SDL_LIBS) $(APEXIMGUI_GL_LIBS) -pthread
+APEXIMGUI_LDLIBS := $(APEXIMGUI_SDL_LIBS) $(APEXIMGUI_GL_LIBS) $(APEXIMGUI_PLATFORM_LIBS) -pthread
 APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 	$(BUILD_DIR)/apeximgui_data.o \
 	$(BUILD_DIR)/apeximgui_analysis.o \
