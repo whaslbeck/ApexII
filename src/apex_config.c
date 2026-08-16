@@ -218,7 +218,8 @@ static int reserved_symbol_name(const char *s)
     return 0;
 }
 
-static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t value)
+static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t value,
+                              uint32_t length)
 {
     size_t i;
 
@@ -234,13 +235,20 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
     if (value > 0xffffu) {
         die("symbol '%s' value out of range", name);
     }
+    if (length == 0u) {
+        length = 1u;
+    }
+    if ((uint32_t)value + length > 0x10000u) {
+        die("symbol '%s' block extends past 0xffff", name);
+    }
     for (i = 0; i < symbols->count; i++) {
         if (strcmp(symbols->items[i].name, name) == 0) {
-            if (symbols->items[i].value != value) {
+            if (symbols->items[i].value != value || symbols->items[i].length != length) {
                 if (!g_config_override) {
                     die("symbol '%s' is defined more than once", name);
                 }
                 symbols->items[i].value = value;   /* later definition wins */
+                symbols->items[i].length = length;
             }
             return;
         }
@@ -257,6 +265,7 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
     }
     symbols->items[symbols->count].name = dup_string(name);
     symbols->items[symbols->count].value = value;
+    symbols->items[symbols->count].length = length;
     symbols->count++;
 }
 
@@ -265,7 +274,7 @@ int config_valid_symbol_name(const char *name)
     return name && *name && valid_symbol_name(name) && !reserved_symbol_name(name);
 }
 
-int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value)
+int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, uint32_t length)
 {
     size_t i;
     ConfigSymbol *new_items;
@@ -274,9 +283,16 @@ int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value)
     if (!symbols || !config_valid_symbol_name(name) || value > 0xffffu) {
         return 1;
     }
+    if (length == 0u) {
+        length = 1u;
+    }
+    if ((uint32_t)value + length > 0x10000u) {
+        return 1;
+    }
     for (i = 0; i < symbols->count; i++) {
         if (strcmp(symbols->items[i].name, name) == 0) {
             symbols->items[i].value = value;
+            symbols->items[i].length = length;
             return 0;
         }
     }
@@ -290,6 +306,7 @@ int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value)
     }
     symbols->items[symbols->count].name  = dup_string(name);
     symbols->items[symbols->count].value = value;
+    symbols->items[symbols->count].length = length;
     symbols->count++;
     return 0;
 }
@@ -1501,13 +1518,23 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             free(value);
         } else if (in_symbols) {
             uint32_t value;
+            uint32_t length = 1u;
             char *key = s;
             char *value_text = dup_config_value(eq + 1);
+            /* "0xADDR" or "0xADDR, LEN" where LEN is the block byte length
+               (decimal or 0x-hex). */
+            char *comma = strchr(value_text, ',');
 
-            if (!parse_u32(value_text, &value)) {
+            if (comma) {
+                *comma = '\0';
+                if (!parse_u32(trim(comma + 1), &length) || length == 0u) {
+                    die("invalid symbol length '%s = %s'", key, value_text);
+                }
+            }
+            if (!parse_u32(trim(value_text), &value)) {
                 die("invalid symbol config '%s = %s'", key, value_text);
             }
-            add_config_symbol(symbols, key, value);
+            add_config_symbol(symbols, key, value, length);
             free(value_text);
         } else if (in_data) {
             uint32_t addr;

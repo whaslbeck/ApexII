@@ -329,6 +329,26 @@ DMD_FRAMEBUFFER  = 0x3800
 
 Symbol names follow the same naming rules as labels.
 
+**Block length.** A symbol may name a **multi-byte block** by giving its byte
+length after the address (decimal or `0x`-hex; default 1):
+
+```ini
+[symbols]
+Score_P1 = 0x0150, 4       ; a 4-byte block
+SW_STATE = 0x002a, 8
+Buf      = 0x0200, 0x10    ; hex length
+```
+
+An **address operand** that lands inside a block resolves to `NAME+offset` instead
+of a raw address — `LDB 0x0152` renders `LDB Score_P1+2`; an exact hit stays the
+bare `Score_P1`. This re-assembles byte-for-byte (`apexasm` evaluates `SYM+n`).
+The equate is annotated with the block size (`Score_P1 = 0x0150 ; 4-byte block`).
+
+Only symbols with a length > 1 produce `+offset` output, so configs without
+lengths are unchanged. Nested/overlapping blocks resolve to the **tightest**
+(highest-start) owner, which lets a struct name its sub-fields. Resolution in
+**immediate** operands additionally obeys [`min_immediate_symbol`](#options).
+
 ### `[docs]`
 
 Attaches a documentation string to any address — code, table, or data. The string is emitted as a `; doc …` comment in the disassembly.

@@ -580,6 +580,7 @@ struct UiState {
     bool show_symbols_editor;
     char sym_edit_name[64];
     char sym_edit_value[16];
+    char sym_edit_length[16];  /* block byte length (dec or 0x-hex); empty/1 = single byte */
     int  sym_selected;       /* index into project->symbols, -1 = none */
     int  sym_usages_sel;
     const ApexRenderedDocument *sym_usages_doc;
@@ -731,6 +732,7 @@ struct SnapshotType {
 struct SnapshotSymbol {
     std::string name;
     uint32_t    value;
+    uint32_t    length;
 };
 
 struct OriginalSnapshot {

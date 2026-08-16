@@ -2551,7 +2551,8 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
         s.types.push_back(std::move(st));
     }
     for (size_t i = 0; i < p->symbols.count; i++) {
-        s.symbols.push_back({p->symbols.items[i].name, p->symbols.items[i].value});
+        s.symbols.push_back({p->symbols.items[i].name, p->symbols.items[i].value,
+                             p->symbols.items[i].length});
     }
     return s;
 }
@@ -2939,11 +2940,16 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     for (size_t i = 0; i < p->symbols.count; i++) {
         const char *sname = p->symbols.items[i].name;
         uint32_t    sval  = p->symbols.items[i].value;
+        uint32_t    slen  = p->symbols.items[i].length;
         bool found = false;
         for (auto &ss : s->symbols) {
-            if (ss.name == sname) { found = true; if (ss.value != sval) csym.push_back({sname, sval}); break; }
+            if (ss.name == sname) {
+                found = true;
+                if (ss.value != sval || ss.length != slen) csym.push_back({sname, sval, slen});
+                break;
+            }
         }
-        if (!found) csym.push_back({sname, sval});
+        if (!found) csym.push_back({sname, sval, slen});
     }
     for (auto &ss : s->symbols) {
         bool still_there = false;
@@ -3060,7 +3066,11 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     if (!csym.empty()) {
         fputs("\n[symbols]\n", o);
         for (auto &sym : csym) {
-            fprintf(o, "%s = 0x%04x\n", sym.name.c_str(), sym.value & 0xffffu);
+            if (sym.length > 1u)
+                fprintf(o, "%s = 0x%04x, %u\n", sym.name.c_str(), sym.value & 0xffffu,
+                        (unsigned)sym.length);
+            else
+                fprintf(o, "%s = 0x%04x\n", sym.name.c_str(), sym.value & 0xffffu);
         }
     }
     fclose(o);
@@ -3115,8 +3125,13 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
     }
     if (p->symbols.count > 0) {
         fputs("\n[symbols]\n", o);
-        for (size_t i = 0; i < p->symbols.count; i++)
-            fprintf(o, "%s = 0x%04x\n", p->symbols.items[i].name, p->symbols.items[i].value);
+        for (size_t i = 0; i < p->symbols.count; i++) {
+            if (p->symbols.items[i].length > 1u)
+                fprintf(o, "%s = 0x%04x, %u\n", p->symbols.items[i].name,
+                        p->symbols.items[i].value, (unsigned)p->symbols.items[i].length);
+            else
+                fprintf(o, "%s = 0x%04x\n", p->symbols.items[i].name, p->symbols.items[i].value);
+        }
     }
     if (p->config_labels.count > 0) {
         fputs("\n[labels]\n", o);

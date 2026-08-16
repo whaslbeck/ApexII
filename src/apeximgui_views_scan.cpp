@@ -2198,7 +2198,7 @@ void render_nvram_import_window(ApexProject *project,
         int applied = 0;
         for (auto &r : rows) {
             if (!r.selected) continue;
-            apex_project_set_symbol(project, r.name.c_str(), r.addr);
+            apex_project_set_symbol(project, r.name.c_str(), r.addr, 1u);
             if (!r.doc.empty())
                 apex_project_set_doc(project, 0, 0, r.addr, r.doc.c_str());
             applied++;

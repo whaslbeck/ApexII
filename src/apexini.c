@@ -362,8 +362,13 @@ static void write_cfg_ex(FILE *f, Cfg *c, AddrFn addr_fn)
 
     if (c->syms.count) {
         fputs("\n[symbols]\n", f);
-        for (i = 0; i < c->syms.count; i++)
-            fprintf(f, "%s = 0x%04x\n", c->syms.items[i].name, c->syms.items[i].value);
+        for (i = 0; i < c->syms.count; i++) {
+            if (c->syms.items[i].length > 1u)
+                fprintf(f, "%s = 0x%04x, %u\n", c->syms.items[i].name,
+                        c->syms.items[i].value, (unsigned)c->syms.items[i].length);
+            else
+                fprintf(f, "%s = 0x%04x\n", c->syms.items[i].name, c->syms.items[i].value);
+        }
     }
 
     if (c->labels.count) {

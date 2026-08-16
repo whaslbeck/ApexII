@@ -669,6 +669,41 @@ const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols)
     return NULL;
 }
 
+/* Resolve `addr` against the symbol table honouring block lengths: an exact match
+   returns the bare name; an address inside a length>1 block returns "NAME+offset"
+   (formatted into `scratch`).  Exact matches win over block containment.  Returns
+   NULL if no symbol covers the address. */
+const char *symbol_ref_at(uint32_t addr, const ConfigSymbols *symbols, char *scratch,
+                          size_t scratch_sz)
+{
+    size_t i;
+    const ConfigSymbol *best = NULL;
+
+    if (!symbols) {
+        return NULL;
+    }
+    for (i = 0; i < symbols->count; i++) {
+        if (symbols->items[i].value == addr) {
+            return symbols->items[i].name;   /* exact match wins */
+        }
+    }
+    for (i = 0; i < symbols->count; i++) {
+        const ConfigSymbol *s = &symbols->items[i];
+        if (s->length > 1u && addr > s->value && addr < s->value + s->length) {
+            /* nearest (highest) block start containing addr, so nested/adjacent
+               blocks pick the tightest owner */
+            if (!best || s->value > best->value) {
+                best = s;
+            }
+        }
+    }
+    if (best && scratch) {
+        snprintf(scratch, scratch_sz, "%s+%u", best->name, (unsigned)(addr - best->value));
+        return scratch;
+    }
+    return NULL;
+}
+
 int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count,
                   int sorted)
 {
@@ -731,8 +766,10 @@ static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr)
 
 const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
 {
-    const LabelLookup *lookup = (const LabelLookup *)ctx;
-    const char *name = symbol_name_at(addr, lookup->symbols);
+    LabelLookup *lookup = (LabelLookup *)ctx;
+    /* Address operands resolve mid-block accesses to "SYM+offset". */
+    const char *name = symbol_ref_at(addr, lookup->symbols, lookup->sym_ref,
+                                     sizeof(lookup->sym_ref));
 
     if (name) {
         return name;
@@ -746,10 +783,11 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
    addresses) still resolve, and address operands keep using lookup_label_for_cpu. */
 const char *lookup_label_for_imm(void *ctx, uint32_t addr)
 {
-    const LabelLookup *lookup = (const LabelLookup *)ctx;
+    LabelLookup *lookup = (LabelLookup *)ctx;
 
     if (!(lookup->min_immediate_symbol && addr < lookup->min_immediate_symbol)) {
-        const char *name = symbol_name_at(addr, lookup->symbols);
+        const char *name = symbol_ref_at(addr, lookup->symbols, lookup->sym_ref,
+                                         sizeof(lookup->sym_ref));
         if (name) {
             return name;
         }

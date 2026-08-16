@@ -145,7 +145,8 @@ int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank,
 int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32_t addr,
                                 uint8_t *out_target_bank, uint8_t *out_type,
                                 uint32_t *out_bank_load);
-int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value);
+int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value,
+                            uint32_t length);
 int apex_project_clear_symbol(ApexProject *project, const char *name);
 
 /* Undo/redo of config edits -----------------------------------------------

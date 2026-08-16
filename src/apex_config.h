@@ -89,6 +89,7 @@ typedef struct {
 typedef struct {
     const char *name;
     uint32_t value;
+    uint32_t length;   /* byte span of the named block; 1 = single byte (default) */
 } ConfigSymbol;
 
 typedef struct ConfigSymbols {
@@ -272,7 +273,7 @@ int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t 
 int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr);
 
 int config_valid_symbol_name(const char *name);
-int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value);
+int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, uint32_t length);
 int config_clear_symbol(ConfigSymbols *symbols, const char *name);
 
 #endif

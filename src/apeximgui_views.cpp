@@ -4025,6 +4025,15 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
             val_ok = (ep && *ep == '\0' && parsed_val <= 0xffffu);
         }
     }
+    /* Optional block length (decimal or 0x-hex); empty = 1. */
+    unsigned long parsed_len = 1;
+    bool len_ok = true;
+    if (s->sym_edit_length[0]) {
+        char *ep = NULL;
+        parsed_len = strtoul(s->sym_edit_length, &ep, 0);
+        len_ok = (ep && *ep == '\0' && parsed_len >= 1 && parsed_len <= 0x10000u &&
+                  parsed_val + parsed_len <= 0x10000u);
+    }
 
     ImGui::SetNextItemWidth(160.0f);
     ImGui::InputTextWithHint("##sym_name", "NAME", s->sym_edit_name, sizeof(s->sym_edit_name));
@@ -4032,15 +4041,22 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
     ImGui::SetNextItemWidth(90.0f);
     ImGui::InputTextWithHint("##sym_val", "0x0000", s->sym_edit_value, sizeof(s->sym_edit_value));
     ImGui::SameLine();
+    ImGui::SetNextItemWidth(70.0f);
+    ImGui::InputTextWithHint("##sym_len", "len", s->sym_edit_length, sizeof(s->sym_edit_length));
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("block byte length (decimal or 0x-hex); empty = 1.\n"
+                          "A length > 1 resolves mid-block accesses to NAME+offset.");
+    ImGui::SameLine();
 
-    bool can_submit = name_ok && val_ok;
+    bool can_submit = name_ok && val_ok && len_ok;
     if (!can_submit) ImGui::BeginDisabled();
     bool is_update = false;
     for (size_t i = 0; i < p->symbols.count; i++) {
         if (strcmp(p->symbols.items[i].name, s->sym_edit_name) == 0) { is_update = true; break; }
     }
     if (ImGui::Button(is_update ? "Update##sym" : "Add##sym")) {
-        if (apex_project_set_symbol(p, s->sym_edit_name, (uint32_t)parsed_val) == 0) {
+        if (apex_project_set_symbol(p, s->sym_edit_name, (uint32_t)parsed_val,
+                                    (uint32_t)parsed_len) == 0) {
             s->overlay_dirty = true;
             s->labels_valid  = false;
         }
@@ -4051,6 +4067,8 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "invalid name");
     else if (!val_ok && s->sym_edit_value[0])
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "value must be 0x0000..0xffff");
+    else if (!len_ok)
+        ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "length must keep the block within 0xffff");
 
     ImGui::Separator();
 
@@ -4095,10 +4113,19 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
                          p->symbols.items[i].name);
                 snprintf(s->sym_edit_value, sizeof(s->sym_edit_value), "0x%04x",
                          p->symbols.items[i].value);
+                if (p->symbols.items[i].length > 1u)
+                    snprintf(s->sym_edit_length, sizeof(s->sym_edit_length), "%u",
+                             (unsigned)p->symbols.items[i].length);
+                else
+                    s->sym_edit_length[0] = '\0';
             }
 
             ImGui::TableSetColumnIndex(1);
-            ImGui::Text("0x%04x", p->symbols.items[i].value);
+            if (p->symbols.items[i].length > 1u)
+                ImGui::Text("0x%04x [%u]", p->symbols.items[i].value,
+                            (unsigned)p->symbols.items[i].length);
+            else
+                ImGui::Text("0x%04x", p->symbols.items[i].value);
 
             ImGui::TableSetColumnIndex(2);
             ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.6f, 0.1f, 0.1f, 1.0f));

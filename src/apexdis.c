@@ -1035,8 +1035,14 @@ static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols, const C
         if ((symbols->items[i].value & 0xffffu) < APEX_SYSTEM_ORG) {
             emit_doc_comment(out, config_doc_at(docs, 0xffu, symbols->items[i].value));
         }
-        fprintf(out, "%s = 0x%04x\n", symbols->items[i].name,
-                (unsigned)symbols->items[i].value & 0xffffu);
+        if (symbols->items[i].length > 1u) {
+            fprintf(out, "%s = 0x%04x ; %u-byte block\n", symbols->items[i].name,
+                    (unsigned)symbols->items[i].value & 0xffffu,
+                    (unsigned)symbols->items[i].length);
+        } else {
+            fprintf(out, "%s = 0x%04x\n", symbols->items[i].name,
+                    (unsigned)symbols->items[i].value & 0xffffu);
+        }
     }
     fputc('\n', out);
 }

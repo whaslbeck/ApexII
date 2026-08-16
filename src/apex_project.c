@@ -2814,11 +2814,11 @@ int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32
     return 0;
 }
 
-int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value)
+int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value, uint32_t length)
 {
     if (!project) return 1;
     project_record_edit(project, "set symbol");
-    if (config_set_symbol(&project->symbols, name, value) != 0) return 1;
+    if (config_set_symbol(&project->symbols, name, value, length) != 0) return 1;
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;

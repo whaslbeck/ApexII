@@ -55,6 +55,9 @@ typedef struct {
        equate whose value is below this is NOT resolved (0 = resolve all).  Only
        consulted by lookup_label_for_imm; address operands are unaffected. */
     uint32_t min_immediate_symbol;
+    /* Scratch for a "SYM+offset" block reference; the callback returns a pointer
+       into this and format_addr copies it out immediately. */
+    char sym_ref[80];
 } LabelLookup;
 
 typedef struct {
@@ -130,6 +133,8 @@ size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr);
 size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr);
 const char *lookup_label_for_cpu(void *ctx, uint32_t addr);
 const char *lookup_label_for_imm(void *ctx, uint32_t addr);
+const char *symbol_ref_at(uint32_t addr, const ConfigSymbols *symbols, char *scratch,
+                          size_t scratch_sz);
 const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables);
 int in_system_addr(uint32_t addr);
 int scannable_code_addr(uint32_t addr, size_t used);
