@@ -342,10 +342,13 @@ il_rom="$OUT/inline_length.rom"
 "$ROOT/build/apexdis" "$il_rom" "$OUT/il_ok.asm" "$ROOT/tests/inline_length_ok.ini" 2>/dev/null
 "$ROOT/build/apexdis" "$il_rom" "$OUT/il_bad.asm" "$ROOT/tests/inline_length_bad.ini" 2>/dev/null
 "$ROOT/build/apexasm" "$OUT/il_ok_rt.rom" "$OUT/il_ok.asm" 2>/dev/null
+"$ROOT/build/apexdis" "$il_rom" "$OUT/il_ack.asm" "$ROOT/tests/inline_length_ack.ini" 2>/dev/null
 if ! grep -q 'inline_length_mismatch' "$OUT/il_ok.asm" &&
     grep -q 'WARNING inline_length_mismatch bank=0xff cpu=0x8009 configured=3 stack_adjust=5' \
         "$OUT/il_bad.asm" &&
-    cmp -s "$il_rom" "$OUT/il_ok_rt.rom"; then
+    cmp -s "$il_rom" "$OUT/il_ok_rt.rom" &&
+    grep -q 'WARNING_ACK inline_length_mismatch bank=0xff cpu=0x8009' "$OUT/il_ack.asm" &&
+    ! grep -q '; WARNING inline_length_mismatch' "$OUT/il_ack.asm"; then
     printf 'PASS check_inline_length\n'
 else
     printf 'FAIL check_inline_length\n' >&2
@@ -368,6 +371,66 @@ if grep -q 'INLINE_BYTES_UNTIL 0x05, 0xf0, 0x03, 0x00' "$OUT/iv.asm" &&
     printf 'PASS inline_variable\n'
 else
     printf 'FAIL inline_variable\n' >&2
+    exit 1
+fi
+
+# A [labels] entry inside a bytes[N] data range must be emitted as a definition
+# (the raw-bytes emitter breaks the row there) so a reference to it re-assembles.
+lid_rom="$OUT/label_in_data.rom"
+"$ROOT/build/apexasm" "$lid_rom" "$ROOT/tests/label_in_data.asm"
+"$ROOT/build/apexdis" "$lid_rom" "$OUT/lid.asm" "$ROOT/tests/label_in_data.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/lid_rt.rom" "$OUT/lid.asm" 2>/dev/null
+if grep -q '^MyBlock:' "$OUT/lid.asm" &&
+    grep -q 'LDX #MyBlock' "$OUT/lid.asm" &&
+    cmp -s "$lid_rom" "$OUT/lid_rt.rom"; then
+    printf 'PASS label_in_data\n'
+else
+    printf 'FAIL label_in_data\n' >&2
+    exit 1
+fi
+
+# Symbol block lengths: an address inside a length>1 [symbols] block resolves to
+# NAME+offset (exact hit = bare name); it round-trips (apexasm evaluates SYM+n)
+# and normalize preserves the length.  Immediates obey min_immediate_symbol.
+sb_rom="$OUT/symbol_block.rom"
+"$ROOT/build/apexasm" "$sb_rom" "$ROOT/tests/symbol_block.asm"
+"$ROOT/build/apexdis" "$sb_rom" "$OUT/sb.asm" "$ROOT/tests/symbol_block.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/sb_rt.rom" "$OUT/sb.asm" 2>/dev/null
+"$ROOT/build/apexini" normalize "$ROOT/tests/symbol_block.ini" "$OUT/sb_norm.ini" 2>/dev/null
+printf '[options]\nmin_immediate_symbol = 0x200\n\n[symbols]\nScore_P1 = 0x0150, 4\nBuf = 0x0200, 0x10\n\n[entries]\n0x8000 = code\n' \
+    > "$OUT/sb_minimm.ini"
+"$ROOT/build/apexdis" "$sb_rom" "$OUT/sb_mi.asm" "$OUT/sb_minimm.ini" 2>/dev/null
+if grep -q 'LDB Score_P1+2' "$OUT/sb.asm" &&
+    grep -q 'STA Score_P1+3' "$OUT/sb.asm" &&
+    grep -q 'LDX #Score_P1' "$OUT/sb.asm" &&
+    grep -q 'LDU Buf+5' "$OUT/sb.asm" &&
+    cmp -s "$sb_rom" "$OUT/sb_rt.rom" &&
+    grep -q 'Score_P1 = 0x0150, 4' "$OUT/sb_norm.ini" &&
+    grep -q 'LDB Score_P1+2' "$OUT/sb_mi.asm" &&
+    grep -q 'LDX #0x0150' "$OUT/sb_mi.asm"; then
+    printf 'PASS symbol_block\n'
+else
+    printf 'FAIL symbol_block\n' >&2
+    exit 1
+fi
+
+# Multi-plane DMD frames: dmd_fullframe[N] consumes N planes; the config survives
+# normalize; and report_dmd_short flags a frame classified with too few planes.
+dmdmp_rom="$OUT/dmd_multiplane.rom"
+"$ROOT/build/apexasm" "$dmdmp_rom" "$ROOT/tests/dmd_multiplane.asm"
+"$ROOT/build/apexdis" "$dmdmp_rom" "$OUT/dmdmp.asm" "$ROOT/tests/dmd_multiplane.ini" 2>/dev/null
+"$ROOT/build/apexasm" "$OUT/dmdmp_rt.rom" "$OUT/dmdmp.asm" 2>/dev/null
+"$ROOT/build/apexini" normalize "$ROOT/tests/dmd_multiplane.ini" "$OUT/dmdmp_norm.ini" 2>/dev/null
+"$ROOT/build/apexdis" "$dmdmp_rom" "$OUT/dmdmp_short.asm" "$ROOT/tests/dmd_multiplane_short.ini" \
+    2>/dev/null
+if grep -q 'planes=2 decoder=0x01 consumed=16' "$OUT/dmdmp.asm" &&
+    cmp -s "$dmdmp_rom" "$OUT/dmdmp_rt.rom" &&
+    grep -q 'dmd_fullframe\[2\]' "$OUT/dmdmp_norm.ini" &&
+    grep -q 'WARNING dmd_decode_short bank=0xff cpu=0x8000 planes=1 decoded=8 suggest_planes=2 full=16' \
+        "$OUT/dmdmp_short.asm"; then
+    printf 'PASS dmd_multiplane\n'
+else
+    printf 'FAIL dmd_multiplane\n' >&2
     exit 1
 fi
 

@@ -1473,7 +1473,9 @@ static void emit_db_line(FILE *out, uint32_t addr, const uint8_t *data, size_t c
 }
 
 static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
-                            size_t *pos, size_t count);
+                            size_t *pos, size_t count,
+                            const Label *labels, size_t label_count,
+                            const Label *extra_labels, size_t extra_label_count);
 
 
 static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
@@ -1587,15 +1589,34 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
             }
         }
         if (*pos < row_start + row_width) {
-            emit_data_bytes(out, data, len, base_addr, pos, row_start + row_width - *pos);
+            emit_data_bytes(out, data, len, base_addr, pos, row_start + row_width - *pos,
+                        labels, label_count, extra_labels, extra_label_count);
         }
     }
 }
 
+/* Emit any label definitions configured at `addr` as bare `Name:` lines. */
+static void emit_bare_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
+                                const Label *extra_labels, size_t extra_label_count)
+{
+    size_t li;
+    for (li = label_lower_bound(labels, label_count, addr);
+         li < label_count && labels[li].addr == addr; li++) {
+        fprintf(out, "%s:\n", labels[li].name);
+    }
+    for (li = label_lower_bound(extra_labels, extra_label_count, addr);
+         li < extra_label_count && extra_labels[li].addr == addr; li++) {
+        fprintf(out, "%s:\n", extra_labels[li].name);
+    }
+}
+
 static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
-                            size_t *pos, size_t count)
+                            size_t *pos, size_t count,
+                            const Label *labels, size_t label_count,
+                            const Label *extra_labels, size_t extra_label_count)
 {
     size_t end = *pos + count;
+    size_t start = *pos;
 
     if (end > len) {
         end = len;
@@ -1604,9 +1625,22 @@ static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t
         size_t col = 0;
         size_t line_start = *pos;
 
+        /* A configured label inside a raw-bytes range would otherwise be swallowed
+           (the outer loop only labels the range start), so far-pointer references
+           to it can't resolve.  Emit it here and break the row at its address —
+           byte output is unchanged, so the round-trip holds. */
+        if (*pos > start) {
+            emit_bare_labels_at(out, base_addr + (uint32_t)*pos, labels, label_count,
+                                extra_labels, extra_label_count);
+        }
         while (*pos < end && col < 16) {
             (*pos)++;
             col++;
+            if (*pos > start && *pos < end &&
+                (labels_at(base_addr + (uint32_t)*pos, labels, label_count, 1) ||
+                 labels_at(base_addr + (uint32_t)*pos, extra_labels, extra_label_count, 1))) {
+                break; /* stop before the next label so it starts a fresh row */
+            }
         }
         emit_db_line(out, base_addr + (uint32_t)line_start, data + line_start, col);
     }
@@ -1719,7 +1753,8 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             }
             total += consumed;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, total);
+        emit_data_bytes(out, data, len, base_addr, pos, total,
+                        labels, label_count, extra_labels, extra_label_count);
         return 1;
     }
     if (range->kind == DATA_SPRITE) {
@@ -1735,7 +1770,8 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
                     warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu);
             consumed = 1u;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, consumed);
+        emit_data_bytes(out, data, len, base_addr, pos, consumed,
+                        labels, label_count, extra_labels, extra_label_count);
         return 1;
     }
     if (range->kind == DATA_SPRITE_NOHEADER) {
@@ -1752,10 +1788,12 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
                     (unsigned long)range->length);
             consumed = 1u;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, consumed);
+        emit_data_bytes(out, data, len, base_addr, pos, consumed,
+                        labels, label_count, extra_labels, extra_label_count);
         return 1;
     }
-    emit_data_bytes(out, data, len, base_addr, pos, range->length);
+    emit_data_bytes(out, data, len, base_addr, pos, range->length,
+                        labels, label_count, extra_labels, extra_label_count);
     return 1;
 }
 
