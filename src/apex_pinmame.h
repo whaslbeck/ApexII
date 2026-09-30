@@ -14,48 +14,49 @@
    gives {"cpus":[{"pc":35939,...}]}, coverage gives {"addr":16384,"bank":30,
    "executed":[0,1,...]}, memory gives {"data":[62,125,...]}. */
 
-#include <stdint.h>
-#include <stddef.h>
-#include <sys/types.h>
-#include <string>
-#include <vector>
-#include <thread>
-#include <mutex>
 #include <atomic>
+#include <mutex>
+#include <stddef.h>
+#include <stdint.h>
+#include <string>
+#include <sys/types.h>
+#include <thread>
+#include <vector>
 
 /* Last CPU halt reported by the /api/events SSE stream (a breakpoint or
    watchpoint firing).  `seq` bumps on every halt so a poller can spot new ones;
    for a watchpoint, `has_addr` is set and `addr` is the accessed address. */
 struct ApexPinmameHalt {
     unsigned long seq = 0;
-    std::string   reason;    /* "bp" | "wp" | other */
-    long          pc = 0;
-    long          addr = 0;
-    int           bank = -1;
-    bool          has_addr = false;
+    std::string reason; /* "bp" | "wp" | other */
+    long pc = 0;
+    long addr = 0;
+    int bank = -1;
+    bool has_addr = false;
 };
 
 struct ApexPinmame {
-    pid_t       pid     = -1;
-    int         port    = 0;
-    bool        running = false;   /* we launched a child that is (was) alive */
+    pid_t pid = -1;
+    int port = 0;
+    bool running = false; /* we launched a child that is (was) alive */
     std::string last_error;
-    std::string log_path;          /* child stdout/stderr, for failure diagnostics */
+    std::string log_path; /* child stdout/stderr, for failure diagnostics */
 
     /* Background reader of the /api/events SSE stream (halt notifications). */
-    std::thread       ev_thread;
+    std::thread ev_thread;
     std::atomic<bool> ev_stop{false};
-    std::mutex        ev_mtx;       /* guards ev_halt */
-    ApexPinmameHalt   ev_halt;
-    bool              ev_running = false;
+    std::mutex ev_mtx; /* guards ev_halt */
+    ApexPinmameHalt ev_halt;
+    bool ev_running = false;            /* thread started and not yet joined */
+    std::atomic<bool> ev_exited{false}; /* the reader gave up (emulator gone) */
 };
 
 struct ApexPinmameInfo {
-    bool        valid    = false;
+    bool valid = false;
     std::string game;
     std::string description;
-    int         paused   = -1;
-    int         wpc_bank = -1;
+    int paused = -1;
+    int wpc_bank = -1;
 };
 
 struct ApexPinmameCpu {
@@ -66,8 +67,8 @@ struct ApexPinmameCpu {
 /* Launch xpinmamed headless & paused for `game`, listening on `port`.  Returns
    true if the child was spawned (not that the HTTP server is up yet — poll
    apex_pinmame_get_info for readiness).  On failure fills pm.last_error. */
-bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
-                         const std::string &rompath, const std::string &game, int port);
+bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin, const std::string &rompath,
+                         const std::string &game, int port);
 
 /* SIGTERM the child and reap it.  Safe to call when not running. */
 void apex_pinmame_stop(ApexPinmame &pm);
@@ -91,22 +92,22 @@ bool apex_pinmame_get_cpu0(int port, ApexPinmameCpu &out);
 
 /* One breakpoint or watchpoint from /api/debugger/points (bank < 0 = system). */
 struct ApexPinmamePoint {
-    int         idx = 0;
-    int         is_wp = 0;   /* 0 = breakpoint, 1 = watchpoint */
-    long        addr = 0;
-    int         bank = -1;
-    long        hits = 0;
-    int         mode = 0;    /* watchpoints: 1=r 2=w 3=rw */
-    int         len = 1;     /* watchpoints: byte length */
-    std::string cond;        /* condition expression, if any */
+    int idx = 0;
+    int is_wp = 0; /* 0 = breakpoint, 1 = watchpoint */
+    long addr = 0;
+    int bank = -1;
+    long hits = 0;
+    int mode = 0;     /* watchpoints: 1=r 2=w 3=rw */
+    int len = 1;      /* watchpoints: byte length */
+    std::string cond; /* condition expression, if any */
 };
 
 /* One switch from /api/switches. */
 struct ApexPinmameSwitch {
-    int         num = 0;
-    int         col = -1;
-    int         row = -1;
-    int         active = 0;
+    int num = 0;
+    int col = -1;
+    int row = -1;
+    int active = 0;
     std::string name;
 };
 
@@ -116,10 +117,8 @@ bool apex_pinmame_control(int port, const char *cmd);
 
 /* Add/clear a bank-aware breakpoint or watchpoint.  cmd is "add" or "clear"
    (clear ignores the other args).  bank < 0 omits the bank (system window). */
-bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank,
-                             const char *cond);
-bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank,
-                             int len, int mode);
+bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond);
+bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len, int mode);
 
 /* Inject a switch: val 0/1; pulse_ms > 0 holds for that long then restores. */
 bool apex_pinmame_input(int port, int sw, int val, int pulse_ms);
@@ -133,26 +132,41 @@ bool apex_pinmame_switches(int port, std::vector<ApexPinmameSwitch> &out);
    for watchpoints, len/mode). */
 bool apex_pinmame_point_delete(int port, int is_wp, int idx);
 
+/* Temporarily replace all points of one type: stash the current ones into
+   `saved`, clear the type (a collector then adds its own temporary point), and
+   later restore exactly the stashed set. */
+bool apex_pinmame_points_stash(int port, int is_wp, std::vector<ApexPinmamePoint> &saved);
+void apex_pinmame_points_restore(int port, int is_wp, const std::vector<ApexPinmamePoint> &saved);
+
 /* Start/stop the background SSE reader that captures halt events (needs a live
    connection).  apex_pinmame_stop also stops it. */
 void apex_pinmame_events_start(ApexPinmame &pm);
+/* True while the reader thread is running (not stopped, not given up). */
+bool apex_pinmame_events_active(const ApexPinmame &pm);
 void apex_pinmame_events_stop(ApexPinmame &pm);
 /* Copy the last captured halt; returns false if none seen yet. */
 bool apex_pinmame_get_halt(ApexPinmame &pm, ApexPinmameHalt &out);
 
 /* Per-address execution counters (/api/debugger/instrument) — for a call hotlist. */
-struct ApexPinmameCount { long addr; int bank; long count; };
+struct ApexPinmameCount {
+    long addr;
+    int bank;
+    long count;
+};
 bool apex_pinmame_instrument(int port, const char *cmd, unsigned addr, int bank);
 bool apex_pinmame_instrument_read(int port, std::vector<ApexPinmameCount> &out);
 
 /* Recent-instruction ring (/api/debugger/exectrace) — for an execution backtrace. */
-struct ApexPinmameTrace { long pc; int bank; long a, b, x; };
-bool apex_pinmame_exectrace_cmd(int port, const char *cmd);   /* start|stop|clear */
+struct ApexPinmameTrace {
+    long pc;
+    int bank;
+    long a, b, x;
+};
+bool apex_pinmame_exectrace_cmd(int port, const char *cmd); /* start|stop|clear */
 bool apex_pinmame_exectrace(int port, std::vector<ApexPinmameTrace> &out);
 
 /* Read `size` bytes from CPU address `addr` (bank < 0 = no bank param). */
-bool apex_pinmame_memory(int port, unsigned addr, int size, int bank,
-                         std::vector<uint8_t> &out);
+bool apex_pinmame_memory(int port, unsigned addr, int size, int bank, std::vector<uint8_t> &out);
 
 /* Fetch the live DMD framebuffer: /api/dmd/info for w/h, /api/dmd/raw for one
    luminance byte per pixel (w*h bytes). */

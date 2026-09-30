@@ -3,10 +3,7 @@
 #include <stdio.h>
 #include <string.h>
 
-enum {
-    WRITE_TYPE_COLUMNS = 1,
-    WRITE_TYPE_ROWS = 2
-};
+enum { WRITE_TYPE_COLUMNS = 1, WRITE_TYPE_ROWS = 2 };
 
 /* Source reader shared by the byte-oriented and bit-stream decoders.  `pos` is
    the running offset from the start of the encoded frame (offset 0 is the type
@@ -21,16 +18,14 @@ typedef struct {
     int bad;
 } DmdReader;
 
-static uint8_t reverse_bits(uint8_t value)
-{
+static uint8_t reverse_bits(uint8_t value) {
     value = (uint8_t)(((value & 0x55u) << 1) | ((value >> 1) & 0x55u));
     value = (uint8_t)(((value & 0x33u) << 2) | ((value >> 2) & 0x33u));
     value = (uint8_t)((value << 4) | (value >> 4));
     return value;
 }
 
-static uint8_t rd_byte(DmdReader *r)
-{
+static uint8_t rd_byte(DmdReader *r) {
     if (r->pos >= r->size) {
         r->bad = 1;
         return 0u;
@@ -40,8 +35,7 @@ static uint8_t rd_byte(DmdReader *r)
 
 /* Read a single bit (MSB first), advancing to the next source byte once all 8
    bits are consumed.  Mirrors WPCEdit's readNextBit(). */
-static unsigned rd_bit(DmdReader *r)
-{
+static unsigned rd_bit(DmdReader *r) {
     unsigned bit;
 
     if (r->pos >= r->size) {
@@ -60,8 +54,7 @@ static unsigned rd_bit(DmdReader *r)
 /* Read one 8-bit value from the bit stream.  A leading 1 selects a dictionary
    entry (count of following 1-bits, max 7, indexes RepeatBytes[]); a leading 0
    is followed by 8 literal bits.  Mirrors WPCEdit's readNext8BitValue(). */
-static uint8_t rd_stream_value(DmdReader *r, const uint8_t *repeat_bytes)
-{
+static uint8_t rd_stream_value(DmdReader *r, const uint8_t *repeat_bytes) {
     if (rd_bit(r)) {
         int ones = 0;
         int i;
@@ -90,8 +83,7 @@ static uint8_t rd_stream_value(DmdReader *r, const uint8_t *repeat_bytes)
 }
 
 static void write_next_8bit_value(uint8_t *dest, size_t *write_counter, uint8_t value,
-                                  uint8_t type)
-{
+                                  uint8_t type) {
     size_t count = *write_counter;
     size_t index;
 
@@ -115,8 +107,7 @@ static void write_next_8bit_value(uint8_t *dest, size_t *write_counter, uint8_t 
    page" semantics (the JS `do { } while (--count && ...)` decrements 0 into a
    negative, so only the page-full check stops it). */
 static void emit_repeat(uint8_t *dest, size_t *write_counter, uint8_t value, unsigned count,
-                        uint8_t type)
-{
+                        uint8_t type) {
     unsigned remaining = count ? count : 0xffffffffu;
 
     do {
@@ -125,8 +116,7 @@ static void emit_repeat(uint8_t *dest, size_t *write_counter, uint8_t value, uns
 }
 
 /* 0x00: raw page copy, no encoding. */
-static void decode_00(DmdReader *r, uint8_t *dest)
-{
+static void decode_00(DmdReader *r, uint8_t *dest) {
     size_t i;
 
     for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
@@ -138,8 +128,7 @@ static void decode_00(DmdReader *r, uint8_t *dest)
 }
 
 /* 0x01/0x02: simple single-flag-byte repeats (columns / rows). */
-static void decode_01or02(DmdReader *r, uint8_t *dest, uint8_t type)
-{
+static void decode_01or02(DmdReader *r, uint8_t *dest, uint8_t type) {
     uint8_t special = rd_byte(r);
     size_t write_counter = 0u;
 
@@ -168,8 +157,7 @@ static void decode_01or02(DmdReader *r, uint8_t *dest, uint8_t type)
 }
 
 /* 0x04/0x05: complex repeats, 1 flag byte + 8-byte dictionary, bit stream. */
-static void decode_04or05(DmdReader *r, uint8_t *dest, uint8_t type)
-{
+static void decode_04or05(DmdReader *r, uint8_t *dest, uint8_t type) {
     uint8_t special = rd_byte(r);
     uint8_t repeat[8];
     size_t write_counter = 0u;
@@ -197,8 +185,7 @@ static void decode_04or05(DmdReader *r, uint8_t *dest, uint8_t type)
 /* 0x06/0x07: XOR-repeats.  Plane data gets 0x00 where the XOR run applies (the
    XOR overlay is an animation delta we do not reconstruct); the source-byte
    walk — and therefore the consumed length — matches the game. */
-static void decode_06or07(DmdReader *r, uint8_t *dest, uint8_t type)
-{
+static void decode_06or07(DmdReader *r, uint8_t *dest, uint8_t type) {
     uint8_t special = rd_byte(r);
     size_t write_counter = 0u;
 
@@ -223,8 +210,7 @@ static void decode_06or07(DmdReader *r, uint8_t *dest, uint8_t type)
 }
 
 /* 0x08/0x09: bulk data loads alternating with bulk skips, byte stream. */
-static void decode_08or09(DmdReader *r, uint8_t *dest, uint8_t type)
-{
+static void decode_08or09(DmdReader *r, uint8_t *dest, uint8_t type) {
     size_t write_counter = 0u;
     int looping = 1;
     uint8_t count;
@@ -283,8 +269,7 @@ static void decode_08or09(DmdReader *r, uint8_t *dest, uint8_t type)
 
 /* 0x0a/0x0b: bulk data loads alternating with bulk skips, 8-byte dictionary,
    bit stream. */
-static void decode_0aor0b(DmdReader *r, uint8_t *dest, uint8_t type)
-{
+static void decode_0aor0b(DmdReader *r, uint8_t *dest, uint8_t type) {
     uint8_t repeat[8];
     size_t write_counter = 0u;
     int looping = 1;
@@ -338,8 +323,7 @@ static void decode_0aor0b(DmdReader *r, uint8_t *dest, uint8_t type)
    — which carries its own type byte — and then reflects the top half of the
    128x32 buffer onto the bottom (rows 0..15 copied to rows 31..16), yielding a
    vertically symmetric frame.  So length(0x04) = 1 + length(inner). */
-static void dmd_reflect_top_to_bottom(uint8_t *dest)
-{
+static void dmd_reflect_top_to_bottom(uint8_t *dest) {
     unsigned i;
     for (i = 0; i < APEX_DMD_HEIGHT / 2u; i++) {
         memcpy(dest + (APEX_DMD_HEIGHT - 1u - i) * APEX_DMD_ROW_BYTES,
@@ -350,15 +334,13 @@ static void dmd_reflect_top_to_bottom(uint8_t *dest)
 static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *dest,
                                  size_t *consumed, uint8_t *type_out, int depth);
 
-int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest,
-                             size_t *consumed, uint8_t *type_out)
-{
+int apexdmd_decode_fullframe(const uint8_t *src, size_t src_size, uint8_t *dest, size_t *consumed,
+                             uint8_t *type_out) {
     return decode_fullframe_impl(src, src_size, dest, consumed, type_out, 0);
 }
 
 static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *dest,
-                                 size_t *consumed, uint8_t *type_out, int depth)
-{
+                                 size_t *consumed, uint8_t *type_out, int depth) {
     DmdReader r;
     uint8_t type;
     int bitstream = 0;
@@ -376,9 +358,8 @@ static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *d
     if (type == 0x04u) {
         size_t inner_consumed = 0;
         uint8_t inner_type = 0;
-        if (depth >= 8 ||
-            !decode_fullframe_impl(src + 1, src_size - 1u, dest, &inner_consumed, &inner_type,
-                                   depth + 1)) {
+        if (depth >= 8 || !decode_fullframe_impl(src + 1, src_size - 1u, dest, &inner_consumed,
+                                                 &inner_type, depth + 1)) {
             return 0;
         }
         dmd_reflect_top_to_bottom(dest);
@@ -386,7 +367,7 @@ static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *d
             *consumed = 1u + inner_consumed;
         }
         if (type_out) {
-            *type_out = 0x04u;  /* the recursion set it to the inner type; this frame is 0x04 */
+            *type_out = 0x04u; /* the recursion set it to the inner type; this frame is 0x04 */
         }
         return 1;
     }
@@ -450,8 +431,7 @@ static int decode_fullframe_impl(const uint8_t *src, size_t src_size, uint8_t *d
     return 1;
 }
 
-int apexdmd_write_plane_pbm(const char *path, const uint8_t *plane)
-{
+int apexdmd_write_plane_pbm(const char *path, const uint8_t *plane) {
     FILE *out;
     size_t row;
 
@@ -479,8 +459,7 @@ int apexdmd_write_plane_pbm(const char *path, const uint8_t *plane)
     return 1;
 }
 
-int apexdmd_write_pair_pgm(const char *path, const uint8_t *plane0, const uint8_t *plane1)
-{
+int apexdmd_write_pair_pgm(const char *path, const uint8_t *plane0, const uint8_t *plane1) {
     FILE *out;
     size_t row;
 

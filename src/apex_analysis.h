@@ -10,23 +10,26 @@
 typedef struct {
     uint32_t addr;
     const char *name;
-    int owns_name;          /* name was heap-allocated by a make_*_label (this set owns it) */
+    int owns_name; /* name was heap-allocated by a make_*_label (this set owns it) */
     int is_code;
     int is_data;
     int is_string;
     int is_conflict;
     int scanned;
-    int is_explicit_entry;  /* from [entries] config section */
-    int reached_by_flow;    /* flow from another entry reaches this address */
+    int is_explicit_entry; /* from [entries] config section */
+    int reached_by_flow;   /* flow from another entry reaches this address */
     const char *explain;
     const char *kind_explain;
 } Label;
+
+struct LabelAddrIndex; /* private: address -> label index hash (apex_analysis.c) */
 
 typedef struct {
     Label *items;
     size_t count;
     size_t cap;
     int sorted;
+    struct LabelAddrIndex *index; /* lazy; NULL or in sync with items[0..count) */
 } LabelSet;
 
 typedef struct {
@@ -67,7 +70,7 @@ typedef struct {
     uint32_t source_addr;
     const char *kind;
     const char *source;
-    int row_index;      /* >= 0 for table row refs, -1 otherwise */
+    int row_index;         /* >= 0 for table row refs, -1 otherwise */
     uint32_t row_cpu_addr; /* CPU address of the row entry within the table */
 } Reference;
 
@@ -85,6 +88,13 @@ int generated_string_label_name(const char *name);
 int generated_any_label_name(const char *name);
 void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count);
 Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code);
+/* Drop the lookup index; required after anything other than add_label /
+   add_owned_label reorders, removes or replaces items (sort, prune, memmove). */
+void label_set_invalidate_index(LabelSet *set);
+/* label_name_at() for a LabelSet, O(1) via the index when it is unsorted. */
+const char *label_set_name_at(LabelSet *set, uint32_t addr);
+/* Indices (ascending) of up to max labels at addr; returns the total count. */
+size_t label_set_find_all(LabelSet *set, uint32_t addr, size_t *out, size_t max);
 /* Like add_label but the set takes ownership of `name` (a make_*_label heap
    string), freeing it in free_label_set/prune — or immediately if the label
    already exists and the name is discarded. */
@@ -94,13 +104,15 @@ void explain_label_kind(Label *label, const char *source);
 void mark_label_data(Label *label);
 void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
                    uint32_t source_addr, const char *kind, const char *source);
-void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
-                              uint8_t source_bank, uint32_t source_addr, const char *source,
-                              int row_index, uint32_t row_cpu_addr);
+void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
+                             uint32_t source_addr, const char *source, int row_index,
+                             uint32_t row_cpu_addr);
 void sort_data_ranges(DataRanges *ranges);
 void sort_table_defs(TableDefs *tables);
 void sort_inline_signatures(InlineSignatures *sigs);
 void sort_and_dedup_refs(ReferenceSet *refs);
+/* Free the owned source strings (not the items array itself). */
+void free_reference_sources(ReferenceSet *refs);
 size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_bank,
                                            uint32_t source_start, uint32_t source_end);
 size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
@@ -154,16 +166,16 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
 void apply_inline_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank, uint16_t ptr);
 void apply_system_ptr16_label(TableFieldKind kind, LabelSet *system_labels, uint16_t ptr,
                               const char *source_prefix);
-void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t used,
-                         size_t *pos, uint8_t current_bank, const uint8_t *paged_rom,
-                         size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
-                         const char *source, uint32_t source_addr, ReferenceSet *refs);
+void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t used, size_t *pos,
+                         uint8_t current_bank, const uint8_t *paged_rom, size_t banks,
+                         LabelSet *bank_labels, LabelSet *system_labels, const char *source,
+                         uint32_t source_addr, ReferenceSet *refs);
 void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, LabelSet *labels,
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
-                          const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs, const ConfigEntries *ref_exclusions,
-                          const ConfigEntries *literals, const ConfigEntries *far_imms);
+                          const DataRanges *data_ranges, uint8_t current_bank, ReferenceSet *refs,
+                          const ConfigEntries *ref_exclusions, const ConfigEntries *literals,
+                          const ConfigEntries *far_imms);
 const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count);
 size_t valid_string_len(const uint8_t *data, size_t len);
 

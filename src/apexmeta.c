@@ -6,27 +6,24 @@
  */
 
 #include "apex_rominfo.h"
+
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static void usage(void)
-{
-    fprintf(stderr,
-        "usage: apexmeta <rom-file> [options]\n"
-        "\n"
-        "Options:\n"
-        "  --fix              Recompute and store a valid checksum (requires -o)\n"
-        "  --disable          Set delta=0x00FF to bypass hardware checksum check\n"
-        "                     (requires -o)\n"
-        "  -o <output.rom>    Write modified ROM to this file\n"
-        "  --verify           Exit 0 if checksum valid, 1 if invalid (no output)\n"
-    );
+static void usage(void) {
+    fprintf(stderr, "usage: apexmeta <rom-file> [options]\n"
+                    "\n"
+                    "Options:\n"
+                    "  --fix              Recompute and store a valid checksum (requires -o)\n"
+                    "  --disable          Set delta=0x00FF to bypass hardware checksum check\n"
+                    "                     (requires -o)\n"
+                    "  -o <output.rom>    Write modified ROM to this file\n"
+                    "  --verify           Exit 0 if checksum valid, 1 if invalid (no output)\n");
     exit(2);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     const char *rom_path = NULL;
     const char *out_path = NULL;
     int do_fix = 0, do_disable = 0, do_verify = 0;
@@ -38,14 +35,24 @@ int main(int argc, char **argv)
     ApexRomInfo info;
 
     for (i = 1; i < argc; i++) {
-        if      (strcmp(argv[i], "--fix")     == 0) do_fix     = 1;
-        else if (strcmp(argv[i], "--disable") == 0) do_disable = 1;
-        else if (strcmp(argv[i], "--verify")  == 0) do_verify  = 1;
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
-        else if (!rom_path) rom_path = argv[i];
-        else usage();
+        if (strcmp(argv[i], "--fix") == 0)
+            do_fix = 1;
+        else if (strcmp(argv[i], "--disable") == 0)
+            do_disable = 1;
+        else if (strcmp(argv[i], "--verify") == 0)
+            do_verify = 1;
+        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc)
+            out_path = argv[++i];
+        else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "apexmeta: unknown option '%s'\n", argv[i]);
+            usage();
+        } else if (!rom_path)
+            rom_path = argv[i];
+        else
+            usage();
     }
-    if (!rom_path) usage();
+    if (!rom_path)
+        usage();
     if ((do_fix || do_disable) && !out_path) {
         fprintf(stderr, "error: --fix / --disable require -o <output>\n");
         return 2;
@@ -56,14 +63,34 @@ int main(int argc, char **argv)
     }
 
     f = fopen(rom_path, "rb");
-    if (!f) { perror(rom_path); return 1; }
-    fseek(f, 0, SEEK_END); fsz = ftell(f); rewind(f);
-    if (fsz <= 0) { fprintf(stderr, "error: empty file\n"); fclose(f); return 1; }
+    if (!f) {
+        perror(rom_path);
+        return 1;
+    }
+    fseek(f, 0, SEEK_END);
+    fsz = ftell(f);
+    rewind(f);
+    /* A WPC image is the 32 KB system bank plus whole 16 KB pages; anything
+       else would have its checksum/delta computed at a bogus offset. */
+    if (fsz < 0x8000 || fsz % 0x4000 != 0) {
+        fprintf(stderr,
+                "error: %s: size %ld is not a WPC ROM image (>= 32 KB, multiple of 16 KB)\n",
+                rom_path, fsz);
+        fclose(f);
+        return 1;
+    }
     rom_size = (size_t)fsz;
     rom = (uint8_t *)malloc(rom_size);
-    if (!rom) { fprintf(stderr, "error: out of memory\n"); fclose(f); return 1; }
+    if (!rom) {
+        fprintf(stderr, "error: out of memory\n");
+        fclose(f);
+        return 1;
+    }
     if (fread(rom, 1, rom_size, f) != rom_size) {
-        fprintf(stderr, "error: read failed\n"); fclose(f); free(rom); return 1;
+        fprintf(stderr, "error: read failed\n");
+        fclose(f);
+        free(rom);
+        return 1;
     }
     fclose(f);
 
@@ -71,8 +98,9 @@ int main(int argc, char **argv)
 
     if (do_verify) {
         int ok = (info.computed_csum == info.stored_csum);
-        if (!ok) fprintf(stderr, "INVALID  computed=0x%04X  stored=0x%04X\n",
-                         info.computed_csum, info.stored_csum);
+        if (!ok)
+            fprintf(stderr, "INVALID  computed=0x%04X  stored=0x%04X\n", info.computed_csum,
+                    info.stored_csum);
         free(rom);
         return ok ? 0 : 1;
     }
@@ -92,43 +120,43 @@ int main(int argc, char **argv)
         printf("OS Version:    unknown  (reset vector 0x%04X)\n", info.reset_addr);
 
     if (info.game_version[0])
-        printf("Game Version:  %s  (offset 0x%zX)\n",
-               info.game_version, info.game_version_offset);
+        printf("Game Version:  %s  (offset 0x%zX)\n", info.game_version, info.game_version_offset);
     else
         printf("Game Version:  not found\n");
 
     if (info.game_id_found) {
         printf("\n");
         printf("Game Identity: (far pointers at Bff_A%04X)\n", info.game_id_ptr_addr);
-        printf("  Name:        %-18s -> B%02x_A%04x\n",
-               info.game_name,   info.game_name_bank,   info.game_name_addr);
-        printf("  Number:      %-18s -> B%02x_A%04x\n",
-               info.game_number, info.game_number_bank, info.game_number_addr);
-        printf("  Date:        %-18s -> B%02x_A%04x\n",
-               info.game_date,   info.game_date_bank,   info.game_date_addr);
+        printf("  Name:        %-18s -> B%02x_A%04x\n", info.game_name, info.game_name_bank,
+               info.game_name_addr);
+        printf("  Number:      %-18s -> B%02x_A%04x\n", info.game_number, info.game_number_bank,
+               info.game_number_addr);
+        printf("  Date:        %-18s -> B%02x_A%04x\n", info.game_date, info.game_date_bank,
+               info.game_date_addr);
     } else {
         printf("Game Identity: not found\n");
     }
 
     printf("\n");
     printf("Checksum:\n");
-    printf("  Stored:      0x%04X  (CPU 0xFFEE / file +0x%zX)\n",
-           info.stored_csum, info.csum_file_off);
+    printf("  Stored:      0x%04X  (CPU 0xFFEE / file +0x%zX)\n", info.stored_csum,
+           info.csum_file_off);
     printf("  Computed:    0x%04X\n", info.computed_csum);
-    printf("  Status:      %s\n",
-           info.computed_csum == info.stored_csum ? "VALID" : "INVALID");
-    printf("  Delta:       0x%04X  (CPU 0xFFEC / file +0x%zX)%s\n",
-           info.stored_delta, info.delta_file_off,
+    printf("  Status:      %s\n", info.computed_csum == info.stored_csum ? "VALID" : "INVALID");
+    printf("  Delta:       0x%04X  (CPU 0xFFEC / file +0x%zX)%s\n", info.stored_delta,
+           info.delta_file_off,
            info.stored_delta == APEX_ROMINFO_DISABLE_DELTA ? "  [check disabled]" : "");
 
     printf("\n");
     printf("Hashes:\n");
     printf("  CRC-32:      %08X\n", info.crc32_val);
     printf("  SHA-1:       ");
-    for (j = 0; j < 20; j++) printf("%02x", info.sha1[j]);
+    for (j = 0; j < 20; j++)
+        printf("%02x", info.sha1[j]);
     printf("\n");
     printf("  SHA-256:     ");
-    for (j = 0; j < 32; j++) printf("%02x", info.sha256[j]);
+    for (j = 0; j < 32; j++)
+        printf("%02x", info.sha256[j]);
     printf("\n");
 
     /* ── Modify ── */
@@ -148,15 +176,23 @@ int main(int argc, char **argv)
             printf("\nChecksum fixed:  checksum=0x%04X  delta=0x%04X\n", nc, nd);
         } else {
             fprintf(stderr, "error: could not find a valid checksum solution\n");
-            free(rom); return 1;
+            free(rom);
+            return 1;
         }
     }
 
     if (out_path) {
         FILE *of = fopen(out_path, "wb");
-        if (!of) { perror(out_path); free(rom); return 1; }
+        if (!of) {
+            perror(out_path);
+            free(rom);
+            return 1;
+        }
         if (fwrite(rom, 1, rom_size, of) != rom_size) {
-            fprintf(stderr, "error: write failed\n"); fclose(of); free(rom); return 1;
+            fprintf(stderr, "error: write failed\n");
+            fclose(of);
+            free(rom);
+            return 1;
         }
         fclose(of);
         printf("Written: %s\n", out_path);

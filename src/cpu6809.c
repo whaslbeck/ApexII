@@ -1,5 +1,6 @@
-#include "apex.h"
 #include "cpu6809.h"
+
+#include "apex.h"
 
 #include <ctype.h>
 #include <stdio.h>
@@ -308,11 +309,115 @@ static const Opcode opcodes[] = {
     {"LBLE", OPER_REL16, 0x10, 0x2f, CPU6809_TARGET_CODE},
     {"LBSR", OPER_REL16, 0x00, 0x17, CPU6809_TARGET_CODE | CPU6809_CALL},
     {"LBEQ", OPER_REL16, 0x10, 0x27, CPU6809_TARGET_CODE},
-    {"LBNE", OPER_REL16, 0x10, 0x26, CPU6809_TARGET_CODE}
+    {"LBNE", OPER_REL16, 0x10, 0x26, CPU6809_TARGET_CODE}};
+
+/* opcodes[] index by (prefix, opcode), -1 = no such instruction.  Generated
+   from opcodes[] (first entry wins, as in a linear scan): the disassembler
+   used to scan the whole table for every instruction.  cpu6809_selfcheck()
+   verifies it against the table, and find_opcode() double-checks each hit. */
+static const int16_t opcode_lut[3][256] = {
+    {
+        81,  -1,  -1,  82,  83,  -1,  84,  85,  86,  88,  89,  -1,  90,  91,  92,  93,  -1,  -1,
+        0,   1,   -1,  -1,  259, 278, -1,  26,  45,  -1,  46,  27,  35,  36,  240, 241, 242, 243,
+        244, 246, 248, 249, 250, 251, 252, 253, 254, 255, 256, 257, 41,  42,  43,  44,  37,  38,
+        39,  40,  -1,  28,  29,  30,  47,  31,  -1,  32,  4,   -1,  -1,  6,   8,   -1,  10,  12,
+        14,  18,  20,  -1,  22,  24,  -1,  2,   5,   -1,  -1,  7,   9,   -1,  11,  13,  16,  19,
+        21,  -1,  23,  25,  -1,  3,   134, -1,  -1,  135, 136, -1,  137, 138, 139, 141, 142, -1,
+        143, 144, 145, 146, 218, -1,  -1,  219, 220, -1,  221, 222, 223, 225, 226, -1,  227, 229,
+        188, 228, 48,  49,  50,  68,  51,  52,  53,  -1,  54,  55,  56,  57,  77,  258, 72,  -1,
+        94,  95,  96,  97,  98,  99,  100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 147, 148,
+        149, 150, 151, 152, 153, 154, 155, 156, 157, 158, 159, 160, 161, 162, 189, 230, 190, 231,
+        191, 192, 202, 193, 194, 195, 196, 197, 198, 187, 215, 201, 58,  59,  60,  79,  61,  62,
+        63,  -1,  64,  65,  66,  67,  73,  -1,  74,  -1,  110, 111, 112, 113, 114, 115, 116, 117,
+        118, 119, 120, 121, 122, 123, 124, 125, 163, 164, 165, 166, 167, 168, 169, 170, 171, 172,
+        173, 174, 175, 176, 177, 178, 203, 204, 205, 206, 207, 208, 209, 199, 210, 211, 212, 213,
+        214, 200, 216, 217,
+    },
+    {
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  260, 261, 262, 263,
+        264, 266, 268, 269, 270, 271, 272, 273, 274, 275, 276, 277, -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  33,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  80,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  70,  -1,  75,  -1,
+        -1,  -1,  -1,  126, -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  127, -1,  128, 129, -1,  -1,
+        -1,  179, -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  180, -1,  181, 182, -1,  -1,  -1,  232,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  233, -1,  234, 235, -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  76,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  -1,  -1,  130, 131, -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  -1,  -1,  183, 184, -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,  -1,
+        -1,  -1,  236, 237,
+    },
+    {
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, 34,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, 69, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        71, -1, -1, -1,  -1, -1, -1, 132, -1,  -1, -1, -1, -1,  -1, -1, -1, 133, -1, -1, -1,
+        -1, -1, -1, 185, -1, -1, -1, -1,  -1,  -1, -1, -1, 186, -1, -1, -1, -1,  -1, -1, 238,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  239, -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1, -1,  -1, -1, -1,
+        -1, -1, -1, -1,  -1, -1, -1, -1,  -1,  -1, -1, -1, -1,  -1, -1, -1,
+    },
 };
 
-static int same_mnemonic(const char *a, const char *b)
-{
+static const Opcode *find_opcode(uint8_t prefix, uint8_t opcode) {
+    int row = prefix == 0x10 ? 1 : prefix == 0x11 ? 2 : 0;
+    int idx = opcode_lut[row][opcode];
+    size_t i;
+
+    if (idx < 0) {
+        return NULL;
+    }
+    if (opcodes[idx].prefix == prefix && opcodes[idx].opcode == opcode) {
+        return &opcodes[idx];
+    }
+    /* stale index (table edited without regenerating): fall back to a scan */
+    for (i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
+        if (opcodes[i].prefix == prefix && opcodes[i].opcode == opcode) {
+            return &opcodes[i];
+        }
+    }
+    return NULL;
+}
+
+int cpu6809_selfcheck(void) {
+    size_t i, j;
+    int row, op;
+
+    for (i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
+        const Opcode *first = NULL;
+        for (j = 0; j < sizeof(opcodes) / sizeof(opcodes[0]) && !first; j++) {
+            if (opcodes[j].prefix == opcodes[i].prefix && opcodes[j].opcode == opcodes[i].opcode) {
+                first = &opcodes[j];
+            }
+        }
+        row = opcodes[i].prefix == 0x10 ? 1 : opcodes[i].prefix == 0x11 ? 2 : 0;
+        if (opcode_lut[row][opcodes[i].opcode] < 0 ||
+            &opcodes[opcode_lut[row][opcodes[i].opcode]] != first) {
+            return 0;
+        }
+    }
+    for (row = 0; row < 3; row++) {
+        uint8_t prefix = row == 1 ? 0x10 : row == 2 ? 0x11 : 0x00;
+        for (op = 0; op < 256; op++) {
+            int idx = opcode_lut[row][op];
+            if (idx >= 0 && (idx >= (int)(sizeof(opcodes) / sizeof(opcodes[0])) ||
+                             opcodes[idx].prefix != prefix || opcodes[idx].opcode != op)) {
+                return 0;
+            }
+        }
+    }
+    return 1;
+}
+
+static int same_mnemonic(const char *a, const char *b) {
     while (*a && *b) {
         if (toupper((unsigned char)*a) != toupper((unsigned char)*b)) {
             return 0;
@@ -323,8 +428,7 @@ static int same_mnemonic(const char *a, const char *b)
     return *a == '\0' && *b == '\0';
 }
 
-static char *skip_hash(char *s)
-{
+static char *skip_hash(char *s) {
     s = trim(s);
     if (*s == '#') {
         s++;
@@ -333,8 +437,7 @@ static char *skip_hash(char *s)
 }
 
 static int parse_operand(void *ctx, Cpu6809ResolveFn resolve, int resolve_symbols, char *operand,
-                         uint32_t *value)
-{
+                         uint32_t *value) {
     operand = trim(operand);
     if (parse_u32(operand, value)) {
         return 1;
@@ -347,8 +450,7 @@ static int parse_operand(void *ctx, Cpu6809ResolveFn resolve, int resolve_symbol
 }
 
 static int parse_direct_operand(void *ctx, Cpu6809ResolveFn resolve, int resolve_symbols,
-                                char *operand, uint32_t *value)
-{
+                                char *operand, uint32_t *value) {
     operand = trim(operand);
     if (*operand == '<') {
         operand++;
@@ -356,16 +458,14 @@ static int parse_direct_operand(void *ctx, Cpu6809ResolveFn resolve, int resolve
     return parse_operand(ctx, resolve, resolve_symbols, operand, value);
 }
 
-static void emit_opcode(const Opcode *op, Cpu6809EmitFn emit, void *ctx)
-{
+static void emit_opcode(const Opcode *op, Cpu6809EmitFn emit, void *ctx) {
     if (op->prefix) {
         emit(ctx, op->prefix);
     }
     emit(ctx, op->opcode);
 }
 
-static size_t indexed_extra_size(uint8_t postbyte)
-{
+static size_t indexed_extra_size(uint8_t postbyte) {
     if ((postbyte & 0x80u) == 0) {
         return 0;
     }
@@ -383,8 +483,7 @@ static size_t indexed_extra_size(uint8_t postbyte)
 }
 
 static char *parse_comma_value(void *ctx, Cpu6809ResolveFn resolve, int resolve_symbols, char *p,
-                               uint32_t *value)
-{
+                               uint32_t *value) {
     char *start;
 
     p = trim(p);
@@ -406,15 +505,13 @@ static char *parse_comma_value(void *ctx, Cpu6809ResolveFn resolve, int resolve_
     return p;
 }
 
-static const char *index_reg_name(unsigned reg)
-{
+static const char *index_reg_name(unsigned reg) {
     static const char *names[] = {"X", "Y", "U", "S"};
 
     return reg < 4u ? names[reg] : "?";
 }
 
-static int parse_index_reg(const char *s, unsigned *reg, const char **end)
-{
+static int parse_index_reg(const char *s, unsigned *reg, const char **end) {
     char c = (char)toupper((unsigned char)*s);
 
     if (c == 'X') {
@@ -432,8 +529,7 @@ static int parse_index_reg(const char *s, unsigned *reg, const char **end)
     return 1;
 }
 
-static int parse_signed_number(char *s, int32_t *value)
-{
+static int parse_signed_number(char *s, int32_t *value) {
     int negative = 0;
     uint32_t magnitude;
 
@@ -451,8 +547,7 @@ static int parse_signed_number(char *s, int32_t *value)
     return 1;
 }
 
-static size_t indexed_forced_offset_size(char *s)
-{
+static size_t indexed_forced_offset_size(char *s) {
     size_t digits = 0;
     int negative = 0;
     const char *hex;
@@ -497,8 +592,7 @@ static size_t indexed_forced_offset_size(char *s)
 
 static int parse_indexed_pretty(void *ctx, Cpu6809ResolveFn resolve, int resolve_symbols,
                                 char *operand, uint8_t *postbyte, uint16_t *extra,
-                                size_t *extra_size)
-{
+                                size_t *extra_size) {
     char *inner;
     char *comma;
     char *left;
@@ -587,7 +681,9 @@ static int parse_indexed_pretty(void *ctx, Cpu6809ResolveFn resolve, int resolve
         if ((c == 'A' || c == 'B' || c == 'D') &&
             parse_index_reg(right, &reg, (const char **)&end) && *trim(end) == '\0') {
             *postbyte = (uint8_t)(0x80u | (reg << 5) | indirect |
-                                  (c == 'A' ? 0x06u : c == 'B' ? 0x05u : 0x0bu));
+                                  (c == 'A'   ? 0x06u
+                                   : c == 'B' ? 0x05u
+                                              : 0x0bu));
             *extra_size = 0;
             return 1;
         }
@@ -638,15 +734,14 @@ static int parse_indexed_pretty(void *ctx, Cpu6809ResolveFn resolve, int resolve
 /* When set, 5-bit indexed offsets are rendered in (minimal, no-leading-zero) hex
    like the 8/16-bit forms instead of signed decimal.  Off by default; toggled per
    write pass from the hex_index_offsets [options] switch. */
-static int s_hex_index_offsets;
+static APEX_THREAD_LOCAL int s_hex_index_offsets; /* per thread: render + workers */
 
-void cpu6809_set_hex_index_offsets(int enabled)
-{
+void cpu6809_set_hex_index_offsets(int enabled) {
     s_hex_index_offsets = enabled ? 1 : 0;
 }
 
-static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte, const uint8_t *extra)
-{
+static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte,
+                                   const uint8_t *extra) {
     unsigned reg = (postbyte >> 5) & 0x03u;
     int indirect = (postbyte & 0x80u) != 0 && (postbyte & 0x10u) != 0;
     unsigned mode = postbyte & 0x0fu;
@@ -677,7 +772,10 @@ static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte,
     } else if (mode == 0x04) {
         snprintf(body, sizeof(body), ",%s", index_reg_name(reg));
     } else if (mode == 0x05 || mode == 0x06 || mode == 0x0b) {
-        snprintf(body, sizeof(body), "%c,%s", mode == 0x05 ? 'B' : mode == 0x06 ? 'A' : 'D',
+        snprintf(body, sizeof(body), "%c,%s",
+                 mode == 0x05   ? 'B'
+                 : mode == 0x06 ? 'A'
+                                : 'D',
                  index_reg_name(reg));
     } else if (mode == 0x08) {
         snprintf(body, sizeof(body), "0x%02x,%s", extra[0], index_reg_name(reg));
@@ -706,8 +804,7 @@ static void format_indexed_operand(char *out, size_t out_size, uint8_t postbyte,
     }
 }
 
-static const char *postbyte_reg_name(unsigned code)
-{
+static const char *postbyte_reg_name(unsigned code) {
     switch (code) {
     case 0x0:
         return "D";
@@ -734,8 +831,7 @@ static const char *postbyte_reg_name(unsigned code)
     }
 }
 
-static int parse_postbyte_reg(const char *s, unsigned *code)
-{
+static int parse_postbyte_reg(const char *s, unsigned *code) {
     char name[8];
     size_t i;
 
@@ -771,8 +867,7 @@ static int parse_postbyte_reg(const char *s, unsigned *code)
     return 1;
 }
 
-static const char *stack_reg_name(const char *mnemonic, unsigned bit)
-{
+static const char *stack_reg_name(const char *mnemonic, unsigned bit) {
     static const char *base_names[] = {"CC", "A", "B", "DP", "X", "Y", "U", "PC"};
 
     if (bit == 6u && toupper((unsigned char)mnemonic[3]) == 'U') {
@@ -781,8 +876,7 @@ static const char *stack_reg_name(const char *mnemonic, unsigned bit)
     return bit < 8u ? base_names[bit] : NULL;
 }
 
-static int parse_stack_reg(const char *mnemonic, const char *s, unsigned *bit)
-{
+static int parse_stack_reg(const char *mnemonic, const char *s, unsigned *bit) {
     unsigned i;
 
     for (i = 0; i < 8u; i++) {
@@ -794,8 +888,7 @@ static int parse_stack_reg(const char *mnemonic, const char *s, unsigned *bit)
     return 0;
 }
 
-static int parse_postbyte_pretty(const char *mnemonic, char *operand, uint8_t *postbyte)
-{
+static int parse_postbyte_pretty(const char *mnemonic, char *operand, uint8_t *postbyte) {
     if (same_mnemonic(mnemonic, "EXG") || same_mnemonic(mnemonic, "TFR")) {
         char *comma = strchr(operand, ',');
         unsigned left;
@@ -843,16 +936,15 @@ static int parse_postbyte_pretty(const char *mnemonic, char *operand, uint8_t *p
     return 0;
 }
 
-static void append_reg_name(char *out, size_t out_size, int *first, const char *name)
-{
+static void append_reg_name(char *out, size_t out_size, int *first, const char *name) {
     size_t len = strlen(out);
 
     snprintf(out + len, out_size > len ? out_size - len : 0, "%s%s", *first ? "" : ",", name);
     *first = 0;
 }
 
-static int format_postbyte_operand(const char *mnemonic, uint8_t postbyte, char *out, size_t out_size)
-{
+static int format_postbyte_operand(const char *mnemonic, uint8_t postbyte, char *out,
+                                   size_t out_size) {
     if (same_mnemonic(mnemonic, "EXG") || same_mnemonic(mnemonic, "TFR")) {
         const char *left = postbyte_reg_name((postbyte >> 4) & 0x0fu);
         const char *right = postbyte_reg_name(postbyte & 0x0fu);
@@ -884,15 +976,13 @@ static int format_postbyte_operand(const char *mnemonic, uint8_t postbyte, char 
     return 0;
 }
 
-static int postbyte_flow_stop(const char *mnemonic, uint8_t postbyte)
-{
+static int postbyte_flow_stop(const char *mnemonic, uint8_t postbyte) {
     return (same_mnemonic(mnemonic, "PULS") || same_mnemonic(mnemonic, "PULU")) &&
            (postbyte & 0x80u) != 0;
 }
 
 int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int resolve_symbols,
-                          Cpu6809ResolveFn resolve, Cpu6809EmitFn emit, void *ctx)
-{
+                          Cpu6809ResolveFn resolve, Cpu6809EmitFn emit, void *ctx) {
     size_t i;
 
     for (i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
@@ -1038,6 +1128,10 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
             }
             if (resolve_symbols) {
                 uint32_t next_pc = pc + (op->prefix ? 2u : 1u) + 2u;
+                if (value > 0xffffu) {
+                    die("%s target 0x%lx is outside the 16-bit address space", mnemonic,
+                        (unsigned long)value);
+                }
                 /* 6809 is a 16-bit CPU: the entire 64 KB address space is
                    reachable with a 16-bit relative offset.  Compute the
                    offset with 16-bit modular arithmetic so cross-bank branches
@@ -1048,19 +1142,18 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
             emit(ctx, (uint8_t)(value >> 8));
             emit(ctx, (uint8_t)value);
             return 1;
-        case OPER_POSTBYTE:
-            {
-                char pretty_operand[128];
-                uint8_t postbyte;
+        case OPER_POSTBYTE: {
+            char pretty_operand[128];
+            uint8_t postbyte;
 
-                if (snprintf(pretty_operand, sizeof(pretty_operand), "%s", trim(operand)) <
-                        (int)sizeof(pretty_operand) &&
-                    parse_postbyte_pretty(mnemonic, pretty_operand, &postbyte)) {
-                    emit_opcode(op, emit, ctx);
-                    emit(ctx, postbyte);
-                    return 1;
-                }
+            if (snprintf(pretty_operand, sizeof(pretty_operand), "%s", trim(operand)) <
+                    (int)sizeof(pretty_operand) &&
+                parse_postbyte_pretty(mnemonic, pretty_operand, &postbyte)) {
+                emit_opcode(op, emit, ctx);
+                emit(ctx, postbyte);
+                return 1;
             }
+        }
             if (!parse_operand(ctx, resolve, resolve_symbols, operand, &value) || value > 0xffu) {
                 die("invalid %s postbyte operand", mnemonic);
             }
@@ -1072,14 +1165,12 @@ int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int 
     return 0;
 }
 
-static uint16_t be16(const uint8_t *p)
-{
+static uint16_t be16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
 static void format_addr(char *out, size_t out_size, Cpu6809LabelFn label, void *label_ctx,
-                        uint32_t addr)
-{
+                        uint32_t addr) {
     const char *name = label ? label(label_ctx, addr) : NULL;
 
     if (name) {
@@ -1090,8 +1181,7 @@ static void format_addr(char *out, size_t out_size, Cpu6809LabelFn label, void *
 }
 
 static void format_direct_addr(char *out, size_t out_size, Cpu6809LabelFn label, void *label_ctx,
-                               uint8_t addr)
-{
+                               uint8_t addr) {
     const char *name = label ? label(label_ctx, addr) : NULL;
 
     if (name) {
@@ -1102,8 +1192,7 @@ static void format_direct_addr(char *out, size_t out_size, Cpu6809LabelFn label,
 }
 
 static void format_indexed_raw(char *out, size_t out_size, uint8_t postbyte, const uint8_t *extra,
-                               Cpu6809LabelFn label, void *label_ctx)
-{
+                               Cpu6809LabelFn label, void *label_ctx) {
     size_t extra_len = indexed_extra_size(postbyte);
 
     if (extra_len == 0) {
@@ -1124,9 +1213,7 @@ static void format_indexed_raw(char *out, size_t out_size, uint8_t postbyte, con
 
 Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, uint32_t pc,
                                               char *out, size_t out_size, Cpu6809LabelFn label,
-                                              void *label_ctx, Cpu6809LabelFn label_imm)
-{
-    size_t i;
+                                              void *label_ctx, Cpu6809LabelFn label_imm) {
     uint8_t prefix = 0;
     uint8_t opcode;
     Cpu6809InstrInfo info;
@@ -1150,13 +1237,14 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, u
         opcode = data[1];
     }
 
-    for (i = 0; i < sizeof(opcodes) / sizeof(opcodes[0]); i++) {
-        const Opcode *op = &opcodes[i];
-        size_t op_len = op->prefix ? 2u : 1u;
+    {
+        const Opcode *op = find_opcode(prefix, opcode);
+        size_t op_len;
 
-        if (op->prefix != prefix || op->opcode != opcode) {
-            continue;
+        if (!op) {
+            return info; /* not a 6809 instruction */
         }
+        op_len = op->prefix ? 2u : 1u;
         info.flags = op->flags;
         switch (op->kind) {
         case OPER_NONE:
@@ -1184,9 +1272,8 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, u
                    accumulate incoming refs (e.g. LDX #TABLE_ADDR). The range
                    checks in collect_code_targets filter out non-ROM values. */
                 info.has_addr_ref = 1;
-                info.addr_ref     = imm;
-                format_addr(value, sizeof(value), label_imm ? label_imm : label,
-                            label_ctx, imm);
+                info.addr_ref = imm;
+                format_addr(value, sizeof(value), label_imm ? label_imm : label, label_ctx, imm);
                 snprintf(out, out_size, "%s #%s", op->mnemonic, value);
             }
             info.size = op_len + 2u;
@@ -1242,8 +1329,7 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, u
                     format_indexed_raw(indexed, sizeof(indexed), postbyte, data + op_len + 1u,
                                        label, label_ctx);
                 } else {
-                    format_indexed_operand(indexed, sizeof(indexed), postbyte,
-                                           data + op_len + 1u);
+                    format_indexed_operand(indexed, sizeof(indexed), postbyte, data + op_len + 1u);
                 }
                 snprintf(out, out_size, "%s %s", op->mnemonic, indexed);
                 info.size = op_len + 1u + extra;
@@ -1305,21 +1391,19 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, u
 }
 
 Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, uint32_t pc,
-                                              char *out, size_t out_size, Cpu6809LabelFn label,
-                                              void *label_ctx)
-{
+                                             char *out, size_t out_size, Cpu6809LabelFn label,
+                                             void *label_ctx) {
     /* Immediates resolve through the same callback as address operands. */
     return cpu6809_disassemble_info_ex2(data, len, pc, out, out_size, label, label_ctx, label);
 }
 
 Cpu6809InstrInfo cpu6809_disassemble_info(const uint8_t *data, size_t len, uint32_t pc, char *out,
-                                           size_t out_size)
-{
+                                          size_t out_size) {
     return cpu6809_disassemble_info_ex2(data, len, pc, out, out_size, NULL, NULL, NULL);
 }
 
-size_t cpu6809_disassemble(const uint8_t *data, size_t len, uint32_t pc, char *out, size_t out_size)
-{
+size_t cpu6809_disassemble(const uint8_t *data, size_t len, uint32_t pc, char *out,
+                           size_t out_size) {
     Cpu6809InstrInfo info = cpu6809_disassemble_info(data, len, pc, out, out_size);
     return info.size;
 }

@@ -1,11 +1,11 @@
 #ifndef APEX_PROJECT_H
 #define APEX_PROJECT_H
 
-#include <stdio.h>
-
 #include "apex.h"
 #include "apex_analysis.h"
 #include "apex_config.h"
+
+#include <stdio.h>
 
 struct ApexRenderedDocument;
 struct ApexUndo;
@@ -30,12 +30,12 @@ typedef enum {
    static label ("set kind", "set label", …); the address fields are meaningful
    only when `has_addr`. The CLI leaves the listener null (no-op). */
 typedef struct {
-    unsigned long seq;      /* monotonic edit counter for this project */
-    const char   *action;   /* short label; valid only during the callback */
-    int           has_addr; /* address fields identify an on-ROM location */
-    int           has_bank;
-    uint8_t       bank;
-    uint32_t      addr;
+    unsigned long seq;  /* monotonic edit counter for this project */
+    const char *action; /* short label; valid only during the callback */
+    int has_addr;       /* address fields identify an on-ROM location */
+    int has_bank;
+    uint8_t bank;
+    uint32_t addr;
 } ApexChangeEvent;
 typedef void (*ApexChangeFn)(void *ctx, const ApexChangeEvent *ev);
 
@@ -57,7 +57,7 @@ typedef struct ApexProject {
     ConfigOptions options;
     ConfigTypes config_types;
     ConfigEntries ref_exclusions;
-    ConfigEntries literals; /* instruction addrs whose immediate is a literal, not an address */
+    ConfigEntries literals;     /* instruction addrs whose immediate is a literal, not an address */
     ConfigEntries ack_warnings; /* addrs whose disassembly warning was reviewed/accepted */
     ConfigEntries far_imms;     /* LDX-style instrs: .value = bank the immediate targets */
     ReferenceSet refs;
@@ -70,25 +70,31 @@ typedef struct ApexProject {
     struct ApexRenderedDocument *render_cache;
     int render_cache_emit_xrefs;
     int render_cache_emit_explain;
-    struct ApexUndo *undo;   /* config edit history (lazily allocated) */
-    ApexChangeFn change_cb;  /* optional per-edit change listener (frontend log) */
-    void        *change_ctx;
+    struct ApexUndo *undo;  /* config edit history (lazily allocated) */
+    ApexChangeFn change_cb; /* optional per-edit change listener (frontend log) */
+    void *change_ctx;
     unsigned long change_seq; /* monotonic edit counter passed to the listener */
+    char last_error[256];     /* why the last set_* call was rejected ("" if none) */
 } ApexProject;
 
 ApexProject *apex_project_open(const char *rom_path, const char *config_path);
 void apex_project_free(ApexProject *project);
+/* Independent copy of a project's ROM and config (not its analysis, render
+   cache or undo history), e.g. for analysing it on a worker thread while the
+   original stays in use. */
+ApexProject *apex_project_clone(const ApexProject *src);
 /* Register (or clear, with fn=NULL) a listener fired once per recorded edit. */
 void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx);
 int apex_project_analyze(ApexProject *project);
+/* Reason the most recent rejected spec edit failed (empty if unknown). */
+const char *apex_project_last_error(const ApexProject *project);
 void apex_project_invalidate(ApexProject *project, unsigned dirty_flags);
 int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
                            const char *name);
 int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
-int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
-                         uint32_t addr, const char *text);
-int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
-                           uint32_t addr);
+int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
+                         const char *text);
+int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
                           ApexConfigKind kind, const char *spec);
 int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
@@ -117,6 +123,37 @@ extern int apex_warn_to_stderr;
 
 int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
                                   int emit_explain);
+
+/* Line metadata the writer reports while it formats the listing, so the GUI
+   renderer does not have to re-derive addresses and sizes from the text.
+   Marks are in text order; each describes the line starting at text_off. */
+typedef enum {
+    APEX_ASM_MARK_ITEM = 1, /* a line that assembles to `size` bytes at cpu/rom */
+    APEX_ASM_MARK_LOCATION  /* a "; <kind> bank=.. cpu=.. rom=.." location comment */
+} ApexAsmMarkKind;
+
+typedef struct {
+    size_t text_off;
+    ApexAsmMarkKind kind;
+    uint8_t bank;
+    uint32_t cpu_addr;
+    size_t rom_addr;
+    size_t size;       /* ITEM: bytes the line assembles to */
+    int conflict;      /* LOCATION: a classification_conflict warning */
+    char loc_kind[40]; /* LOCATION: the kind word, e.g. "code" or "code_to_data" */
+} ApexAsmMark;
+
+typedef struct {
+    char *text; /* NUL-terminated */
+    size_t text_len;
+    ApexAsmMark *marks;
+    size_t mark_count;
+} ApexAsmText;
+
+/* Format the listing into memory together with its line marks. */
+int apex_project_write_asm_text(const ApexProject *project, int emit_xrefs, int emit_explain,
+                                ApexAsmText *out);
+void apex_asm_text_free(ApexAsmText *text);
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
                            int emit_explain);
 int apex_project_save_overlay(ApexProject *project, const char *path, const char *include_path);
@@ -125,14 +162,11 @@ void apex_project_sort_config(ApexProject *project);
 int apex_project_set_type(ApexProject *project, const char *name, int is_word,
                           const char *values_str);
 int apex_project_remove_type(ApexProject *project, const char *name);
-int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
-                                   uint32_t addr);
+int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
                                       uint32_t addr);
-int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
-                             uint32_t addr);
-int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank,
-                                uint32_t addr);
+int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
+int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr);
 int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
 int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr);
@@ -168,42 +202,21 @@ int apex_project_redo(ApexProject *project);
 #define APEX_CANDIDATE_PREVIEW 80
 
 typedef struct {
-    uint8_t  bank;
+    uint8_t bank;
     uint32_t addr;
-    int      score;       /* 0-100 */
-    int      tier;        /* 1=far-ptr, 2=probe */
-    int      instr_count;
-    char     preview[APEX_CANDIDATE_PREVIEW];
+    int score; /* 0-100 */
+    int tier;  /* 1=far-ptr, 2=probe */
+    int instr_count;
+    char preview[APEX_CANDIDATE_PREVIEW];
 } ApexCodeCandidate;
 
 typedef struct {
     ApexCodeCandidate *items;
-    size_t             count;
-    size_t             cap;
+    size_t count;
+    size_t cap;
 } ApexCodeCandidates;
 
 void apex_scan_code_candidates(const ApexProject *project, ApexCodeCandidates *out);
 void apex_free_code_candidates(ApexCodeCandidates *candidates);
-
-/* Inline-dispatcher candidate scanner ------------------------------------ */
-#define APEX_INLINE_SPEC_MAX 128
-
-typedef struct {
-    uint8_t  bank;
-    uint32_t addr;
-    char     spec[APEX_INLINE_SPEC_MAX]; /* e.g. "byte", "far_code", "byte, word" */
-    int      score;           /* 0-100 */
-    int      callsite_count;
-    int      callsite_valid;  /* callsites whose inline bytes validate the spec */
-} ApexInlineCandidate;
-
-typedef struct {
-    ApexInlineCandidate *items;
-    size_t               count;
-    size_t               cap;
-} ApexInlineCandidates;
-
-void apex_scan_inline_candidates(const ApexProject *project, ApexInlineCandidates *out);
-void apex_free_inline_candidates(ApexInlineCandidates *candidates);
 
 #endif

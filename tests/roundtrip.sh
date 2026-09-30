@@ -1248,3 +1248,133 @@ else
     printf 'FAIL sprite_invalid\n' >&2
     exit 1
 fi
+
+# Assembler: symbol precedence over the generated Bxx_Ayyyy form, left-assoc
+# +/- chains, and rejection of overlapping .ORG output.
+asm_se_rom="$OUT/asm_symbols_expr.rom"
+"$ROOT/build/apexasm" "$asm_se_rom" "$ROOT/tests/asm_symbols_expr.asm"
+asm_se_bytes=$(od -An -tx1 -j $((0x38001)) -N 11 "$asm_se_rom" | tr -d ' \n')
+asm_ov_asm="$OUT/asm_overlap.asm"
+printf '.ROM_SIZE 262144\n.BANK 0\n.ORG 0x4000\n    BANK_ID 0x20\n.BANK SYSTEM\n.ORG 0x8000\n    RTS\n    RTS\n.ORG 0x8001\n    NOP\n' >"$asm_ov_asm"
+if [ "$asm_se_bytes" = "8000ff86ff8e00058e00f1" ] &&
+   ! "$ROOT/build/apexasm" "$OUT/asm_overlap.rom" "$asm_ov_asm" 2>/dev/null; then
+    printf 'PASS asm_symbols_expr\n'
+else
+    printf 'FAIL asm_symbols_expr (got %s)\n' "$asm_se_bytes" >&2
+    exit 1
+fi
+
+# [far_imm] on a system-bank instruction is honoured by the system code pass.
+fis_rom="$OUT/far_imm_system.rom"
+fis_asm="$OUT/far_imm_system.disasm"
+fis_rebuilt="$OUT/far_imm_system.rebuilt"
+"$ROOT/build/apexasm" "$fis_rom" "$ROOT/tests/far_imm_system.asm"
+"$ROOT/build/apexdis" "$fis_rom" "$fis_asm" "$ROOT/tests/far_imm_system.ini"
+"$ROOT/build/apexasm" "$fis_rebuilt" "$fis_asm"
+if cmp -s "$fis_rom" "$fis_rebuilt" &&
+   grep -q '^    LDX #B38_A5123' "$fis_asm" &&
+   grep -q '^B38_A5123:' "$fis_asm"; then
+    printf 'PASS far_imm_system\n'
+else
+    printf 'FAIL far_imm_system\n' >&2
+    exit 1
+fi
+
+# apexasm: a source line far longer than the old 8 KB buffer assembles fully,
+# and errors carry file:line.
+long_asm="$OUT/long_line.asm"
+{
+    printf '.ROM_SIZE 262144\n.BANK 0\n.ORG 0x4000\n    BANK_ID 0x20\n.BANK SYSTEM\n.ORG 0x8000\n    .DB '
+    i=0
+    while [ $i -lt 3999 ]; do printf '0x%02x, ' $((i % 200 + 1)); i=$((i + 1)); done
+    printf '0xee\n'
+} >"$long_asm"
+"$ROOT/build/apexasm" "$OUT/long_line.rom" "$long_asm"
+long_last=$(od -An -tx1 -j $((0x38000 + 3999)) -N 1 "$OUT/long_line.rom" | tr -d ' ')
+asm_err=$("$ROOT/build/apexasm" "$OUT/asm_overlap.rom" "$asm_ov_asm" 2>&1 || true)
+if [ "$long_last" = "ee" ] && printf '%s' "$asm_err" | grep -q "asm_overlap.asm:10: overlapping"; then
+    printf 'PASS asm_long_line_and_location\n'
+else
+    printf 'FAIL asm_long_line_and_location (last=%s err=%s)\n' "$long_last" "$asm_err" >&2
+    exit 1
+fi
+
+# Config loading: include cycles are an error (not a stack overflow), an
+# unknown section is reported, and errors carry file:line.
+printf 'include = cyc_b.ini\n' >"$OUT/cyc_a.ini"
+printf 'include = cyc_a.ini\n' >"$OUT/cyc_b.ini"
+printf '[lables]\nBff_A8000 = X\n[data]\nBff_A8100 = bytes[x\n' >"$OUT/cfg_bad.ini"
+cyc_err=$("$ROOT/build/apexini" check "$OUT/cyc_a.ini" 2>&1 || true)
+bad_err=$("$ROOT/build/apexini" check "$OUT/cfg_bad.ini" 2>&1 || true)
+if printf '%s' "$cyc_err" | grep -q "include cycle" &&
+   printf '%s' "$bad_err" | grep -q "cfg_bad.ini:1: warning: unknown section \[lables\]" &&
+   printf '%s' "$bad_err" | grep -q "cfg_bad.ini:4: invalid bytes count"; then
+    printf 'PASS config_diagnostics\n'
+else
+    printf 'FAIL config_diagnostics\n%s\n%s\n' "$cyc_err" "$bad_err" >&2
+    exit 1
+fi
+
+# A [labels] entry inside an inline payload is emitted as an equate (it has no
+# line of its own) so the listing still reassembles.
+lmi_rom="$OUT/label_mid_instruction.rom"
+lmi_asm="$OUT/label_mid_instruction.disasm"
+"$ROOT/build/apexasm" "$lmi_rom" "$ROOT/tests/label_mid_instruction.asm"
+"$ROOT/build/apexdis" "$lmi_rom" "$lmi_asm" "$ROOT/tests/label_mid_instruction.ini"
+if "$ROOT/build/apexasm" "$OUT/label_mid_instruction.rebuilt" "$lmi_asm" &&
+   cmp -s "$lmi_rom" "$OUT/label_mid_instruction.rebuilt" &&
+   grep -q '^InPayload = 0x8004' "$lmi_asm"; then
+    printf 'PASS label_mid_instruction\n'
+else
+    printf 'FAIL label_mid_instruction\n' >&2
+    exit 1
+fi
+
+# apexini find-redundant: an entry right after 'PULS PC' (a return) is needed.
+puls_ini="$OUT/puls_entry.ini"
+printf '[entries]\nBff_A8002 = code\n' >"$puls_ini"
+if "$ROOT/build/apexini" find-redundant "$puls_rom" "$puls_ini" 2>&1 | grep -q "no redundant"; then
+    printf 'PASS find_redundant_puls_pc\n'
+else
+    printf 'FAIL find_redundant_puls_pc\n' >&2
+    exit 1
+fi
+
+# CLI usage errors exit 2 (processing errors exit 1); unknown options and
+# non-numeric numbers are rejected instead of being taken as paths / zero.
+cli_rc() { if "$@" >/dev/null 2>&1; then echo 0; else echo $?; fi; }  # safe under set -e
+if [ "$(cli_rc "$ROOT/build/apexdis")" = 2 ] &&
+   [ "$(cli_rc "$ROOT/build/apexasm")" = 2 ] &&
+   [ "$(cli_rc "$ROOT/build/apexmatch" --bogus a b c)" = 2 ] &&
+   [ "$(cli_rc "$ROOT/build/apexmatch" a b c --min-confidence foo)" = 2 ] &&
+   [ "$(cli_rc "$ROOT/build/apexmeta" --bogus x)" = 2 ]; then
+    printf 'PASS cli_usage_errors\n'
+else
+    printf 'FAIL cli_usage_errors\n' >&2
+    exit 1
+fi
+
+# apexini detect-inline: marker and walker routines are found with the right
+# layout, a coincidental 0xCF 0x74 in data is not, and --apply writes an overlay
+# that renders the inline bytes and still round-trips.
+idt_rom="$OUT/inline_detect.rom"
+idt_ini="$OUT/inline_detect.ini"
+idt_asm="$OUT/inline_detect.disasm"
+"$ROOT/build/apexasm" "$idt_rom" "$ROOT/tests/inline_detect.asm"
+idt_report=$("$ROOT/build/apexini" detect-inline "$idt_rom")
+"$ROOT/build/apexini" detect-inline "$idt_rom" --apply "$idt_ini" >/dev/null
+"$ROOT/build/apexdis" "$idt_rom" "$idt_asm" "$idt_ini"
+if printf '%s\n' "$idt_report" | grep -q '^Bff_A802a W     1  high   new .* byte' &&
+   printf '%s\n' "$idt_report" | grep -q '^Bff_A8034 W     2  high   new .* word' &&
+   printf '%s\n' "$idt_report" | grep -q '^Bff_A8040 MW    3  high   new .* byte, byte, byte' &&
+   printf '%s\n' "$idt_report" | grep -q '^Bff_A8050 MW    2  high   new .* word' &&
+   ! printf '%s\n' "$idt_report" | grep -q '^Bff_A805f' &&
+   grep -q '^Bff_A803e = bytes\[2\]' "$idt_ini" &&
+   grep -q 'INLINE_WORD 0x5678' "$idt_asm" &&
+   "$ROOT/build/apexasm" "$OUT/inline_detect.rebuilt" "$idt_asm" &&
+   cmp -s "$idt_rom" "$OUT/inline_detect.rebuilt"; then
+    printf 'PASS inline_detect\n'
+else
+    printf 'FAIL inline_detect\n%s\n' "$idt_report" >&2
+    exit 1
+fi

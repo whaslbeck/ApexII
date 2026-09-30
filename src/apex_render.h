@@ -27,8 +27,8 @@ typedef enum {
     APEX_RENDER_BLOCK_DATA,
     APEX_RENDER_BLOCK_TABLE,
     APEX_RENDER_BLOCK_UNCLASSIFIED,
-    APEX_RENDER_BLOCK_FREE,      /* 0xFF fill region at end of bank */
-    APEX_RENDER_BLOCK_SPRITE     /* DATA_SPRITE / DATA_SPRITE_NOHEADER / DATA_FAR_SPRITE */
+    APEX_RENDER_BLOCK_FREE,  /* 0xFF fill region at end of bank */
+    APEX_RENDER_BLOCK_SPRITE /* DATA_SPRITE / DATA_SPRITE_NOHEADER / DATA_FAR_SPRITE */
 } ApexRenderedBlockKind;
 
 typedef enum {
@@ -73,10 +73,10 @@ typedef struct ApexRenderedDocument {
     size_t text_len;
     ApexRenderedLine *lines;
     size_t line_count;
-    ApexRenderedAddrIndex *addr_index;  /* sorted; NULL until built by build_line_index */
+    ApexRenderedAddrIndex *addr_index; /* sorted; NULL until built by build_line_index */
     size_t addr_index_count;
-    unsigned long generation;  /* bumped on every (re)build; survives clear_document
-                                  so frontends can cache derived data keyed on it */
+    unsigned long generation; /* bumped on every (re)build; survives clear_document
+                                 so frontends can cache derived data keyed on it */
 } ApexRenderedDocument;
 
 int apex_render_project(const struct ApexProject *project, int emit_xrefs, int emit_explain,

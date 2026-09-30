@@ -3,17 +3,20 @@
    inject pass runs in analyze_system_region / analyze_bank_region, not only in
    the full analysis.  Argument: a ROM with a 2-entry ptr16_sprite table at
    Bff_A8000 (tests/sprite_table.asm assembled). */
-#include "apex_project.h"
 #include "apex_analysis.h"
 #include "apex_config.h"
+#include "apex_project.h"
 
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
-static void fail(const char *m) { fprintf(stderr, "sprite_scope_test: %s\n", m); exit(1); }
+static void fail(const char *m) {
+    fprintf(stderr, "sprite_scope_test: %s\n", m);
+    exit(1);
+}
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     ApexProject *p;
     const DataRange *nohdr;
     const DataRange *hdr;
@@ -22,25 +25,53 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <sprite_table.rom>\n", argv[0]);
         return 2;
     }
-    p = apex_project_open(argv[1], NULL);   /* no config: table unclassified */
-    if (!p || apex_project_analyze(p) != 0) fail("open/analyze failed");
+    p = apex_project_open(argv[1], NULL); /* no config: table unclassified */
+    if (!p || apex_project_analyze(p) != 0)
+        fail("open/analyze failed");
 
     /* Classify the table at a system-bank address -> system-only scope. */
-    if (apex_project_set_kind(p, 0, 0xffu, 0x8000u, APEX_KIND_TABLE,
-                              "rows[2](ptr16_sprite(3))") != 0)
+    if (apex_project_set_kind(p, 0, 0xffu, 0x8000u, APEX_KIND_TABLE, "rows[2](ptr16_sprite(3))") !=
+        0)
         fail("set_kind(table) failed");
     if (p->analysis_scope != APEX_ANALYZE_SCOPE_SYSTEM_ONLY)
         fail("expected system-only scope for the table edit");
 
-    if (apex_project_analyze(p) != 0) fail("scoped re-analyze failed");
+    if (apex_project_analyze(p) != 0)
+        fail("scoped re-analyze failed");
 
     /* The image targets must now be classified by the scoped-path inject. */
     nohdr = data_range_at(0xffu, 0x8010u, &p->data_ranges); /* no-header image */
-    hdr   = data_range_at(0xffu, 0x8020u, &p->data_ranges); /* 0x00 header image */
+    hdr = data_range_at(0xffu, 0x8020u, &p->data_ranges);   /* 0x00 header image */
     if (!nohdr || nohdr->kind != DATA_SPRITE_NOHEADER || nohdr->length != 3u)
         fail("no-header image not auto-classified via scoped analysis");
     if (!hdr || hdr->kind != DATA_SPRITE)
         fail("header image not auto-classified via scoped analysis");
+
+    /* The auto-classified targets are analysis output: they must not be saved
+       into the overlay, and must disappear with the table on a full analysis. */
+    if (!nohdr->derived || !hdr->derived)
+        fail("auto-classified image ranges not flagged as derived");
+    if (apex_project_save_overlay(p, "out/sprite_scope_overlay.ini", NULL) != 0)
+        fail("save_overlay failed");
+    {
+        FILE *f = fopen("out/sprite_scope_overlay.ini", "r");
+        char line[256];
+        if (!f)
+            fail("cannot reopen saved overlay");
+        while (fgets(line, sizeof(line), f)) {
+            if (strstr(line, "A8010") || strstr(line, "A8020"))
+                fail("derived image range was saved into the overlay");
+        }
+        fclose(f);
+    }
+    if (apex_project_clear_table(p, 0xffu, 0x8000u) != 0)
+        fail("clear_table failed");
+    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS); /* full analysis */
+    if (apex_project_analyze(p) != 0)
+        fail("full re-analyze failed");
+    if (data_range_at(0xffu, 0x8010u, &p->data_ranges) ||
+        data_range_at(0xffu, 0x8020u, &p->data_ranges))
+        fail("derived image ranges outlived their table");
 
     apex_project_free(p);
 
@@ -49,10 +80,12 @@ int main(int argc, char **argv)
     {
         ApexProject *p2 = apex_project_open(argv[1], NULL);
         const DataRange *tgt;
-        if (!p2 || apex_project_analyze(p2) != 0) fail("p2 open/analyze failed");
+        if (!p2 || apex_project_analyze(p2) != 0)
+            fail("p2 open/analyze failed");
         if (apex_project_set_kind(p2, 0, 0xffu, 0x8002u, APEX_KIND_DATA, "ptr16_sprite") != 0)
             fail("set_kind(ptr16_sprite data) failed");
-        if (apex_project_analyze(p2) != 0) fail("p2 re-analyze failed");
+        if (apex_project_analyze(p2) != 0)
+            fail("p2 re-analyze failed");
         tgt = data_range_at(0xffu, 0x8020u, &p2->data_ranges);
         if (!tgt || tgt->kind != DATA_SPRITE)
             fail("single ptr16_sprite target not auto-classified");

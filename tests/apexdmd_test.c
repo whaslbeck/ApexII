@@ -4,41 +4,35 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void fail(const char *message)
-{
+static void fail(const char *message) {
     fprintf(stderr, "%s\n", message);
     exit(1);
 }
 
-static void expect(int condition, const char *message)
-{
+static void expect(int condition, const char *message) {
     if (!condition) {
         fail(message);
     }
 }
 
-static void fill_expected_rows(uint8_t *expected)
-{
+static void fill_expected_rows(uint8_t *expected) {
     size_t i;
     for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
         expected[i] = (uint8_t)i;
     }
 }
 
-static void fill_expected_columns(uint8_t *expected)
-{
+static void fill_expected_columns(uint8_t *expected) {
     size_t row;
     size_t col;
     for (row = 0; row < APEX_DMD_HEIGHT; row++) {
         for (col = 0; col < APEX_DMD_ROW_BYTES; col++) {
-            expected[row * APEX_DMD_ROW_BYTES + col] =
-                (uint8_t)(col * APEX_DMD_HEIGHT + row);
+            expected[row * APEX_DMD_ROW_BYTES + col] = (uint8_t)(col * APEX_DMD_HEIGHT + row);
         }
     }
 }
 
-static size_t build_literal_stream(uint8_t *out, uint8_t type, uint8_t special)
-{
+static size_t build_literal_stream(uint8_t *out, uint8_t type, uint8_t special) {
     size_t pos = 0u;
     unsigned value;
 
@@ -57,8 +51,7 @@ static size_t build_literal_stream(uint8_t *out, uint8_t type, uint8_t special)
     return pos;
 }
 
-static void test_decode_rows(void)
-{
+static void test_decode_rows(void) {
     uint8_t src[APEX_DMD_PAGE_BYTES * 3u];
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     uint8_t expected[APEX_DMD_PAGE_BYTES];
@@ -68,15 +61,13 @@ static void test_decode_rows(void)
 
     fill_expected_rows(expected);
     src_size = build_literal_stream(src, 0x02u, 0xaau);
-    expect(apexdmd_decode_fullframe(src, src_size, plane, &consumed, &type),
-           "row decode failed");
+    expect(apexdmd_decode_fullframe(src, src_size, plane, &consumed, &type), "row decode failed");
     expect(type == 0x02u, "row type mismatch");
     expect(consumed == src_size, "row consumed mismatch");
     expect(memcmp(plane, expected, sizeof(expected)) == 0, "row payload mismatch");
 }
 
-static void test_decode_columns(void)
-{
+static void test_decode_columns(void) {
     uint8_t src[APEX_DMD_PAGE_BYTES * 3u];
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     uint8_t expected[APEX_DMD_PAGE_BYTES];
@@ -93,8 +84,7 @@ static void test_decode_columns(void)
     expect(memcmp(plane, expected, sizeof(expected)) == 0, "column payload mismatch");
 }
 
-static void test_repeat_zero_means_256(void)
-{
+static void test_repeat_zero_means_256(void) {
     uint8_t src[] = {0x02u, 0xaau, 0xaau, 0x00u, 0x11u, 0xaau, 0x00u, 0x22u};
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     size_t i;
@@ -110,8 +100,7 @@ static void test_repeat_zero_means_256(void)
 }
 
 /* 0x00: raw page copy, written in row order (sequential). */
-static void test_decode_raw_00(void)
-{
+static void test_decode_raw_00(void) {
     uint8_t src[1u + APEX_DMD_PAGE_BYTES];
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     size_t consumed = 0u;
@@ -135,8 +124,7 @@ static void test_decode_raw_00(void)
    (every value encoded as a 0 extension bit followed by 8 literal MSB-first
    bits) so the decoded page is a known constant and the stream ends exactly on
    a byte boundary. */
-static void test_decode_stream_05(void)
-{
+static void test_decode_stream_05(void) {
     uint8_t src[10u + (APEX_DMD_PAGE_BYTES * 9u + 7u) / 8u];
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     size_t consumed = 0u;
@@ -146,8 +134,8 @@ static void test_decode_stream_05(void)
     const uint8_t literal = 0x55u;
 
     memset(src, 0, sizeof(src));
-    src[0] = 0x05u;                 /* type: rows */
-    src[1] = 0xaau;                 /* special flag (never produced) */
+    src[0] = 0x05u; /* type: rows */
+    src[1] = 0xaau; /* special flag (never produced) */
     /* src[2..9] = dictionary, unused by an all-literal stream */
 
     bitpos = 10u * 8u;
@@ -172,8 +160,7 @@ static void test_decode_stream_05(void)
     }
 }
 
-static void test_pbm_write(void)
-{
+static void test_pbm_write(void) {
     static const char *path = "out/apexdmd_test.pbm";
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     FILE *in;
@@ -194,8 +181,7 @@ static void test_pbm_write(void)
     expect(first_row[0] == 0x80u, "pbm bit order mismatch");
 }
 
-static void test_pgm_pair_write(void)
-{
+static void test_pgm_pair_write(void) {
     static const char *path = "out/apexdmd_pair_test.pgm";
     uint8_t plane0[APEX_DMD_PAGE_BYTES];
     uint8_t plane1[APEX_DMD_PAGE_BYTES];
@@ -213,7 +199,8 @@ static void test_pgm_pair_write(void)
     expect(in != NULL, "pgm reopen failed");
     expect(fread(header, 1, 14, in) == 14u, "pgm header short");
     expect(memcmp(header, "P5\n128 32\n255\n", 14u) == 0, "pgm header mismatch");
-    expect(fread(first_pixels, 1, sizeof(first_pixels), in) == sizeof(first_pixels), "pgm pixel short");
+    expect(fread(first_pixels, 1, sizeof(first_pixels), in) == sizeof(first_pixels),
+           "pgm pixel short");
     fclose(in);
 
     expect(first_pixels[0] == 255u, "pgm pixel0 mismatch");
@@ -222,8 +209,7 @@ static void test_pgm_pair_write(void)
     expect(first_pixels[3] == 0u, "pgm pixel3 mismatch");
 }
 
-int main(void)
-{
+int main(void) {
     test_decode_rows();
     test_decode_columns();
     test_repeat_zero_means_256();

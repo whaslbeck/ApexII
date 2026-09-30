@@ -8,11 +8,11 @@
  * Minimal JSON value tree + recursive-descent parser.
  * ------------------------------------------------------------------------- */
 
-static char *nv_strdup(const char *s)
-{
+static char *nv_strdup(const char *s) {
     size_t n = strlen(s) + 1;
-    char  *d = malloc(n);
-    if (d) memcpy(d, s, n);
+    char *d = malloc(n);
+    if (d)
+        memcpy(d, s, n);
     return d;
 }
 
@@ -20,13 +20,13 @@ typedef enum { J_NULL, J_BOOL, J_NUM, J_STR, J_ARR, J_OBJ } JType;
 
 typedef struct JVal {
     JType type;
-    int    b;      /* J_BOOL */
-    double n;      /* J_NUM  */
-    char  *num_raw;/* J_NUM: exact source text, re-emitted verbatim (owned; may be NULL) */
-    char  *s;      /* J_STR (owned) */
-    struct JVal **arr;              /* J_ARR (owned) */
+    int b;             /* J_BOOL */
+    double n;          /* J_NUM  */
+    char *num_raw;     /* J_NUM: exact source text, re-emitted verbatim (owned; may be NULL) */
+    char *s;           /* J_STR (owned) */
+    struct JVal **arr; /* J_ARR (owned) */
     size_t arrn;
-    char **keys;                    /* J_OBJ (owned) */
+    char **keys; /* J_OBJ (owned) */
     struct JVal **vals;
     size_t objn;
 } JVal;
@@ -37,21 +37,22 @@ typedef struct JVal {
 typedef struct {
     const char *p;
     const char *end;
-    int   depth;
-    int   error;
-    char  errbuf[128];
+    int depth;
+    int error;
+    char errbuf[128];
 } JParser;
 
-static void jval_free(JVal *v)
-{
+static void jval_free(JVal *v) {
     size_t i;
-    if (!v) return;
+    if (!v)
+        return;
     if (v->type == J_NUM) {
         free(v->num_raw);
     } else if (v->type == J_STR) {
         free(v->s);
     } else if (v->type == J_ARR) {
-        for (i = 0; i < v->arrn; i++) jval_free(v->arr[i]);
+        for (i = 0; i < v->arrn; i++)
+            jval_free(v->arr[i]);
         free(v->arr);
     } else if (v->type == J_OBJ) {
         for (i = 0; i < v->objn; i++) {
@@ -64,23 +65,22 @@ static void jval_free(JVal *v)
     free(v);
 }
 
-static void jerr(JParser *jp, const char *msg)
-{
+static void jerr(JParser *jp, const char *msg) {
     if (!jp->error) {
         jp->error = 1;
         snprintf(jp->errbuf, sizeof(jp->errbuf), "%s", msg);
     }
 }
 
-static void jskip_ws(JParser *jp)
-{
+static void jskip_ws(JParser *jp) {
     while (jp->p < jp->end) {
         char c = *jp->p;
         if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
             jp->p++;
         } else if (c == '/' && jp->p + 1 < jp->end && jp->p[1] == '/') {
             /* tolerate // line comments (some maps carry them) */
-            while (jp->p < jp->end && *jp->p != '\n') jp->p++;
+            while (jp->p < jp->end && *jp->p != '\n')
+                jp->p++;
         } else {
             break;
         }
@@ -90,9 +90,8 @@ static void jskip_ws(JParser *jp)
 static JVal *jparse_value(JParser *jp);
 
 /* Parse a JSON string literal (jp->p points at the opening quote). */
-static char *jparse_string_raw(JParser *jp)
-{
-    char  *buf;
+static char *jparse_string_raw(JParser *jp) {
+    char *buf;
     size_t cap = 16, len = 0;
     if (jp->p >= jp->end || *jp->p != '"') {
         jerr(jp, "expected string");
@@ -100,41 +99,71 @@ static char *jparse_string_raw(JParser *jp)
     }
     jp->p++;
     buf = malloc(cap);
-    if (!buf) { jerr(jp, "out of memory"); return NULL; }
+    if (!buf) {
+        jerr(jp, "out of memory");
+        return NULL;
+    }
     while (jp->p < jp->end && *jp->p != '"') {
         char c = *jp->p++;
         char out = c;
         if (c == '\\') {
-            if (jp->p >= jp->end) break;
+            if (jp->p >= jp->end)
+                break;
             char e = *jp->p++;
             switch (e) {
-            case '"':  out = '"';  break;
-            case '\\': out = '\\'; break;
-            case '/':  out = '/';  break;
-            case 'n':  out = '\n'; break;
-            case 't':  out = '\t'; break;
-            case 'r':  out = '\r'; break;
-            case 'b':  out = '\b'; break;
-            case 'f':  out = '\f'; break;
+            case '"':
+                out = '"';
+                break;
+            case '\\':
+                out = '\\';
+                break;
+            case '/':
+                out = '/';
+                break;
+            case 'n':
+                out = '\n';
+                break;
+            case 't':
+                out = '\t';
+                break;
+            case 'r':
+                out = '\r';
+                break;
+            case 'b':
+                out = '\b';
+                break;
+            case 'f':
+                out = '\f';
+                break;
             case 'u': {
                 /* \uXXXX: keep ASCII, otherwise emit '?' (docs are display text) */
-                unsigned v = 0; int k;
+                unsigned v = 0;
+                int k;
                 for (k = 0; k < 4 && jp->p < jp->end; k++) {
                     char h = *jp->p++;
                     v <<= 4;
-                    if (h >= '0' && h <= '9') v |= (unsigned)(h - '0');
-                    else if (h >= 'a' && h <= 'f') v |= (unsigned)(h - 'a' + 10);
-                    else if (h >= 'A' && h <= 'F') v |= (unsigned)(h - 'A' + 10);
+                    if (h >= '0' && h <= '9')
+                        v |= (unsigned)(h - '0');
+                    else if (h >= 'a' && h <= 'f')
+                        v |= (unsigned)(h - 'a' + 10);
+                    else if (h >= 'A' && h <= 'F')
+                        v |= (unsigned)(h - 'A' + 10);
                 }
                 out = (v < 0x80u) ? (char)v : '?';
                 break;
             }
-            default: out = e; break;
+            default:
+                out = e;
+                break;
             }
         }
         if (len + 1 >= cap) {
             char *nb = realloc(buf, cap *= 2);
-            if (!nb) { free(buf); jerr(jp, "out of memory"); return NULL; }
+            if (!nb) {
+                free(buf);
+                jerr(jp, "out of memory");
+                return NULL;
+            }
             buf = nb;
         }
         buf[len++] = out;
@@ -149,37 +178,73 @@ static char *jparse_string_raw(JParser *jp)
     return buf;
 }
 
-static JVal *jparse_object(JParser *jp)
-{
+static JVal *jparse_object(JParser *jp) {
     JVal *v = calloc(1, sizeof(*v));
-    if (!v) { jerr(jp, "out of memory"); return NULL; }
+    if (!v) {
+        jerr(jp, "out of memory");
+        return NULL;
+    }
     v->type = J_OBJ;
     jp->p++; /* '{' */
     jskip_ws(jp);
-    if (jp->p < jp->end && *jp->p == '}') { jp->p++; return v; }
+    if (jp->p < jp->end && *jp->p == '}') {
+        jp->p++;
+        return v;
+    }
     for (;;) {
         char *key;
         JVal *val;
         jskip_ws(jp);
         key = jparse_string_raw(jp);
-        if (jp->error) { jval_free(v); return NULL; }
+        if (jp->error) {
+            jval_free(v);
+            return NULL;
+        }
         jskip_ws(jp);
-        if (jp->p >= jp->end || *jp->p != ':') { free(key); jerr(jp, "expected ':'"); jval_free(v); return NULL; }
+        if (jp->p >= jp->end || *jp->p != ':') {
+            free(key);
+            jerr(jp, "expected ':'");
+            jval_free(v);
+            return NULL;
+        }
         jp->p++;
         val = jparse_value(jp);
-        if (jp->error) { free(key); jval_free(v); return NULL; }
+        if (jp->error) {
+            free(key);
+            jval_free(v);
+            return NULL;
+        }
         {
+            /* Store each grown array at once: if the second realloc fails, v
+               must still own valid arrays for jval_free (the old code freed
+               the moved block and left a dangling pointer). */
             char **nk = realloc(v->keys, (v->objn + 1) * sizeof(*nk));
-            JVal **nv = realloc(v->vals, (v->objn + 1) * sizeof(*nv));
-            if (!nk || !nv) { free(nk ? nk : v->keys); free(key); jval_free(val); jerr(jp, "out of memory"); jval_free(v); return NULL; }
-            v->keys = nk; v->vals = nv;
+            JVal **nv = NULL;
+            if (nk) {
+                v->keys = nk;
+                nv = realloc(v->vals, (v->objn + 1) * sizeof(*nv));
+            }
+            if (!nk || !nv) {
+                free(key);
+                jval_free(val);
+                jerr(jp, "out of memory");
+                jval_free(v);
+                return NULL;
+            }
+            v->vals = nv;
             v->keys[v->objn] = key;
             v->vals[v->objn] = val;
             v->objn++;
         }
         jskip_ws(jp);
-        if (jp->p < jp->end && *jp->p == ',') { jp->p++; continue; }
-        if (jp->p < jp->end && *jp->p == '}') { jp->p++; break; }
+        if (jp->p < jp->end && *jp->p == ',') {
+            jp->p++;
+            continue;
+        }
+        if (jp->p < jp->end && *jp->p == '}') {
+            jp->p++;
+            break;
+        }
         jerr(jp, "expected ',' or '}'");
         jval_free(v);
         return NULL;
@@ -187,26 +252,45 @@ static JVal *jparse_object(JParser *jp)
     return v;
 }
 
-static JVal *jparse_array(JParser *jp)
-{
+static JVal *jparse_array(JParser *jp) {
     JVal *v = calloc(1, sizeof(*v));
-    if (!v) { jerr(jp, "out of memory"); return NULL; }
+    if (!v) {
+        jerr(jp, "out of memory");
+        return NULL;
+    }
     v->type = J_ARR;
     jp->p++; /* '[' */
     jskip_ws(jp);
-    if (jp->p < jp->end && *jp->p == ']') { jp->p++; return v; }
+    if (jp->p < jp->end && *jp->p == ']') {
+        jp->p++;
+        return v;
+    }
     for (;;) {
         JVal *el = jparse_value(jp);
-        if (jp->error) { jval_free(v); return NULL; }
+        if (jp->error) {
+            jval_free(v);
+            return NULL;
+        }
         {
             JVal **na = realloc(v->arr, (v->arrn + 1) * sizeof(*na));
-            if (!na) { jval_free(el); jerr(jp, "out of memory"); jval_free(v); return NULL; }
+            if (!na) {
+                jval_free(el);
+                jerr(jp, "out of memory");
+                jval_free(v);
+                return NULL;
+            }
             v->arr = na;
             v->arr[v->arrn++] = el;
         }
         jskip_ws(jp);
-        if (jp->p < jp->end && *jp->p == ',') { jp->p++; continue; }
-        if (jp->p < jp->end && *jp->p == ']') { jp->p++; break; }
+        if (jp->p < jp->end && *jp->p == ',') {
+            jp->p++;
+            continue;
+        }
+        if (jp->p < jp->end && *jp->p == ']') {
+            jp->p++;
+            break;
+        }
         jerr(jp, "expected ',' or ']'");
         jval_free(v);
         return NULL;
@@ -216,25 +300,30 @@ static JVal *jparse_array(JParser *jp)
 
 /* Length-bounded literal match: the fixed-size keywords `true`/`false`/`null`
    are compared only within [jp->p, jp->end), never past the buffer. */
-static int jmatch_kw(JParser *jp, const char *kw)
-{
+static int jmatch_kw(JParser *jp, const char *kw) {
     size_t n = strlen(kw);
-    if ((size_t)(jp->end - jp->p) < n) return 0;
+    if ((size_t)(jp->end - jp->p) < n)
+        return 0;
     return memcmp(jp->p, kw, n) == 0;
 }
 
-static JVal *jmk_bool_null(JParser *jp, JType t, int b)
-{
+static JVal *jmk_bool_null(JParser *jp, JType t, int b) {
     JVal *v = calloc(1, sizeof(*v));
-    if (!v) { jerr(jp, "out of memory"); return NULL; }
-    v->type = t; v->b = b;
+    if (!v) {
+        jerr(jp, "out of memory");
+        return NULL;
+    }
+    v->type = t;
+    v->b = b;
     return v;
 }
 
-static JVal *jparse_value(JParser *jp)
-{
+static JVal *jparse_value(JParser *jp) {
     jskip_ws(jp);
-    if (jp->p >= jp->end) { jerr(jp, "unexpected end of input"); return NULL; }
+    if (jp->p >= jp->end) {
+        jerr(jp, "unexpected end of input");
+        return NULL;
+    }
     char c = *jp->p;
     if (c == '{' || c == '[') {
         if (++jp->depth > JSON_MAX_DEPTH) {
@@ -248,41 +337,71 @@ static JVal *jparse_value(JParser *jp)
     }
     if (c == '"') {
         JVal *v = calloc(1, sizeof(*v));
-        if (!v) { jerr(jp, "out of memory"); return NULL; }
+        if (!v) {
+            jerr(jp, "out of memory");
+            return NULL;
+        }
         v->type = J_STR;
         v->s = jparse_string_raw(jp);
-        if (jp->error) { jval_free(v); return NULL; }
+        if (jp->error) {
+            jval_free(v);
+            return NULL;
+        }
         return v;
     }
-    if (jmatch_kw(jp, "true"))  { jp->p += 4; return jmk_bool_null(jp, J_BOOL, 1); }
-    if (jmatch_kw(jp, "false")) { jp->p += 5; return jmk_bool_null(jp, J_BOOL, 0); }
-    if (jmatch_kw(jp, "null"))  { jp->p += 4; return jmk_bool_null(jp, J_NULL, 0); }
+    if (jmatch_kw(jp, "true")) {
+        jp->p += 4;
+        return jmk_bool_null(jp, J_BOOL, 1);
+    }
+    if (jmatch_kw(jp, "false")) {
+        jp->p += 5;
+        return jmk_bool_null(jp, J_BOOL, 0);
+    }
+    if (jmatch_kw(jp, "null")) {
+        jp->p += 4;
+        return jmk_bool_null(jp, J_NULL, 0);
+    }
     if (c == '-' || (c >= '0' && c <= '9')) {
         /* Scan the numeric run bounded by jp->end (so strtod never reads past
            the buffer) and keep the exact source text for verbatim re-emit. */
         const char *start = jp->p;
         const char *q = jp->p;
-        while (q < jp->end && (*q == '-' || *q == '+' || *q == '.' ||
-               *q == 'e' || *q == 'E' || (*q >= '0' && *q <= '9'))) {
+        while (q < jp->end && (*q == '-' || *q == '+' || *q == '.' || *q == 'e' || *q == 'E' ||
+                               (*q >= '0' && *q <= '9'))) {
             q++;
         }
         size_t nlen = (size_t)(q - start);
-        if (nlen == 0) { jerr(jp, "invalid number"); return NULL; }
+        if (nlen == 0) {
+            jerr(jp, "invalid number");
+            return NULL;
+        }
         char numbuf[64];
         char *tmp = (nlen < sizeof(numbuf)) ? numbuf : malloc(nlen + 1);
-        if (!tmp) { jerr(jp, "out of memory"); return NULL; }
-        memcpy(tmp, start, nlen); tmp[nlen] = '\0';
+        if (!tmp) {
+            jerr(jp, "out of memory");
+            return NULL;
+        }
+        memcpy(tmp, start, nlen);
+        tmp[nlen] = '\0';
         char *end2 = NULL;
         double d = strtod(tmp, &end2);
         int ok = (end2 != tmp);
         JVal *v = ok ? calloc(1, sizeof(*v)) : NULL;
         if (ok && v) {
-            v->type = J_NUM; v->n = d;
+            v->type = J_NUM;
+            v->n = d;
             v->num_raw = nv_strdup(tmp);
         }
-        if (tmp != numbuf) free(tmp);
-        if (!ok)  { jerr(jp, "invalid number"); return NULL; }
-        if (!v)   { jerr(jp, "out of memory"); return NULL; }
+        if (tmp != numbuf)
+            free(tmp);
+        if (!ok) {
+            jerr(jp, "invalid number");
+            return NULL;
+        }
+        if (!v) {
+            jerr(jp, "out of memory");
+            return NULL;
+        }
         jp->p = q;
         return v;
     }
@@ -290,12 +409,13 @@ static JVal *jparse_value(JParser *jp)
     return NULL;
 }
 
-static const JVal *jobj_get(const JVal *o, const char *key)
-{
+static const JVal *jobj_get(const JVal *o, const char *key) {
     size_t i;
-    if (!o || o->type != J_OBJ) return NULL;
+    if (!o || o->type != J_OBJ)
+        return NULL;
     for (i = 0; i < o->objn; i++) {
-        if (strcmp(o->keys[i], key) == 0) return o->vals[i];
+        if (strcmp(o->keys[i], key) == 0)
+            return o->vals[i];
     }
     return NULL;
 }
@@ -304,30 +424,32 @@ static const JVal *jobj_get(const JVal *o, const char *key)
  * Descriptor walk + mapping to ApexII RAM locations.
  * ------------------------------------------------------------------------- */
 
-static int parse_u32_str(const char *s, uint32_t *out)
-{
+static int parse_u32_str(const char *s, uint32_t *out) {
     char *end = NULL;
     unsigned long v;
-    if (!s || !*s) return 0;
-    while (*s == ' ' || *s == '\t') s++;
+    if (!s || !*s)
+        return 0;
+    while (*s == ' ' || *s == '\t')
+        s++;
     v = strtoul(s, &end, (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) ? 16 : 0);
-    if (end == s) return 0;
+    if (end == s)
+        return 0;
     *out = (uint32_t)v;
     return 1;
 }
 
 /* Produce a valid symbol name from a label: [A-Za-z_][A-Za-z0-9_]* */
-static char *sanitize_name(const char *label)
-{
+static char *sanitize_name(const char *label) {
     size_t cap = 64, len = 0;
-    char  *buf = malloc(cap);
+    char *buf = malloc(cap);
     const char *p = label ? label : "";
     int last_us = 0;
-    if (!buf) return NULL;
+    if (!buf)
+        return NULL;
     for (; *p && len + 2 < cap; p++) {
         char c = *p;
-        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
-            (c >= '0' && c <= '9') || c == '_') {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') ||
+            c == '_') {
             buf[len++] = c;
             last_us = 0;
         } else if (!last_us && len > 0) {
@@ -335,7 +457,8 @@ static char *sanitize_name(const char *label)
             last_us = 1;
         }
     }
-    while (len > 0 && buf[len - 1] == '_') len--;   /* trim trailing _ */
+    while (len > 0 && buf[len - 1] == '_')
+        len--; /* trim trailing _ */
     buf[len] = '\0';
     if (len == 0 || (buf[0] >= '0' && buf[0] <= '9')) {
         /* empty or leading digit → prefix underscore */
@@ -345,21 +468,24 @@ static char *sanitize_name(const char *label)
     return buf;
 }
 
-static int name_in_use(const ApexNvramLocs *locs, const char *name)
-{
+static int name_in_use(const ApexNvramLocs *locs, const char *name) {
     size_t i;
     for (i = 0; i < locs->count; i++) {
-        if (locs->items[i].name && strcmp(locs->items[i].name, name) == 0) return 1;
+        if (locs->items[i].name && strcmp(locs->items[i].name, name) == 0)
+            return 1;
     }
     return 0;
 }
 
-static void add_loc(ApexNvramLocs *locs, char *name, uint32_t addr, char *doc)
-{
+static void add_loc(ApexNvramLocs *locs, char *name, uint32_t addr, char *doc) {
     if (locs->count == locs->cap) {
         size_t nc = locs->cap ? locs->cap * 2 : 32;
         ApexNvramLoc *ni = realloc(locs->items, nc * sizeof(*ni));
-        if (!ni) { free(name); free(doc); return; }
+        if (!ni) {
+            free(name);
+            free(doc);
+            return;
+        }
         locs->items = ni;
         locs->cap = nc;
     }
@@ -370,8 +496,7 @@ static void add_loc(ApexNvramLocs *locs, char *name, uint32_t addr, char *doc)
 }
 
 /* An object with a "start" key is a leaf descriptor → one RAM location. */
-static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *locs)
-{
+static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *locs) {
     const JVal *start = jobj_get(d, "start");
     const JVal *label = jobj_get(d, "label");
     const JVal *slabel = jobj_get(d, "short_label");
@@ -380,7 +505,8 @@ static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *loc
     char *name, *doc;
 
     if (start->type == J_STR) {
-        if (!parse_u32_str(start->s, &addr)) return;
+        if (!parse_u32_str(start->s, &addr))
+            return;
     } else if (start->type == J_NUM) {
         addr = (uint32_t)start->n;
     } else {
@@ -390,13 +516,16 @@ static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *loc
 
     /* name: short_label preferred (concise), else label */
     name_src = (slabel && slabel->type == J_STR && slabel->s[0]) ? slabel->s
-             : (label && label->type == J_STR && label->s[0]) ? label->s : NULL;
+               : (label && label->type == J_STR && label->s[0])  ? label->s
+                                                                 : NULL;
     name = sanitize_name(name_src);
-    if (!name) return;
+    if (!name)
+        return;
     if (name[0] == '\0') {
         free(name);
         name = malloc(16);
-        if (!name) return;
+        if (!name)
+            return;
         snprintf(name, 16, "RAM_%04x", addr & 0xffffu);
     }
     /* ensure uniqueness */
@@ -404,7 +533,9 @@ static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *loc
         char *u = malloc(strlen(name) + 12);
         int k = 2;
         if (u) {
-            do { sprintf(u, "%s_%d", name, k++); } while (name_in_use(locs, u) && k < 10000);
+            do {
+                sprintf(u, "%s_%d", name, k++);
+            } while (name_in_use(locs, u) && k < 10000);
             free(name);
             name = u;
         }
@@ -412,35 +543,37 @@ static void add_from_descriptor(const JVal *d, uint32_t base, ApexNvramLocs *loc
 
     /* doc: the human label (fall back to short_label) */
     doc_src = (label && label->type == J_STR && label->s[0]) ? label->s
-            : (slabel && slabel->type == J_STR) ? slabel->s : "";
+              : (slabel && slabel->type == J_STR)            ? slabel->s
+                                                             : "";
     doc = nv_strdup(doc_src ? doc_src : "");
 
     add_loc(locs, name, addr, doc);
 }
 
-static void walk(const JVal *v, uint32_t base, ApexNvramLocs *locs)
-{
+static void walk(const JVal *v, uint32_t base, ApexNvramLocs *locs) {
     size_t i;
-    if (!v) return;
+    if (!v)
+        return;
     if (v->type == J_OBJ) {
         if (jobj_get(v, "start")) {
             add_from_descriptor(v, base, locs); /* leaf */
             return;
         }
         for (i = 0; i < v->objn; i++) {
-            if (v->keys[i][0] == '_') continue; /* _metadata / _fileformat */
+            if (v->keys[i][0] == '_')
+                continue; /* _metadata / _fileformat */
             walk(v->vals[i], base, locs);
         }
     } else if (v->type == J_ARR) {
-        for (i = 0; i < v->arrn; i++) walk(v->arr[i], base, locs);
+        for (i = 0; i < v->arrn; i++)
+            walk(v->arr[i], base, locs);
     }
 }
 
-int apex_nvram_parse_json(const char *text, size_t len, uint32_t base,
-                          ApexNvramLocs *out, char *err, size_t errsz)
-{
+int apex_nvram_parse_json(const char *text, size_t len, uint32_t base, ApexNvramLocs *out,
+                          char *err, size_t errsz) {
     JParser jp;
-    JVal   *root;
+    JVal *root;
 
     memset(out, 0, sizeof(*out));
     memset(&jp, 0, sizeof(jp));
@@ -448,19 +581,22 @@ int apex_nvram_parse_json(const char *text, size_t len, uint32_t base,
     jp.end = text + len;
     root = jparse_value(&jp);
     if (jp.error || !root) {
-        if (err) snprintf(err, errsz, "JSON parse error: %s", jp.errbuf);
+        if (err)
+            snprintf(err, errsz, "JSON parse error: %s", jp.errbuf);
         jval_free(root);
         return 1;
     }
     if (root->type != J_OBJ) {
-        if (err) snprintf(err, errsz, "top-level JSON is not an object");
+        if (err)
+            snprintf(err, errsz, "top-level JSON is not an object");
         jval_free(root);
         return 1;
     }
     walk(root, base, out);
     jval_free(root);
     if (out->count == 0) {
-        if (err) snprintf(err, errsz, "no memory-location descriptors found");
+        if (err)
+            snprintf(err, errsz, "no memory-location descriptors found");
         return 1;
     }
     return 0;
@@ -470,26 +606,36 @@ int apex_nvram_parse_json(const char *text, size_t len, uint32_t base,
  * Export.
  * ------------------------------------------------------------------------- */
 
-static void json_write_escaped(FILE *out, const char *s)
-{
+static void json_write_escaped(FILE *out, const char *s) {
     for (; s && *s; s++) {
         unsigned char c = (unsigned char)*s;
         switch (c) {
-        case '"':  fputs("\\\"", out); break;
-        case '\\': fputs("\\\\", out); break;
-        case '\n': fputs("\\n", out);  break;
-        case '\t': fputs("\\t", out);  break;
-        case '\r': fputs("\\r", out);  break;
+        case '"':
+            fputs("\\\"", out);
+            break;
+        case '\\':
+            fputs("\\\\", out);
+            break;
+        case '\n':
+            fputs("\\n", out);
+            break;
+        case '\t':
+            fputs("\\t", out);
+            break;
+        case '\r':
+            fputs("\\r", out);
+            break;
         default:
-            if (c < 0x20) fprintf(out, "\\u%04x", c);
-            else fputc((char)c, out);
+            if (c < 0x20)
+                fprintf(out, "\\u%04x", c);
+            else
+                fputc((char)c, out);
         }
     }
 }
 
 int apex_nvram_write_json(FILE *out, const ApexNvramLoc *items, size_t count,
-                          const char *rom_name)
-{
+                          const char *rom_name) {
     size_t i;
     fputs("{\n", out);
     fputs("  \"_fileformat\": 0.8,\n", out);
@@ -527,42 +673,62 @@ int apex_nvram_write_json(FILE *out, const ApexNvramLoc *items, size_t count,
  * Zero-loss (template-merge) export: JSON tree serializer + descriptor update.
  * ------------------------------------------------------------------------- */
 
-static void jindent(FILE *f, int n) { while (n-- > 0) fputs("  ", f); }
+static void jindent(FILE *f, int n) {
+    while (n-- > 0)
+        fputs("  ", f);
+}
 
-static void jwrite_string(FILE *f, const char *s)
-{
+static void jwrite_string(FILE *f, const char *s) {
     fputc('"', f);
     json_write_escaped(f, s ? s : "");
     fputc('"', f);
 }
 
-static void jval_write(FILE *f, const JVal *v, int ind)
-{
+static void jval_write(FILE *f, const JVal *v, int ind) {
     size_t i;
-    if (!v) { fputs("null", f); return; } /* tolerate an OOM-dropped node */
+    if (!v) {
+        fputs("null", f);
+        return;
+    } /* tolerate an OOM-dropped node */
     switch (v->type) {
-    case J_NULL: fputs("null", f); break;
-    case J_BOOL: fputs(v->b ? "true" : "false", f); break;
+    case J_NULL:
+        fputs("null", f);
+        break;
+    case J_BOOL:
+        fputs(v->b ? "true" : "false", f);
+        break;
     case J_NUM:
         /* Re-emit the original numeric text verbatim (zero-loss); only synthesized
            numbers, which have no source text, are formatted from the double. */
-        if (v->num_raw) fputs(v->num_raw, f);
-        else if (v->n == (double)(long long)v->n) fprintf(f, "%lld", (long long)v->n);
-        else fprintf(f, "%.17g", v->n);
+        if (v->num_raw)
+            fputs(v->num_raw, f);
+        else if (v->n == (double)(long long)v->n)
+            fprintf(f, "%lld", (long long)v->n);
+        else
+            fprintf(f, "%.17g", v->n);
         break;
-    case J_STR: jwrite_string(f, v->s); break;
+    case J_STR:
+        jwrite_string(f, v->s);
+        break;
     case J_ARR:
-        if (v->arrn == 0) { fputs("[]", f); break; }
+        if (v->arrn == 0) {
+            fputs("[]", f);
+            break;
+        }
         fputs("[\n", f);
         for (i = 0; i < v->arrn; i++) {
             jindent(f, ind + 1);
             jval_write(f, v->arr[i], ind + 1);
             fputs(i + 1 < v->arrn ? ",\n" : "\n", f);
         }
-        jindent(f, ind); fputc(']', f);
+        jindent(f, ind);
+        fputc(']', f);
         break;
     case J_OBJ:
-        if (v->objn == 0) { fputs("{}", f); break; }
+        if (v->objn == 0) {
+            fputs("{}", f);
+            break;
+        }
         fputs("{\n", f);
         for (i = 0; i < v->objn; i++) {
             jindent(f, ind + 1);
@@ -571,29 +737,53 @@ static void jval_write(FILE *f, const JVal *v, int ind)
             jval_write(f, v->vals[i], ind + 1);
             fputs(i + 1 < v->objn ? ",\n" : "\n", f);
         }
-        jindent(f, ind); fputc('}', f);
+        jindent(f, ind);
+        fputc('}', f);
         break;
     }
 }
 
-static JVal *jmk_str(const char *s) { JVal *v = calloc(1, sizeof(*v)); if (v) { v->type = J_STR; v->s = nv_strdup(s); } return v; }
-static JVal *jmk_num(double n)      { JVal *v = calloc(1, sizeof(*v)); if (v) { v->type = J_NUM; v->n = n; } return v; }
-static JVal *jmk_obj(void)          { JVal *v = calloc(1, sizeof(*v)); if (v)   v->type = J_OBJ; return v; }
+static JVal *jmk_str(const char *s) {
+    JVal *v = calloc(1, sizeof(*v));
+    if (v) {
+        v->type = J_STR;
+        v->s = nv_strdup(s);
+    }
+    return v;
+}
+static JVal *jmk_num(double n) {
+    JVal *v = calloc(1, sizeof(*v));
+    if (v) {
+        v->type = J_NUM;
+        v->n = n;
+    }
+    return v;
+}
+static JVal *jmk_obj(void) {
+    JVal *v = calloc(1, sizeof(*v));
+    if (v)
+        v->type = J_OBJ;
+    return v;
+}
 
-static void jobj_add(JVal *o, const char *k, JVal *val)
-{
+static void jobj_add(JVal *o, const char *k, JVal *val) {
     char **nk = realloc(o->keys, (o->objn + 1) * sizeof(char *));
-    JVal **nv = realloc(o->vals, (o->objn + 1) * sizeof(JVal *));
-    if (!nk || !nv) { free(nk ? nk : o->keys); jval_free(val); return; } /* OOM: drop */
-    o->keys = nk;
+    JVal **nv = NULL;
+    if (nk) {
+        o->keys = nk; /* keep o valid whichever realloc fails */
+        nv = realloc(o->vals, (o->objn + 1) * sizeof(JVal *));
+    }
+    if (!nk || !nv) {
+        jval_free(val); /* OOM: drop the value, o is unchanged */
+        return;
+    }
     o->vals = nv;
     o->keys[o->objn] = nv_strdup(k);
     o->vals[o->objn] = val;
     o->objn++;
 }
 
-static void jobj_set_str(JVal *o, const char *k, const char *val)
-{
+static void jobj_set_str(JVal *o, const char *k, const char *val) {
     size_t i;
     for (i = 0; i < o->objn; i++) {
         if (strcmp(o->keys[i], k) == 0) {
@@ -607,17 +797,21 @@ static void jobj_set_str(JVal *o, const char *k, const char *val)
 
 /* Update each template descriptor's short_label/label from the matching apex
    location (by start address), marking that location used. */
-static void merge_walk(JVal *v, const ApexNvramLoc *items, size_t count, char *used)
-{
+static void merge_walk(JVal *v, const ApexNvramLoc *items, size_t count, char *used) {
     size_t i;
-    if (!v) return;
+    if (!v)
+        return;
     if (v->type == J_OBJ) {
         const JVal *start = jobj_get(v, "start");
         if (start) {
             uint32_t addr = 0;
             int ok = 0;
-            if (start->type == J_STR) ok = parse_u32_str(start->s, &addr);
-            else if (start->type == J_NUM) { addr = (uint32_t)start->n; ok = 1; }
+            if (start->type == J_STR)
+                ok = parse_u32_str(start->s, &addr);
+            else if (start->type == J_NUM) {
+                addr = (uint32_t)start->n;
+                ok = 1;
+            }
             if (ok) {
                 for (i = 0; i < count; i++) {
                     if (items[i].addr == addr && !used[i]) {
@@ -632,41 +826,45 @@ static void merge_walk(JVal *v, const ApexNvramLoc *items, size_t count, char *u
             return; /* leaf */
         }
         for (i = 0; i < v->objn; i++) {
-            if (v->keys[i][0] == '_') continue;
+            if (v->keys[i][0] == '_')
+                continue;
             merge_walk(v->vals[i], items, count, used);
         }
     } else if (v->type == J_ARR) {
-        for (i = 0; i < v->arrn; i++) merge_walk(v->arr[i], items, count, used);
+        for (i = 0; i < v->arrn; i++)
+            merge_walk(v->arr[i], items, count, used);
     }
 }
 
 int apex_nvram_export_merged(FILE *out, const char *template_text, size_t template_len,
-                             const ApexNvramLoc *items, size_t count,
-                             char *err, size_t errsz)
-{
+                             const ApexNvramLoc *items, size_t count, char *err, size_t errsz) {
     JParser jp;
-    JVal   *root;
-    char   *used;
-    size_t  i, unused = 0;
+    JVal *root;
+    char *used;
+    size_t i, unused = 0;
 
     memset(&jp, 0, sizeof(jp));
     jp.p = template_text;
     jp.end = template_text + template_len;
     root = jparse_value(&jp);
     if (jp.error || !root || root->type != J_OBJ) {
-        if (err) snprintf(err, errsz, "template parse error: %s", jp.errbuf);
+        if (err)
+            snprintf(err, errsz, "template parse error: %s", jp.errbuf);
         jval_free(root);
         return 1;
     }
     used = calloc(count ? count : 1, 1);
     if (!used) {
-        if (err) snprintf(err, errsz, "out of memory");
+        if (err)
+            snprintf(err, errsz, "out of memory");
         jval_free(root);
         return 1;
     }
     merge_walk(root, items, count, used);
 
-    for (i = 0; i < count; i++) if (!used[i]) unused++;
+    for (i = 0; i < count; i++)
+        if (!used[i])
+            unused++;
     if (unused) {
         /* Re-fetch after each add so a node dropped on OOM (jobj_add frees it)
            becomes NULL here instead of a dangling pointer. */
@@ -686,7 +884,8 @@ int apex_nvram_export_merged(FILE *out, const char *template_text, size_t templa
         for (i = 0; grp && i < count; i++) {
             char sb[16];
             JVal *d;
-            if (used[i]) continue;
+            if (used[i])
+                continue;
             d = jmk_obj();
             jobj_add(d, "short_label", jmk_str(items[i].name));
             jobj_add(d, "label", jmk_str(items[i].doc ? items[i].doc : ""));
@@ -704,10 +903,10 @@ int apex_nvram_export_merged(FILE *out, const char *template_text, size_t templa
     return 0;
 }
 
-void apex_nvram_locs_free(ApexNvramLocs *locs)
-{
+void apex_nvram_locs_free(ApexNvramLocs *locs) {
     size_t i;
-    if (!locs) return;
+    if (!locs)
+        return;
     for (i = 0; i < locs->count; i++) {
         free(locs->items[i].name);
         free(locs->items[i].doc);

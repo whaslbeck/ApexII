@@ -1,8 +1,7 @@
-#include "apexdmd.h"
-
 #include "apex.h"
 #include "apex_analysis.h"
 #include "apex_config.h"
+#include "apexdmd.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -10,8 +9,7 @@
 #include <string.h>
 #include <sys/stat.h>
 
-static int starts_with_ci(const char *text, const char *prefix)
-{
+static int starts_with_ci(const char *text, const char *prefix) {
     while (*prefix) {
         unsigned char a = (unsigned char)*text;
         unsigned char b = (unsigned char)*prefix;
@@ -30,8 +28,7 @@ static int starts_with_ci(const char *text, const char *prefix)
     return 1;
 }
 
-static int parse_target_address(const char *input, uint8_t *bank, uint32_t *cpu_addr)
-{
+static int parse_target_address(const char *input, uint8_t *bank, uint32_t *cpu_addr) {
     unsigned parsed_bank;
     unsigned parsed_cpu;
 
@@ -51,8 +48,8 @@ static int parse_target_address(const char *input, uint8_t *bank, uint32_t *cpu_
     return 0;
 }
 
-static const uint8_t *locate_asset(const Buffer *rom, uint8_t bank, uint32_t addr, size_t *size_out)
-{
+static const uint8_t *locate_asset(const Buffer *rom, uint8_t bank, uint32_t addr,
+                                   size_t *size_out) {
     size_t paged_size;
     size_t banks;
     size_t offset;
@@ -86,8 +83,7 @@ static const uint8_t *locate_asset(const Buffer *rom, uint8_t bank, uint32_t add
     return rom->data + offset;
 }
 
-static void ensure_dir(const char *path)
-{
+static void ensure_dir(const char *path) {
 #ifdef _WIN32
     if (mkdir(path) != 0 && errno != EEXIST) {
 #else
@@ -97,13 +93,11 @@ static void ensure_dir(const char *path)
     }
 }
 
-static const TableDef *find_table(const TableDefs *tables, uint8_t bank, uint32_t addr)
-{
+static const TableDef *find_table(const TableDefs *tables, uint8_t bank, uint32_t addr) {
     return table_def_at(bank, addr, tables);
 }
 
-static void format_address(char *out, size_t out_size, uint8_t bank, uint32_t addr)
-{
+static void format_address(char *out, size_t out_size, uint8_t bank, uint32_t addr) {
     if (bank == 0xffu) {
         snprintf(out, out_size, "Bff_A%04x", (unsigned)addr & 0xffffu);
     } else {
@@ -112,8 +106,7 @@ static void format_address(char *out, size_t out_size, uint8_t bank, uint32_t ad
 }
 
 static void run_table_mode(const char *rom_path, const char *config_path, const char *table_text,
-                           const char *out_dir)
-{
+                           const char *out_dir) {
     Buffer rom;
     InlineSignatures sigs = {0};
     ConfigLabels labels = {0};
@@ -141,8 +134,8 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
     {
         ConfigTypes types = {0};
 
-        load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &docs,
-                    &symbols, &data_ranges, &options, &types, NULL, NULL, NULL, NULL);
+        load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &docs, &symbols,
+                    &data_ranges, &options, &types, NULL, NULL, NULL, NULL);
         free_config_types(&types);
     }
     table = find_table(&tables, table_bank, table_addr);
@@ -153,7 +146,8 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
         (table->schema.items[0].kind != TABLE_FAR_DATA &&
          table->schema.items[0].kind != TABLE_FAR_DMD_FULLFRAME) ||
         table->schema.items[0].count != 1u) {
-        die("table mode currently supports only rows[n](far_data|far_dmd_fullframe) without header");
+        die("table mode currently supports only rows[n](far_data|far_dmd_fullframe) without "
+            "header");
     }
 
     rom = read_file(rom_path);
@@ -178,7 +172,8 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
 
     for (row = 0; row < table->rows; row++) {
         size_t entry_off = row * 3u;
-        uint16_t target_addr = (uint16_t)(((unsigned)table_src[entry_off] << 8) | table_src[entry_off + 1u]);
+        uint16_t target_addr =
+            (uint16_t)(((unsigned)table_src[entry_off] << 8) | table_src[entry_off + 1u]);
         uint8_t target_bank = table_src[entry_off + 2u];
         const uint8_t *src;
         size_t src_size = 0u;
@@ -206,7 +201,8 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
 
         if (row + 1u < table->rows) {
             size_t next_off = (row + 1u) * 3u;
-            uint16_t next_addr = (uint16_t)(((unsigned)table_src[next_off] << 8) | table_src[next_off + 1u]);
+            uint16_t next_addr =
+                (uint16_t)(((unsigned)table_src[next_off] << 8) | table_src[next_off + 1u]);
             uint8_t next_bank = table_src[next_off + 2u];
             const uint8_t *src1;
             size_t src1_size = 0u;
@@ -246,16 +242,14 @@ static void run_table_mode(const char *rom_path, const char *config_path, const 
     free(rom.data);
 }
 
-static void usage(const char *argv0)
-{
+static void usage(const char *argv0) {
     fprintf(stderr, "usage:\n");
     fprintf(stderr, "  %s <rom> <Bxx_Ayyyy|0xhhhh> <out.pbm>\n", argv0);
     fprintf(stderr, "  %s --pair <rom> <addr0> <addr1> <out.pgm>\n", argv0);
     fprintf(stderr, "  %s --table <rom> <config.ini> <table_addr> <outdir>\n", argv0);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     Buffer rom;
     const uint8_t *src0;
     const uint8_t *src1;
@@ -332,8 +326,7 @@ int main(int argc, char **argv)
     if (!apexdmd_write_pair_pgm(argv[5], plane0, plane1)) {
         die("failed to write %s", argv[5]);
     }
-    fprintf(stderr,
-            "decoded pair %s(type=0x%02x bytes=%lu) + %s(type=0x%02x bytes=%lu) -> %s\n",
+    fprintf(stderr, "decoded pair %s(type=0x%02x bytes=%lu) + %s(type=0x%02x bytes=%lu) -> %s\n",
             argv[3], (unsigned)type0, (unsigned long)consumed0, argv[4], (unsigned)type1,
             (unsigned long)consumed1, argv[5]);
 

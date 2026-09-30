@@ -4,16 +4,21 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void fail(const char *m) { fprintf(stderr, "%s\n", m); exit(1); }
-static void expect(int c, const char *m) { if (!c) fail(m); }
+static void fail(const char *m) {
+    fprintf(stderr, "%s\n", m);
+    exit(1);
+}
+static void expect(int c, const char *m) {
+    if (!c)
+        fail(m);
+}
 
 /* width=10 -> row_bytes=2, height=3 -> page=6 */
 #define W 10u
 #define H 3u
 #define PAGE 6u
 
-int main(void)
-{
+int main(void) {
     uint8_t dest[APEX_SPRITE_MAX_BYTES];
     uint8_t enc;
     uint8_t w, h;
@@ -22,7 +27,9 @@ int main(void)
 
     /* ---- 0x00 monochrome: 5 + page ---- */
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0x00; buf[3] = H; buf[4] = W;
+    buf[0] = 0x00;
+    buf[3] = H;
+    buf[4] = W;
     expect(apexsprite_decode(buf, sizeof(buf), dest, NULL, NULL, NULL, &w, &h, &enc, &consumed),
            "mono decode failed");
     expect(consumed == 5u + PAGE, "mono consumed wrong");
@@ -31,7 +38,9 @@ int main(void)
 
     /* ---- 0xFD: 5 + page, enc fd ---- */
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0xFD; buf[3] = H; buf[4] = W;
+    buf[0] = 0xFD;
+    buf[3] = H;
+    buf[4] = W;
     expect(apexsprite_decode(buf, sizeof(buf), dest, NULL, NULL, NULL, NULL, NULL, &enc, &consumed),
            "fd decode failed");
     expect(consumed == 5u + PAGE, "fd consumed wrong");
@@ -39,7 +48,9 @@ int main(void)
 
     /* ---- 0xFE bicolor-indirect: 5 + 2 + page ---- */
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0xFE; buf[3] = H; buf[4] = W;
+    buf[0] = 0xFE;
+    buf[3] = H;
+    buf[4] = W;
     expect(apexsprite_decode(buf, sizeof(buf), dest, NULL, NULL, NULL, NULL, NULL, &enc, &consumed),
            "indirect decode failed");
     expect(consumed == 5u + 2u + PAGE, "indirect consumed wrong");
@@ -47,11 +58,15 @@ int main(void)
 
     /* ---- 0xFF bicolor-direct: 5 + 2*page, plane0|plane1 OR-ed into dest ---- */
     memset(buf, 0, sizeof(buf));
-    buf[0] = 0xFF; buf[3] = H; buf[4] = W;
+    buf[0] = 0xFF;
+    buf[3] = H;
+    buf[4] = W;
     {
         size_t i;
-        for (i = 0; i < PAGE; i++) buf[5u + i]        = 0x0F; /* plane1 */
-        for (i = 0; i < PAGE; i++) buf[5u + PAGE + i] = 0xF0; /* plane0 */
+        for (i = 0; i < PAGE; i++)
+            buf[5u + i] = 0x0F; /* plane1 */
+        for (i = 0; i < PAGE; i++)
+            buf[5u + PAGE + i] = 0xF0; /* plane0 */
     }
     expect(apexsprite_decode(buf, sizeof(buf), dest, NULL, NULL, NULL, NULL, NULL, &enc, &consumed),
            "direct decode failed");

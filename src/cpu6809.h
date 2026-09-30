@@ -10,8 +10,9 @@ typedef const char *(*Cpu6809LabelFn)(void *ctx, uint32_t addr);
 
 #define CPU6809_FLOW_STOP 0x01u
 #define CPU6809_TARGET_CODE 0x02u
-#define CPU6809_CALL 0x04u   /* subroutine call (JSR/BSR/LBSR): pushes a return
-                                address, so an inline payload may follow it */
+#define CPU6809_CALL                                                                               \
+    0x04u /* subroutine call (JSR/BSR/LBSR): pushes a return                                       \
+             address, so an inline payload may follow it */
 
 typedef struct {
     size_t size;
@@ -24,12 +25,13 @@ typedef struct {
 
 int cpu6809_assemble_line(const char *mnemonic, char *operand, uint32_t pc, int resolve_symbols,
                           Cpu6809ResolveFn resolve, Cpu6809EmitFn emit, void *ctx);
-size_t cpu6809_disassemble(const uint8_t *data, size_t len, uint32_t pc, char *out, size_t out_size);
+size_t cpu6809_disassemble(const uint8_t *data, size_t len, uint32_t pc, char *out,
+                           size_t out_size);
 Cpu6809InstrInfo cpu6809_disassemble_info(const uint8_t *data, size_t len, uint32_t pc, char *out,
-                                           size_t out_size);
+                                          size_t out_size);
 Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, uint32_t pc,
-                                              char *out, size_t out_size, Cpu6809LabelFn label,
-                                              void *label_ctx);
+                                             char *out, size_t out_size, Cpu6809LabelFn label,
+                                             void *label_ctx);
 /* Like _ex, but resolves immediate operands (LDX/LDD/... #imm16) through a
    separate callback (sharing label_ctx), so callers can suppress or restrict
    symbol resolution in immediates independently of address operands.  When
@@ -37,6 +39,9 @@ Cpu6809InstrInfo cpu6809_disassemble_info_ex(const uint8_t *data, size_t len, ui
 Cpu6809InstrInfo cpu6809_disassemble_info_ex2(const uint8_t *data, size_t len, uint32_t pc,
                                               char *out, size_t out_size, Cpu6809LabelFn label,
                                               void *label_ctx, Cpu6809LabelFn label_imm);
+
+/* 1 if the internal opcode lookup index matches the opcode table (tests). */
+int cpu6809_selfcheck(void);
 
 /* Render 5-bit indexed offsets in hex (opt-in; default off). */
 void cpu6809_set_hex_index_offsets(int enabled);

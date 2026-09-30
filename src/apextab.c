@@ -1,8 +1,8 @@
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <stdint.h>
 #include <string.h>
-#include <stdbool.h>
 
 #define BANK_SIZE 0x4000
 #define MAX_STRING_LEN 50
@@ -16,10 +16,11 @@ typedef struct {
 
 FoundTable found_text_tables[MAX_TABLES];
 int num_found_text_tables = 0;
-uint8_t rom_bank_ids[256]; // IDs read from first byte of each 16KB physical bank
+uint8_t rom_bank_ids[256];  // IDs read from first byte of each 16KB physical bank
 
 bool is_valid_string(const uint8_t *rom, uint32_t size, uint32_t offset) {
-    if (offset >= size) return false;
+    if (offset >= size)
+        return false;
     uint32_t len = 0;
     while (offset + len < size && len <= MAX_STRING_LEN) {
         uint8_t c = rom[offset + len];
@@ -39,12 +40,13 @@ uint32_t translate_ptr16(uint16_t ptr, int phys_bank, int total_banks) {
         return (uint32_t)phys_bank * BANK_SIZE + (ptr - 0x4000);
     } else if (ptr >= 0x8000) {
         int system_start_bank = total_banks - 2;
-        if (system_start_bank < 0) system_start_bank = 0;
+        if (system_start_bank < 0)
+            system_start_bank = 0;
         // 0x8000 is start of the second-to-last bank
         if (ptr < 0xC000) {
-             return (uint32_t)system_start_bank * BANK_SIZE + (ptr - 0x8000);
+            return (uint32_t)system_start_bank * BANK_SIZE + (ptr - 0x8000);
         } else {
-             return (uint32_t)(system_start_bank + 1) * BANK_SIZE + (ptr - 0xC000);
+            return (uint32_t)(system_start_bank + 1) * BANK_SIZE + (ptr - 0xC000);
         }
     }
     return 0xFFFFFFFF;
@@ -71,12 +73,15 @@ uint32_t find_offset_by_far_ptr(uint8_t bank_id, uint16_t addr, int total_banks)
 }
 
 bool is_text_table_at(const uint8_t *rom, uint32_t size, uint32_t offset, int total_banks) {
-    if (offset + 3 > size) return false;
+    if (offset + 3 > size)
+        return false;
     uint16_t num_rows = (rom[offset] << 8) | rom[offset + 1];
     uint8_t width = rom[offset + 2];
-    if (width != 2 || num_rows == 0 || num_rows > 1000) return false;
+    if (width != 2 || num_rows == 0 || num_rows > 1000)
+        return false;
     uint32_t data_offset = offset + 3;
-    if (data_offset + num_rows * 2 > size) return false;
+    if (data_offset + num_rows * 2 > size)
+        return false;
     int phys_bank = offset / BANK_SIZE;
     for (int i = 0; i < num_rows; i++) {
         uint16_t ptr = (rom[data_offset + i * 2] << 8) | rom[data_offset + i * 2 + 1];
@@ -90,7 +95,8 @@ bool is_text_table_at(const uint8_t *rom, uint32_t size, uint32_t offset, int to
 
 bool is_known_text_table(uint32_t offset) {
     for (int i = 0; i < num_found_text_tables; i++) {
-        if (found_text_tables[i].offset == offset) return true;
+        if (found_text_tables[i].offset == offset)
+            return true;
     }
     return false;
 }
@@ -106,12 +112,21 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     fseek(f, 0, SEEK_END);
-    uint32_t size = ftell(f);
+    long fsz = ftell(f);
     fseek(f, 0, SEEK_SET);
+    /* The scans below index rom[i + 8] and one bank-ID slot per 16 KB page. */
+    if (fsz < 0x8000 || fsz % BANK_SIZE != 0 || fsz / BANK_SIZE > 256) {
+        fprintf(stderr, "%s: size %ld is not a WPC ROM image (32 KB - 4 MB, multiple of 16 KB)\n",
+                argv[1], fsz);
+        fclose(f);
+        return 1;
+    }
+    uint32_t size = (uint32_t)fsz;
     uint8_t *rom = malloc(size);
     if (!rom || fread(rom, 1, size, f) != size) {
         perror("fread/malloc");
-        if(rom) free(rom);
+        if (rom)
+            free(rom);
         fclose(f);
         return 1;
     }
@@ -128,7 +143,8 @@ int main(int argc, char *argv[]) {
             uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : rom_bank_ids[phys_bank];
             uint16_t addr = 0x4000 + (i % BANK_SIZE);
             if (phys_bank >= total_banks - 2) {
-                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % BANK_SIZE) : 0xC000 + (i % BANK_SIZE);
+                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % BANK_SIZE)
+                                                      : 0xC000 + (i % BANK_SIZE);
             }
             if (num_found_text_tables < MAX_TABLES) {
                 found_text_tables[num_found_text_tables++] = (FoundTable){i, bank_id, addr};
@@ -156,7 +172,8 @@ int main(int argc, char *argv[]) {
             uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : rom_bank_ids[phys_bank];
             uint16_t addr = 0x4000 + (i % BANK_SIZE);
             if (phys_bank >= total_banks - 2) {
-                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % BANK_SIZE) : 0xC000 + (i % BANK_SIZE);
+                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % BANK_SIZE)
+                                                      : 0xC000 + (i % BANK_SIZE);
             }
             printf("B%02x_A%04x = rows[3](far_data)\n", bank_id, addr);
             i += 8;

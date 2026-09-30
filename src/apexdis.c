@@ -1,57 +1,207 @@
 #include "apex.h"
 #include "apex_analysis.h"
 #include "apex_config.h"
+#include "apex_project.h"
+#include "apex_rominfo.h"
+#include "apexdis_api.h"
 #include "apexdmd.h"
 #include "apexsprite.h"
-#include "apex_project.h"
 #include "cpu6809.h"
-#include "apexdis_api.h"
-#include "apex_rominfo.h"
 
 #include <ctype.h>
+#include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
 
+/* The listing is formatted into this growable buffer rather than a FILE*: the
+   CLI writes it out in one go, and the GUI renderer takes the text together
+   with the line marks recorded alongside (see ApexAsmMark in apex_project.h),
+   instead of round-tripping through a temp file and re-parsing the text. */
+typedef struct AsmOut {
+    char *buf;
+    size_t len;
+    size_t cap;
+    int record_marks;
+    ApexAsmMark *marks;
+    size_t mark_count;
+    size_t mark_cap;
+    /* last location mark: an item's bank and ROM offset follow from it */
+    uint8_t loc_bank;
+    uint32_t loc_cpu;
+    size_t loc_rom;
+} AsmOut;
+
+static void ao_reserve(AsmOut *o, size_t extra) {
+    if (o->len + extra + 1u > o->cap) {
+        size_t cap = o->cap ? o->cap : 65536u;
+        char *nb;
+        while (o->len + extra + 1u > cap) {
+            cap *= 2u;
+        }
+        nb = realloc(o->buf, cap);
+        if (!nb) {
+            die("out of memory");
+        }
+        o->buf = nb;
+        o->cap = cap;
+    }
+}
+
+static void ao_printf(AsmOut *o, const char *fmt, ...) {
+    va_list ap;
+    int n;
+    size_t avail;
+
+    ao_reserve(o, 256u); /* most lines fit: format straight into the buffer */
+    avail = o->cap - o->len;
+    va_start(ap, fmt);
+    n = vsnprintf(o->buf + o->len, avail, fmt, ap);
+    va_end(ap);
+    if (n < 0) {
+        o->buf[o->len] = '\0';
+        return;
+    }
+    if ((size_t)n >= avail) {
+        ao_reserve(o, (size_t)n);
+        va_start(ap, fmt);
+        vsnprintf(o->buf + o->len, (size_t)n + 1u, fmt, ap);
+        va_end(ap);
+    }
+    o->len += (size_t)n;
+}
+
+static void ao_puts(AsmOut *o, const char *s) {
+    size_t n = strlen(s);
+    ao_reserve(o, n);
+    memcpy(o->buf + o->len, s, n + 1u);
+    o->len += n;
+}
+
+static void ao_putc(AsmOut *o, int c) {
+    ao_reserve(o, 1u);
+    o->buf[o->len++] = (char)c;
+    o->buf[o->len] = '\0';
+}
+
+static ApexAsmMark *ao_new_mark(AsmOut *o) {
+    ApexAsmMark *m;
+    if (o->mark_count == o->mark_cap) {
+        size_t cap = o->mark_cap ? o->mark_cap * 2u : 4096u;
+        ApexAsmMark *nm = realloc(o->marks, cap * sizeof(*nm));
+        if (!nm) {
+            die("out of memory");
+        }
+        o->marks = nm;
+        o->mark_cap = cap;
+    }
+    m = &o->marks[o->mark_count++];
+    memset(m, 0, sizeof(*m));
+    m->text_off = o->len;
+    return m;
+}
+
+/* The next line written is a location comment of `kind` for (bank, cpu, rom). */
+static void ao_mark_location(AsmOut *o, const char *kind, uint8_t bank, uint32_t cpu, size_t rom,
+                             int conflict) {
+    o->loc_bank = bank;
+    o->loc_cpu = cpu;
+    o->loc_rom = rom;
+    if (o->record_marks) {
+        ApexAsmMark *m = ao_new_mark(o);
+        m->kind = APEX_ASM_MARK_LOCATION;
+        m->bank = bank;
+        m->cpu_addr = cpu;
+        m->rom_addr = rom;
+        m->conflict = conflict;
+        snprintf(m->loc_kind, sizeof(m->loc_kind), "%s", kind);
+    }
+}
+
+/* The current output line assembles to `size` bytes.  May be called anywhere
+   in the line (the mark is anchored at the line start); the line's address
+   follows from the last location mark plus the sizes of the items since. */
+static void ao_mark_item(AsmOut *o, size_t size) {
+    if (o->record_marks) {
+        size_t line_start = o->len;
+        ApexAsmMark *m;
+        while (line_start > 0 && o->buf[line_start - 1u] != '\n') {
+            line_start--;
+        }
+        m = ao_new_mark(o);
+        m->kind = APEX_ASM_MARK_ITEM;
+        m->text_off = line_start;
+        m->size = size;
+    }
+}
+
 /* See apex_project.h — the GUI clears this to keep warnings out of the console. */
 int apex_warn_to_stderr = 1;
 
-/* Acked-warning set for the current write pass: set at the top of
+/* The g_render_* pointers below are thread-local: the GUI renders on a worker
+   thread while other workers (match/compare) may analyse other projects.
+
+   Acked-warning set for the current write pass: set at the top of
    apex_project_write_asm_stream and cleared at the end.  A warning whose
    (bank, cpu) is in this set is emitted as "; WARNING_ACK ..." (an acknowledged
    note that no longer reads as a warning) and is not printed to stderr. */
-static const ConfigEntries *g_render_acks = NULL;
+static APEX_THREAD_LOCAL const ConfigEntries *g_render_acks = NULL;
 
 /* Far-immediate hints for the current write pass (set in write_asm_stream): the
    LDX-style instruction at (bank, addr) loads an address in .value's bank, so its
    immediate operand is resolved against that bank instead of the current one. */
-static const ConfigEntries *g_render_far_imms = NULL;
+static APEX_THREAD_LOCAL const ConfigEntries *g_render_far_imms = NULL;
 
 /* Opt-in render switches for the current write pass (set in write_asm_stream from
    project->options; NULL = all defaults).  See ConfigOptions in apex_config.h. */
-static const ConfigOptions *g_render_options = NULL;
+static APEX_THREAD_LOCAL const ConfigOptions *g_render_options = NULL;
 
-static uint32_t render_min_immediate_symbol(void)
-{
+/* CPU addresses in the bank being written whose labels got a definition line
+   (or equate); see emit_unplaced_label_equates.  NULL outside a write pass. */
+static APEX_THREAD_LOCAL uint8_t *g_label_placed;
+
+static void mark_label_placed(uint32_t addr) {
+    if (g_label_placed && addr <= 0xffffu) {
+        g_label_placed[addr >> 3] |= (uint8_t)(1u << (addr & 7u));
+    }
+}
+
+/* A named label whose address never starts a rendered line (it lies inside an
+   instruction, an inline payload or other multi-byte item) got no definition,
+   yet operands may still use its name, so the listing did not reassemble.
+   Define every such label as an equate inside its bank section. */
+static void emit_unplaced_label_equates(AsmOut *out, const LabelSet *labels, uint32_t lo,
+                                        uint32_t hi) {
+    size_t i;
+
+    for (i = 0; i < labels->count; i++) {
+        const Label *l = &labels->items[i];
+        if (l->addr < lo || l->addr >= hi || !l->name || generated_any_label_name(l->name) ||
+            (g_label_placed[l->addr >> 3] & (1u << (l->addr & 7u)))) {
+            continue;
+        }
+        ao_printf(out, "%s = 0x%04x ; label inside a multi-byte item\n", l->name,
+                  (unsigned)l->addr);
+        mark_label_placed(l->addr);
+    }
+}
+
+static uint32_t render_min_immediate_symbol(void) {
     return g_render_options ? g_render_options->min_immediate_symbol : 0u;
 }
-static int render_reference_counts(void)
-{
+static int render_reference_counts(void) {
     return g_render_options ? g_render_options->reference_counts : 0;
 }
-static int render_instruction_addresses(void)
-{
+static int render_instruction_addresses(void) {
     return g_render_options ? g_render_options->instruction_addresses : 0;
 }
 /* A 0x0000 inline far-code pointer is the regular "no body" case for some effect
    descriptors; with far_code_allow_null it is emitted plainly (no warning). */
-static int render_far_code_null_ok(uint16_t target)
-{
+static int render_far_code_null_ok(uint16_t target) {
     return target == 0u && g_render_options && g_render_options->far_code_allow_null;
 }
 
-static int far_imm_render_bank(uint8_t bank, uint32_t addr, uint8_t *out_target)
-{
+static int far_imm_render_bank(uint8_t bank, uint32_t addr, uint8_t *out_target) {
     size_t i;
     if (!g_render_far_imms) {
         return 0;
@@ -66,8 +216,7 @@ static int far_imm_render_bank(uint8_t bank, uint32_t addr, uint8_t *out_target)
     return 0;
 }
 
-static int warning_is_acked(uint8_t bank, uint32_t cpu_addr)
-{
+static int warning_is_acked(uint8_t bank, uint32_t cpu_addr) {
     size_t i;
     if (!g_render_acks) {
         return 0;
@@ -82,8 +231,7 @@ static int warning_is_acked(uint8_t bank, uint32_t cpu_addr)
 }
 
 /* "WARNING" for an active warning, "WARNING_ACK" for an acknowledged one. */
-static const char *warning_keyword(uint8_t bank, uint32_t cpu_addr)
-{
+static const char *warning_keyword(uint8_t bank, uint32_t cpu_addr) {
     return warning_is_acked(bank, cpu_addr) ? "WARNING_ACK" : "WARNING";
 }
 
@@ -91,16 +239,14 @@ static const char *warning_keyword(uint8_t bank, uint32_t cpu_addr)
    returns 1 and sets *ldx_addr to the address-loading instruction and
    *target_bank to the far target's bank. */
 static int far_imm_bank_load(uint8_t bank, uint32_t addr, uint32_t *ldx_addr,
-                             uint8_t *target_bank)
-{
+                             uint8_t *target_bank) {
     size_t i;
     if (!g_render_far_imms) {
         return 0;
     }
     for (i = 0; i < g_render_far_imms->count; i++) {
         const ConfigEntry *e = &g_render_far_imms->items[i];
-        if (e->aux_addr == addr && e->aux_addr != 0 &&
-            (!e->has_bank || e->bank == bank)) {
+        if (e->aux_addr == addr && e->aux_addr != 0 && (!e->has_bank || e->bank == bank)) {
             *ldx_addr = e->addr;
             *target_bank = e->value;
             return 1;
@@ -113,14 +259,13 @@ static int far_imm_bank_load(uint8_t bank, uint32_t addr, uint32_t *ldx_addr,
    label if one exists there, else the generated Bbb_Aaaaa form. */
 static const char *far_load_label_name(uint8_t target_bank, uint16_t addr,
                                        const LabelSet *bank_labels, size_t banks,
-                                       const uint8_t *paged_rom,
-                                       const Label *extra_labels, size_t extra_count,
-                                       char *buf, size_t bufsz)
-{
+                                       const uint8_t *paged_rom, const Label *extra_labels,
+                                       size_t extra_count, char *buf, size_t bufsz) {
     const char *n = NULL;
     if (target_bank == 0xffu) {
         n = label_name_at(addr, extra_labels, extra_count, 0);
-        if (n) return n;
+        if (n)
+            return n;
         snprintf(buf, bufsz, "Bff_A%04x", (unsigned)addr);
         return buf;
     }
@@ -131,7 +276,8 @@ static const char *far_load_label_name(uint8_t target_bank, uint16_t addr,
                               bank_labels[bi].sorted);
         }
     }
-    if (n) return n;
+    if (n)
+        return n;
     snprintf(buf, bufsz, "B%02x_A%04x", (unsigned)target_bank, (unsigned)addr);
     return buf;
 }
@@ -145,34 +291,29 @@ typedef enum {
     BLOCK_SPRITE
 } BlockKind;
 
-static void emit_vector_equates(FILE *out, const VectorInfo *vectors, size_t count)
-{
+static void emit_vector_equates(AsmOut *out, const VectorInfo *vectors, size_t count) {
     size_t i;
 
     for (i = 0; i < count; i++) {
-        fprintf(out, "%s_ADDR = 0x%04x\n", vectors[i].vector_name, vectors[i].vector_addr);
-        fprintf(out, "%s_ADDR = 0x%04x\n", vectors[i].entry_name, vectors[i].target_addr);
+        ao_printf(out, "%s_ADDR = 0x%04x\n", vectors[i].vector_name, vectors[i].vector_addr);
+        ao_printf(out, "%s_ADDR = 0x%04x\n", vectors[i].entry_name, vectors[i].target_addr);
     }
-    fputc('\n', out);
+    ao_putc(out, '\n');
 }
 
-
 static void add_inline_signature(InlineSignatures *sigs, uint32_t addr, unsigned length,
-                                 TableFieldKind kind)
-{
+                                 TableFieldKind kind) {
     add_inline_signature_ex(sigs, 0, 0, addr, length, kind);
 }
 
-
-static void emit_location_comment(FILE *out, const char *kind, uint8_t bank, uint32_t cpu_addr,
-                                  size_t rom_addr)
-{
-    fprintf(out, "; %s bank=0x%02x cpu=0x%04x rom=0x%06lx\n", kind, bank,
-            (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr);
+static void emit_location_comment(AsmOut *out, const char *kind, uint8_t bank, uint32_t cpu_addr,
+                                  size_t rom_addr) {
+    ao_mark_location(out, kind, bank, cpu_addr & 0xffffu, rom_addr, 0);
+    ao_printf(out, "; %s bank=0x%02x cpu=0x%04x rom=0x%06lx\n", kind, bank,
+              (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr);
 }
 
-static const char *block_kind_name(BlockKind kind)
-{
+static const char *block_kind_name(BlockKind kind) {
     if (kind == BLOCK_CODE) {
         return "code";
     }
@@ -191,9 +332,8 @@ static const char *block_kind_name(BlockKind kind)
     return "unknown";
 }
 
-static void emit_transition_comment(FILE *out, BlockKind from, BlockKind to, uint8_t bank,
-                                    uint32_t cpu_addr, size_t rom_addr)
-{
+static void emit_transition_comment(AsmOut *out, BlockKind from, BlockKind to, uint8_t bank,
+                                    uint32_t cpu_addr, size_t rom_addr) {
     char kind[32];
 
     if (to == BLOCK_UNKNOWN || from == to) {
@@ -207,31 +347,29 @@ static void emit_transition_comment(FILE *out, BlockKind from, BlockKind to, uin
     emit_location_comment(out, kind, bank, cpu_addr, rom_addr);
 }
 
-static void emit_doc_comment(FILE *out, const char *doc)
-{
+static void emit_doc_comment(AsmOut *out, const char *doc) {
     const char *line = doc;
 
     while (line && *line) {
         const char *end = strchr(line, '\n');
 
         if (end) {
-            fprintf(out, "; doc %.*s\n", (int)(end - line), line);
+            ao_printf(out, "; doc %.*s\n", (int)(end - line), line);
             line = end + 1;
         } else {
-            fprintf(out, "; doc %s\n", line);
+            ao_printf(out, "; doc %s\n", line);
             break;
         }
     }
 }
 
-static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
-                                 const InlineSignature *inline_sig)
-{
+static void emit_explain_comment(AsmOut *out, BlockKind kind, const Label *label,
+                                 const InlineSignature *inline_sig) {
     int is_dmd = 0;
     int is_sprite = 0;
 
     if (label && label->explain) {
-        fprintf(out, "; explain label source=%s\n", label->explain);
+        ao_printf(out, "; explain label source=%s\n", label->explain);
     }
     if (label && ((label->kind_explain && strstr(label->kind_explain, "dmd_fullframe")) ||
                   (label->explain && strstr(label->explain, "dmd_fullframe")))) {
@@ -242,21 +380,21 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
         is_sprite = 1;
     }
     if (kind != BLOCK_UNKNOWN) {
-        const char *source = label && label->kind_explain ? label->kind_explain :
-                             label && label->explain      ? label->explain :
-                                                            "scan";
+        const char *source = label && label->kind_explain ? label->kind_explain
+                             : label && label->explain    ? label->explain
+                                                          : "scan";
         const char *kind_name = block_kind_name(kind);
 
         if (kind == BLOCK_TABLE) {
             source = label && label->kind_explain ? label->kind_explain : "config_table";
         } else if (kind == BLOCK_DATA && label && label->is_string) {
-            source = label->kind_explain ? label->kind_explain :
-                     label->explain      ? label->explain :
-                                           "string_label";
+            source = label->kind_explain ? label->kind_explain
+                     : label->explain    ? label->explain
+                                         : "string_label";
         } else if (kind == BLOCK_DATA && label && label->is_data) {
-            source = label->kind_explain ? label->kind_explain :
-                     label->explain      ? label->explain :
-                                           "data_label";
+            source = label->kind_explain ? label->kind_explain
+                     : label->explain    ? label->explain
+                                         : "data_label";
         }
         if (kind == BLOCK_DATA && is_dmd) {
             kind_name = "dmd_fullframe";
@@ -264,16 +402,16 @@ static void emit_explain_comment(FILE *out, BlockKind kind, const Label *label,
         if (kind == BLOCK_DATA && is_sprite) {
             kind_name = "sprite";
         }
-        fprintf(out, "; explain kind=%s source=%s\n", kind_name, source);
+        ao_printf(out, "; explain kind=%s source=%s\n", kind_name, source);
     }
     if (inline_sig) {
-        fprintf(out, "; explain inline source=%s\n",
-                inline_sig->has_bank ? "config_inline_banked" : "config_inline");
+        ao_printf(out, "; explain inline source=%s\n",
+                  inline_sig->has_bank ? "config_inline_banked" : "config_inline");
     }
 }
 
-static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t bank, uint32_t addr)
-{
+static void emit_reference_comment(AsmOut *out, const ReferenceSet *refs, uint8_t bank,
+                                   uint32_t addr) {
     size_t i;
     int emitted = 0;
     const char *header = "; referenced_by ";
@@ -289,7 +427,8 @@ static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t 
         size_t j = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
         for (; j < refs->count; j++) {
             if (refs->items[j].bank != bank || refs->items[j].addr != addr) {
-                if (refs->sorted) break;
+                if (refs->sorted)
+                    break;
                 continue;
             }
             n++;
@@ -304,29 +443,28 @@ static void emit_reference_comment(FILE *out, const ReferenceSet *refs, uint8_t 
     i = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
     for (; i < refs->count; i++) {
         if (refs->items[i].bank != bank || refs->items[i].addr != addr) {
-            if (refs->sorted) break;
+            if (refs->sorted)
+                break;
             continue;
         }
         if (refs->items[i].row_index >= 0) {
             uint32_t rc = refs->items[i].row_cpu_addr;
             uint8_t rb = refs->items[i].source_bank;
-            fprintf(out, "%stable:%s line:%d[B%02x_A%04x]",
-                    emitted ? ", " : header,
-                    refs->items[i].source, refs->items[i].row_index,
-                    (unsigned)rb, (unsigned)rc & 0xffffu);
+            ao_printf(out, "%stable:%s line:%d[B%02x_A%04x]", emitted ? ", " : header,
+                      refs->items[i].source, refs->items[i].row_index, (unsigned)rb,
+                      (unsigned)rc & 0xffffu);
         } else {
-            fprintf(out, "%s%s:%s", emitted ? ", " : header,
-                    refs->items[i].kind, refs->items[i].source);
+            ao_printf(out, "%s%s:%s", emitted ? ", " : header, refs->items[i].kind,
+                      refs->items[i].source);
         }
         emitted = 1;
     }
     if (emitted) {
-        fputc('\n', out);
+        ao_putc(out, '\n');
     }
 }
 
-static const char *table_field_name(TableFieldKind kind)
-{
+static const char *table_field_name(TableFieldKind kind) {
     if (kind == TABLE_BYTE) {
         return "byte";
     }
@@ -375,8 +513,7 @@ static const char *table_field_name(TableFieldKind kind)
     return "far_code";
 }
 
-static void format_table_schema(const TableSchema *schema, char *out, size_t out_size)
-{
+static void format_table_schema(const TableSchema *schema, char *out, size_t out_size) {
     size_t i;
     size_t used = 0;
 
@@ -390,13 +527,13 @@ static void format_table_schema(const TableSchema *schema, char *out, size_t out
 
         {
             const char *fname = schema->items[i].type_name
-                                ? schema->items[i].type_name
-                                : table_field_name(schema->items[i].kind);
+                                    ? schema->items[i].type_name
+                                    : table_field_name(schema->items[i].kind);
             if (schema->items[i].count == 1) {
                 written = snprintf(out + used, out_size - used, "%s%s", sep, fname);
             } else {
-                written = snprintf(out + used, out_size - used, "%s%s[%lu]", sep,
-                                   fname, (unsigned long)schema->items[i].count);
+                written = snprintf(out + used, out_size - used, "%s%s[%lu]", sep, fname,
+                                   (unsigned long)schema->items[i].count);
             }
         }
         if (written < 0 || (size_t)written >= out_size - used) {
@@ -407,8 +544,7 @@ static void format_table_schema(const TableSchema *schema, char *out, size_t out
     }
 }
 
-static const char *data_kind_name(DataKind kind)
-{
+static const char *data_kind_name(DataKind kind) {
     if (kind == DATA_STRING) {
         return "string";
     }
@@ -463,30 +599,30 @@ static const char *data_kind_name(DataKind kind)
     return "bytes";
 }
 
-static int data_kind_is_far(DataKind kind)
-{
+static int data_kind_is_far(DataKind kind) {
     return kind == DATA_FAR_STRING || kind == DATA_FAR_DATA || kind == DATA_FAR_TABLE ||
            kind == DATA_FAR_CODE || kind == DATA_FAR_DMD_FULLFRAME || kind == DATA_FAR_SPRITE;
 }
 
-static int data_kind_is_ptr16(DataKind kind)
-{
-    return kind == DATA_PTR16_STRING || kind == DATA_PTR16_DATA ||
-           kind == DATA_PTR16_CODE  || kind == DATA_PTR16_TABLE || kind == DATA_PTR16_SPRITE;
+static int data_kind_is_ptr16(DataKind kind) {
+    return kind == DATA_PTR16_STRING || kind == DATA_PTR16_DATA || kind == DATA_PTR16_CODE ||
+           kind == DATA_PTR16_TABLE || kind == DATA_PTR16_SPRITE;
 }
 
-static TableFieldKind data_ptr16_to_table_kind(DataKind kind)
-{
-    if (kind == DATA_PTR16_CODE)   return TABLE_PTR16_CODE;
-    if (kind == DATA_PTR16_STRING) return TABLE_PTR16_STRING;
-    if (kind == DATA_PTR16_TABLE)  return TABLE_PTR16_TABLE;
-    if (kind == DATA_PTR16_SPRITE) return TABLE_PTR16_SPRITE;
+static TableFieldKind data_ptr16_to_table_kind(DataKind kind) {
+    if (kind == DATA_PTR16_CODE)
+        return TABLE_PTR16_CODE;
+    if (kind == DATA_PTR16_STRING)
+        return TABLE_PTR16_STRING;
+    if (kind == DATA_PTR16_TABLE)
+        return TABLE_PTR16_TABLE;
+    if (kind == DATA_PTR16_SPRITE)
+        return TABLE_PTR16_SPRITE;
     return TABLE_PTR16_DATA;
 }
 
 static int locate_bank_bytes(const uint8_t *paged_rom, size_t banks, uint8_t bank, uint16_t addr,
-                             const uint8_t **src, size_t *len)
-{
+                             const uint8_t **src, size_t *len) {
     size_t offset;
     int bank_index;
 
@@ -511,8 +647,7 @@ static int locate_bank_bytes(const uint8_t *paged_rom, size_t banks, uint8_t ban
 }
 
 static int decode_dmd_fullframe_metadata(const uint8_t *src, size_t len, uint8_t *decoder_type,
-                                         size_t *consumed)
-{
+                                         size_t *consumed) {
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     size_t used = 0;
     uint8_t type = 0;
@@ -529,9 +664,8 @@ static int decode_dmd_fullframe_metadata(const uint8_t *src, size_t len, uint8_t
     return 1;
 }
 
-static void emit_dmd_fullframe_comment_planes(FILE *out, const uint8_t *src, size_t len,
-                                              size_t planes)
-{
+static void emit_dmd_fullframe_comment_planes(AsmOut *out, const uint8_t *src, size_t len,
+                                              size_t planes) {
     size_t total = 0;
     size_t p;
     uint8_t first_type = 0;
@@ -544,7 +678,7 @@ static void emit_dmd_fullframe_comment_planes(FILE *out, const uint8_t *src, siz
         size_t consumed = 0;
         if (!decode_dmd_fullframe_metadata(src + total, len - total, &type, &consumed) ||
             consumed == 0u) {
-            fputs(" ; dmd type=fullframe invalid=1", out);
+            ao_puts(out, " ; dmd type=fullframe invalid=1");
             return;
         }
         if (p == 0) {
@@ -553,130 +687,126 @@ static void emit_dmd_fullframe_comment_planes(FILE *out, const uint8_t *src, siz
         total += consumed;
     }
     if (planes > 1u) {
-        fprintf(out, " ; dmd type=fullframe planes=%lu decoder=0x%02x consumed=%lu"
-                     " width=%u height=%u",
-                (unsigned long)planes, (unsigned)first_type, (unsigned long)total,
-                (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
+        ao_printf(out,
+                  " ; dmd type=fullframe planes=%lu decoder=0x%02x consumed=%lu"
+                  " width=%u height=%u",
+                  (unsigned long)planes, (unsigned)first_type, (unsigned long)total,
+                  (unsigned)APEX_DMD_WIDTH, (unsigned)APEX_DMD_HEIGHT);
     } else {
-        fprintf(out, " ; dmd type=fullframe decoder=0x%02x consumed=%lu width=%u height=%u",
-                (unsigned)first_type, (unsigned long)total, (unsigned)APEX_DMD_WIDTH,
-                (unsigned)APEX_DMD_HEIGHT);
+        ao_printf(out, " ; dmd type=fullframe decoder=0x%02x consumed=%lu width=%u height=%u",
+                  (unsigned)first_type, (unsigned long)total, (unsigned)APEX_DMD_WIDTH,
+                  (unsigned)APEX_DMD_HEIGHT);
     }
 }
 
-static void emit_dmd_fullframe_comment(FILE *out, const uint8_t *src, size_t len)
-{
+static void emit_dmd_fullframe_comment(AsmOut *out, const uint8_t *src, size_t len) {
     emit_dmd_fullframe_comment_planes(out, src, len, 1u);
 }
 
-static void emit_dmd_fullframe_target_comment(FILE *out, const uint8_t *paged_rom, size_t banks,
-                                              uint8_t bank, uint16_t addr)
-{
+static void emit_dmd_fullframe_target_comment(AsmOut *out, const uint8_t *paged_rom, size_t banks,
+                                              uint8_t bank, uint16_t addr) {
     const uint8_t *src;
     size_t len;
 
     if (locate_bank_bytes(paged_rom, banks, bank, addr, &src, &len)) {
         emit_dmd_fullframe_comment(out, src, len);
     } else {
-        fputs(" ; dmd type=fullframe unmapped=1", out);
+        ao_puts(out, " ; dmd type=fullframe unmapped=1");
     }
 }
 
-static void emit_sprite_comment(FILE *out, const uint8_t *src, size_t len)
-{
+static void emit_sprite_comment(AsmOut *out, const uint8_t *src, size_t len) {
     uint8_t hdr = 0, vert = 0, horiz = 0, width = 0, height = 0, enc_type = 0;
     size_t consumed = 0;
     uint8_t tmp[APEX_SPRITE_MAX_BYTES];
 
-    if (apexsprite_decode(src, len, tmp, &hdr, &vert, &horiz, &width, &height, &enc_type, &consumed)) {
-        const char *enc =
-            enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT   ? "bicolor_direct" :
-            enc_type == APEX_SPRITE_ENC_BICOLOR_INDIRECT ? "bicolor_indirect" :
-            enc_type == APEX_SPRITE_ENC_FD               ? "fd" : "mono";
-        fprintf(out, " ; sprite hdr=0x%02x enc=%s vert=%u horiz=%u width=%u height=%u consumed=%lu",
-                (unsigned)hdr, enc, (unsigned)vert, (unsigned)horiz,
-                (unsigned)width, (unsigned)height, (unsigned long)consumed);
+    if (apexsprite_decode(src, len, tmp, &hdr, &vert, &horiz, &width, &height, &enc_type,
+                          &consumed)) {
+        const char *enc = enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT     ? "bicolor_direct"
+                          : enc_type == APEX_SPRITE_ENC_BICOLOR_INDIRECT ? "bicolor_indirect"
+                          : enc_type == APEX_SPRITE_ENC_FD               ? "fd"
+                                                                         : "mono";
+        ao_printf(out,
+                  " ; sprite hdr=0x%02x enc=%s vert=%u horiz=%u width=%u height=%u consumed=%lu",
+                  (unsigned)hdr, enc, (unsigned)vert, (unsigned)horiz, (unsigned)width,
+                  (unsigned)height, (unsigned long)consumed);
     } else {
-        fputs(" ; sprite invalid=1", out);
+        ao_puts(out, " ; sprite invalid=1");
     }
 }
 
-static void emit_sprite_noheader_comment(FILE *out, const uint8_t *src, size_t len,
-                                         uint8_t table_height)
-{
+static void emit_sprite_noheader_comment(AsmOut *out, const uint8_t *src, size_t len,
+                                         uint8_t table_height) {
     uint8_t width = 0;
     size_t consumed = 0;
     uint8_t tmp[APEX_SPRITE_MAX_BYTES];
 
     if (apexsprite_decode_noheader(src, len, tmp, table_height, &width, &consumed)) {
-        fprintf(out, " ; sprite_noheader width=%u height=%u consumed=%lu",
-                (unsigned)width, (unsigned)table_height, (unsigned long)consumed);
+        ao_printf(out, " ; sprite_noheader width=%u height=%u consumed=%lu", (unsigned)width,
+                  (unsigned)table_height, (unsigned long)consumed);
     } else {
-        fputs(" ; sprite_noheader invalid=1", out);
+        ao_puts(out, " ; sprite_noheader invalid=1");
     }
 }
 
-static void emit_sprite_target_comment(FILE *out, const uint8_t *paged_rom, size_t banks,
-                                       uint8_t bank, uint16_t addr)
-{
+static void emit_sprite_target_comment(AsmOut *out, const uint8_t *paged_rom, size_t banks,
+                                       uint8_t bank, uint16_t addr) {
     const uint8_t *src;
     size_t len;
 
     if (!locate_bank_bytes(paged_rom, banks, bank, addr, &src, &len)) {
-        fputs(" ; sprite unmapped=1", out);
+        ao_puts(out, " ; sprite unmapped=1");
         return;
     }
     /* No-header VSI: byte 0 is width (1..128); header format uses 0x00/0xFD/0xFE/0xFF */
     if (apexsprite_is_noheader(src, len)) {
-        fprintf(out, " ; sprite_noheader width=%u", (unsigned)src[0]);
+        ao_printf(out, " ; sprite_noheader width=%u", (unsigned)src[0]);
     } else {
         emit_sprite_comment(out, src, len);
     }
 }
 
-static void emit_routine_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
+static void emit_routine_comment_block(AsmOut *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
                                        size_t rom_base, const InlineSignature *inline_sig,
-                                       const char *doc, const ReferenceSet *refs)
-{
-    fputc('\n', out);
+                                       const char *doc, const ReferenceSet *refs) {
+    ao_putc(out, '\n');
     emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
     emit_reference_comment(out, refs, bank, addr);
-    fprintf(out, "; kind routine\n");
+    ao_printf(out, "; kind routine\n");
     if (inline_sig) {
         char schema_text[128];
 
         format_table_schema(&inline_sig->schema, schema_text, sizeof(schema_text));
         if (table_schema_is_variable(&inline_sig->schema)) {
-            fprintf(out, "; inline length=variable\n");
+            ao_printf(out, "; inline length=variable\n");
         } else {
-            fprintf(out, "; inline length=%u\n", inline_sig->length);
+            ao_printf(out, "; inline length=%u\n", inline_sig->length);
         }
-        fprintf(out, "; inline params=%s\n", schema_text);
+        ao_printf(out, "; inline params=%s\n", schema_text);
     }
     emit_doc_comment(out, doc);
 }
 
-static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
-                                    size_t rom_base, const DataRange *range,
-                                    const char *doc, const ReferenceSet *refs,
-                                    const uint8_t *paged_rom, size_t banks)
-{
-    fputc('\n', out);
+static void emit_data_comment_block(AsmOut *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
+                                    size_t rom_base, const DataRange *range, const char *doc,
+                                    const ReferenceSet *refs, const uint8_t *paged_rom,
+                                    size_t banks) {
+    ao_putc(out, '\n');
     emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
     emit_reference_comment(out, refs, bank, addr);
     if (range->kind == DATA_SPRITE || range->kind == DATA_SPRITE_NOHEADER ||
         range->kind == DATA_FAR_SPRITE) {
-        fprintf(out, "; kind sprite\n");
+        ao_printf(out, "; kind sprite\n");
     } else {
-        fprintf(out, "; kind data\n");
+        ao_printf(out, "; kind data\n");
     }
     if (range->kind == DATA_BYTES) {
-        fprintf(out, "; data type=%s length=%lu\n", data_kind_name(range->kind),
-                (unsigned long)range->length);
+        ao_printf(out, "; data type=%s length=%lu\n", data_kind_name(range->kind),
+                  (unsigned long)range->length);
     } else if (range->kind == DATA_SPRITE_NOHEADER) {
-        fprintf(out, "; data type=sprite_noheader[%lu]\n", (unsigned long)range->length);
+        ao_printf(out, "; data type=sprite_noheader[%lu]\n", (unsigned long)range->length);
     } else {
-        fprintf(out, "; data type=%s\n", data_kind_name(range->kind));
+        ao_printf(out, "; data type=%s\n", data_kind_name(range->kind));
     }
     if (range->kind == DATA_DMD_FULLFRAME) {
         const uint8_t *src;
@@ -684,7 +814,7 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
 
         if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
             emit_dmd_fullframe_comment_planes(out, src, len, range->length);
-            fputc('\n', out);
+            ao_putc(out, '\n');
         }
     }
     if (range->kind == DATA_SPRITE) {
@@ -693,7 +823,7 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
 
         if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
             emit_sprite_comment(out, src, len);
-            fputc('\n', out);
+            ao_putc(out, '\n');
         }
     }
     if (range->kind == DATA_SPRITE_NOHEADER) {
@@ -702,14 +832,13 @@ static void emit_data_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint
 
         if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &len)) {
             emit_sprite_noheader_comment(out, src, len, (uint8_t)range->length);
-            fputc('\n', out);
+            ao_putc(out, '\n');
         }
     }
     emit_doc_comment(out, doc);
 }
 
-static int label_is_dmd_fullframe(const Label *label)
-{
+static int label_is_dmd_fullframe(const Label *label) {
     if (!label) {
         return 0;
     }
@@ -717,8 +846,7 @@ static int label_is_dmd_fullframe(const Label *label)
            (label->explain && strstr(label->explain, "dmd_fullframe"));
 }
 
-static int label_is_sprite(const Label *label)
-{
+static int label_is_sprite(const Label *label) {
     if (!label) {
         return 0;
     }
@@ -726,11 +854,10 @@ static int label_is_sprite(const Label *label)
            (label->explain && strstr(label->explain, "sprite"));
 }
 
-static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
+static void emit_table_comment_block(AsmOut *out, uint8_t bank, uint32_t addr, uint32_t base_addr,
                                      size_t rom_base, const TableDef *table, const uint8_t *data,
                                      size_t len, size_t pos, const char *doc,
-                                     const ReferenceSet *refs)
-{
+                                     const ReferenceSet *refs) {
     size_t rows = table->rows;
     unsigned row_width = (unsigned)table_schema_width(&table->schema);
     char row_format[256];
@@ -745,12 +872,12 @@ static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uin
         }
     }
     format_table_schema(&table->schema, row_format, sizeof(row_format));
-    fputc('\n', out);
+    ao_putc(out, '\n');
     emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
     emit_reference_comment(out, refs, bank, addr);
-    fprintf(out, "; kind table\n");
-    fprintf(out, "; table rows=%lu row_width=%u row_format=%s\n", (unsigned long)rows, row_width,
-            row_format);
+    ao_printf(out, "; kind table\n");
+    ao_printf(out, "; table rows=%lu row_width=%u row_format=%s\n", (unsigned long)rows, row_width,
+              row_format);
     emit_doc_comment(out, doc);
 }
 
@@ -758,9 +885,8 @@ static void emit_table_comment_block(FILE *out, uint8_t bank, uint32_t addr, uin
    "code@B21_A4006, table@B20_A4007".  This turns a generic conflict reason like
    "inline_far_code_ref" into the concrete locations that point here, so a
    classification conflict can be traced back to its source. */
-static void format_ref_sources(char *buf, size_t bufsz, const ReferenceSet *refs,
-                               uint8_t bank, uint32_t addr)
-{
+static void format_ref_sources(char *buf, size_t bufsz, const ReferenceSet *refs, uint8_t bank,
+                               uint32_t addr) {
     size_t i, j, off = 0, n = 0;
 
     buf[0] = '\0';
@@ -772,31 +898,32 @@ static void format_ref_sources(char *buf, size_t bufsz, const ReferenceSet *refs
         int dup = 0;
         int w;
 
-        if (r->bank != bank || r->addr != addr) continue;
+        if (r->bank != bank || r->addr != addr)
+            continue;
         /* dedup identical (kind, source location) pairs */
         for (j = 0; j < i; j++) {
             const Reference *q = &refs->items[j];
-            if (q->bank == bank && q->addr == addr &&
-                q->source_bank == r->source_bank && q->source_addr == r->source_addr &&
+            if (q->bank == bank && q->addr == addr && q->source_bank == r->source_bank &&
+                q->source_addr == r->source_addr &&
                 ((q->kind == r->kind) || (q->kind && r->kind && strcmp(q->kind, r->kind) == 0))) {
                 dup = 1;
                 break;
             }
         }
-        if (dup) continue;
+        if (dup)
+            continue;
         w = snprintf(buf + off, bufsz - off, "%s%s@B%02x_A%04x", n ? ", " : "",
-                     r->kind ? r->kind : "ref",
-                     r->source_bank, (unsigned)r->source_addr & 0xffffu);
-        if (w < 0 || (size_t)w >= bufsz - off) break;
+                     r->kind ? r->kind : "ref", r->source_bank, (unsigned)r->source_addr & 0xffffu);
+        if (w < 0 || (size_t)w >= bufsz - off)
+            break;
         off += (size_t)w;
         n++;
     }
 }
 
-static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, size_t rom_addr,
-                                   const char *code_from, const char *data_from,
-                                   const ReferenceSet *refs)
-{
+static void emit_conflict_warning(AsmOut *out, uint8_t bank, uint32_t cpu_addr, size_t rom_addr,
+                                  const char *code_from, const char *data_from,
+                                  const ReferenceSet *refs) {
     const char *cf = code_from ? code_from : "unknown";
     const char *df = data_from ? data_from : "unknown";
     char srcs[256], extra[280];
@@ -814,39 +941,41 @@ static void emit_conflict_warning(FILE *out, uint8_t bank, uint32_t cpu_addr, si
                 "code_from=%s data_from=%s%s\n",
                 bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
     }
-    fprintf(out,
-            "; %s classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
-            "code_from=%s data_from=%s%s\n",
-            acked ? "WARNING_ACK" : "WARNING",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, cf, df, extra);
+    ao_mark_location(out, acked ? "WARNING_ACK" : "WARNING", bank, cpu_addr & 0xffffu, rom_addr, 1);
+    ao_printf(out,
+              "; %s classification_conflict bank=0x%02x cpu=0x%04x rom=0x%06lx "
+              "code_from=%s data_from=%s%s\n",
+              acked ? "WARNING_ACK" : "WARNING", bank, (unsigned)cpu_addr & 0xffffu,
+              (unsigned long)rom_addr, cf, df, extra);
 }
 
 /* If `name` matches the generated Bxx_Ayyyy form (with valid hex) but its encoded
    address differs from `addr`, it "shadows" another address: a defined symbol now
    wins in the assembler, but the name is ambiguous/confusing.  Returns the decoded
    16-bit address in *decoded and 1 when such a collision is present. */
-static int name_shadows_addr(const char *name, uint32_t addr, unsigned *decoded)
-{
+static int name_shadows_addr(const char *name, uint32_t addr, unsigned *decoded) {
     int i;
     unsigned d = 0;
     if (!name || strlen(name) != 9 || name[0] != 'B' || name[3] != '_' || name[4] != 'A') {
         return 0;
     }
     for (i = 1; i <= 8; i++) {
-        if (i == 3 || i == 4) continue; /* '_' and 'A' */
-        if (!isxdigit((unsigned char)name[i])) return 0;
+        if (i == 3 || i == 4)
+            continue; /* '_' and 'A' */
+        if (!isxdigit((unsigned char)name[i]))
+            return 0;
     }
     for (i = 5; i <= 8; i++) {
         char c = name[i];
         d = (d << 4) | (unsigned)(c <= '9' ? c - '0' : (c | 0x20) - 'a' + 10);
     }
-    if (decoded) *decoded = d;
+    if (decoded)
+        *decoded = d;
     return d != (addr & 0xffffu);
 }
 
-static void emit_label_shadow_warning(FILE *out, uint8_t bank, uint32_t cpu_addr,
-                                      size_t rom_addr, const char *name, unsigned decoded)
-{
+static void emit_label_shadow_warning(AsmOut *out, uint8_t bank, uint32_t cpu_addr, size_t rom_addr,
+                                      const char *name, unsigned decoded) {
     int acked = warning_is_acked(bank, cpu_addr);
     if (apex_warn_to_stderr && !acked) {
         fprintf(stderr,
@@ -854,19 +983,22 @@ static void emit_label_shadow_warning(FILE *out, uint8_t bank, uint32_t cpu_addr
                 "generated Bxx_Ayyyy form and decodes to 0x%04x — rename to avoid ambiguity\n",
                 name, bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, decoded);
     }
-    fprintf(out,
-            "; %s label_name_collision bank=0x%02x cpu=0x%04x rom=0x%06lx name=%s decodes=0x%04x\n",
-            acked ? "WARNING_ACK" : "WARNING",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, name, decoded);
+    ao_mark_location(out, acked ? "WARNING_ACK" : "WARNING", bank, cpu_addr & 0xffffu, rom_addr, 0);
+    ao_printf(
+        out,
+        "; %s label_name_collision bank=0x%02x cpu=0x%04x rom=0x%06lx name=%s decodes=0x%04x\n",
+        acked ? "WARNING_ACK" : "WARNING", bank, (unsigned)cpu_addr & 0xffffu,
+        (unsigned long)rom_addr, name, decoded);
 }
 
 /* True if some label at `addr` carries a real (non-generated) name. */
-static int addr_has_named_label(const Label *labels, size_t label_count, int sorted, uint32_t addr)
-{
+static int addr_has_named_label(const Label *labels, size_t label_count, int sorted,
+                                uint32_t addr) {
     size_t i = sorted ? label_lower_bound(labels, label_count, addr) : 0;
     for (; i < label_count; i++) {
         if (labels[i].addr != addr) {
-            if (sorted) break;
+            if (sorted)
+                break;
             continue;
         }
         if (!generated_any_label_name(labels[i].name)) {
@@ -876,16 +1008,12 @@ static int addr_has_named_label(const Label *labels, size_t label_count, int sor
     return 0;
 }
 
-static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
-                           int labels_sorted,
-                           uint8_t bank, uint32_t base_addr, size_t rom_base,
+static void emit_labels_at(AsmOut *out, uint32_t addr, const Label *labels, size_t label_count,
+                           int labels_sorted, uint8_t bank, uint32_t base_addr, size_t rom_base,
                            const InlineSignatures *inline_sigs, const TableDef *table,
-                           const DataRange *data_range,
-                           const uint8_t *data, size_t len, size_t pos,
-                           const ConfigDocs *docs,
-                           const ReferenceSet *refs, int emit_explain,
-                           const uint8_t *paged_rom, size_t banks)
-{
+                           const DataRange *data_range, const uint8_t *data, size_t len, size_t pos,
+                           const ConfigDocs *docs, const ReferenceSet *refs, int emit_explain,
+                           const uint8_t *paged_rom, size_t banks) {
     size_t i;
     int emitted_block = 0;
     int emitted_label = 0;
@@ -900,83 +1028,81 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
     i = labels_sorted ? label_lower_bound(labels, label_count, addr) : 0;
     for (; i < label_count; i++) {
         if (labels[i].addr != addr) {
-            if (labels_sorted) break;
+            if (labels_sorted)
+                break;
             continue;
         }
         if (have_named && generated_any_label_name(labels[i].name)) {
             continue;
         }
         if (!emitted_block && table) {
-                emit_table_comment_block(out, bank, addr, base_addr, rom_base, table, data, len, pos,
-                                         config_doc_at(docs, bank, addr), refs);
-                if (emit_explain) {
-                    emit_explain_comment(out, BLOCK_TABLE, &labels[i], NULL);
-                }
-                emitted_block = 1;
-            } else if (!emitted_block && data_range) {
-                emit_data_comment_block(out, bank, addr, base_addr, rom_base, data_range,
-                                        config_doc_at(docs, bank, addr), refs,
-                                        paged_rom, banks);
-                if (emit_explain) {
-                    emit_explain_comment(out, BLOCK_DATA, &labels[i], NULL);
-                }
-                emitted_block = 1;
-            } else if (!emitted_block && labels[i].is_code) {
-                emit_routine_comment_block(out, bank, addr, base_addr, rom_base, inline_sig,
-                                           config_doc_at(docs, bank, addr), refs);
-                if (emit_explain) {
-                    emit_explain_comment(out, BLOCK_CODE, &labels[i], inline_sig);
-                }
-                emitted_block = 1;
-            } else if (!emitted_block) {
-                emit_location_comment(out, "label", bank, addr,
-                                      rom_base + (size_t)(addr - base_addr));
-                emit_reference_comment(out, refs, bank, addr);
-                if (label_is_dmd_fullframe(&labels[i])) {
-                    const uint8_t *src;
-                    size_t meta_len;
+            emit_table_comment_block(out, bank, addr, base_addr, rom_base, table, data, len, pos,
+                                     config_doc_at(docs, bank, addr), refs);
+            if (emit_explain) {
+                emit_explain_comment(out, BLOCK_TABLE, &labels[i], NULL);
+            }
+            emitted_block = 1;
+        } else if (!emitted_block && data_range) {
+            emit_data_comment_block(out, bank, addr, base_addr, rom_base, data_range,
+                                    config_doc_at(docs, bank, addr), refs, paged_rom, banks);
+            if (emit_explain) {
+                emit_explain_comment(out, BLOCK_DATA, &labels[i], NULL);
+            }
+            emitted_block = 1;
+        } else if (!emitted_block && labels[i].is_code) {
+            emit_routine_comment_block(out, bank, addr, base_addr, rom_base, inline_sig,
+                                       config_doc_at(docs, bank, addr), refs);
+            if (emit_explain) {
+                emit_explain_comment(out, BLOCK_CODE, &labels[i], inline_sig);
+            }
+            emitted_block = 1;
+        } else if (!emitted_block) {
+            emit_location_comment(out, "label", bank, addr, rom_base + (size_t)(addr - base_addr));
+            emit_reference_comment(out, refs, bank, addr);
+            if (label_is_dmd_fullframe(&labels[i])) {
+                const uint8_t *src;
+                size_t meta_len;
 
-                    fprintf(out, "; kind data\n");
-                    fprintf(out, "; data type=dmd_fullframe\n");
-                    if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &meta_len)) {
-                        emit_dmd_fullframe_comment(out, src, meta_len);
-                        fputc('\n', out);
-                    }
+                ao_printf(out, "; kind data\n");
+                ao_printf(out, "; data type=dmd_fullframe\n");
+                if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &meta_len)) {
+                    emit_dmd_fullframe_comment(out, src, meta_len);
+                    ao_putc(out, '\n');
                 }
-                if (label_is_sprite(&labels[i])) {
-                    const uint8_t *src;
-                    size_t meta_len;
+            }
+            if (label_is_sprite(&labels[i])) {
+                const uint8_t *src;
+                size_t meta_len;
 
-                    fprintf(out, "; kind data\n");
-                    fprintf(out, "; data type=sprite\n");
-                    if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &meta_len)) {
-                        emit_sprite_comment(out, src, meta_len);
-                        fputc('\n', out);
-                    }
-                }
-                if (emit_explain) {
-                    emit_explain_comment(out, labels[i].is_data || labels[i].is_string ? BLOCK_DATA :
-                                                                              BLOCK_UNKNOWN,
-                                         &labels[i], inline_sig);
-                }
-                emitted_block = 1;
-            }
-            if (labels[i].is_conflict && !emitted_conflict) {
-                emit_conflict_warning(out, bank, addr,
-                                      rom_base + (size_t)(addr - base_addr),
-                                      labels[i].explain, labels[i].kind_explain, refs);
-                emitted_conflict = 1;
-            }
-            {
-                unsigned decoded;
-                if (name_shadows_addr(labels[i].name, addr, &decoded)) {
-                    emit_label_shadow_warning(out, bank, addr,
-                                              rom_base + (size_t)(addr - base_addr),
-                                              labels[i].name, decoded);
+                ao_printf(out, "; kind data\n");
+                ao_printf(out, "; data type=sprite\n");
+                if (locate_bank_bytes(paged_rom, banks, bank, (uint16_t)addr, &src, &meta_len)) {
+                    emit_sprite_comment(out, src, meta_len);
+                    ao_putc(out, '\n');
                 }
             }
-            fprintf(out, "%s:\n", labels[i].name);
-            emitted_label = 1;
+            if (emit_explain) {
+                emit_explain_comment(
+                    out, labels[i].is_data || labels[i].is_string ? BLOCK_DATA : BLOCK_UNKNOWN,
+                    &labels[i], inline_sig);
+            }
+            emitted_block = 1;
+        }
+        if (labels[i].is_conflict && !emitted_conflict) {
+            emit_conflict_warning(out, bank, addr, rom_base + (size_t)(addr - base_addr),
+                                  labels[i].explain, labels[i].kind_explain, refs);
+            emitted_conflict = 1;
+        }
+        {
+            unsigned decoded;
+            if (name_shadows_addr(labels[i].name, addr, &decoded)) {
+                emit_label_shadow_warning(out, bank, addr, rom_base + (size_t)(addr - base_addr),
+                                          labels[i].name, decoded);
+            }
+        }
+        mark_label_placed(labels[i].addr);
+        ao_printf(out, "%s:\n", labels[i].name);
+        emitted_label = 1;
     }
     if (!emitted_label && refs) {
         size_t ri = refs->sorted ? refs_lower_bound(refs, bank, addr) : 0;
@@ -989,24 +1115,22 @@ static void emit_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t
                     emit_reference_comment(out, refs, bank, addr);
                 }
                 {
-                    char *lbl = (char *)(bank == 0xffu
-                                    ? make_generated_label(addr)
-                                    : make_bank_label(bank, (uint16_t)addr));
-                    fprintf(out, "%s:\n", lbl);
+                    char *lbl = (char *)(bank == 0xffu ? make_generated_label(addr)
+                                                       : make_bank_label(bank, (uint16_t)addr));
+                    ao_printf(out, "%s:\n", lbl);
                     free(lbl);
                 }
                 break;
             }
             if (refs->sorted && (refs->items[ri].bank > bank ||
-                                  (refs->items[ri].bank == bank && refs->items[ri].addr > addr))) {
+                                 (refs->items[ri].bank == bank && refs->items[ri].addr > addr))) {
                 break;
             }
         }
     }
 }
 
-static const char *symbol_name_for_value(const ConfigSymbols *symbols, uint32_t value)
-{
+static const char *symbol_name_for_value(const ConfigSymbols *symbols, uint32_t value) {
     size_t i;
 
     if (!symbols) {
@@ -1020,8 +1144,7 @@ static const char *symbol_name_for_value(const ConfigSymbols *symbols, uint32_t 
     return NULL;
 }
 
-static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols, const ConfigDocs *docs)
-{
+static void emit_config_symbols(AsmOut *out, const ConfigSymbols *symbols, const ConfigDocs *docs) {
     size_t i;
 
     if (!symbols || symbols->count == 0) {
@@ -1036,22 +1159,21 @@ static void emit_config_symbols(FILE *out, const ConfigSymbols *symbols, const C
             emit_doc_comment(out, config_doc_at(docs, 0xffu, symbols->items[i].value));
         }
         if (symbols->items[i].length > 1u) {
-            fprintf(out, "%s = 0x%04x ; %u-byte block\n", symbols->items[i].name,
-                    (unsigned)symbols->items[i].value & 0xffffu,
-                    (unsigned)symbols->items[i].length);
+            ao_printf(out, "%s = 0x%04x ; %u-byte block\n", symbols->items[i].name,
+                      (unsigned)symbols->items[i].value & 0xffffu,
+                      (unsigned)symbols->items[i].length);
         } else {
-            fprintf(out, "%s = 0x%04x\n", symbols->items[i].name,
-                    (unsigned)symbols->items[i].value & 0xffffu);
+            ao_printf(out, "%s = 0x%04x\n", symbols->items[i].name,
+                      (unsigned)symbols->items[i].value & 0xffffu);
         }
     }
-    fputc('\n', out);
+    ao_putc(out, '\n');
 }
 
 /* Emit [docs] attached to RAM/ASIC addresses (0x0000-0x3fff) that have no
    [symbols] equate — without this they would never appear in the output, since
    such addresses are not part of the ROM and produce no disassembly line. */
-static void emit_nonrom_docs(FILE *out, const ConfigDocs *docs, const ConfigSymbols *symbols)
-{
+static void emit_nonrom_docs(AsmOut *out, const ConfigDocs *docs, const ConfigSymbols *symbols) {
     size_t i;
     int header = 0;
 
@@ -1068,19 +1190,18 @@ static void emit_nonrom_docs(FILE *out, const ConfigDocs *docs, const ConfigSymb
             continue; /* already emitted above its equate */
         }
         if (!header) {
-            fprintf(out, "; ---- RAM/ASIC documentation (no symbol) ----\n");
+            ao_printf(out, "; ---- RAM/ASIC documentation (no symbol) ----\n");
             header = 1;
         }
-        fprintf(out, "; 0x%04x:\n", (unsigned)d->addr & 0xffffu);
+        ao_printf(out, "; 0x%04x:\n", (unsigned)d->addr & 0xffffu);
         emit_doc_comment(out, d->text);
     }
     if (header) {
-        fputc('\n', out);
+        ao_putc(out, '\n');
     }
 }
 
-static void emit_type_equates(FILE *out, const ConfigTypes *types)
-{
+static void emit_type_equates(AsmOut *out, const ConfigTypes *types) {
     size_t i, j;
     int emitted = 0;
 
@@ -1103,21 +1224,21 @@ static void emit_type_equates(FILE *out, const ConfigTypes *types)
                 upper_val[k] = (char)toupper((unsigned char)type->values[j].name[k]);
             }
             upper_val[k] = '\0';
-            fprintf(out, type->kind == TABLE_WORD ? "%s_%s = 0x%04x\n" : "%s_%s = 0x%02x\n",
-                    upper_type, upper_val,
-                    (unsigned)type->values[j].value & (type->kind == TABLE_WORD ? 0xffffu : 0xffu));
+            ao_printf(out, type->kind == TABLE_WORD ? "%s_%s = 0x%04x\n" : "%s_%s = 0x%02x\n",
+                      upper_type, upper_val,
+                      (unsigned)type->values[j].value &
+                          (type->kind == TABLE_WORD ? 0xffffu : 0xffu));
             emitted = 1;
         }
     }
     if (emitted) {
-        fputc('\n', out);
+        ao_putc(out, '\n');
     }
 }
 
-static void emit_inline_truncated_warning(FILE *out, uint8_t bank, uint32_t cpu_addr,
+static void emit_inline_truncated_warning(AsmOut *out, uint8_t bank, uint32_t cpu_addr,
                                           size_t rom_addr, const char *inst, unsigned expected,
-                                          size_t available)
-{
+                                          size_t available) {
     int acked = warning_is_acked(bank, cpu_addr);
     if (apex_warn_to_stderr && !acked) {
         fprintf(stderr,
@@ -1126,18 +1247,17 @@ static void emit_inline_truncated_warning(FILE *out, uint8_t bank, uint32_t cpu_
                 inst, bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, expected,
                 (unsigned long)available);
     }
-    fprintf(out,
-            "; %s inline_truncated bank=0x%02x cpu=0x%04x rom=0x%06lx expected=%u "
-            "available=%lu for %s\n",
-            acked ? "WARNING_ACK" : "WARNING",
-            bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, expected,
-            (unsigned long)available, inst);
+    ao_mark_location(out, acked ? "WARNING_ACK" : "WARNING", bank, cpu_addr & 0xffffu, rom_addr, 0);
+    ao_printf(out,
+              "; %s inline_truncated bank=0x%02x cpu=0x%04x rom=0x%06lx expected=%u "
+              "available=%lu for %s\n",
+              acked ? "WARNING_ACK" : "WARNING", bank, (unsigned)cpu_addr & 0xffffu,
+              (unsigned long)rom_addr, expected, (unsigned long)available, inst);
 }
 
-static void emit_inline_far_warning(FILE *out, uint8_t current_bank, uint32_t cpu_addr,
+static void emit_inline_far_warning(AsmOut *out, uint8_t current_bank, uint32_t cpu_addr,
                                     size_t rom_addr, const char *inst, uint16_t target,
-                                    uint8_t target_bank)
-{
+                                    uint8_t target_bank) {
     int acked = warning_is_acked(current_bank, cpu_addr);
     if (apex_warn_to_stderr && !acked) {
         fprintf(stderr,
@@ -1146,71 +1266,91 @@ static void emit_inline_far_warning(FILE *out, uint8_t current_bank, uint32_t cp
                 inst, current_bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, target,
                 target_bank);
     }
-    fprintf(out,
-            "; %s inline_far_code_invalid bank=0x%02x cpu=0x%04x rom=0x%06lx "
-            "target=0x%04x target_bank=0x%02x for %s\n",
-            acked ? "WARNING_ACK" : "WARNING",
-            current_bank, (unsigned)cpu_addr & 0xffffu, (unsigned long)rom_addr, target,
-            target_bank, inst);
+    ao_mark_location(out, acked ? "WARNING_ACK" : "WARNING", current_bank, cpu_addr & 0xffffu,
+                     rom_addr, 0);
+    ao_printf(out,
+              "; %s inline_far_code_invalid bank=0x%02x cpu=0x%04x rom=0x%06lx "
+              "target=0x%04x target_bank=0x%02x for %s\n",
+              acked ? "WARNING_ACK" : "WARNING", current_bank, (unsigned)cpu_addr & 0xffffu,
+              (unsigned long)rom_addr, target, target_bank, inst);
 }
 
-static void emit_string(FILE *out, const uint8_t *data, size_t len)
-{
+static void emit_string(AsmOut *out, const uint8_t *data, size_t len) {
     size_t i;
 
-    fprintf(out, "    STRING \"");
+    ao_mark_item(out, len);
+    ao_printf(out, "    STRING \"");
     for (i = 0; i + 1u < len; i++) {
-        if (data[i] == '\n') { fputs("\\n", out); continue; }
-        if (data[i] == '\t') { fputs("\\t", out); continue; }
-        if (data[i] == 0x07) { fputs("\\a", out); continue; }
-        if (data[i] == '"' || data[i] == '\\') {
-            fputc('\\', out);
+        if (data[i] == '\n') {
+            ao_puts(out, "\\n");
+            continue;
         }
-        fputc(data[i], out);
+        if (data[i] == '\t') {
+            ao_puts(out, "\\t");
+            continue;
+        }
+        if (data[i] == 0x07) {
+            ao_puts(out, "\\a");
+            continue;
+        }
+        if (data[i] == '"' || data[i] == '\\') {
+            ao_putc(out, '\\');
+        }
+        ao_putc(out, data[i]);
     }
-    fprintf(out, "\"\n");
+    ao_printf(out, "\"\n");
 }
 
 /* Bytes STRING_FIXED can represent: printable ASCII plus the \a \t \n \r escapes
    understood by emit_string_fixed below and apexasm's parse_string_fixed. The
    emit_data_range gate uses this so a classified fixed string is only rejected
    (→ .DB) for a byte it genuinely cannot round-trip, not for CR/LF/BEL. */
-static int string_fixed_encodable(uint8_t c)
-{
-    return c == 0x07u || c == 0x09u || c == 0x0au || c == 0x0du ||
-           (c >= 0x20u && c <= 0x7fu);
+static int string_fixed_encodable(uint8_t c) {
+    return c == 0x07u || c == 0x09u || c == 0x0au || c == 0x0du || (c >= 0x20u && c <= 0x7fu);
 }
 
 /* Emits STRING_FIXED "…" (data[0..len-1] are the chars, no extra byte). */
-static void emit_string_fixed(FILE *out, const uint8_t *data, size_t len)
-{
+static void emit_string_fixed(AsmOut *out, const uint8_t *data, size_t len) {
     size_t i;
-    fprintf(out, "    STRING_FIXED \"");
+    ao_mark_item(out, len);
+    ao_printf(out, "    STRING_FIXED \"");
     for (i = 0; i < len; i++) {
-        if (data[i] == '\n') { fputs("\\n", out); continue; }
-        if (data[i] == '\r') { fputs("\\r", out); continue; }
-        if (data[i] == '\t') { fputs("\\t", out); continue; }
-        if (data[i] == 0x07) { fputs("\\a", out); continue; }
-        if (data[i] == '"' || data[i] == '\\') fputc('\\', out);
-        fputc(data[i], out);
+        if (data[i] == '\n') {
+            ao_puts(out, "\\n");
+            continue;
+        }
+        if (data[i] == '\r') {
+            ao_puts(out, "\\r");
+            continue;
+        }
+        if (data[i] == '\t') {
+            ao_puts(out, "\\t");
+            continue;
+        }
+        if (data[i] == 0x07) {
+            ao_puts(out, "\\a");
+            continue;
+        }
+        if (data[i] == '"' || data[i] == '\\')
+            ao_putc(out, '\\');
+        ao_putc(out, data[i]);
     }
-    fprintf(out, "\"\n");
+    ao_printf(out, "\"\n");
 }
 
 /* Emits BCD <digits> — N bytes as 2N decimal digits (each nibble 0-9). */
-static void emit_bcd(FILE *out, const uint8_t *data, size_t len)
-{
+static void emit_bcd(AsmOut *out, const uint8_t *data, size_t len) {
     size_t i;
-    fprintf(out, "    BCD ");
+    ao_mark_item(out, len);
+    ao_printf(out, "    BCD ");
     for (i = 0; i < len; i++) {
-        fprintf(out, "%02x", data[i]); /* nibbles are 0-9, so hex == decimal digits */
+        ao_printf(out, "%02x", data[i]); /* nibbles are 0-9, so hex == decimal digits */
     }
-    fputc('\n', out);
+    ao_putc(out, '\n');
 }
 
-static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t len,
-                                            const Label *labels, size_t label_count)
-{
+static void emit_inner_string_label_equates(AsmOut *out, uint32_t start, size_t len,
+                                            const Label *labels, size_t label_count) {
     const char *start_name = label_name_at(start, labels, label_count, 0);
     size_t i;
 
@@ -1219,8 +1359,9 @@ static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t le
     }
     for (i = 0; i < label_count; i++) {
         if (labels[i].is_string && labels[i].addr > start && labels[i].addr < start + len) {
-            fprintf(out, "%s = %s + 0x%04x\n", labels[i].name, start_name,
-                    (unsigned)(labels[i].addr - start));
+            mark_label_placed(labels[i].addr);
+            ao_printf(out, "%s = %s + 0x%04x\n", labels[i].name, start_name,
+                      (unsigned)(labels[i].addr - start));
         }
     }
 }
@@ -1228,11 +1369,9 @@ static void emit_inner_string_label_equates(FILE *out, uint32_t start, size_t le
 /* Returns a label string for the pointer target. *owned is set to 1 when the
    result is a freshly allocated make_*_label the caller must free, 0 when it is
    a borrowed pointer into a label set. */
-static const char *table_ptr_label(uint16_t ptr, uint8_t bank,
-                                   const Label *labels,
+static const char *table_ptr_label(uint16_t ptr, uint8_t bank, const Label *labels,
                                    size_t label_count, const Label *extra_labels,
-                                   size_t extra_label_count, int *owned)
-{
+                                   size_t extra_label_count, int *owned) {
     const char *label = label_name_at(ptr, labels, label_count, 0);
 
     *owned = 0;
@@ -1250,11 +1389,10 @@ static const char *table_ptr_label(uint16_t ptr, uint8_t bank,
     return label;
 }
 
-static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
-                                 size_t *pos, uint8_t bank, TableFieldKind kind, const Label *labels,
+static void emit_table_ptr_field(AsmOut *out, const uint8_t *data, size_t len, size_t *pos,
+                                 uint8_t bank, TableFieldKind kind, const Label *labels,
                                  size_t label_count, const Label *extra_labels,
-                                 size_t extra_label_count, const uint8_t *paged_rom, size_t banks)
-{
+                                 size_t extra_label_count, const uint8_t *paged_rom, size_t banks) {
     uint16_t ptr;
     const char *label;
 
@@ -1266,13 +1404,14 @@ static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
     label = table_ptr_label(ptr, bank, labels, label_count, extra_labels, extra_label_count,
                             &label_owned);
     {
-        const char *pseudo = kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME" :
-                             kind == TABLE_PTR16_SPRITE         ? "TABLE_PTR_SPRITE"         :
-                                                                  "TABLE_PTR";
+        const char *pseudo = kind == TABLE_PTR16_DMD_FULLFRAME ? "TABLE_PTR_DMD_FULLFRAME"
+                             : kind == TABLE_PTR16_SPRITE      ? "TABLE_PTR_SPRITE"
+                                                               : "TABLE_PTR";
+        ao_mark_item(out, 2u);
         if (label) {
-            fprintf(out, "    %s %s", pseudo, label);
+            ao_printf(out, "    %s %s", pseudo, label);
         } else {
-            fprintf(out, "    %s 0x%04x", pseudo, ptr);
+            ao_printf(out, "    %s 0x%04x", pseudo, ptr);
         }
     }
     if (label_owned) {
@@ -1284,26 +1423,25 @@ static void emit_table_ptr_field(FILE *out, const uint8_t *data, size_t len,
     if (kind == TABLE_PTR16_SPRITE) {
         emit_sprite_target_comment(out, paged_rom, banks, bank, ptr);
     }
-    fputc('\n', out);
+    ao_putc(out, '\n');
     *pos += 2u;
 }
 
-static void emit_db_line(FILE *out, uint32_t addr, const uint8_t *data, size_t count);
+static void emit_db_line(AsmOut *out, uint32_t addr, const uint8_t *data, size_t count);
 
-static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
+static void emit_table_rows(AsmOut *out, const TableDef *table, const uint8_t *data, size_t len,
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
                             const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
                             const ConfigTypes *types, const ConfigDocs *docs);
 
-static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
+static void emit_counted_table(AsmOut *out, const TableDef *table, const uint8_t *data, size_t len,
                                uint32_t base_addr, size_t *pos, uint8_t bank, const Label *labels,
                                size_t label_count, const Label *extra_labels,
                                size_t extra_label_count, const uint8_t *paged_rom, size_t banks,
                                const LabelSet *bank_labels, const ConfigTypes *types,
-                               const ConfigDocs *docs)
-{
+                               const ConfigDocs *docs) {
     uint16_t count;
     uint8_t row_width;
 
@@ -1311,7 +1449,8 @@ static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *
         return;
     }
     count = read_be16(data + *pos);
-    fprintf(out, "    .DW 0x%04x\n", count);
+    ao_mark_item(out, 2u);
+    ao_printf(out, "    .DW 0x%04x\n", count);
     row_width = data[*pos + 2u];
     emit_db_line(out, base_addr + (uint32_t)(*pos + 2u), data + *pos + 2u, 1);
     *pos += 3u;
@@ -1320,16 +1459,15 @@ static void emit_counted_table(FILE *out, const TableDef *table, const uint8_t *
                     types, docs);
 }
 
-static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint8_t bank,
-                              const Label *labels, size_t label_count,
-                              const Label *extra_labels, size_t extra_label_count,
-                              const uint8_t *paged_rom, size_t banks,
-                              const LabelSet *bank_labels)
-{
+static void emit_far_code_ref(AsmOut *out, const char *pseudo, uint16_t addr, uint8_t bank,
+                              const Label *labels, size_t label_count, const Label *extra_labels,
+                              size_t extra_label_count, const uint8_t *paged_rom, size_t banks,
+                              const LabelSet *bank_labels) {
     const char *label = NULL;
     int generated = 0;
     uint8_t label_bank = bank;
 
+    ao_mark_item(out, 3u); /* FAR_* / TABLE_FAR_* / INLINE_FAR_*: addr_hi, addr_lo, bank */
     if (bank == 0xffu && in_system_addr(addr)) {
         label = label_name_at(addr, labels, label_count, 0);
         if (!label) {
@@ -1344,7 +1482,8 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
 
         if (bank_index >= 0) {
             label_bank = bank_id_for_index(banks, bank_index);
-            label = label_name_at(addr, bank_labels[bank_index].items, bank_labels[bank_index].count, 0);
+            label = label_name_at(addr, bank_labels[bank_index].items,
+                                  bank_labels[bank_index].count, 0);
         }
         if (!label) {
             label = make_bank_label(label_bank, addr);
@@ -1356,17 +1495,16 @@ static void emit_far_code_ref(FILE *out, const char *pseudo, uint16_t addr, uint
     }
 
     if (label_bank == bank && (generated || generated_label_name(label) || !generated)) {
-        fprintf(out, "    %s %s", pseudo, label);
+        ao_printf(out, "    %s %s", pseudo, label);
     } else {
-        fprintf(out, "    %s %s, 0x%02x", pseudo, label, bank);
+        ao_printf(out, "    %s %s, 0x%02x", pseudo, label, bank);
     }
     if (generated) {
         free((char *)label);
     }
 }
 
-static const char *table_far_pseudo(TableFieldKind kind)
-{
+static const char *table_far_pseudo(TableFieldKind kind) {
     if (kind == TABLE_FAR_STRING) {
         return "TABLE_FAR_STRING";
     }
@@ -1385,8 +1523,7 @@ static const char *table_far_pseudo(TableFieldKind kind)
     return "TABLE_FAR_PTR";
 }
 
-static const char *inline_far_pseudo(TableFieldKind kind)
-{
+static const char *inline_far_pseudo(TableFieldKind kind) {
     if (kind == TABLE_FAR_STRING) {
         return "INLINE_FAR_STRING";
     }
@@ -1405,8 +1542,7 @@ static const char *inline_far_pseudo(TableFieldKind kind)
     return "INLINE_FAR_PTR";
 }
 
-static const char *inline_ptr_pseudo(TableFieldKind kind)
-{
+static const char *inline_ptr_pseudo(TableFieldKind kind) {
     if (kind == TABLE_PTR16_STRING) {
         return "INLINE_STRING_PTR";
     }
@@ -1425,8 +1561,7 @@ static const char *inline_ptr_pseudo(TableFieldKind kind)
     return "INLINE_PTR";
 }
 
-static const char *data_far_pseudo(DataKind kind)
-{
+static const char *data_far_pseudo(DataKind kind) {
     if (kind == DATA_FAR_STRING) {
         return "FAR_STRING";
     }
@@ -1445,46 +1580,41 @@ static const char *data_far_pseudo(DataKind kind)
     return "FAR_PTR";
 }
 
-static char db_ascii_char(uint8_t value)
-{
+static char db_ascii_char(uint8_t value) {
     return value >= 0x20u && value <= 0x7eu ? (char)value : '.';
 }
 
-static void emit_db_ascii_comment(FILE *out, uint32_t addr, const uint8_t *data, size_t count)
-{
+static void emit_db_ascii_comment(AsmOut *out, uint32_t addr, const uint8_t *data, size_t count) {
     size_t i;
 
-    fprintf(out, " ; 0x%04x |", (unsigned)addr & 0xffffu);
+    ao_printf(out, " ; 0x%04x |", (unsigned)addr & 0xffffu);
     for (i = 0; i < count; i++) {
-        fputc(db_ascii_char(data[i]), out);
+        ao_putc(out, db_ascii_char(data[i]));
     }
-    fputs("|\n", out);
+    ao_puts(out, "|\n");
 }
 
-static void emit_db_line(FILE *out, uint32_t addr, const uint8_t *data, size_t count)
-{
+static void emit_db_line(AsmOut *out, uint32_t addr, const uint8_t *data, size_t count) {
     size_t i;
 
-    fprintf(out, "    .DB ");
+    ao_mark_item(out, count);
+    ao_printf(out, "    .DB ");
     for (i = 0; i < count; i++) {
-        fprintf(out, "%s0x%02x", i == 0 ? "" : ", ", data[i]);
+        ao_printf(out, "%s0x%02x", i == 0 ? "" : ", ", data[i]);
     }
     emit_db_ascii_comment(out, addr, data, count);
 }
 
-static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
-                            size_t *pos, size_t count,
-                            const Label *labels, size_t label_count,
+static void emit_data_bytes(AsmOut *out, const uint8_t *data, size_t len, uint32_t base_addr,
+                            size_t *pos, size_t count, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count);
 
-
-static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *data, size_t len,
+static void emit_table_rows(AsmOut *out, const TableDef *table, const uint8_t *data, size_t len,
                             uint32_t base_addr, size_t *pos, uint8_t current_bank, size_t rows,
                             size_t row_width, const Label *labels, size_t label_count,
                             const Label *extra_labels, size_t extra_label_count,
                             const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
-                            const ConfigTypes *types, const ConfigDocs *docs)
-{
+                            const ConfigTypes *types, const ConfigDocs *docs) {
     size_t row;
 
     for (row = 0; row < rows && *pos + row_width <= len; row++) {
@@ -1505,15 +1635,17 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                linear form is O(rows * labels) and dominates large tables. */
             for (li = label_lower_bound(labels, label_count, row_addr);
                  li < label_count && labels[li].addr == row_addr; li++) {
-                fprintf(out, "%s:\n", labels[li].name);
+                mark_label_placed(labels[li].addr);
+                ao_printf(out, "%s:\n", labels[li].name);
             }
             for (li = label_lower_bound(extra_labels, extra_label_count, row_addr);
                  li < extra_label_count && extra_labels[li].addr == row_addr; li++) {
-                fprintf(out, "%s:\n", extra_labels[li].name);
+                mark_label_placed(extra_labels[li].addr);
+                ao_printf(out, "%s:\n", extra_labels[li].name);
             }
         }
 
-        fprintf(out, "; [row %lu / %04lx]\n", (unsigned long)row, (unsigned long)(row & 0xffffu));
+        ao_printf(out, "; [row %lu / %04lx]\n", (unsigned long)row, (unsigned long)(row & 0xffffu));
         emit_doc_comment(out, config_doc_at(docs, current_bank, base_addr + (uint32_t)row_start));
 
         for (i = 0; i < table->schema.count; i++) {
@@ -1536,34 +1668,39 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                     uint8_t byte_val = data[*pos];
 
                     if (field->type_name && types) {
-                        const char *ename = config_type_enum_name(types, field->type_name, byte_val);
+                        const char *ename =
+                            config_type_enum_name(types, field->type_name, byte_val);
 
-                        fprintf(out, "    .DB 0x%02x ; 0x%04x |%c|", byte_val,
-                                (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu,
-                                db_ascii_char(byte_val));
+                        ao_mark_item(out, 1u);
+                        ao_printf(out, "    .DB 0x%02x ; 0x%04x |%c|", byte_val,
+                                  (unsigned)(base_addr + (uint32_t)*pos) & 0xffffu,
+                                  db_ascii_char(byte_val));
                         if (ename) {
-                            fprintf(out, " %s=%s", field->type_name, ename);
+                            ao_printf(out, " %s=%s", field->type_name, ename);
                         } else {
-                            fprintf(out, " %s=0x%02x", field->type_name, byte_val);
+                            ao_printf(out, " %s=0x%02x", field->type_name, byte_val);
                         }
-                        fputc('\n', out);
+                        ao_putc(out, '\n');
                     }
                     (*pos)++;
                 } else if (kind == TABLE_WORD) {
                     uint16_t word_val = read_be16(data + *pos);
 
                     if (field->type_name && types) {
-                        const char *ename = config_type_enum_name(types, field->type_name, word_val);
+                        const char *ename =
+                            config_type_enum_name(types, field->type_name, word_val);
 
-                        fprintf(out, "    .DW 0x%04x ;", word_val);
+                        ao_mark_item(out, 2u);
+                        ao_printf(out, "    .DW 0x%04x ;", word_val);
                         if (ename) {
-                            fprintf(out, " %s=%s", field->type_name, ename);
+                            ao_printf(out, " %s=%s", field->type_name, ename);
                         } else {
-                            fprintf(out, " %s=0x%04x", field->type_name, word_val);
+                            ao_printf(out, " %s=0x%04x", field->type_name, word_val);
                         }
-                        fputc('\n', out);
+                        ao_putc(out, '\n');
                     } else {
-                        fprintf(out, "    .DW 0x%04x\n", word_val);
+                        ao_mark_item(out, 2u);
+                        ao_printf(out, "    .DW 0x%04x\n", word_val);
                     }
                     *pos += 2u;
                 } else if (table_kind_is_far(kind)) {
@@ -1579,7 +1716,7 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
                     if (kind == TABLE_FAR_SPRITE) {
                         emit_sprite_target_comment(out, paged_rom, banks, bank, addr);
                     }
-                    fputc('\n', out);
+                    ao_putc(out, '\n');
                     *pos += 3u;
                 } else {
                     emit_table_ptr_field(out, data, len, pos, current_bank, kind, labels,
@@ -1589,32 +1726,31 @@ static void emit_table_rows(FILE *out, const TableDef *table, const uint8_t *dat
             }
         }
         if (*pos < row_start + row_width) {
-            emit_data_bytes(out, data, len, base_addr, pos, row_start + row_width - *pos,
-                        labels, label_count, extra_labels, extra_label_count);
+            emit_data_bytes(out, data, len, base_addr, pos, row_start + row_width - *pos, labels,
+                            label_count, extra_labels, extra_label_count);
         }
     }
 }
 
 /* Emit any label definitions configured at `addr` as bare `Name:` lines. */
-static void emit_bare_labels_at(FILE *out, uint32_t addr, const Label *labels, size_t label_count,
-                                const Label *extra_labels, size_t extra_label_count)
-{
+static void emit_bare_labels_at(AsmOut *out, uint32_t addr, const Label *labels, size_t label_count,
+                                const Label *extra_labels, size_t extra_label_count) {
     size_t li;
     for (li = label_lower_bound(labels, label_count, addr);
          li < label_count && labels[li].addr == addr; li++) {
-        fprintf(out, "%s:\n", labels[li].name);
+        mark_label_placed(labels[li].addr);
+        ao_printf(out, "%s:\n", labels[li].name);
     }
     for (li = label_lower_bound(extra_labels, extra_label_count, addr);
          li < extra_label_count && extra_labels[li].addr == addr; li++) {
-        fprintf(out, "%s:\n", extra_labels[li].name);
+        mark_label_placed(extra_labels[li].addr);
+        ao_printf(out, "%s:\n", extra_labels[li].name);
     }
 }
 
-static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
-                            size_t *pos, size_t count,
-                            const Label *labels, size_t label_count,
-                            const Label *extra_labels, size_t extra_label_count)
-{
+static void emit_data_bytes(AsmOut *out, const uint8_t *data, size_t len, uint32_t base_addr,
+                            size_t *pos, size_t count, const Label *labels, size_t label_count,
+                            const Label *extra_labels, size_t extra_label_count) {
     size_t end = *pos + count;
     size_t start = *pos;
 
@@ -1630,8 +1766,8 @@ static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t
            to it can't resolve.  Emit it here and break the row at its address —
            byte output is unchanged, so the round-trip holds. */
         if (*pos > start) {
-            emit_bare_labels_at(out, base_addr + (uint32_t)*pos, labels, label_count,
-                                extra_labels, extra_label_count);
+            emit_bare_labels_at(out, base_addr + (uint32_t)*pos, labels, label_count, extra_labels,
+                                extra_label_count);
         }
         while (*pos < end && col < 16) {
             (*pos)++;
@@ -1646,12 +1782,10 @@ static void emit_data_bytes(FILE *out, const uint8_t *data, size_t len, uint32_t
     }
 }
 
-static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *data, size_t len,
+static int emit_data_range(AsmOut *out, const DataRange *range, const uint8_t *data, size_t len,
                            uint32_t base_addr, size_t *pos, const Label *labels, size_t label_count,
                            const Label *extra_labels, size_t extra_label_count,
-                           const uint8_t *paged_rom, size_t banks,
-                           const LabelSet *bank_labels)
-{
+                           const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels) {
     if (range->kind == DATA_STRING) {
         size_t string_len = valid_string_len(data + *pos, len - *pos);
 
@@ -1696,7 +1830,7 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
         return 1;
     }
     if (range->kind == DATA_PTR16_STRING || range->kind == DATA_PTR16_DATA ||
-        range->kind == DATA_PTR16_CODE  || range->kind == DATA_PTR16_TABLE) {
+        range->kind == DATA_PTR16_CODE || range->kind == DATA_PTR16_TABLE) {
         uint16_t ptr;
         const char *lbl;
         int lbl_owned = 0;
@@ -1705,12 +1839,13 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             return 0;
         }
         ptr = read_be16(data + *pos);
-        lbl = table_ptr_label(ptr, range->bank, labels, label_count,
-                              extra_labels, extra_label_count, &lbl_owned);
+        lbl = table_ptr_label(ptr, range->bank, labels, label_count, extra_labels,
+                              extra_label_count, &lbl_owned);
+        ao_mark_item(out, 2u);
         if (lbl) {
-            fprintf(out, "    .DW %s\n", lbl);
+            ao_printf(out, "    .DW %s\n", lbl);
         } else {
-            fprintf(out, "    .DW 0x%04x\n", ptr);
+            ao_printf(out, "    .DW 0x%04x\n", ptr);
         }
         if (lbl_owned) {
             free((char *)lbl);
@@ -1733,91 +1868,92 @@ static int emit_data_range(FILE *out, const DataRange *range, const uint8_t *dat
             emit_sprite_target_comment(out, paged_rom, banks, data[*pos + 2u],
                                        read_be16(data + *pos));
         }
-        fputc('\n', out);
+        ao_putc(out, '\n');
         *pos += 3u;
         return 1;
     }
     if (range->kind == DATA_DMD_FULLFRAME) {
         size_t total = 0;
-        size_t planes = range->length ? range->length : 1u;  /* bit-plane count */
+        size_t planes = range->length ? range->length : 1u; /* bit-plane count */
         size_t p;
 
         for (p = 0; p < planes; p++) {
             size_t consumed = 0;
             uint8_t type = 0;
             if (!decode_dmd_fullframe_metadata(data + *pos + total, len - *pos - total, &type,
-                                               &consumed) || consumed == 0u) {
-                total += 1u;  /* undecodable plane: emit 1 byte, stop expanding */
+                                               &consumed) ||
+                consumed == 0u) {
+                total += 1u; /* undecodable plane: emit 1 byte, stop expanding */
                 planes = p + 1u;
                 break;
             }
             total += consumed;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, total,
-                        labels, label_count, extra_labels, extra_label_count);
+        emit_data_bytes(out, data, len, base_addr, pos, total, labels, label_count, extra_labels,
+                        extra_label_count);
         return 1;
     }
     if (range->kind == DATA_SPRITE) {
         uint8_t tmp[APEX_SPRITE_MAX_BYTES];
         size_t consumed = 0;
 
-        if (!apexsprite_decode(data + *pos, len - *pos, tmp,
-                               NULL, NULL, NULL, NULL, NULL, NULL, &consumed) ||
+        if (!apexsprite_decode(data + *pos, len - *pos, tmp, NULL, NULL, NULL, NULL, NULL, NULL,
+                               &consumed) ||
             consumed == 0u) {
             uint32_t wcpu = (base_addr + (uint32_t)*pos) & 0xffffu;
-            fprintf(out, "; %s sprite_invalid bank=0x%02x cpu=0x%04x"
-                         " (decode failed; emitting 1 byte as data)\n",
-                    warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu);
+            ao_printf(out,
+                      "; %s sprite_invalid bank=0x%02x cpu=0x%04x"
+                      " (decode failed; emitting 1 byte as data)\n",
+                      warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu);
             consumed = 1u;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, consumed,
-                        labels, label_count, extra_labels, extra_label_count);
+        emit_data_bytes(out, data, len, base_addr, pos, consumed, labels, label_count, extra_labels,
+                        extra_label_count);
         return 1;
     }
     if (range->kind == DATA_SPRITE_NOHEADER) {
         uint8_t tmp[APEX_SPRITE_MAX_BYTES];
         size_t consumed = 0;
 
-        if (!apexsprite_decode_noheader(data + *pos, len - *pos, tmp,
-                                        (uint8_t)range->length, NULL, &consumed) ||
+        if (!apexsprite_decode_noheader(data + *pos, len - *pos, tmp, (uint8_t)range->length, NULL,
+                                        &consumed) ||
             consumed == 0u) {
             uint32_t wcpu = (base_addr + (uint32_t)*pos) & 0xffffu;
-            fprintf(out, "; %s sprite_noheader_invalid bank=0x%02x cpu=0x%04x height=%lu"
-                         " (decode failed; emitting 1 byte as data)\n",
-                    warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu,
-                    (unsigned long)range->length);
+            ao_printf(out,
+                      "; %s sprite_noheader_invalid bank=0x%02x cpu=0x%04x height=%lu"
+                      " (decode failed; emitting 1 byte as data)\n",
+                      warning_keyword(range->bank, wcpu), range->bank, (unsigned)wcpu,
+                      (unsigned long)range->length);
             consumed = 1u;
         }
-        emit_data_bytes(out, data, len, base_addr, pos, consumed,
-                        labels, label_count, extra_labels, extra_label_count);
+        emit_data_bytes(out, data, len, base_addr, pos, consumed, labels, label_count, extra_labels,
+                        extra_label_count);
         return 1;
     }
-    emit_data_bytes(out, data, len, base_addr, pos, range->length,
-                        labels, label_count, extra_labels, extra_label_count);
+    emit_data_bytes(out, data, len, base_addr, pos, range->length, labels, label_count,
+                    extra_labels, extra_label_count);
     return 1;
 }
 
 /* Emit a raw byte list (count bytes from data[*pos]) as `pseudo b0, b1, ...`. */
-static void emit_inline_byte_list(FILE *out, const char *pseudo, const uint8_t *data, size_t *pos,
-                                  size_t count, const char *inst)
-{
+static void emit_inline_byte_list(AsmOut *out, const char *pseudo, const uint8_t *data, size_t *pos,
+                                  size_t count, const char *inst) {
     size_t k;
-    fprintf(out, "        %s ", pseudo);
+    ao_mark_item(out, count);
+    ao_printf(out, "        %s ", pseudo);
     for (k = 0; k < count; k++) {
-        fprintf(out, "%s0x%02x", k ? ", " : "", data[*pos + k]);
+        ao_printf(out, "%s0x%02x", k ? ", " : "", data[*pos + k]);
     }
-    fprintf(out, " ; for %s\n", inst);
+    ao_printf(out, " ; for %s\n", inst);
     *pos += count;
 }
 
-static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint8_t *data,
+static void emit_inline_fields(AsmOut *out, const InlineSignature *sig, const uint8_t *data,
                                size_t len, size_t *pos, uint8_t current_bank, const char *inst,
-                               const Label *labels, size_t label_count,
-                               const Label *extra_labels, size_t extra_label_count,
-                               const uint8_t *paged_rom, size_t banks,
+                               const Label *labels, size_t label_count, const Label *extra_labels,
+                               size_t extra_label_count, const uint8_t *paged_rom, size_t banks,
                                const LabelSet *bank_labels, uint32_t base_addr, size_t rom_base,
-                               const ConfigTypes *types)
-{
+                               const ConfigTypes *types) {
     size_t i;
 
     for (i = 0; i < sig->schema.count; i++) {
@@ -1830,64 +1966,69 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
             if (kind == TABLE_BYTES_UNTIL) {
                 uint8_t term = (uint8_t)field->param;
                 size_t span = 0;
-                while (*pos + span < len && data[*pos + span] != term) span++;
-                if (*pos + span < len) span++;   /* include the terminator */
+                while (*pos + span < len && data[*pos + span] != term)
+                    span++;
+                if (*pos + span < len)
+                    span++; /* include the terminator */
                 emit_inline_byte_list(out, "INLINE_BYTES_UNTIL", data, pos, span, inst);
             } else if (kind == TABLE_COUNTED_BYTES) {
-                size_t span = 1u + (size_t)data[*pos];   /* count byte + payload */
-                if (*pos + span > len) span = len - *pos;
+                size_t span = 1u + (size_t)data[*pos]; /* count byte + payload */
+                if (*pos + span > len)
+                    span = len - *pos;
                 emit_inline_byte_list(out, "INLINE_COUNTED_BYTES", data, pos, span, inst);
             } else if (kind == TABLE_BYTE) {
                 uint8_t byte_val = data[*pos];
 
-                fprintf(out, "        INLINE_BYTE 0x%02x ; for %s", byte_val, inst);
+                ao_mark_item(out, 1u);
+                ao_printf(out, "        INLINE_BYTE 0x%02x ; for %s", byte_val, inst);
                 if (field->type_name && types) {
                     const char *ename = config_type_enum_name(types, field->type_name, byte_val);
 
                     if (ename) {
-                        fprintf(out, " %s=%s", field->type_name, ename);
+                        ao_printf(out, " %s=%s", field->type_name, ename);
                     } else {
-                        fprintf(out, " %s=0x%02x", field->type_name, byte_val);
+                        ao_printf(out, " %s=0x%02x", field->type_name, byte_val);
                     }
                 }
-                fputc('\n', out);
+                ao_putc(out, '\n');
                 (*pos)++;
             } else if (kind == TABLE_WORD) {
                 uint16_t word_val = read_be16(data + *pos);
 
-                fprintf(out, "        INLINE_WORD 0x%04x ; for %s", word_val, inst);
+                ao_mark_item(out, 2u);
+                ao_printf(out, "        INLINE_WORD 0x%04x ; for %s", word_val, inst);
                 if (field->type_name && types) {
                     const char *ename = config_type_enum_name(types, field->type_name, word_val);
 
                     if (ename) {
-                        fprintf(out, " %s=%s", field->type_name, ename);
+                        ao_printf(out, " %s=%s", field->type_name, ename);
                     } else {
-                        fprintf(out, " %s=0x%04x", field->type_name, word_val);
+                        ao_printf(out, " %s=0x%04x", field->type_name, word_val);
                     }
                 }
-                fputc('\n', out);
+                ao_putc(out, '\n');
                 *pos += 2u;
             } else if (table_kind_is_far(kind)) {
                 uint16_t target = read_be16(data + *pos);
                 uint8_t bank = data[*pos + 2u];
 
-                if (kind == TABLE_FAR_CODE && !valid_far_code_target(target, bank, paged_rom,
-                                                                     banks) &&
+                if (kind == TABLE_FAR_CODE &&
+                    !valid_far_code_target(target, bank, paged_rom, banks) &&
                     !render_far_code_null_ok(target)) {
                     emit_inline_far_warning(out, current_bank, base_addr + (uint32_t)*pos,
                                             rom_base + *pos, inst, target, bank);
                 }
-                fputs("    ", out);
+                ao_puts(out, "    ");
                 emit_far_code_ref(out, inline_far_pseudo(kind), target, bank, labels, label_count,
                                   extra_labels, extra_label_count, paged_rom, banks, bank_labels);
-                fprintf(out, " ; for %s", inst);
+                ao_printf(out, " ; for %s", inst);
                 if (kind == TABLE_FAR_DMD_FULLFRAME) {
                     emit_dmd_fullframe_target_comment(out, paged_rom, banks, bank, target);
                 }
                 if (kind == TABLE_FAR_SPRITE) {
                     emit_sprite_target_comment(out, paged_rom, banks, bank, target);
                 }
-                fputc('\n', out);
+                ao_putc(out, '\n');
                 *pos += 3u;
             } else {
                 uint16_t ptr = read_be16(data + *pos);
@@ -1895,10 +2036,12 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 const char *label = table_ptr_label(ptr, current_bank, labels, label_count,
                                                     extra_labels, extra_label_count, &label_owned);
 
+                ao_mark_item(out, 2u);
                 if (label) {
-                    fprintf(out, "        %s %s ; for %s", inline_ptr_pseudo(kind), label, inst);
+                    ao_printf(out, "        %s %s ; for %s", inline_ptr_pseudo(kind), label, inst);
                 } else {
-                    fprintf(out, "        %s 0x%04x ; for %s", inline_ptr_pseudo(kind), ptr, inst);
+                    ao_printf(out, "        %s 0x%04x ; for %s", inline_ptr_pseudo(kind), ptr,
+                              inst);
                 }
                 if (label_owned) {
                     free((char *)label);
@@ -1909,7 +2052,7 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
                 if (kind == TABLE_PTR16_SPRITE) {
                     emit_sprite_target_comment(out, paged_rom, banks, current_bank, ptr);
                 }
-                fputc('\n', out);
+                ao_putc(out, '\n');
                 *pos += 2u;
             }
             if (*pos > len) {
@@ -1922,8 +2065,7 @@ static void emit_inline_fields(FILE *out, const InlineSignature *sig, const uint
 /* True if an instruction at (current_bank, addr) is marked as a literal in the
    [literals] config section — its immediate operand is a fixed value, not an
    address, and must render raw instead of resolving to a label. */
-static int literal_instr_at(const ConfigEntries *literals, uint8_t bank, uint32_t addr)
-{
+static int literal_instr_at(const ConfigEntries *literals, uint8_t bank, uint32_t addr) {
     size_t i;
 
     if (!literals) {
@@ -1938,19 +2080,16 @@ static int literal_instr_at(const ConfigEntries *literals, uint8_t bank, uint32_
     return 0;
 }
 
-static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint32_t base_addr,
+static void emit_db_with_labels(AsmOut *out, const uint8_t *data, size_t len, uint32_t base_addr,
                                 const Label *labels, size_t label_count, int sorted,
                                 const Label *extra_labels, size_t extra_label_count,
                                 const VectorInfo *vectors, size_t vector_count,
                                 const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                                 size_t banks, const LabelSet *bank_labels, const TableDefs *tables,
-                                const ConfigDocs *docs,
-                                const ConfigSymbols *symbols, const DataRanges *data_ranges,
-                                const ReferenceSet *refs,
-                                uint8_t current_bank,
-                                size_t rom_base, int emit_explain, const ConfigTypes *types,
-                                const ConfigEntries *literals)
-{
+                                const ConfigDocs *docs, const ConfigSymbols *symbols,
+                                const DataRanges *data_ranges, const ReferenceSet *refs,
+                                uint8_t current_bank, size_t rom_base, int emit_explain,
+                                const ConfigTypes *types, const ConfigEntries *literals) {
     size_t pos = 0;
     int decoding_code = 0;
     BlockKind previous_kind = BLOCK_UNKNOWN;
@@ -1998,13 +2137,12 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         }
         emit_transition_comment(out, previous_kind, current_kind, current_bank,
                                 base_addr + (uint32_t)pos, rom_base + pos);
-        emit_labels_at(out, base_addr + (uint32_t)pos, labels, label_count, sorted,
-                       current_bank, base_addr, rom_base, inline_sigs, table, data_range,
-                       data, len, pos, docs, refs, emit_explain,
-                       paged_rom, banks);
-        if (data_range && emit_data_range(out, data_range, data, len, base_addr, &pos, labels, label_count,
-                                          extra_labels, extra_label_count, paged_rom, banks,
-                                          bank_labels)) {
+        emit_labels_at(out, base_addr + (uint32_t)pos, labels, label_count, sorted, current_bank,
+                       base_addr, rom_base, inline_sigs, table, data_range, data, len, pos, docs,
+                       refs, emit_explain, paged_rom, banks);
+        if (data_range &&
+            emit_data_range(out, data_range, data, len, base_addr, &pos, labels, label_count,
+                            extra_labels, extra_label_count, paged_rom, banks, bank_labels)) {
             decoding_code = 0;
             previous_kind = (current_kind == BLOCK_SPRITE) ? BLOCK_SPRITE : BLOCK_DATA;
             continue;
@@ -2042,7 +2180,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         }
         entry_name = vector_entry_at(base_addr + (uint32_t)pos, vectors, vector_count);
         if (entry_name && pos + 1 < len) {
-            fprintf(out, "    .DW %s\n", entry_name);
+            ao_mark_item(out, 2u);
+            ao_printf(out, "    .DW %s\n", entry_name);
             pos += 2;
             decoding_code = 0;
             previous_kind = current_kind == BLOCK_CODE ? BLOCK_UNCLASSIFIED : current_kind;
@@ -2056,8 +2195,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
             if (literal_instr_at(literals, current_bank, instr_addr)) {
                 /* Literal-marked: decode without the label callback so an immediate
                    operand renders as a raw value rather than a label. */
-                info = cpu6809_disassemble_info(data + pos, len - pos, instr_addr, inst,
-                                                sizeof(inst));
+                info =
+                    cpu6809_disassemble_info(data + pos, len - pos, instr_addr, inst, sizeof(inst));
             } else if (far_imm_render_bank(current_bank, instr_addr, &far_tb)) {
                 /* Far immediate: resolve the operand against its target bank by
                    pointing the lookup at that bank's label set (a system target is
@@ -2088,13 +2227,13 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                    #bank(<far label>) instead of the raw byte. */
                 {
                     uint32_t bl_ldx;
-                    uint8_t  bl_bank;
+                    uint8_t bl_bank;
                     if (far_imm_bank_load(current_bank, instr_addr, &bl_ldx, &bl_bank) &&
                         bl_ldx >= base_addr && (size_t)(bl_ldx - base_addr) < len) {
                         char ldxinst[8];
                         Cpu6809InstrInfo lx = cpu6809_disassemble_info(
-                            data + (bl_ldx - base_addr), len - (size_t)(bl_ldx - base_addr),
-                            bl_ldx, ldxinst, sizeof(ldxinst));
+                            data + (bl_ldx - base_addr), len - (size_t)(bl_ldx - base_addr), bl_ldx,
+                            ldxinst, sizeof(ldxinst));
                         if (lx.size > 0 && lx.has_addr_ref) {
                             char lbl[40], mnem[16];
                             const char *lname = far_load_label_name(
@@ -2112,8 +2251,8 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                 }
 
                 if (label_between(base_addr + (uint32_t)pos,
-                                  base_addr + (uint32_t)(pos + info.size), labels,
-                                  label_count, sorted)) {
+                                  base_addr + (uint32_t)(pos + info.size), labels, label_count,
+                                  sorted)) {
                     decoding_code = 0;
                     emit_transition_comment(out, BLOCK_CODE, BLOCK_UNCLASSIFIED, current_bank,
                                             base_addr + (uint32_t)pos, rom_base + pos);
@@ -2122,30 +2261,31 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                     /* A system-bank absolute call/jump into the paged window that did
                        not resolve is bank-ambiguous (the mapped bank is a runtime
                        value); flag it so the raw target reads as expected, not a bug. */
-                    int paged_ambiguous =
-                        current_bank == 0xffu && info.has_target &&
-                        info.target >= APEX_PAGED_ORG && info.target < 0x8000u &&
-                        lookup_label_for_cpu(&lookup, info.target) == NULL;
+                    int paged_ambiguous = current_bank == 0xffu && info.has_target &&
+                                          info.target >= APEX_PAGED_ORG && info.target < 0x8000u &&
+                                          lookup_label_for_cpu(&lookup, info.target) == NULL;
                     /* Append doc as end-of-line comment when no code label at this
                        address (label-address docs are already in the label header). */
                     const char *idoc = has_code_label ? NULL
-                        : config_doc_at(docs, current_bank, base_addr + (uint32_t)pos);
+                                                      : config_doc_at(docs, current_bank,
+                                                                      base_addr + (uint32_t)pos);
                     /* Opt-in: a per-instruction address comment so [literals] /
                        [far_imm] / [imm_types] entries can be keyed by exact address. */
                     if (render_instruction_addresses()) {
-                        fprintf(out, "    ; addr B%02x_A%04x\n", (unsigned)current_bank,
-                                (unsigned)(base_addr + (uint32_t)pos) & 0xffffu);
+                        ao_printf(out, "    ; addr B%02x_A%04x\n", (unsigned)current_bank,
+                                  (unsigned)(base_addr + (uint32_t)pos) & 0xffffu);
                     }
+                    ao_mark_item(out, info.size);
                     if (idoc) {
                         const char *nl = strchr(idoc, '\n');
                         if (nl)
-                            fprintf(out, "    %-40s ; %.*s\n", inst, (int)(nl - idoc), idoc);
+                            ao_printf(out, "    %-40s ; %.*s\n", inst, (int)(nl - idoc), idoc);
                         else
-                            fprintf(out, "    %-40s ; %s\n", inst, idoc);
+                            ao_printf(out, "    %-40s ; %s\n", inst, idoc);
                     } else if (paged_ambiguous) {
-                        fprintf(out, "    %-40s ; paged (bank-ambiguous)\n", inst);
+                        ao_printf(out, "    %-40s ; paged (bank-ambiguous)\n", inst);
                     } else {
-                        fprintf(out, "    %s\n", inst);
+                        ao_printf(out, "    %s\n", inst);
                     }
                     pos += info.size;
                     /* Inline payloads only follow a subroutine call (JSR/BSR/
@@ -2164,9 +2304,9 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
                             fits = pos + inline_sig->length <= len;
                         }
                         if (!fits) {
-                            emit_inline_truncated_warning(
-                                out, current_bank, base_addr + (uint32_t)pos, rom_base + pos, inst,
-                                inline_sig->length, len - pos);
+                            emit_inline_truncated_warning(out, current_bank,
+                                                          base_addr + (uint32_t)pos, rom_base + pos,
+                                                          inst, inline_sig->length, len - pos);
                         } else {
                             emit_inline_fields(out, inline_sig, data, len, &pos, current_bank, inst,
                                                labels, label_count, extra_labels, extra_label_count,
@@ -2194,31 +2334,29 @@ static void emit_db_with_labels(FILE *out, const uint8_t *data, size_t len, uint
         {
             size_t line_start = pos;
 
-        while (pos < len && col < 16) {
-            if (col > 0 && labels_at(base_addr + (uint32_t)pos, labels, label_count, sorted)) {
-                break;
+            while (pos < len && col < 16) {
+                if (col > 0 && labels_at(base_addr + (uint32_t)pos, labels, label_count, sorted)) {
+                    break;
+                }
+                if (col > 0 && vector_entry_at(base_addr + (uint32_t)pos, vectors, vector_count)) {
+                    break;
+                }
+                pos++;
+                col++;
             }
-            if (col > 0 && vector_entry_at(base_addr + (uint32_t)pos, vectors, vector_count)) {
-                break;
-            }
-            pos++;
-            col++;
-        }
             emit_db_line(out, base_addr + (uint32_t)line_start, data + line_start, col);
         }
         previous_kind = current_kind == BLOCK_CODE ? BLOCK_UNCLASSIFIED : current_kind;
     }
 }
 
-static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *labels,
-                               const LabelSet *system_labels, const InlineSignatures *inline_sigs,
-                               const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
-                               const TableDefs *tables, const ConfigDocs *docs,
-                               const ConfigSymbols *symbols,
-                               const DataRanges *data_ranges, const ReferenceSet *refs,
-                               size_t rom_bank_base, int emit_explain, const ConfigTypes *types,
-                               const ConfigEntries *literals)
-{
+static void emit_paged_region(AsmOut *out, const uint8_t *data, const LabelSet *labels,
+                              const LabelSet *system_labels, const InlineSignatures *inline_sigs,
+                              const uint8_t *paged_rom, size_t banks, const LabelSet *bank_labels,
+                              const TableDefs *tables, const ConfigDocs *docs,
+                              const ConfigSymbols *symbols, const DataRanges *data_ranges,
+                              const ReferenceSet *refs, size_t rom_bank_base, int emit_explain,
+                              const ConfigTypes *types, const ConfigEntries *literals) {
     size_t used = last_non_ff(data, APEX_BANK_SIZE);
     /* The canonical (computed) bank id names labels and references; the raw byte
        stored at the start of the page is emitted verbatim as BANK_ID so the
@@ -2229,47 +2367,48 @@ static void emit_paged_region(FILE *out, const uint8_t *data, const LabelSet *la
 
     emit_location_comment(out, "bank_start", bank_id, APEX_PAGED_ORG, rom_bank_base);
     if (!labels_at(APEX_PAGED_ORG, labels->items, labels->count, labels->sorted)) {
-        fprintf(out, "B%02x_A%04x:\n", bank_id, (unsigned)APEX_PAGED_ORG);
+        ao_printf(out, "B%02x_A%04x:\n", bank_id, (unsigned)APEX_PAGED_ORG);
     }
 
     if (used == 0) {
         used = 1;
     }
-    fprintf(out, "    BANK_ID 0x%02x\n", raw_bank_byte);    if (used > 1) {
+    ao_mark_item(out, 1u);
+    ao_printf(out, "    BANK_ID 0x%02x\n", raw_bank_byte);
+    if (used > 1) {
         emit_db_with_labels(out, data + 1, used - 1, APEX_PAGED_ORG + 1, labels->items,
                             labels->count, labels->sorted, system_labels->items,
                             system_labels->count, NULL, 0, inline_sigs, paged_rom, banks,
-                            bank_labels, tables, docs, symbols, data_ranges,
-                            refs, bank_id, rom_bank_base + 1u, emit_explain, types, literals);
+                            bank_labels, tables, docs, symbols, data_ranges, refs, bank_id,
+                            rom_bank_base + 1u, emit_explain, types, literals);
     }
     if (used < APEX_BANK_SIZE) {
-        emit_location_comment(out, "free", bank_id,
-                              (uint32_t)(APEX_PAGED_ORG + used),
+        emit_location_comment(out, "free", bank_id, (uint32_t)(APEX_PAGED_ORG + used),
                               rom_bank_base + used);
-        fprintf(out, "    FILL_TO_BANK_END\n");
+        ao_mark_item(out, APEX_BANK_SIZE - used);
+        ao_printf(out, "    FILL_TO_BANK_END\n");
     }
 }
 
-static size_t total_code_bank_labels(const LabelSet *bank_labels, size_t banks)
-{
+static size_t total_code_bank_labels(const LabelSet *bank_labels, size_t banks) {
     size_t total = 0, i, j;
 
     for (i = 0; i < banks; i++) {
         for (j = 0; j < bank_labels[i].count; j++) {
-            if (bank_labels[i].items[j].is_code) total++;
+            if (bank_labels[i].items[j].is_code)
+                total++;
         }
     }
     return total;
 }
 
 void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t vector_count,
-                         InlineSignatures *inline_sigs, const uint8_t *paged_rom,
-                         size_t banks, LabelSet *bank_labels, LabelSet *labels,
-                         const ConfigLabels *config_labels,
-                         const ConfigEntries *config_entries,
-                         const DataRanges *data_ranges, const ConfigOptions *options,
-                         ReferenceSet *refs)
-{
+                         InlineSignatures *inline_sigs, const uint8_t *paged_rom, size_t banks,
+                         LabelSet *bank_labels, LabelSet *labels, const ConfigLabels *config_labels,
+                         const ConfigEntries *config_entries, const DataRanges *data_ranges,
+                         const ConfigOptions *options, ReferenceSet *refs,
+                         const ConfigEntries *ref_exclusions, const ConfigEntries *literals,
+                         const ConfigEntries *far_imms) {
     size_t used = last_non_ff(data, APEX_SYSTEM_SIZE);
     size_t i;
     uint32_t inline_dispatcher;
@@ -2302,7 +2441,7 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
              (config_entries->items[i].has_bank && config_entries->items[i].bank == 0xffu)) &&
             in_system_addr(config_entries->items[i].addr)) {
             Label *label = add_owned_label(labels, config_entries->items[i].addr,
-                                     make_generated_label(config_entries->items[i].addr), 1);
+                                           make_generated_label(config_entries->items[i].addr), 1);
 
             label->is_explicit_entry = 1;
             explain_label(label, "config_entry");
@@ -2317,56 +2456,61 @@ void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t 
         size_t prev_count, prev_code;
         do {
             prev_count = labels->count;
-            prev_code  = total_code_bank_labels(labels, 1);
-            collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom,
-                                 banks, bank_labels, labels, data_ranges, 0xff, refs, NULL, NULL,
-                                 NULL);
+            prev_code = total_code_bank_labels(labels, 1);
+            collect_code_targets(data, used, APEX_SYSTEM_ORG, labels, inline_sigs, paged_rom, banks,
+                                 bank_labels, labels, data_ranges, 0xff, refs, ref_exclusions,
+                                 literals, far_imms);
         } while (labels->count != prev_count || total_code_bank_labels(labels, 1) != prev_code);
     }
 }
 
-static void emit_system_region(FILE *out, const uint8_t *data, const VectorInfo *vectors,
-                                size_t vector_count, const InlineSignatures *inline_sigs,
-                                const LabelSet *labels, const uint8_t *paged_rom, size_t banks,
-                                const LabelSet *bank_labels, const TableDefs *tables,
-                                const ConfigDocs *docs,
-                                const ConfigSymbols *symbols, const DataRanges *data_ranges,
-                                const ReferenceSet *refs,
-                                size_t rom_system_base, int emit_explain, const ConfigTypes *types,
-                                const ConfigEntries *literals)
-{
+static void emit_system_region(AsmOut *out, const uint8_t *data, const VectorInfo *vectors,
+                               size_t vector_count, const InlineSignatures *inline_sigs,
+                               const LabelSet *labels, const uint8_t *paged_rom, size_t banks,
+                               const LabelSet *bank_labels, const TableDefs *tables,
+                               const ConfigDocs *docs, const ConfigSymbols *symbols,
+                               const DataRanges *data_ranges, const ReferenceSet *refs,
+                               size_t rom_system_base, int emit_explain, const ConfigTypes *types,
+                               const ConfigEntries *literals) {
     size_t used = last_non_ff(data, APEX_SYSTEM_SIZE);
 
     emit_location_comment(out, "bank_start", 0xffu, APEX_SYSTEM_ORG, rom_system_base);
     if (!labels_at(APEX_SYSTEM_ORG, labels->items, labels->count, labels->sorted)) {
-        fprintf(out, "Bff_A%04x:\n", (unsigned)APEX_SYSTEM_ORG);
+        ao_printf(out, "Bff_A%04x:\n", (unsigned)APEX_SYSTEM_ORG);
     }
 
     if (used > 0) {
         emit_db_with_labels(out, data, used, APEX_SYSTEM_ORG, labels->items, labels->count,
-                            labels->sorted, NULL, 0, vectors, vector_count, inline_sigs,
-                            paged_rom, banks, bank_labels, tables, docs,
-                            symbols, data_ranges, refs, 0xff, rom_system_base, emit_explain,
-                            types, literals);
+                            labels->sorted, NULL, 0, vectors, vector_count, inline_sigs, paged_rom,
+                            banks, bank_labels, tables, docs, symbols, data_ranges, refs, 0xff,
+                            rom_system_base, emit_explain, types, literals);
     }
     if (used < APEX_SYSTEM_SIZE) {
-        emit_location_comment(out, "free", 0xffu,
-                              (uint32_t)(APEX_SYSTEM_ORG + used),
+        emit_location_comment(out, "free", 0xffu, (uint32_t)(APEX_SYSTEM_ORG + used),
                               rom_system_base + used);
-        fprintf(out, "    FILL_TO_BANK_END\n");
+        ao_mark_item(out, APEX_SYSTEM_SIZE - used);
+        ao_printf(out, "    FILL_TO_BANK_END\n");
     }
 }
 
-static void emit_xref_for_label(FILE *out, uint8_t bank, const Label *label,
-                                const ReferenceSet *refs)
-{
+static void emit_xref_for_label(AsmOut *out, uint8_t bank, const Label *label,
+                                const ReferenceSet *refs) {
     size_t i;
     size_t j;
+    size_t first = 0;
     int header = 0;
 
-    for (i = 0; i < refs->count; i++) {
+    /* Sorted refs: only the (bank, addr) run can match (this ran over every
+       reference for every label, with a quadratic duplicate check). */
+    if (refs->sorted) {
+        first = refs_lower_bound(refs, bank, label->addr);
+    }
+    for (i = first; i < refs->count; i++) {
+        if (refs->sorted && (refs->items[i].bank != bank || refs->items[i].addr != label->addr)) {
+            break;
+        }
         if (refs->items[i].bank == bank && refs->items[i].addr == label->addr) {
-            for (j = 0; j < i; j++) {
+            for (j = first; j < i; j++) {
                 if (refs->items[j].bank == bank && refs->items[j].addr == label->addr &&
                     strcmp(refs->items[j].kind, refs->items[i].kind) == 0 &&
                     strcmp(refs->items[j].source, refs->items[i].source) == 0) {
@@ -2377,19 +2521,17 @@ static void emit_xref_for_label(FILE *out, uint8_t bank, const Label *label,
                 continue;
             }
             if (!header) {
-                fprintf(out, "; XREF %s bank=0x%02x cpu=0x%04x\n", label->name, bank,
-                        (unsigned)label->addr & 0xffffu);
+                ao_printf(out, "; XREF %s bank=0x%02x cpu=0x%04x\n", label->name, bank,
+                          (unsigned)label->addr & 0xffffu);
                 header = 1;
             }
-            fprintf(out, ";   %s:%s\n", refs->items[i].kind, refs->items[i].source);
+            ao_printf(out, ";   %s:%s\n", refs->items[i].kind, refs->items[i].source);
         }
     }
 }
 
-static void emit_xref_index(FILE *out, const uint8_t *paged_rom, const LabelSet *bank_labels,
-                            size_t banks,
-                            const LabelSet *system_labels, const ReferenceSet *refs)
-{
+static void emit_xref_index(AsmOut *out, const uint8_t *paged_rom, const LabelSet *bank_labels,
+                            size_t banks, const LabelSet *system_labels, const ReferenceSet *refs) {
     size_t i;
     size_t j;
 
@@ -2397,7 +2539,7 @@ static void emit_xref_index(FILE *out, const uint8_t *paged_rom, const LabelSet 
     if (!refs || refs->count == 0) {
         return;
     }
-    fprintf(out, "\n; XREF INDEX\n");
+    ao_printf(out, "\n; XREF INDEX\n");
     for (i = 0; i < banks; i++) {
         uint8_t bank_id = bank_id_for_index(banks, (int)i);
 
@@ -2410,8 +2552,7 @@ static void emit_xref_index(FILE *out, const uint8_t *paged_rom, const LabelSet 
     }
 }
 
-static size_t total_bank_labels(const LabelSet *bank_labels, size_t banks)
-{
+static size_t total_bank_labels(const LabelSet *bank_labels, size_t banks) {
     size_t total = 0;
     size_t i;
 
@@ -2422,18 +2563,16 @@ static size_t total_bank_labels(const LabelSet *bank_labels, size_t banks)
 }
 
 void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
-                               const InlineSignatures *inline_sigs,
-                               LabelSet *bank_labels, LabelSet *system_labels,
-                               const DataRanges *data_ranges, ReferenceSet *refs,
-                               const ConfigEntries *ref_exclusions,
-                               const ConfigEntries *literals, const ConfigEntries *far_imms)
-{
+                               const InlineSignatures *inline_sigs, LabelSet *bank_labels,
+                               LabelSet *system_labels, const DataRanges *data_ranges,
+                               ReferenceSet *refs, const ConfigEntries *ref_exclusions,
+                               const ConfigEntries *literals, const ConfigEntries *far_imms) {
     size_t prev_count, prev_code;
 
     do {
         size_t i;
         prev_count = total_bank_labels(bank_labels, banks);
-        prev_code  = total_code_bank_labels(bank_labels, banks);
+        prev_code = total_code_bank_labels(bank_labels, banks);
         for (i = 0; i < banks; i++) {
             const uint8_t *bank = paged_rom + i * APEX_BANK_SIZE;
             size_t used = last_non_ff(bank, APEX_BANK_SIZE);
@@ -2449,9 +2588,7 @@ void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
 }
 
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
-                              size_t banks, LabelSet *bank_labels,
-                              const ConfigOptions *options)
-{
+                              size_t banks, LabelSet *bank_labels, const ConfigOptions *options) {
     size_t i;
 
     for (i = 0; i < config_labels->count; i++) {
@@ -2476,8 +2613,7 @@ void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *
 }
 
 void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_t *paged_rom,
-                               size_t banks, LabelSet *bank_labels)
-{
+                               size_t banks, LabelSet *bank_labels) {
     size_t i;
 
     for (i = 0; i < config_entries->count; i++) {
@@ -2490,7 +2626,7 @@ void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_
         bank_index = bank_index_for_id(paged_rom, banks, entry->bank);
         if (bank_index >= 0 && entry->addr >= APEX_PAGED_ORG && entry->addr < 0x8000u) {
             Label *label = add_owned_label(&bank_labels[bank_index], entry->addr,
-                                     make_bank_label(entry->bank, entry->addr), 1);
+                                           make_bank_label(entry->bank, entry->addr), 1);
 
             label->is_explicit_entry = 1;
             explain_label(label, "config_entry");
@@ -2505,8 +2641,7 @@ static void apply_data_far_label(DataKind kind, const uint8_t *paged_rom, size_t
 static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank,
                                     uint16_t ptr);
 
-static const char *table_far_ref_source(TableFieldKind kind)
-{
+static const char *table_far_ref_source(TableFieldKind kind) {
     if (kind == TABLE_FAR_CODE) {
         return "table_far_code_ref";
     }
@@ -2522,8 +2657,7 @@ static const char *table_far_ref_source(TableFieldKind kind)
     return "table_far_data_ref";
 }
 
-static const char *table_ptr_ref_source(TableFieldKind kind)
-{
+static const char *table_ptr_ref_source(TableFieldKind kind) {
     if (kind == TABLE_PTR16_CODE) {
         return "table_ptr16_code_ref";
     }
@@ -2539,8 +2673,7 @@ static const char *table_ptr_ref_source(TableFieldKind kind)
     return "table_ptr16_data_ref";
 }
 
-static const char *config_data_source(DataKind kind)
-{
+static const char *config_data_source(DataKind kind) {
     if (kind == DATA_DMD_FULLFRAME) {
         return "config_dmd_fullframe";
     }
@@ -2550,11 +2683,9 @@ static const char *config_data_source(DataKind kind)
     return "config_data";
 }
 
-void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged_rom,
-                             size_t banks, const uint8_t *system_rom,
-                             LabelSet *bank_labels, LabelSet *system_labels,
-                             ReferenceSet *refs)
-{
+void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged_rom, size_t banks,
+                             const uint8_t *system_rom, LabelSet *bank_labels,
+                             LabelSet *system_labels, ReferenceSet *refs) {
     size_t i;
 
     for (i = 0; i < data_ranges->count; i++) {
@@ -2565,7 +2696,8 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
             if (!in_system_addr(range->addr)) {
                 continue;
             }
-            label = add_owned_label(system_labels, range->addr, make_generated_label(range->addr), 0);
+            label =
+                add_owned_label(system_labels, range->addr, make_generated_label(range->addr), 0);
         } else {
             int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
 
@@ -2573,7 +2705,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                 continue;
             }
             label = add_owned_label(&bank_labels[bank_index], range->addr,
-                              make_bank_label(range->bank, range->addr), 0);
+                                    make_bank_label(range->bank, range->addr), 0);
         }
         explain_label(label, config_data_source(range->kind));
         explain_label_kind(label, config_data_source(range->kind));
@@ -2595,8 +2727,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
             } else {
                 int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
 
-                if (bank_index < 0 || range->addr < APEX_PAGED_ORG ||
-                    range->addr + 2u >= 0x8000u) {
+                if (bank_index < 0 || range->addr < APEX_PAGED_ORG || range->addr + 2u >= 0x8000u) {
                     continue;
                 }
                 data = paged_rom + (size_t)bank_index * APEX_BANK_SIZE +
@@ -2614,8 +2745,8 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                 int bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
 
                 if (bank_index >= 0 && target >= APEX_PAGED_ORG && target < 0x8000u) {
-                    add_reference(refs, bank_id_for_index(banks, bank_index), target,
-                                  range->bank, range->addr, "data", source);
+                    add_reference(refs, bank_id_for_index(banks, bank_index), target, range->bank,
+                                  range->addr, "data", source);
                 }
             }
         } else if (data_kind_is_ptr16(range->kind)) {
@@ -2634,8 +2765,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
             } else {
                 int bank_index = bank_index_for_id(paged_rom, banks, range->bank);
 
-                if (bank_index < 0 || range->addr < APEX_PAGED_ORG ||
-                    range->addr >= 0x8000u) {
+                if (bank_index < 0 || range->addr < APEX_PAGED_ORG || range->addr >= 0x8000u) {
                     continue;
                 }
                 data = paged_rom + (size_t)bank_index * APEX_BANK_SIZE +
@@ -2656,8 +2786,8 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
                     }
                 } else if (in_system_addr(ptr)) {
                     apply_system_ptr16_label(tkind, system_labels, ptr, "data");
-                    add_reference(refs, 0xff, ptr, range->bank,
-                                  range->addr + (uint32_t)j, "data", source);
+                    add_reference(refs, 0xff, ptr, range->bank, range->addr + (uint32_t)j, "data",
+                                  source);
                 }
             }
         }
@@ -2666,8 +2796,7 @@ void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged
 
 static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_t banks,
                                   LabelSet *bank_labels, LabelSet *system_labels, uint16_t addr,
-                                  uint8_t bank)
-{
+                                  uint8_t bank) {
     int bank_index;
     int is_code = kind == TABLE_FAR_CODE;
     int is_string = kind == TABLE_FAR_STRING;
@@ -2687,9 +2816,9 @@ static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom,
     }
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-        label = add_owned_label(&bank_labels[bank_index], addr,
-                          make_bank_label(bank_id_for_index(banks, bank_index), addr),
-                          is_code);
+        label =
+            add_owned_label(&bank_labels[bank_index], addr,
+                            make_bank_label(bank_id_for_index(banks, bank_index), addr), is_code);
         explain_label(label, table_far_ref_source(kind));
         explain_label_kind(label, table_far_ref_source(kind));
         if (!is_code) {
@@ -2703,8 +2832,7 @@ static void apply_table_far_label(TableFieldKind kind, const uint8_t *paged_rom,
 
 static void apply_data_far_label(DataKind kind, const uint8_t *paged_rom, size_t banks,
                                  LabelSet *bank_labels, LabelSet *system_labels, uint16_t addr,
-                                 uint8_t bank)
-{
+                                 uint8_t bank) {
     TableFieldKind table_kind = TABLE_FAR_DATA;
 
     if (kind == DATA_FAR_STRING) {
@@ -2721,8 +2849,8 @@ static void apply_data_far_label(DataKind kind, const uint8_t *paged_rom, size_t
     apply_table_far_label(table_kind, paged_rom, banks, bank_labels, system_labels, addr, bank);
 }
 
-static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank, uint16_t ptr)
-{
+static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank,
+                                    uint16_t ptr) {
     Label *target;
 
     if (ptr < APEX_PAGED_ORG || ptr >= 0x8000u) {
@@ -2740,11 +2868,10 @@ static void apply_table_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8
 }
 
 static void apply_table_field_labels(const TableDef *table, const uint8_t *data, size_t used,
-                                     size_t *pos, uint8_t current_bank,
-                                     const uint8_t *paged_rom, size_t banks, LabelSet *bank_labels,
-                                     LabelSet *system_labels, const char *source,
-                                     ReferenceSet *refs, size_t row_index, uint32_t row_cpu_addr)
-{
+                                     size_t *pos, uint8_t current_bank, const uint8_t *paged_rom,
+                                     size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
+                                     const char *source, ReferenceSet *refs, size_t row_index,
+                                     uint32_t row_cpu_addr) {
     size_t row_start = *pos;
     size_t i;
 
@@ -2772,8 +2899,8 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
                 apply_table_far_label(kind, paged_rom, banks, bank_labels, system_labels, addr,
                                       bank);
                 if (bank == 0xffu && in_system_addr(addr)) {
-                    add_table_row_reference(refs, 0xff, addr, table->bank, table->addr,
-                                            source, (int)row_index, row_cpu_addr);
+                    add_table_row_reference(refs, 0xff, addr, table->bank, table->addr, source,
+                                            (int)row_index, row_cpu_addr);
                 } else {
                     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
                     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
@@ -2800,8 +2927,8 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
                     }
                 } else if (in_system_addr(ptr)) {
                     apply_system_ptr16_label(kind, system_labels, ptr, "table");
-                    add_table_row_reference(refs, 0xff, ptr, table->bank, table->addr,
-                                            source, (int)row_index, row_cpu_addr);
+                    add_table_row_reference(refs, 0xff, ptr, table->bank, table->addr, source,
+                                            (int)row_index, row_cpu_addr);
                 }
                 *pos += 2u;
             }
@@ -2813,9 +2940,8 @@ static void apply_table_field_labels(const TableDef *table, const uint8_t *data,
 }
 
 void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_t banks,
-                        LabelSet *bank_labels, LabelSet *system_labels,
-                        const uint8_t *system_rom, ReferenceSet *refs)
-{
+                        LabelSet *bank_labels, LabelSet *system_labels, const uint8_t *system_rom,
+                        ReferenceSet *refs) {
     size_t i;
 
     for (i = 0; i < tables->count; i++) {
@@ -2837,8 +2963,8 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
             used = last_non_ff(bank, APEX_SYSTEM_SIZE);
             pos = (size_t)(table->addr - APEX_SYSTEM_ORG);
             {
-                Label *table_label =
-                    add_owned_label(system_labels, table->addr, make_generated_label(table->addr), 0);
+                Label *table_label = add_owned_label(system_labels, table->addr,
+                                                     make_generated_label(table->addr), 0);
 
                 explain_label(table_label, "config_table");
                 explain_label_kind(table_label, "config_table");
@@ -2871,13 +2997,14 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
         pos = (size_t)(table->addr - APEX_PAGED_ORG);
         {
             Label *table_label = add_owned_label(&bank_labels[bank_index], table->addr,
-                                           make_bank_label(table->bank, table->addr), 0);
+                                                 make_bank_label(table->bank, table->addr), 0);
 
             explain_label(table_label, "config_table");
             explain_label_kind(table_label, "config_table");
             mark_label_data(table_label);
         }
-        source = label_name_at(table->addr, bank_labels[bank_index].items, bank_labels[bank_index].count, 0);
+        source = label_name_at(table->addr, bank_labels[bank_index].items,
+                               bank_labels[bank_index].count, 0);
         if (!table->has_header) {
             row_width = (uint8_t)table_schema_width(&table->schema);
             for (row = 0; row < table->rows && pos + row_width <= used; row++) {
@@ -2907,8 +3034,7 @@ void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_
     }
 }
 
-static void emit_preamble(FILE *out, const ApexProject *project)
-{
+static void emit_preamble(AsmOut *out, const ApexProject *project) {
     ApexRomInfo info;
     char timebuf[32];
     time_t now = time(NULL);
@@ -2921,9 +3047,9 @@ static void emit_preamble(FILE *out, const ApexProject *project)
     else
         strcpy(timebuf, "unknown");
 
-    fputs("; ============================================================\n", out);
-    fputs("; ApexII Disassembly\n", out);
-    fputs("; ============================================================\n", out);
+    ao_puts(out, "; ============================================================\n");
+    ao_puts(out, "; ApexII Disassembly\n");
+    ao_puts(out, "; ============================================================\n");
 
     /* ROM path (basename only to keep it tidy) */
     {
@@ -2931,85 +3057,89 @@ static void emit_preamble(FILE *out, const ApexProject *project)
         const char *base = path;
         const char *p;
         for (p = path; *p; p++)
-            if (*p == '/' || *p == '\\') base = p + 1;
-        fprintf(out, "; %-14s%s\n", "ROM:", base);
+            if (*p == '/' || *p == '\\')
+                base = p + 1;
+        ao_printf(out, "; %-14s%s\n", "ROM:", base);
     }
 
-    fprintf(out, "; %-14s%s\n", "Generated:", timebuf);
+    ao_printf(out, "; %-14s%s\n", "Generated:", timebuf);
 
     /* Size */
     if (project->rom.size >= 1048576u)
-        fprintf(out, "; %-14s%zu bytes (%zu MB)\n",
-                "Size:", project->rom.size, project->rom.size / 1048576u);
+        ao_printf(out, "; %-14s%zu bytes (%zu MB)\n", "Size:", project->rom.size,
+                  project->rom.size / 1048576u);
     else
-        fprintf(out, "; %-14s%zu bytes (%zu KB)\n",
-                "Size:", project->rom.size, project->rom.size / 1024u);
+        ao_printf(out, "; %-14s%zu bytes (%zu KB)\n", "Size:", project->rom.size,
+                  project->rom.size / 1024u);
 
-    fputs(";\n", out);
+    ao_puts(out, ";\n");
 
     /* OS + game version */
     if (info.os_valid)
-        fprintf(out, "; %-14s%u.%u\n",
-                "OS Version:", (unsigned)info.os_major, (unsigned)info.os_minor);
+        ao_printf(out, "; %-14s%u.%u\n", "OS Version:", (unsigned)info.os_major,
+                  (unsigned)info.os_minor);
     else
-        fprintf(out, "; %-14sunknown\n", "OS Version:");
+        ao_printf(out, "; %-14sunknown\n", "OS Version:");
 
     if (info.game_version[0])
-        fprintf(out, "; %-14s%s\n", "Game Version:", info.game_version);
+        ao_printf(out, "; %-14s%s\n", "Game Version:", info.game_version);
     else
-        fprintf(out, "; %-14snot found\n", "Game Version:");
+        ao_printf(out, "; %-14snot found\n", "Game Version:");
 
     if (info.game_id_found) {
-        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
-                "Game Name:", info.game_name, info.game_id_ptr_addr,
-                info.game_name_bank, info.game_name_addr);
-        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
-                "Game Number:", info.game_number, (unsigned)(info.game_id_ptr_addr + 3u),
-                info.game_number_bank, info.game_number_addr);
-        fprintf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n",
-                "Game Date:", info.game_date, (unsigned)(info.game_id_ptr_addr + 6u),
-                info.game_date_bank, info.game_date_addr);
+        ao_printf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n", "Game Name:", info.game_name,
+                  info.game_id_ptr_addr, info.game_name_bank, info.game_name_addr);
+        ao_printf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n", "Game Number:", info.game_number,
+                  (unsigned)(info.game_id_ptr_addr + 3u), info.game_number_bank,
+                  info.game_number_addr);
+        ao_printf(out, "; %-14s%s  (Bff_A%04X -> B%02x_A%04x)\n", "Game Date:", info.game_date,
+                  (unsigned)(info.game_id_ptr_addr + 6u), info.game_date_bank, info.game_date_addr);
     }
 
-    fputs(";\n", out);
+    ao_puts(out, ";\n");
 
     /* Checksum */
-    fprintf(out, "; %-14s0x%04X  %s  (delta 0x%04X)\n",
-            "Checksum:",
-            info.stored_csum,
-            info.computed_csum == info.stored_csum ? "VALID" : "INVALID",
-            info.stored_delta);
+    ao_printf(out, "; %-14s0x%04X  %s  (delta 0x%04X)\n", "Checksum:", info.stored_csum,
+              info.computed_csum == info.stored_csum ? "VALID" : "INVALID", info.stored_delta);
 
     /* CRC-32 */
-    fprintf(out, "; %-14s%08X\n", "CRC-32:", info.crc32_val);
+    ao_printf(out, "; %-14s%08X\n", "CRC-32:", info.crc32_val);
 
     /* SHA-1 (40 hex chars) */
-    fprintf(out, "; %-14s", "SHA-1:");
-    for (j = 0; j < 20; j++) fprintf(out, "%02x", info.sha1[j]);
-    fputc('\n', out);
+    ao_printf(out, "; %-14s", "SHA-1:");
+    for (j = 0; j < 20; j++)
+        ao_printf(out, "%02x", info.sha1[j]);
+    ao_putc(out, '\n');
 
     /* SHA-256 (64 hex chars — split at 32 for readability) */
-    fprintf(out, "; %-14s", "SHA-256:");
-    for (j = 0; j < 32; j++) fprintf(out, "%02x", info.sha256[j]);
-    fputc('\n', out);
+    ao_printf(out, "; %-14s", "SHA-256:");
+    for (j = 0; j < 32; j++)
+        ao_printf(out, "%02x", info.sha256[j]);
+    ao_putc(out, '\n');
 
-    fputs("; ============================================================\n", out);
-    fputc('\n', out);
+    ao_puts(out, "; ============================================================\n");
+    ao_putc(out, '\n');
 }
 
 /* Number of bytes of a [data] range worth scanning for a mislabelled JSR/JMP.
    Only ranges with a known byte span are scanned; pointer/sprite kinds are too
    short or self-describing to hide a call, so they are skipped (span 0). */
-static size_t code_scan_span(const DataRange *r, const uint8_t *src, size_t avail)
-{
+static size_t code_scan_span(const DataRange *r, const uint8_t *src, size_t avail) {
     size_t span;
     switch (r->kind) {
     case DATA_BYTES:
     case DATA_STRING_FIXED:
-    case DATA_BCD:            span = r->length; break;
-    case DATA_DMD_FULLFRAME:  span = 512u; break;
-    case DATA_STRING:         span = valid_string_len(src, avail); break;
-    default:                  return 0u;
+    case DATA_BCD:
+        span = r->length;
+        break;
+    case DATA_DMD_FULLFRAME:
+        span = 512u;
+        break;
+    case DATA_STRING:
+        span = valid_string_len(src, avail);
+        break;
+    default:
+        return 0u;
     }
     return span < avail ? span : avail;
 }
@@ -3019,8 +3149,7 @@ static size_t code_scan_span(const DataRange *r, const uint8_t *src, size_t avai
    mislabelled code — the far-pointer-reached bodies the flow analysis never sees.
    Emits `; WARNING code_in_data ...` (and a stderr line) per hit.  Returns the
    count. */
-static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
-{
+static size_t emit_code_in_data_report(AsmOut *out, const ApexProject *project) {
     const uint8_t *rom = project->rom.data;
     size_t banks = project->banks;
     size_t found = 0;
@@ -3045,7 +3174,7 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
             uint8_t tbank;
             const char *name;
 
-            if (op != 0xBDu && op != 0x7Eu) {  /* JSR / JMP extended */
+            if (op != 0xBDu && op != 0x7Eu) { /* JSR / JMP extended */
                 continue;
             }
             target = (uint16_t)((src[i + 1] << 8) | src[i + 2]);
@@ -3055,12 +3184,12 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
             } else if (target >= APEX_PAGED_ORG && r->bank != 0xffu) {
                 int bi = bank_index_for_id(rom, banks, r->bank);
                 if (bi < 0) {
-                    continue;  /* target bank-ambiguous */
+                    continue; /* target bank-ambiguous */
                 }
                 ls = &project->bank_labels[bi];
                 tbank = r->bank;
             } else {
-                continue;  /* RAM / bank-ambiguous system-window operand */
+                continue; /* RAM / bank-ambiguous system-window operand */
             }
             if (!code_label_at(target, ls->items, ls->count, ls->sorted)) {
                 continue;
@@ -3074,14 +3203,16 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
                     fprintf(stderr,
                             "warning: code_in_data at bank=0x%02x cpu=0x%04x rom=0x%06lx: "
                             "%s B%02x_A%04x (%s) inside a [data] range\n",
-                            r->bank, (unsigned)cpu, rom_off, op == 0xBDu ? "JSR" : "JMP",
-                            tbank, (unsigned)target, name ? name : "?");
+                            r->bank, (unsigned)cpu, rom_off, op == 0xBDu ? "JSR" : "JMP", tbank,
+                            (unsigned)target, name ? name : "?");
                 }
-                fprintf(out,
-                        "; %s code_in_data bank=0x%02x cpu=0x%04x rom=0x%06lx op=%s "
-                        "target=B%02x_A%04x name=%s\n",
-                        warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, rom_off,
-                        op == 0xBDu ? "JSR" : "JMP", tbank, (unsigned)target, name ? name : "?");
+                ao_mark_location(out, warning_keyword(r->bank, cpu), r->bank, cpu, (size_t)rom_off,
+                                 0);
+                ao_printf(out,
+                          "; %s code_in_data bank=0x%02x cpu=0x%04x rom=0x%06lx op=%s "
+                          "target=B%02x_A%04x name=%s\n",
+                          warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, rom_off,
+                          op == 0xBDu ? "JSR" : "JMP", tbank, (unsigned)target, name ? name : "?");
             }
             found++;
         }
@@ -3091,34 +3222,41 @@ static size_t emit_code_in_data_report(FILE *out, const ApexProject *project)
 
 /* Parse the signed offset of an "N,REG" indexed operand (decimal or 0x hex),
    returning it and the index register letter.  Returns 0 if not that shape. */
-static int parse_index_offset(const char *operand, long *out_off, char *out_reg)
-{
+static int parse_index_offset(const char *operand, long *out_off, char *out_reg) {
     const char *p = operand;
     long sign = 1, val = 0;
     const char *comma;
 
-    while (*p == ' ' || *p == '\t') p++;
-    if (*p == ',') {            /* ",REG" — zero offset (top of stack) */
+    while (*p == ' ' || *p == '\t')
+        p++;
+    if (*p == ',') { /* ",REG" — zero offset (top of stack) */
         *out_reg = p[1];
         *out_off = 0;
         return 1;
     }
-    if (*p == '-') { sign = -1; p++; }
-    else if (*p == '+') { p++; }
+    if (*p == '-') {
+        sign = -1;
+        p++;
+    } else if (*p == '+') {
+        p++;
+    }
     if (p[0] == '0' && (p[1] == 'x' || p[1] == 'X')) {
         p += 2;
-        if (!isxdigit((unsigned char)*p)) return 0;
+        if (!isxdigit((unsigned char)*p))
+            return 0;
         for (; isxdigit((unsigned char)*p); p++) {
             int d = (*p <= '9') ? *p - '0' : (toupper((unsigned char)*p) - 'A' + 10);
             val = val * 16 + d;
         }
     } else if (isdigit((unsigned char)*p)) {
-        for (; isdigit((unsigned char)*p); p++) val = val * 10 + (*p - '0');
+        for (; isdigit((unsigned char)*p); p++)
+            val = val * 10 + (*p - '0');
     } else {
         return 0;
     }
     comma = strchr(p, ',');
-    if (!comma || comma != p) return 0;   /* offset must be immediately followed by ",REG" */
+    if (!comma || comma != p)
+        return 0; /* offset must be immediately followed by ",REG" */
     *out_reg = comma[1];
     *out_off = sign * val;
     return 1;
@@ -3127,8 +3265,7 @@ static int parse_index_offset(const char *operand, long *out_off, char *out_reg)
 /* If a routine reads its return address off the stack (LD{U,X,Y} n,S), advances
    it (LEA{U,X,Y} N,same), the N is the inline-parameter length.  Scans the
    routine prologue and returns that N, or -1 if the pattern is absent. */
-static long inline_stack_adjust_len(const uint8_t *src, size_t avail)
-{
+static long inline_stack_adjust_len(const uint8_t *src, size_t avail) {
     uint32_t pc = 0;
     size_t pos = 0;
     int steps;
@@ -3142,26 +3279,32 @@ static long inline_stack_adjust_len(const uint8_t *src, size_t avail)
         const char *sp;
         size_t m = 0;
 
-        if (info.size == 0) break;
-        while (text[m] && text[m] != ' ' && m + 1 < sizeof(mnem)) { mnem[m] = text[m]; m++; }
+        if (info.size == 0)
+            break;
+        while (text[m] && text[m] != ' ' && m + 1 < sizeof(mnem)) {
+            mnem[m] = text[m];
+            m++;
+        }
         mnem[m] = '\0';
         sp = text[m] ? text + m + 1 : text + m;
 
         if ((strcmp(mnem, "LDU") == 0 || strcmp(mnem, "LDX") == 0 || strcmp(mnem, "LDY") == 0)) {
-            long off; char reg;
+            long off;
+            char reg;
             if (parse_index_offset(sp, &off, &reg) && reg == 'S') {
-                loaded_reg = mnem[2];  /* the register now holding the return address */
+                loaded_reg = mnem[2]; /* the register now holding the return address */
             }
-        } else if (loaded_reg &&
-                   (strcmp(mnem, "LEAU") == 0 || strcmp(mnem, "LEAX") == 0 ||
-                    strcmp(mnem, "LEAY") == 0)) {
-            long off; char reg;
-            if (mnem[3] == loaded_reg && parse_index_offset(sp, &off, &reg) &&
-                reg == loaded_reg && off > 0) {
-                return off;  /* return address advanced by the parameter length */
+        } else if (loaded_reg && (strcmp(mnem, "LEAU") == 0 || strcmp(mnem, "LEAX") == 0 ||
+                                  strcmp(mnem, "LEAY") == 0)) {
+            long off;
+            char reg;
+            if (mnem[3] == loaded_reg && parse_index_offset(sp, &off, &reg) && reg == loaded_reg &&
+                off > 0) {
+                return off; /* return address advanced by the parameter length */
             }
         }
-        if (info.flags & CPU6809_FLOW_STOP) break;
+        if (info.flags & CPU6809_FLOW_STOP)
+            break;
         pos += info.size;
     }
     return -1;
@@ -3169,8 +3312,7 @@ static long inline_stack_adjust_len(const uint8_t *src, size_t avail)
 
 /* check_inline_length option: warn when an [inline] length disagrees with the
    LDU/LEAU/STU stack fixup detectable in the routine.  Returns the mismatch count. */
-static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
-{
+static size_t emit_inline_length_report(AsmOut *out, const ApexProject *project) {
     size_t i, found = 0;
 
     for (i = 0; i < project->inline_sigs.count; i++) {
@@ -3180,8 +3322,8 @@ static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
         size_t avail;
         long adj;
 
-        if (!locate_bank_bytes(project->rom.data, project->banks, bank, (uint16_t)sig->addr,
-                               &src, &avail)) {
+        if (!locate_bank_bytes(project->rom.data, project->banks, bank, (uint16_t)sig->addr, &src,
+                               &avail)) {
             continue;
         }
         adj = inline_stack_adjust_len(src, avail);
@@ -3197,10 +3339,10 @@ static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
                         "routine advances the return address by %ld\n",
                         bank, (unsigned)cpu, sig->length, adj);
             }
-            fprintf(out,
-                    "; %s inline_length_mismatch bank=0x%02x cpu=0x%04x configured=%u "
-                    "stack_adjust=%ld\n",
-                    warning_keyword(bank, cpu), bank, (unsigned)cpu, sig->length, adj);
+            ao_printf(out,
+                      "; %s inline_length_mismatch bank=0x%02x cpu=0x%04x configured=%u "
+                      "stack_adjust=%ld\n",
+                      warning_keyword(bank, cpu), bank, (unsigned)cpu, sig->length, adj);
         }
         found++;
     }
@@ -3213,8 +3355,7 @@ static size_t emit_inline_length_report(FILE *out, const ApexProject *project)
    but classified as one.  Requiring an exact fill avoids flagging the normal case
    where a frame is simply followed by unrelated data/code.  Emits `; WARNING
    dmd_decode_short`.  Returns the count. */
-static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
-{
+static size_t emit_dmd_short_report(AsmOut *out, const ApexProject *project) {
     size_t i, found = 0;
 
     for (i = 0; i < project->data_ranges.count; i++) {
@@ -3227,8 +3368,8 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
         if (r->kind != DATA_DMD_FULLFRAME) {
             continue;
         }
-        if (!locate_bank_bytes(project->rom.data, project->banks, r->bank, (uint16_t)r->addr,
-                               &src, &avail)) {
+        if (!locate_bank_bytes(project->rom.data, project->banks, r->bank, (uint16_t)r->addr, &src,
+                               &avail)) {
             continue;
         }
         planes = r->length ? r->length : 1u;
@@ -3237,7 +3378,7 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
             uint8_t type = 0;
             if (!decode_dmd_fullframe_metadata(src + total, avail - total, &type, &consumed) ||
                 consumed == 0u) {
-                total = 0;  /* undecodable — not a short-decode case */
+                total = 0; /* undecodable — not a short-decode case */
                 break;
             }
             total += consumed;
@@ -3245,12 +3386,17 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
         if (total == 0u) {
             continue;
         }
-        /* nearest data range at a higher address in the same bank */
-        for (j = 0; j < project->data_ranges.count; j++) {
+        /* nearest data range at a higher address in the same bank: the ranges
+           are (bank, addr)-sorted by the analysis, so it is a following entry */
+        for (j = i + 1u; j < project->data_ranges.count; j++) {
             const DataRange *o = &project->data_ranges.items[j];
-            if (o->bank == r->bank && o->addr > r->addr && (!have_next || o->addr < next)) {
+            if (o->bank != r->bank) {
+                break;
+            }
+            if (o->addr > r->addr) {
                 next = o->addr;
                 have_next = 1;
+                break;
             }
         }
         if (!have_next || (size_t)(next - r->addr) <= total) {
@@ -3269,7 +3415,7 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
             extra++;
         }
         if (extra == 0u || r->addr + t2 != next) {
-            continue;  /* the gap is not simply more planes — leave it alone */
+            continue; /* the gap is not simply more planes — leave it alone */
         }
         {
             uint32_t cpu = r->addr & 0xffffu;
@@ -3281,21 +3427,19 @@ static size_t emit_dmd_short_report(FILE *out, const ApexProject *project)
                         r->bank, (unsigned)cpu, (unsigned long)planes, (unsigned long)total,
                         (unsigned long)(planes + extra), (unsigned long)(next - r->addr));
             }
-            fprintf(out,
-                    "; %s dmd_decode_short bank=0x%02x cpu=0x%04x planes=%lu decoded=%lu "
-                    "suggest_planes=%lu full=%lu\n",
-                    warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, (unsigned long)planes,
-                    (unsigned long)total, (unsigned long)(planes + extra),
-                    (unsigned long)(next - r->addr));
+            ao_printf(out,
+                      "; %s dmd_decode_short bank=0x%02x cpu=0x%04x planes=%lu decoded=%lu "
+                      "suggest_planes=%lu full=%lu\n",
+                      warning_keyword(r->bank, cpu), r->bank, (unsigned)cpu, (unsigned long)planes,
+                      (unsigned long)total, (unsigned long)(planes + extra),
+                      (unsigned long)(next - r->addr));
             found++;
         }
     }
     return found;
 }
 
-int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
-                                  int emit_explain)
-{
+static int write_asm(const ApexProject *project, AsmOut *out, int emit_xrefs, int emit_explain) {
     size_t i;
 
     g_render_acks = &project->ack_warnings;
@@ -3303,47 +3447,54 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
     g_render_options = &project->options;
     cpu6809_set_hex_index_offsets(project->options.hex_index_offsets);
     emit_preamble(out, project);
-    fprintf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
+    ao_printf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
     emit_config_symbols(out, &project->symbols, &project->docs);
     emit_nonrom_docs(out, &project->docs, &project->symbols);
     emit_type_equates(out, &project->config_types);
-    emit_vector_equates(out, project->vectors, sizeof(project->vectors) / sizeof(project->vectors[0]));
+    emit_vector_equates(out, project->vectors,
+                        sizeof(project->vectors) / sizeof(project->vectors[0]));
 
+    g_label_placed = xmalloc(0x10000u / 8u);
     for (i = 0; i < project->banks; i++) {
-        fprintf(out, ".BANK 0x%02lx\n", (unsigned long)i);
-        fprintf(out, ".ORG 0x%04x\n", APEX_PAGED_ORG);
+        memset(g_label_placed, 0, 0x10000u / 8u);
+        ao_printf(out, ".BANK 0x%02lx\n", (unsigned long)i);
+        ao_printf(out, ".ORG 0x%04x\n", APEX_PAGED_ORG);
         emit_paged_region(out, project->rom.data + i * APEX_BANK_SIZE, &project->bank_labels[i],
                           &project->system_labels, &project->inline_sigs, project->rom.data,
-                          project->banks, project->bank_labels, &project->tables,
-                          &project->docs, &project->symbols,
-                          &project->data_ranges, &project->refs, i * APEX_BANK_SIZE,
-                          emit_explain, &project->config_types, &project->literals);
-        fputc('\n', out);
+                          project->banks, project->bank_labels, &project->tables, &project->docs,
+                          &project->symbols, &project->data_ranges, &project->refs,
+                          i * APEX_BANK_SIZE, emit_explain, &project->config_types,
+                          &project->literals);
+        emit_unplaced_label_equates(out, &project->bank_labels[i], APEX_PAGED_ORG, APEX_SYSTEM_ORG);
+        ao_putc(out, '\n');
     }
 
-    fprintf(out, ".BANK SYSTEM\n");
-    fprintf(out, ".ORG 0x%04x\n", APEX_SYSTEM_ORG);
-    emit_system_region(out, project->rom.data + project->paged_size, project->vectors,
-                       sizeof(project->vectors) / sizeof(project->vectors[0]),
-                       &project->inline_sigs, &project->system_labels, project->rom.data,
-                       project->banks, project->bank_labels, &project->tables,
-                       &project->docs, &project->symbols,
-                       &project->data_ranges, &project->refs, project->paged_size, emit_explain,
-                       &project->config_types, &project->literals);
+    memset(g_label_placed, 0, 0x10000u / 8u);
+    ao_printf(out, ".BANK SYSTEM\n");
+    ao_printf(out, ".ORG 0x%04x\n", APEX_SYSTEM_ORG);
+    emit_system_region(
+        out, project->rom.data + project->paged_size, project->vectors,
+        sizeof(project->vectors) / sizeof(project->vectors[0]), &project->inline_sigs,
+        &project->system_labels, project->rom.data, project->banks, project->bank_labels,
+        &project->tables, &project->docs, &project->symbols, &project->data_ranges, &project->refs,
+        project->paged_size, emit_explain, &project->config_types, &project->literals);
+    emit_unplaced_label_equates(out, &project->system_labels, APEX_SYSTEM_ORG, 0x10000u);
+    free(g_label_placed);
+    g_label_placed = NULL;
     if (emit_xrefs) {
         emit_xref_index(out, project->rom.data, project->bank_labels, project->banks,
                         &project->system_labels, &project->refs);
     }
     if (project->options.report_code_in_data) {
-        fputs("\n; ---- code_in_data report (JSR/JMP into [data] ranges) ----\n", out);
+        ao_puts(out, "\n; ---- code_in_data report (JSR/JMP into [data] ranges) ----\n");
         emit_code_in_data_report(out, project);
     }
     if (project->options.check_inline_length) {
-        fputs("\n; ---- inline_length report (config vs stack fixup) ----\n", out);
+        ao_puts(out, "\n; ---- inline_length report (config vs stack fixup) ----\n");
         emit_inline_length_report(out, project);
     }
     if (project->options.report_dmd_short) {
-        fputs("\n; ---- dmd_decode_short report (frame shorter than next) ----\n", out);
+        ao_puts(out, "\n; ---- dmd_decode_short report (frame shorter than next) ----\n");
         emit_dmd_short_report(out, project);
     }
     g_render_acks = NULL;
@@ -3353,33 +3504,71 @@ int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emi
     return 0;
 }
 
+int apex_project_write_asm_stream(const ApexProject *project, FILE *out, int emit_xrefs,
+                                  int emit_explain) {
+    AsmOut o;
+    int rc;
+
+    memset(&o, 0, sizeof(o));
+    rc = write_asm(project, &o, emit_xrefs, emit_explain);
+    if (o.len && fwrite(o.buf, 1, o.len, out) != o.len) {
+        rc = 1;
+    }
+    free(o.buf);
+    return rc;
+}
+
+int apex_project_write_asm_text(const ApexProject *project, int emit_xrefs, int emit_explain,
+                                ApexAsmText *text) {
+    AsmOut o;
+    int rc;
+
+    memset(&o, 0, sizeof(o));
+    o.record_marks = 1;
+    rc = write_asm(project, &o, emit_xrefs, emit_explain);
+    ao_reserve(&o, 0); /* NUL-terminated even when empty */
+    o.buf[o.len] = '\0';
+    text->text = o.buf;
+    text->text_len = o.len;
+    text->marks = o.marks;
+    text->mark_count = o.mark_count;
+    return rc;
+}
+
+void apex_asm_text_free(ApexAsmText *text) {
+    if (text) {
+        free(text->text);
+        free(text->marks);
+        memset(text, 0, sizeof(*text));
+    }
+}
+
 int apex_project_write_asm(const ApexProject *project, const char *output_path, int emit_xrefs,
-                           int emit_explain)
-{
+                           int emit_explain) {
     FILE *out;
 
     out = fopen(output_path, "w");
     if (!out) {
         die("failed to open %s for writing", output_path);
     }
-
-    apex_project_write_asm_stream(project, out, emit_xrefs, emit_explain);
-
+    if (apex_project_write_asm_stream(project, out, emit_xrefs, emit_explain) != 0) {
+        fclose(out);
+        die("failed to write %s", output_path);
+    }
     if (fclose(out) != 0) {
         die("failed to close %s", output_path);
     }
     return 0;
 }
 
-int apexdis_run(const ApexDisOptions *run_options)
-{
+int apexdis_run(const ApexDisOptions *run_options) {
     ApexProject *project = apex_project_open(run_options->input_path, run_options->config_path);
     int rc;
 
     rc = apex_project_analyze(project);
     if (rc == 0) {
         if (run_options->emit_addrs) {
-            project->options.instruction_addresses = 1;  /* CLI --addr forces it on */
+            project->options.instruction_addresses = 1; /* CLI --addr forces it on */
         }
         rc = apex_project_write_asm(project, run_options->output_path, run_options->emit_xrefs,
                                     run_options->emit_explain);

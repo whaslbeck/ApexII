@@ -1,5 +1,6 @@
-#include "apex.h"
 #include "apex_analysis.h"
+
+#include "apex.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -7,8 +8,7 @@
 
 /* forward declaration — defined later; also exposed in header for apexdis.c */
 
-size_t last_non_ff(const uint8_t *data, size_t len)
-{
+size_t last_non_ff(const uint8_t *data, size_t len) {
     size_t n = len;
 
     while (n > 0 && data[n - 1] == 0xff) {
@@ -17,37 +17,28 @@ size_t last_non_ff(const uint8_t *data, size_t len)
     return n;
 }
 
-uint16_t read_be16(const uint8_t *p)
-{
+uint16_t read_be16(const uint8_t *p) {
     return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
 }
 
-int generated_label_name(const char *name)
-{
+int generated_label_name(const char *name) {
     return name && strlen(name) == 9 && name[0] == 'B' && name[3] == '_' && name[4] == 'A';
 }
 
-int generated_string_label_name(const char *name)
-{
+int generated_string_label_name(const char *name) {
     return name && strlen(name) > 16 && name[0] == 'B' && name[3] == '_' && name[4] == 'A' &&
            strncmp(name + 9, "_STRING_", 8) == 0;
 }
 
-int generated_any_label_name(const char *name)
-{
+int generated_any_label_name(const char *name) {
     return generated_label_name(name) || generated_string_label_name(name);
 }
 
-void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count)
-{
-    static const char *vector_names[] = {
-        "VECTOR_SWI3", "VECTOR_SWI2", "VECTOR_FIRQ", "VECTOR_IRQ",
-        "VECTOR_SWI", "VECTOR_NMI", "VECTOR_RESET"
-    };
-    static const char *entry_names[] = {
-        "ENTRY_SWI3", "ENTRY_SWI2", "ENTRY_FIRQ", "ENTRY_IRQ",
-        "ENTRY_SWI", "ENTRY_NMI", "ENTRY_RESET"
-    };
+void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count) {
+    static const char *vector_names[] = {"VECTOR_SWI3", "VECTOR_SWI2", "VECTOR_FIRQ", "VECTOR_IRQ",
+                                         "VECTOR_SWI",  "VECTOR_NMI",  "VECTOR_RESET"};
+    static const char *entry_names[] = {"ENTRY_SWI3", "ENTRY_SWI2", "ENTRY_FIRQ", "ENTRY_IRQ",
+                                        "ENTRY_SWI",  "ENTRY_NMI",  "ENTRY_RESET"};
     size_t i;
 
     for (i = 0; i < count; i++) {
@@ -58,34 +49,172 @@ void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count)
     }
 }
 
-static Label *add_label_impl(LabelSet *set, uint32_t addr, const char *name, int is_code, int owns)
-{
+/* ---- address index for LabelSets ------------------------------------------
+   The analysis appends labels while it scans (add_label_impl) and looks them up
+   by address for every branch target, which was a linear scan of the set each
+   time: O(instructions x labels) per pass.  This chained hash keeps those
+   lookups O(1).  It is built lazily, extended for appended items, and dropped
+   (label_set_invalidate_index) wherever items are reordered or removed. */
+#define LABEL_INDEX_NONE ((size_t) - 1)
+
+struct LabelAddrIndex {
+    size_t nbuckets; /* power of two */
+    size_t *head;    /* bucket -> highest label index in its chain */
+    size_t *next;    /* label index -> next lower index in the same bucket */
+    size_t next_cap;
+    size_t indexed; /* items[0..indexed) are in the hash */
+};
+
+static size_t label_hash(uint32_t addr, size_t nbuckets) {
+    return (size_t)((addr * 2654435761u) >> 8) & (nbuckets - 1u);
+}
+
+void label_set_invalidate_index(LabelSet *set) {
+    if (set && set->index) {
+        free(set->index->head);
+        free(set->index->next);
+        free(set->index);
+        set->index = NULL;
+    }
+}
+
+static struct LabelAddrIndex *label_index_sync(LabelSet *set) {
+    struct LabelAddrIndex *ix = set->index;
+    size_t i;
+
+    if (ix && (set->count < ix->indexed || set->count > ix->nbuckets / 2u)) {
+        label_set_invalidate_index(set); /* shrunk (missed invalidation) or too full */
+        ix = NULL;
+    }
+    if (!ix) {
+        size_t nb = 64;
+        while (nb < set->count * 4u) {
+            nb *= 2u;
+        }
+        ix = xmalloc(sizeof(*ix));
+        ix->nbuckets = nb;
+        ix->head = xmalloc(nb * sizeof(ix->head[0]));
+        for (i = 0; i < nb; i++) {
+            ix->head[i] = LABEL_INDEX_NONE;
+        }
+        ix->next_cap = nb / 2u;
+        ix->next = xmalloc(ix->next_cap * sizeof(ix->next[0]));
+        ix->indexed = 0;
+        set->index = ix;
+    }
+    for (i = ix->indexed; i < set->count; i++) {
+        size_t b = label_hash(set->items[i].addr, ix->nbuckets);
+        ix->next[i] = ix->head[b];
+        ix->head[b] = i;
+    }
+    ix->indexed = set->count;
+    return ix;
+}
+
+size_t label_set_find_all(LabelSet *set, uint32_t addr, size_t *out, size_t max) {
+    struct LabelAddrIndex *ix;
+    size_t i, n = 0;
+
+    if (!set || set->count == 0) {
+        return 0;
+    }
+    ix = label_index_sync(set);
+    for (i = ix->head[label_hash(addr, ix->nbuckets)]; i != LABEL_INDEX_NONE; i = ix->next[i]) {
+        if (set->items[i].addr == addr) {
+            if (n < max) {
+                out[n] = i;
+            }
+            n++;
+        }
+    }
+    /* chains run from high to low index; callers want array order */
+    if (n > 1) {
+        size_t lo = 0, hi = (n < max ? n : max) - 1u;
+        while (lo < hi) {
+            size_t t = out[lo];
+            out[lo++] = out[hi];
+            out[hi--] = t;
+        }
+    }
+    return n;
+}
+
+const char *label_set_name_at(LabelSet *set, uint32_t addr) {
+    size_t idx[16];
+    size_t n, k;
+    const char *generated = NULL;
+
+    if (!set) {
+        return NULL;
+    }
+    if (set->sorted) {
+        return label_name_at(addr, set->items, set->count, 1);
+    }
+    n = label_set_find_all(set, addr, idx, 16);
+    if (n > 16) {
+        return label_name_at(addr, set->items, set->count, 0);
+    }
+    for (k = 0; k < n; k++) {
+        const Label *l = &set->items[idx[k]];
+        if (!generated_label_name(l->name)) {
+            return l->name;
+        }
+        if (!generated) {
+            generated = l->name;
+        }
+    }
+    return generated;
+}
+
+/* One existing label at the target address during add_label_impl: mark it as
+   code (or conflicting) and return it if it is the requested one. */
+static Label *add_label_visit(Label *l, const char *name, int is_code, int owns,
+                              Label **first_at_addr) {
+    if (!*first_at_addr) {
+        *first_at_addr = l;
+    }
+    if (!name || strcmp(l->name, name) == 0) {
+        if (is_code && !l->is_data) {
+            l->is_code = 1;
+        } else if (is_code && l->is_data) {
+            l->is_conflict = 1;
+        }
+        if (owns && name)
+            free((char *)name); /* discarded duplicate */
+        return l;
+    }
+    if (is_code && !l->is_data) {
+        l->is_code = 1;
+    } else if (is_code && l->is_data) {
+        l->is_conflict = 1;
+    }
+    return NULL;
+}
+
+static Label *add_label_impl(LabelSet *set, uint32_t addr, const char *name, int is_code,
+                             int owns) {
     size_t i;
     Label *first_at_addr = NULL;
+    Label *hit;
+    size_t at[16];
+    size_t n_at = label_set_find_all(set, addr, at, 16);
 
-    for (i = 0; i < set->count; i++) {
-        if (set->items[i].addr == addr) {
-            if (!first_at_addr) {
-                first_at_addr = &set->items[i];
-            }
-            if (!name || strcmp(set->items[i].name, name) == 0) {
-                if (is_code && !set->items[i].is_data) {
-                    set->items[i].is_code = 1;
-                } else if (is_code && set->items[i].is_data) {
-                    set->items[i].is_conflict = 1;
-                }
-                if (owns && name) free((char *)name); /* discarded duplicate */
-                return &set->items[i];
-            }
-            if (is_code && !set->items[i].is_data) {
-                set->items[i].is_code = 1;
-            } else if (is_code && set->items[i].is_data) {
-                set->items[i].is_conflict = 1;
-            }
+    if (n_at <= 16) {
+        size_t k;
+        for (k = 0; k < n_at; k++) {
+            if ((hit = add_label_visit(&set->items[at[k]], name, is_code, owns, &first_at_addr)))
+                return hit;
+        }
+    } else { /* pathological pile-up at one address: plain scan */
+        for (i = 0; i < set->count; i++) {
+            if (set->items[i].addr == addr &&
+                (hit = add_label_visit(&set->items[i], name, is_code, owns, &first_at_addr)))
+                return hit;
         }
     }
     if (first_at_addr && (!name || generated_any_label_name(name))) {
-        if (owns && name) free((char *)name); /* discarded generated duplicate */
+        if (owns && name)
+            free((char *)name); /* discarded generated duplicate */
         return first_at_addr;
     }
     if (set->count == set->cap) {
@@ -115,32 +244,27 @@ static Label *add_label_impl(LabelSet *set, uint32_t addr, const char *name, int
     return &set->items[set->count - 1];
 }
 
-Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
-{
+Label *add_label(LabelSet *set, uint32_t addr, const char *name, int is_code) {
     return add_label_impl(set, addr, name, is_code, 0);
 }
 
-Label *add_owned_label(LabelSet *set, uint32_t addr, const char *name, int is_code)
-{
+Label *add_owned_label(LabelSet *set, uint32_t addr, const char *name, int is_code) {
     return add_label_impl(set, addr, name, is_code, 1);
 }
 
-void explain_label(Label *label, const char *source)
-{
+void explain_label(Label *label, const char *source) {
     if (label && source && !label->explain) {
         label->explain = source;
     }
 }
 
-void explain_label_kind(Label *label, const char *source)
-{
+void explain_label_kind(Label *label, const char *source) {
     if (label && source) {
         label->kind_explain = source;
     }
 }
 
-void mark_label_data(Label *label)
-{
+void mark_label_data(Label *label) {
     if (!label) {
         return;
     }
@@ -152,9 +276,25 @@ void mark_label_data(Label *label)
     label->scanned = 0;
 }
 
+/* Reference.source is owned by the set: callers often pass a label's name,
+   which set_label/clear_label/prune free while the reference lives on. */
+static const char *ref_source_dup(const char *source) {
+    size_t n = strlen(source) + 1u;
+    char *copy = xmalloc(n);
+    memcpy(copy, source, n);
+    return copy;
+}
+
+void free_reference_sources(ReferenceSet *refs) {
+    size_t i;
+
+    for (i = 0; i < refs->count; i++) {
+        free((char *)refs->items[i].source);
+    }
+}
+
 void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
-                   uint32_t source_addr, const char *kind, const char *source)
-{
+                   uint32_t source_addr, const char *kind, const char *source) {
     if (!refs || !source) {
         return;
     }
@@ -173,17 +313,16 @@ void add_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t sour
     refs->items[refs->count].source_bank = source_bank;
     refs->items[refs->count].source_addr = source_addr;
     refs->items[refs->count].kind = kind;
-    refs->items[refs->count].source = source;
+    refs->items[refs->count].source = ref_source_dup(source);
     refs->items[refs->count].row_index = -1;
     refs->items[refs->count].row_cpu_addr = 0;
     refs->sorted = 0;
     refs->count++;
 }
 
-void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
-                              uint8_t source_bank, uint32_t source_addr, const char *source,
-                              int row_index, uint32_t row_cpu_addr)
-{
+void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr, uint8_t source_bank,
+                             uint32_t source_addr, const char *source, int row_index,
+                             uint32_t row_cpu_addr) {
     if (!refs || !source) {
         return;
     }
@@ -202,7 +341,7 @@ void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
     refs->items[refs->count].source_bank = source_bank;
     refs->items[refs->count].source_addr = source_addr;
     refs->items[refs->count].kind = "table";
-    refs->items[refs->count].source = source;
+    refs->items[refs->count].source = ref_source_dup(source);
     refs->items[refs->count].row_index = row_index;
     refs->items[refs->count].row_cpu_addr = row_cpu_addr;
     refs->sorted = 0;
@@ -210,8 +349,7 @@ void add_table_row_reference(ReferenceSet *refs, uint8_t bank, uint32_t addr,
 }
 
 size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_bank,
-                                           uint32_t source_start, uint32_t source_end)
-{
+                                           uint32_t source_start, uint32_t source_end) {
     size_t read_idx;
     size_t write_idx = 0;
     size_t removed = 0;
@@ -224,6 +362,7 @@ size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_ba
 
         if (ref->source_bank == source_bank && ref->source_addr >= source_start &&
             ref->source_addr <= source_end) {
+            free((char *)ref->source);
             removed++;
             continue;
         }
@@ -236,12 +375,17 @@ size_t remove_references_from_source_range(ReferenceSet *refs, uint8_t source_ba
     return removed;
 }
 
-static int label_has_inbound_ref(uint8_t bank, uint32_t addr, const ReferenceSet *refs)
-{
+static int label_has_inbound_ref(uint8_t bank, uint32_t addr, const ReferenceSet *refs) {
     size_t i;
 
     if (!refs) {
         return 0;
+    }
+    /* Called once per label while pruning: binary search when the set is
+       sorted (it is after sort_and_dedup_refs), else fall back to a scan. */
+    if (refs->sorted) {
+        i = refs_lower_bound(refs, bank, addr);
+        return i < refs->count && refs->items[i].bank == bank && refs->items[i].addr == addr;
     }
     for (i = 0; i < refs->count; i++) {
         if (refs->items[i].bank == bank && refs->items[i].addr == addr) {
@@ -251,8 +395,7 @@ static int label_has_inbound_ref(uint8_t bank, uint32_t addr, const ReferenceSet
     return 0;
 }
 
-static int label_is_pinned(const Label *label)
-{
+static int label_is_pinned(const Label *label) {
     const char *source;
 
     if (!label) {
@@ -273,8 +416,7 @@ static int label_is_pinned(const Label *label)
 }
 
 size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
-                                           const ReferenceSet *refs)
-{
+                                           const ReferenceSet *refs) {
     size_t read_idx;
     size_t write_idx = 0;
     size_t removed = 0;
@@ -298,11 +440,11 @@ size_t prune_unreferenced_generated_labels(LabelSet *labels, uint8_t bank,
         write_idx++;
     }
     labels->count = write_idx;
+    label_set_invalidate_index(labels);
     return removed;
 }
 
-const char *make_generated_label(uint32_t addr)
-{
+const char *make_generated_label(uint32_t addr) {
     char *name = xmalloc(16);
 
     snprintf(name, 16, "Bff_A%04x", (unsigned)addr & 0xffffu);
@@ -310,8 +452,7 @@ const char *make_generated_label(uint32_t addr)
 }
 
 const InlineSignature *inline_signature_for(const InlineSignatures *sigs, uint8_t bank,
-                                            uint32_t addr)
-{
+                                            uint32_t addr) {
     const InlineSignature *unbanked = NULL;
     uint8_t callee_bank = (addr >= APEX_SYSTEM_ORG) ? 0xffu : bank;
     size_t i;
@@ -333,8 +474,7 @@ const InlineSignature *inline_signature_for(const InlineSignatures *sigs, uint8_
     return unbanked;
 }
 
-const char *make_bank_label(uint8_t bank, uint16_t addr)
-{
+const char *make_bank_label(uint8_t bank, uint16_t addr) {
     char *name = xmalloc(16);
 
     snprintf(name, 16, "B%02x_A%04x", bank, addr);
@@ -349,8 +489,7 @@ const char *make_bank_label(uint8_t bank, uint16_t addr)
    See docs/config-format.md and apexasm's clearer operand error. */
 #define APEX_STRING_LABEL_TEXT_MAX 40u
 
-const char *make_string_label(const char *base, const uint8_t *data, size_t len)
-{
+const char *make_string_label(const char *base, const uint8_t *data, size_t len) {
     size_t text_len = len > 0 ? len - 1u : 0;
     size_t suffix_cap = text_len == 0 ? 5u : text_len;
     size_t cap;
@@ -379,8 +518,7 @@ const char *make_string_label(const char *base, const uint8_t *data, size_t len)
 }
 
 void apply_string_content_labels(LabelSet *labels, const uint8_t *data, size_t used,
-                                 uint32_t base_addr)
-{
+                                 uint32_t base_addr) {
     size_t i;
 
     for (i = 0; i < labels->count; i++) {
@@ -420,13 +558,11 @@ void apply_string_content_labels(LabelSet *labels, const uint8_t *data, size_t u
 
    The stored bank-id byte is unreliable — some ROMs (e.g. AFM 1.13) carry a
    wrong/duplicate value in the first page — so we never trust it for identity. */
-uint8_t apex_bank_id_base(size_t banks)
-{
+uint8_t apex_bank_id_base(size_t banks) {
     return (uint8_t)(0x3eu - banks);
 }
 
-int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id)
-{
+int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id) {
     uint8_t base = apex_bank_id_base(banks);
     size_t idx;
 
@@ -443,19 +579,16 @@ int bank_index_for_id(const uint8_t *paged_rom, size_t banks, uint8_t bank_id)
    unresolved (-1) rather than aliased to some other page.  Such bytes seen in
    the wild appear to target hardware/debug ROMs absent from a production dump,
    so mapping them into a real bank only produced misleading code/labels. */
-int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank)
-{
+int bank_index_for_far_ref(const uint8_t *paged_rom, size_t banks, uint8_t bank) {
     return bank_index_for_id(paged_rom, banks, bank);
 }
 
-uint8_t bank_id_for_index(size_t banks, int bank_index)
-{
+uint8_t bank_id_for_index(size_t banks, int bank_index) {
     return (uint8_t)(apex_bank_id_base(banks) + (size_t)bank_index);
 }
 
 void validate_config_classification(const ConfigEntries *entries, const TableDefs *tables,
-                                    const DataRanges *data_ranges)
-{
+                                    const DataRanges *data_ranges) {
     size_t i;
     size_t j;
 
@@ -478,21 +611,23 @@ void validate_config_classification(const ConfigEntries *entries, const TableDef
         for (j = 0; j < data_ranges->count; j++) {
             if (tables->items[i].bank == data_ranges->items[j].bank &&
                 tables->items[i].addr == data_ranges->items[j].addr) {
-                die("config classifies B%02x_A%04x as both table and data",
-                    tables->items[i].bank, (unsigned)tables->items[i].addr & 0xffffu);
+                die("config classifies B%02x_A%04x as both table and data", tables->items[i].bank,
+                    (unsigned)tables->items[i].addr & 0xffffu);
             }
         }
     }
 }
 
-size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
-{
+size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sorted) {
     size_t count = 0;
     size_t i;
 
     if (sorted) {
         i = label_lower_bound(labels, label_count, addr);
-        while (i < label_count && labels[i].addr == addr) { count++; i++; }
+        while (i < label_count && labels[i].addr == addr) {
+            count++;
+            i++;
+        }
         return count;
     }
     for (i = 0; i < label_count; i++) {
@@ -503,14 +638,14 @@ size_t labels_at(uint32_t addr, const Label *labels, size_t label_count, int sor
     return count;
 }
 
-int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
-{
+int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted) {
     size_t i;
 
     if (sorted) {
         i = label_lower_bound(labels, label_count, addr);
         while (i < label_count && labels[i].addr == addr) {
-            if (labels[i].is_code) return 1;
+            if (labels[i].is_code)
+                return 1;
             i++;
         }
         return 0;
@@ -523,8 +658,7 @@ int code_label_at(uint32_t addr, const Label *labels, size_t label_count, int so
     return 0;
 }
 
-const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ranges)
-{
+const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ranges) {
     size_t lo, hi;
 
     if (!ranges) {
@@ -547,8 +681,7 @@ const DataRange *data_range_at(uint8_t bank, uint32_t addr, const DataRanges *ra
     return NULL;
 }
 
-const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
-{
+const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr) {
     size_t i;
 
     if (!docs) {
@@ -561,19 +694,22 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
         size_t lo = 0, hi = docs->count;
         while (lo < hi) {
             size_t mid = lo + (hi - lo) / 2;
-            if (docs->items[mid].addr < addr) lo = mid + 1; else hi = mid;
+            if (docs->items[mid].addr < addr)
+                lo = mid + 1;
+            else
+                hi = mid;
         }
         for (i = lo; i < docs->count && docs->items[i].addr == addr; i++) {
             if (docs->items[i].has_bank && docs->items[i].bank == bank) {
                 return docs->items[i].text;
             }
-            if (!docs->items[i].has_bank) unbanked = docs->items[i].text;
+            if (!docs->items[i].has_bank)
+                unbanked = docs->items[i].text;
         }
         return (bank == 0xffu) ? unbanked : NULL;
     }
     for (i = 0; i < docs->count; i++) {
-        if (docs->items[i].has_bank && docs->items[i].bank == bank &&
-            docs->items[i].addr == addr) {
+        if (docs->items[i].has_bank && docs->items[i].bank == bank && docs->items[i].addr == addr) {
             return docs->items[i].text;
         }
     }
@@ -587,17 +723,18 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr)
     return NULL;
 }
 
-int doc_addr_cmp(const void *pa, const void *pb)
-{
+int doc_addr_cmp(const void *pa, const void *pb) {
     const ConfigDoc *a = (const ConfigDoc *)pa, *b = (const ConfigDoc *)pb;
-    if (a->addr != b->addr) return a->addr < b->addr ? -1 : 1;
-    if (a->has_bank != b->has_bank) return b->has_bank - a->has_bank;
-    if (a->bank != b->bank) return (int)a->bank - (int)b->bank;
+    if (a->addr != b->addr)
+        return a->addr < b->addr ? -1 : 1;
+    if (a->has_bank != b->has_bank)
+        return b->has_bank - a->has_bank;
+    if (a->bank != b->bank)
+        return (int)a->bank - (int)b->bank;
     return 0;
 }
 
-void sort_config_docs(ConfigDocs *docs)
-{
+void sort_config_docs(ConfigDocs *docs) {
     if (!docs || docs->sorted) {
         return;
     }
@@ -607,14 +744,14 @@ void sort_config_docs(ConfigDocs *docs)
     docs->sorted = 1;
 }
 
-int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
-{
+int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int sorted) {
     size_t i;
 
     if (sorted) {
         i = label_lower_bound(labels, label_count, addr);
         while (i < label_count && labels[i].addr == addr) {
-            if (labels[i].is_string) return 1;
+            if (labels[i].is_string)
+                return 1;
             i++;
         }
         return 0;
@@ -627,16 +764,17 @@ int string_label_at(uint32_t addr, const Label *labels, size_t label_count, int 
     return 0;
 }
 
-const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count, int sorted)
-{
+const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count, int sorted) {
     size_t i;
     const char *generated = NULL;
 
     if (sorted) {
         i = label_lower_bound(labels, label_count, addr);
         while (i < label_count && labels[i].addr == addr) {
-            if (!generated_label_name(labels[i].name)) return labels[i].name;
-            if (!generated) generated = labels[i].name;
+            if (!generated_label_name(labels[i].name))
+                return labels[i].name;
+            if (!generated)
+                generated = labels[i].name;
             i++;
         }
         return generated;
@@ -654,8 +792,7 @@ const char *label_name_at(uint32_t addr, const Label *labels, size_t label_count
     return generated;
 }
 
-const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols)
-{
+const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols) {
     size_t i;
 
     if (!symbols) {
@@ -674,8 +811,7 @@ const char *symbol_name_at(uint32_t addr, const ConfigSymbols *symbols)
    (formatted into `scratch`).  Exact matches win over block containment.  Returns
    NULL if no symbol covers the address. */
 const char *symbol_ref_at(uint32_t addr, const ConfigSymbols *symbols, char *scratch,
-                          size_t scratch_sz)
-{
+                          size_t scratch_sz) {
     size_t i;
     const ConfigSymbol *best = NULL;
 
@@ -684,7 +820,7 @@ const char *symbol_ref_at(uint32_t addr, const ConfigSymbols *symbols, char *scr
     }
     for (i = 0; i < symbols->count; i++) {
         if (symbols->items[i].value == addr) {
-            return symbols->items[i].name;   /* exact match wins */
+            return symbols->items[i].name; /* exact match wins */
         }
     }
     for (i = 0; i < symbols->count; i++) {
@@ -705,8 +841,7 @@ const char *symbol_ref_at(uint32_t addr, const ConfigSymbols *symbols, char *scr
 }
 
 int label_between(uint32_t start, uint32_t end, const Label *labels, size_t label_count,
-                  int sorted)
-{
+                  int sorted) {
     size_t i;
 
     if (sorted) {
@@ -723,8 +858,7 @@ int label_between(uint32_t start, uint32_t end, const Label *labels, size_t labe
 
 /* Label-only resolution (no [symbols] equates): the shared tail of the CPU and
    immediate lookups. */
-static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr)
-{
+static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr) {
     const char *name;
 
     name = label_name_at(addr, lookup->labels, lookup->label_count, lookup->sorted);
@@ -754,7 +888,7 @@ static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr)
             const char *n = label_name_at(addr, ls->items, ls->count, ls->sorted);
             if (n) {
                 if (found) {
-                    return NULL;  /* ambiguous across banks */
+                    return NULL; /* ambiguous across banks */
                 }
                 found = n;
             }
@@ -764,12 +898,11 @@ static const char *lookup_labels_only(const LabelLookup *lookup, uint32_t addr)
     return NULL;
 }
 
-const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
-{
+const char *lookup_label_for_cpu(void *ctx, uint32_t addr) {
     LabelLookup *lookup = (LabelLookup *)ctx;
     /* Address operands resolve mid-block accesses to "SYM+offset". */
-    const char *name = symbol_ref_at(addr, lookup->symbols, lookup->sym_ref,
-                                     sizeof(lookup->sym_ref));
+    const char *name =
+        symbol_ref_at(addr, lookup->symbols, lookup->sym_ref, sizeof(lookup->sym_ref));
 
     if (name) {
         return name;
@@ -781,13 +914,12 @@ const char *lookup_label_for_cpu(void *ctx, uint32_t addr)
    equate (a RAM/ASIC field whose value collides with a count, mask, or text
    number) is not resolved inside an immediate like `LDX #0x0014`.  Labels (ROM
    addresses) still resolve, and address operands keep using lookup_label_for_cpu. */
-const char *lookup_label_for_imm(void *ctx, uint32_t addr)
-{
+const char *lookup_label_for_imm(void *ctx, uint32_t addr) {
     LabelLookup *lookup = (LabelLookup *)ctx;
 
     if (!(lookup->min_immediate_symbol && addr < lookup->min_immediate_symbol)) {
-        const char *name = symbol_ref_at(addr, lookup->symbols, lookup->sym_ref,
-                                         sizeof(lookup->sym_ref));
+        const char *name =
+            symbol_ref_at(addr, lookup->symbols, lookup->sym_ref, sizeof(lookup->sym_ref));
         if (name) {
             return name;
         }
@@ -795,8 +927,7 @@ const char *lookup_label_for_imm(void *ctx, uint32_t addr)
     return lookup_labels_only(lookup, addr);
 }
 
-const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables)
-{
+const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *tables) {
     size_t lo = 0, hi = tables->count;
 
     if (!tables->sorted) {
@@ -825,19 +956,16 @@ const TableDef *table_def_at(uint8_t bank, uint32_t addr, const TableDefs *table
     return NULL;
 }
 
-int in_system_addr(uint32_t addr)
-{
+int in_system_addr(uint32_t addr) {
     return addr >= APEX_SYSTEM_ORG && addr <= 0xffffu;
 }
 
-int scannable_code_addr(uint32_t addr, size_t used)
-{
+int scannable_code_addr(uint32_t addr, size_t used) {
     return addr >= APEX_SYSTEM_ORG && addr < APEX_SYSTEM_ORG + used && addr < 0xfff2u;
 }
 
 uint32_t detect_inline_dispatcher(const uint8_t *data, size_t used, const VectorInfo *vectors,
-                                  size_t vector_count)
-{
+                                  size_t vector_count) {
     uint32_t addr;
     size_t pos;
     size_t i;
@@ -852,9 +980,8 @@ uint32_t detect_inline_dispatcher(const uint8_t *data, size_t used, const Vector
     pos = (size_t)(addr - APEX_SYSTEM_ORG);
     for (i = 0; i < 8 && pos < used; i++) {
         char inst[64];
-        Cpu6809InstrInfo info =
-            cpu6809_disassemble_info(data + pos, used - pos, APEX_SYSTEM_ORG + (uint32_t)pos,
-                                     inst, sizeof(inst));
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(
+            data + pos, used - pos, APEX_SYSTEM_ORG + (uint32_t)pos, inst, sizeof(inst));
 
         (void)inst;
         if (info.size == 0) {
@@ -871,14 +998,12 @@ uint32_t detect_inline_dispatcher(const uint8_t *data, size_t used, const Vector
     return 0;
 }
 
-static size_t inline_fixed_field_width(TableFieldKind kind)
-{
+static size_t inline_fixed_field_width(TableFieldKind kind) {
     return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
 }
 
 size_t inline_actual_length(const InlineSignature *sig, const uint8_t *data, size_t pos,
-                            size_t used, int *ok)
-{
+                            size_t used, int *ok) {
     size_t start = pos, i, n;
 
     *ok = 1;
@@ -888,18 +1013,31 @@ size_t inline_actual_length(const InlineSignature *sig, const uint8_t *data, siz
             if (f->kind == TABLE_BYTES_UNTIL) {
                 uint8_t term = (uint8_t)f->param;
                 for (;;) {
-                    if (pos >= used) { *ok = 0; return 0; }
-                    if (data[pos++] == term) break;
+                    if (pos >= used) {
+                        *ok = 0;
+                        return 0;
+                    }
+                    if (data[pos++] == term)
+                        break;
                 }
             } else if (f->kind == TABLE_COUNTED_BYTES) {
                 uint8_t cnt;
-                if (pos >= used) { *ok = 0; return 0; }
+                if (pos >= used) {
+                    *ok = 0;
+                    return 0;
+                }
                 cnt = data[pos++];
-                if (pos + cnt > used) { *ok = 0; return 0; }
+                if (pos + cnt > used) {
+                    *ok = 0;
+                    return 0;
+                }
                 pos += cnt;
             } else {
                 size_t w = inline_fixed_field_width(f->kind);
-                if (pos + w > used) { *ok = 0; return 0; }
+                if (pos + w > used) {
+                    *ok = 0;
+                    return 0;
+                }
                 pos += w;
             }
         }
@@ -908,8 +1046,7 @@ size_t inline_actual_length(const InlineSignature *sig, const uint8_t *data, siz
 }
 
 unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatures *sigs,
-                               uint8_t current_bank, size_t pos, size_t used, const uint8_t *data)
-{
+                               uint8_t current_bank, size_t pos, size_t used, const uint8_t *data) {
     const InlineSignature *sig;
 
     /* Inline payloads only follow a subroutine call (JSR/BSR/LBSR), which pushes
@@ -933,8 +1070,7 @@ unsigned inline_bytes_consumed(const Cpu6809InstrInfo *info, const InlineSignatu
     return sig->length;
 }
 
-int valid_far_code_target(uint16_t addr, uint8_t bank, const uint8_t *paged_rom, size_t banks)
-{
+int valid_far_code_target(uint16_t addr, uint8_t bank, const uint8_t *paged_rom, size_t banks) {
     if (bank == 0xffu) {
         return in_system_addr(addr);
     }
@@ -944,16 +1080,14 @@ int valid_far_code_target(uint16_t addr, uint8_t bank, const uint8_t *paged_rom,
 
 void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_t banks,
                             LabelSet *bank_labels, LabelSet *system_labels, uint16_t addr,
-                            uint8_t bank)
-{
+                            uint8_t bank) {
     int bank_index;
     int is_code = kind == TABLE_FAR_CODE;
     int is_string = kind == TABLE_FAR_STRING;
-    const char *source = kind == TABLE_FAR_CODE   ? "inline_far_code_ref" :
-                         kind == TABLE_FAR_STRING ? "inline_far_string_ref" :
-                         kind == TABLE_FAR_DMD_FULLFRAME ?
-                             "inline_far_dmd_fullframe_ref" :
-                             "inline_far_data_ref";
+    const char *source = kind == TABLE_FAR_CODE            ? "inline_far_code_ref"
+                         : kind == TABLE_FAR_STRING        ? "inline_far_string_ref"
+                         : kind == TABLE_FAR_DMD_FULLFRAME ? "inline_far_dmd_fullframe_ref"
+                                                           : "inline_far_data_ref";
     Label *label;
 
     if (bank == 0xffu && in_system_addr(addr)) {
@@ -970,9 +1104,9 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
     }
     bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
     if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
-        label = add_owned_label(&bank_labels[bank_index], addr,
-                          make_bank_label(bank_id_for_index(banks, bank_index), addr),
-                          is_code);
+        label =
+            add_owned_label(&bank_labels[bank_index], addr,
+                            make_bank_label(bank_id_for_index(banks, bank_index), addr), is_code);
         explain_label(label, source);
         explain_label_kind(label, source);
         if (!is_code) {
@@ -984,14 +1118,12 @@ void apply_inline_far_label(TableFieldKind kind, const uint8_t *paged_rom, size_
     }
 }
 
-void apply_inline_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank, uint16_t ptr)
-{
+void apply_inline_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t bank, uint16_t ptr) {
     Label *target;
-    const char *source = kind == TABLE_PTR16_CODE   ? "inline_ptr16_code_ref" :
-                         kind == TABLE_PTR16_STRING ? "inline_ptr16_string_ref" :
-                         kind == TABLE_PTR16_DMD_FULLFRAME ?
-                             "inline_ptr16_dmd_fullframe_ref" :
-                             "inline_ptr16_data_ref";
+    const char *source = kind == TABLE_PTR16_CODE            ? "inline_ptr16_code_ref"
+                         : kind == TABLE_PTR16_STRING        ? "inline_ptr16_string_ref"
+                         : kind == TABLE_PTR16_DMD_FULLFRAME ? "inline_ptr16_dmd_fullframe_ref"
+                                                             : "inline_ptr16_data_ref";
 
     if (ptr < APEX_PAGED_ORG || ptr >= 0x8000u) {
         return;
@@ -1008,8 +1140,7 @@ void apply_inline_ptr16_label(TableFieldKind kind, LabelSet *labels, uint8_t ban
 }
 
 void apply_system_ptr16_label(TableFieldKind kind, LabelSet *system_labels, uint16_t ptr,
-                              const char *source_prefix)
-{
+                              const char *source_prefix) {
     int is_code = kind == TABLE_PTR16_CODE;
     int is_string = kind == TABLE_PTR16_STRING;
     const char *source = source_prefix;
@@ -1019,15 +1150,15 @@ void apply_system_ptr16_label(TableFieldKind kind, LabelSet *system_labels, uint
         return;
     }
     if (strcmp(source_prefix, "inline") == 0) {
-        source = is_code ? "inline_ptr16_code_ref" :
-                 is_string ? "inline_ptr16_string_ref" :
-                 kind == TABLE_PTR16_DMD_FULLFRAME ? "inline_ptr16_dmd_fullframe_ref" :
-                             "inline_ptr16_data_ref";
+        source = is_code                             ? "inline_ptr16_code_ref"
+                 : is_string                         ? "inline_ptr16_string_ref"
+                 : kind == TABLE_PTR16_DMD_FULLFRAME ? "inline_ptr16_dmd_fullframe_ref"
+                                                     : "inline_ptr16_data_ref";
     } else if (strcmp(source_prefix, "table") == 0) {
-        source = is_code ? "table_ptr16_code_ref" :
-                 is_string ? "table_ptr16_string_ref" :
-                 kind == TABLE_PTR16_DMD_FULLFRAME ? "table_ptr16_dmd_fullframe_ref" :
-                             "table_ptr16_data_ref";
+        source = is_code                             ? "table_ptr16_code_ref"
+                 : is_string                         ? "table_ptr16_string_ref"
+                 : kind == TABLE_PTR16_DMD_FULLFRAME ? "table_ptr16_dmd_fullframe_ref"
+                                                     : "table_ptr16_data_ref";
     }
     target = add_owned_label(system_labels, ptr, make_generated_label(ptr), is_code);
     explain_label(target, source);
@@ -1040,11 +1171,10 @@ void apply_system_ptr16_label(TableFieldKind kind, LabelSet *system_labels, uint
     }
 }
 
-void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t used,
-                         size_t *pos, uint8_t current_bank, const uint8_t *paged_rom,
-                         size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
-                         const char *source, uint32_t source_addr, ReferenceSet *refs)
-{
+void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t used, size_t *pos,
+                         uint8_t current_bank, const uint8_t *paged_rom, size_t banks,
+                         LabelSet *bank_labels, LabelSet *system_labels, const char *source,
+                         uint32_t source_addr, ReferenceSet *refs) {
     size_t i;
 
     for (i = 0; i < sig->schema.count; i++) {
@@ -1060,7 +1190,7 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
                     (*pos)++;
                 }
                 if (*pos < used) {
-                    (*pos)++;  /* consume the terminator */
+                    (*pos)++; /* consume the terminator */
                 }
             } else if (kind == TABLE_COUNTED_BYTES) {
                 /* Leading count byte + that many opaque bytes — no address refs. */
@@ -1088,11 +1218,10 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
                 addr = read_be16(data + *pos);
                 bank = data[*pos + 2u];
                 if (kind != TABLE_FAR_CODE || valid_far_code_target(addr, bank, paged_rom, banks)) {
-                    apply_inline_far_label(kind, paged_rom, banks, bank_labels, system_labels,
-                                           addr, bank);
+                    apply_inline_far_label(kind, paged_rom, banks, bank_labels, system_labels, addr,
+                                           bank);
                     if (bank == 0xffu && in_system_addr(addr)) {
-                        add_reference(refs, 0xff, addr, current_bank, source_addr, "code",
-                                      source);
+                        add_reference(refs, 0xff, addr, current_bank, source_addr, "code", source);
                     } else {
                         bank_index = bank_index_for_far_ref(paged_rom, banks, bank);
                         if (bank_index >= 0 && addr >= APEX_PAGED_ORG && addr < 0x8000u) {
@@ -1127,8 +1256,7 @@ void collect_inline_refs(const InlineSignature *sig, const uint8_t *data, size_t
     }
 }
 
-static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t addr)
-{
+static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t addr) {
     size_t i;
 
     if (!excl) {
@@ -1148,9 +1276,7 @@ static int addr_ref_excluded(const ConfigEntries *excl, uint8_t bank, uint32_t a
    exactly ONE paged bank has real content (non-0xFF) at that offset, that bank is
    the unambiguous target — return its index; else -1 (0 or several candidates,
    genuinely ambiguous). */
-static int unique_paged_bank_with_content(const uint8_t *paged_rom, size_t banks,
-                                          uint16_t addr)
-{
+static int unique_paged_bank_with_content(const uint8_t *paged_rom, size_t banks, uint16_t addr) {
     size_t off, b;
     int found = -1;
 
@@ -1173,8 +1299,7 @@ static int unique_paged_bank_with_content(const uint8_t *paged_rom, size_t banks
    *out_target to the bank its immediate operand addresses and *out_type to the
    target's FarImmType. */
 static int far_imm_target_bank(const ConfigEntries *far_imms, uint8_t bank, uint32_t addr,
-                               uint8_t *out_target, uint8_t *out_type)
-{
+                               uint8_t *out_target, uint8_t *out_type) {
     size_t i;
 
     if (!far_imms) {
@@ -1184,7 +1309,7 @@ static int far_imm_target_bank(const ConfigEntries *far_imms, uint8_t bank, uint
         if (far_imms->items[i].addr == addr &&
             (!far_imms->items[i].has_bank || far_imms->items[i].bank == bank)) {
             *out_target = far_imms->items[i].value;
-            *out_type   = far_imms->items[i].value2;
+            *out_type = far_imms->items[i].value2;
             return 1;
         }
     }
@@ -1199,20 +1324,18 @@ static int far_imm_target_bank(const ConfigEntries *far_imms, uint8_t bank, uint
 void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, LabelSet *labels,
                           const InlineSignatures *inline_sigs, const uint8_t *paged_rom,
                           size_t banks, LabelSet *bank_labels, LabelSet *system_labels,
-                          const DataRanges *data_ranges, uint8_t current_bank,
-                          ReferenceSet *refs, const ConfigEntries *ref_exclusions,
-                          const ConfigEntries *literals, const ConfigEntries *far_imms)
-{
+                          const DataRanges *data_ranges, uint8_t current_bank, ReferenceSet *refs,
+                          const ConfigEntries *ref_exclusions, const ConfigEntries *literals,
+                          const ConfigEntries *far_imms) {
     size_t i = 0;
 
     while (i < labels->count) {
         Label *label = &labels->items[i++];
         uint32_t addr = label->addr;
-        const char *source = label_name_at(addr, labels->items, labels->count, 0);
+        const char *source = label_set_name_at(labels, addr);
         size_t pos;
 
-        if (!label->is_code || label->scanned || addr < base_addr ||
-            addr >= base_addr + used ||
+        if (!label->is_code || label->scanned || addr < base_addr || addr >= base_addr + used ||
             (base_addr == APEX_SYSTEM_ORG && addr >= 0xfff2u)) {
             continue;
         }
@@ -1231,13 +1354,13 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                    user-defined label at this address (not auto-generated), mark it
                    as conflicted so the disassembler emits a WARNING. */
                 uint32_t cont_addr = base_addr + (uint32_t)pos;
-                size_t j;
-                for (j = 0; j < labels->count; j++) {
-                    if (labels->items[j].addr == cont_addr &&
-                        labels->items[j].name &&
-                        !generated_any_label_name(labels->items[j].name)) {
-                        labels->items[j].is_conflict = 1;
-                        explain_label_kind(&labels->items[j], "code_flow");
+                size_t at[16], n_at, k;
+                n_at = label_set_find_all(labels, cont_addr, at, 16);
+                for (k = 0; k < n_at && k < 16; k++) {
+                    Label *l = &labels->items[at[k]];
+                    if (l->name && !generated_any_label_name(l->name)) {
+                        l->is_conflict = 1;
+                        explain_label_kind(l, "code_flow");
                         break;
                     }
                 }
@@ -1248,14 +1371,14 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             if (info.has_target) {
                 if (info.target >= base_addr && info.target < base_addr + used) {
-                    if (!label_name_at(info.target, labels->items, labels->count, 0)) {
+                    if (!label_set_name_at(labels, info.target)) {
                         Label *target;
                         if (base_addr == APEX_SYSTEM_ORG) {
                             target = add_owned_label(labels, info.target,
-                                               make_generated_label(info.target), 1);
+                                                     make_generated_label(info.target), 1);
                         } else {
                             target = add_owned_label(labels, info.target,
-                                               make_bank_label(data[0], info.target), 1);
+                                                     make_bank_label(data[0], info.target), 1);
                         }
                         explain_label(target, "code_flow");
                         explain_label_kind(target, "code_flow");
@@ -1264,11 +1387,11 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                            be marked as code yet. Promote it so the convergence loop
                            will scan it on the next pass. */
                         {
-                            size_t j;
-                            for (j = 0; j < labels->count; j++) {
-                                if (labels->items[j].addr == info.target &&
-                                    labels->items[j].is_explicit_entry) {
-                                    labels->items[j].reached_by_flow = 1;
+                            size_t at[16], n_at, k;
+                            n_at = label_set_find_all(labels, info.target, at, 16);
+                            for (k = 0; k < n_at && k < 16; k++) {
+                                if (labels->items[at[k]].is_explicit_entry) {
+                                    labels->items[at[k]].reached_by_flow = 1;
                                     break;
                                 }
                             }
@@ -1276,8 +1399,8 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                         add_label(labels, info.target, NULL, 1);
                     }
                 } else if (base_addr != APEX_SYSTEM_ORG && in_system_addr(info.target)) {
-                    Label *target =
-                        add_owned_label(system_labels, info.target, make_generated_label(info.target), 1);
+                    Label *target = add_owned_label(system_labels, info.target,
+                                                    make_generated_label(info.target), 1);
 
                     explain_label(target, "code_flow");
                     explain_label_kind(target, "code_flow");
@@ -1287,16 +1410,17 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                        general, but if exactly one paged bank has content at that
                        offset, seed a code label + reference there so the target
                        resolves (the render's single-bank fallback picks it up). */
-                    int ub = unique_paged_bank_with_content(paged_rom, banks,
-                                                            (uint16_t)info.target);
+                    int ub =
+                        unique_paged_bank_with_content(paged_rom, banks, (uint16_t)info.target);
                     if (ub >= 0) {
                         uint8_t bid = bank_id_for_index(banks, ub);
-                        Label *target = add_owned_label(&bank_labels[ub], info.target,
-                                                  make_bank_label(bid, (uint16_t)info.target), 1);
+                        Label *target =
+                            add_owned_label(&bank_labels[ub], info.target,
+                                            make_bank_label(bid, (uint16_t)info.target), 1);
                         explain_label(target, "code_flow");
                         explain_label_kind(target, "code_flow");
-                        add_reference(refs, bid, info.target, current_bank, instr_addr,
-                                      "code", source);
+                        add_reference(refs, bid, info.target, current_bank, instr_addr, "code",
+                                      source);
                     }
                 }
                 if (info.target >= base_addr && info.target < base_addr + used) {
@@ -1319,19 +1443,20 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                     if (tb == 0xffu && in_system_addr(info.addr_ref)) {
                         if (system_labels) {
                             add_owned_label(system_labels, info.addr_ref,
-                                      make_generated_label(info.addr_ref), tcode);
+                                            make_generated_label(info.addr_ref), tcode);
                         }
-                        add_reference(refs, 0xffu, info.addr_ref, current_bank, instr_addr,
-                                      "code", source);
+                        add_reference(refs, 0xffu, info.addr_ref, current_bank, instr_addr, "code",
+                                      source);
                     } else if (tb != 0xffu && info.addr_ref >= APEX_PAGED_ORG &&
                                info.addr_ref < 0x8000u && bank_labels) {
                         int bi = bank_index_for_id(paged_rom, banks, tb);
                         if (bi >= 0) {
                             add_owned_label(&bank_labels[bi], info.addr_ref,
-                                      make_bank_label(bank_id_for_index(banks, bi),
-                                                      (uint16_t)info.addr_ref), tcode);
-                            add_reference(refs, tb, info.addr_ref, current_bank, instr_addr,
-                                          "code", source);
+                                            make_bank_label(bank_id_for_index(banks, bi),
+                                                            (uint16_t)info.addr_ref),
+                                            tcode);
+                            add_reference(refs, tb, info.addr_ref, current_bank, instr_addr, "code",
+                                          source);
                         }
                     }
                 } else if (info.addr_ref >= base_addr && info.addr_ref < base_addr + used) {
@@ -1350,14 +1475,12 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
                 const InlineSignature *sig =
                     inline_signature_for(inline_sigs, current_bank, info.target);
 
-                if (sig && pos + info.size + sig->length <= used &&
-                    paged_rom && bank_labels) {
+                if (sig && pos + info.size + sig->length <= used && paged_rom && bank_labels) {
                     size_t inline_pos = pos + info.size;
 
                     collect_inline_refs(sig, data, used, &inline_pos, current_bank, paged_rom,
-                                        banks, bank_labels,
-                                        system_labels ? system_labels : labels, source,
-                                        instr_addr, refs);
+                                        banks, bank_labels, system_labels ? system_labels : labels,
+                                        source, instr_addr, refs);
                 }
             }
             pos += info.size;
@@ -1372,11 +1495,11 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
             }
             if (!(info.flags & CPU6809_FLOW_STOP) && pos < used) {
                 uint32_t next_addr = base_addr + (uint32_t)pos;
-                size_t j;
-                for (j = 0; j < labels->count; j++) {
-                    if (labels->items[j].addr == next_addr &&
-                        labels->items[j].is_explicit_entry) {
-                        labels->items[j].reached_by_flow = 1;
+                size_t at[16], n_at, k;
+                n_at = label_set_find_all(labels, next_addr, at, 16);
+                for (k = 0; k < n_at && k < 16; k++) {
+                    if (labels->items[at[k]].is_explicit_entry) {
+                        labels->items[at[k]].reached_by_flow = 1;
                         break;
                     }
                 }
@@ -1388,8 +1511,7 @@ void collect_code_targets(const uint8_t *data, size_t used, uint32_t base_addr, 
     }
 }
 
-const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count)
-{
+const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vector_count) {
     size_t i;
 
     for (i = 0; i < vector_count; i++) {
@@ -1400,8 +1522,7 @@ const char *vector_entry_at(uint32_t addr, const VectorInfo *vectors, size_t vec
     return NULL;
 }
 
-size_t valid_string_len(const uint8_t *data, size_t len)
-{
+size_t valid_string_len(const uint8_t *data, size_t len) {
     size_t i;
 
     for (i = 0; i < len; i++) {
@@ -1423,8 +1544,7 @@ size_t valid_string_len(const uint8_t *data, size_t len)
 
 /* --- sort + binary-search helpers --- */
 
-size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr)
-{
+size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr) {
     size_t lo = 0, hi = count;
 
     while (lo < hi) {
@@ -1439,8 +1559,7 @@ size_t label_lower_bound(const Label *labels, size_t count, uint32_t addr)
     return lo;
 }
 
-size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr)
-{
+size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr) {
     size_t lo = 0, hi = refs->count;
 
     while (lo < hi) {
@@ -1456,99 +1575,107 @@ size_t refs_lower_bound(const ReferenceSet *refs, uint8_t bank, uint32_t addr)
     return lo;
 }
 
-static int label_addr_cmp(const void *a, const void *b)
-{
+static int label_addr_cmp(const void *a, const void *b) {
     const Label *la = (const Label *)a;
     const Label *lb = (const Label *)b;
 
-    if (la->addr < lb->addr) return -1;
-    if (la->addr > lb->addr) return 1;
+    if (la->addr < lb->addr)
+        return -1;
+    if (la->addr > lb->addr)
+        return 1;
     return 0;
 }
 
-void sort_label_set(LabelSet *set)
-{
+void sort_label_set(LabelSet *set) {
     if (set->count > 1) {
         qsort(set->items, set->count, sizeof(set->items[0]), label_addr_cmp);
+        label_set_invalidate_index(set);
     }
     set->sorted = 1;
 }
 
-static int data_range_cmp(const void *a, const void *b)
-{
+static int data_range_cmp(const void *a, const void *b) {
     const DataRange *ra = (const DataRange *)a;
     const DataRange *rb = (const DataRange *)b;
 
-    if (ra->bank != rb->bank) return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
-    if (ra->addr < rb->addr) return -1;
-    if (ra->addr > rb->addr) return 1;
+    if (ra->bank != rb->bank)
+        return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
+    if (ra->addr < rb->addr)
+        return -1;
+    if (ra->addr > rb->addr)
+        return 1;
     return 0;
 }
 
-void sort_data_ranges(DataRanges *ranges)
-{
+void sort_data_ranges(DataRanges *ranges) {
     if (ranges->count > 1) {
         qsort(ranges->items, ranges->count, sizeof(ranges->items[0]), data_range_cmp);
     }
 }
 
-static int table_def_cmp(const void *a, const void *b)
-{
+static int table_def_cmp(const void *a, const void *b) {
     const TableDef *ta = (const TableDef *)a;
     const TableDef *tb = (const TableDef *)b;
 
-    if (ta->bank != tb->bank) return (int)(unsigned)ta->bank - (int)(unsigned)tb->bank;
-    if (ta->addr < tb->addr) return -1;
-    if (ta->addr > tb->addr) return 1;
+    if (ta->bank != tb->bank)
+        return (int)(unsigned)ta->bank - (int)(unsigned)tb->bank;
+    if (ta->addr < tb->addr)
+        return -1;
+    if (ta->addr > tb->addr)
+        return 1;
     return 0;
 }
 
-void sort_table_defs(TableDefs *tables)
-{
+void sort_table_defs(TableDefs *tables) {
     if (tables->count > 1) {
         qsort(tables->items, tables->count, sizeof(tables->items[0]), table_def_cmp);
     }
     tables->sorted = 1;
 }
 
-static int inline_sig_cmp(const void *a, const void *b)
-{
+static int inline_sig_cmp(const void *a, const void *b) {
     const InlineSignature *sa = (const InlineSignature *)a;
     const InlineSignature *sb = (const InlineSignature *)b;
 
-    if (sa->addr < sb->addr) return -1;
-    if (sa->addr > sb->addr) return 1;
+    if (sa->addr < sb->addr)
+        return -1;
+    if (sa->addr > sb->addr)
+        return 1;
     return 0;
 }
 
-void sort_inline_signatures(InlineSignatures *sigs)
-{
+void sort_inline_signatures(InlineSignatures *sigs) {
     if (sigs->count > 1) {
         qsort(sigs->items, sigs->count, sizeof(sigs->items[0]), inline_sig_cmp);
     }
 }
 
-static int ref_cmp(const void *a, const void *b)
-{
+static int ref_cmp(const void *a, const void *b) {
     const Reference *ra = (const Reference *)a;
     const Reference *rb = (const Reference *)b;
     int c;
 
-    if (ra->bank != rb->bank) return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
-    if (ra->addr < rb->addr) return -1;
-    if (ra->addr > rb->addr) return 1;
+    if (ra->bank != rb->bank)
+        return (int)(unsigned)ra->bank - (int)(unsigned)rb->bank;
+    if (ra->addr < rb->addr)
+        return -1;
+    if (ra->addr > rb->addr)
+        return 1;
     if (ra->source_bank != rb->source_bank)
         return (int)(unsigned)ra->source_bank - (int)(unsigned)rb->source_bank;
-    if (ra->source_addr < rb->source_addr) return -1;
-    if (ra->source_addr > rb->source_addr) return 1;
-    if (ra->row_index != rb->row_index) return ra->row_index - rb->row_index;
+    if (ra->source_addr < rb->source_addr)
+        return -1;
+    if (ra->source_addr > rb->source_addr)
+        return 1;
+    if (ra->row_index != rb->row_index)
+        return ra->row_index - rb->row_index;
     c = strcmp(ra->kind, rb->kind);
-    if (c) return c;
+    if (c)
+        return c;
     return strcmp(ra->source, rb->source);
 }
 
-void sort_and_dedup_refs(ReferenceSet *refs)
-{
+void sort_and_dedup_refs(ReferenceSet *refs) {
     size_t read_idx, write_idx;
 
     if (!refs || refs->count < 2) {
@@ -1559,6 +1686,8 @@ void sort_and_dedup_refs(ReferenceSet *refs)
     for (read_idx = 1; read_idx < refs->count; read_idx++) {
         if (ref_cmp(&refs->items[read_idx], &refs->items[write_idx]) != 0) {
             refs->items[++write_idx] = refs->items[read_idx];
+        } else {
+            free((char *)refs->items[read_idx].source);
         }
     }
     refs->count = write_idx + 1;

@@ -6,8 +6,8 @@
    - a streaming animated GIF built from indexed frames + a 256-entry palette.
    Pure C++ (no ImGui), so it can be unit-tested headless. */
 
-#include <stdint.h>
 #include <stddef.h>
+#include <stdint.h>
 
 /* Write w*h*3 RGB bytes as a PNG.  Returns false on any I/O error. */
 bool apex_png_write_rgb(const char *path, int w, int h, const uint8_t *rgb);
@@ -17,7 +17,7 @@ bool apex_png_write_rgb(const char *path, int w, int h, const uint8_t *rgb);
    centiseconds (1/100 s).  Returns NULL on failure. */
 struct ApexGif;
 ApexGif *apex_gif_begin(const char *path, int w, int h, const uint8_t *palette256_rgb);
-bool     apex_gif_add_frame(ApexGif *g, const uint8_t *indices, int delay_centiseconds);
-bool     apex_gif_end(ApexGif *g); /* writes trailer, closes, frees g */
+bool apex_gif_add_frame(ApexGif *g, const uint8_t *indices, int delay_centiseconds);
+bool apex_gif_end(ApexGif *g); /* writes trailer, closes, frees g */
 
 #endif /* APEX_IMGEXPORT_H */

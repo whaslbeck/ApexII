@@ -2,121 +2,126 @@
 
 #include <string.h>
 
-int apexsprite_is_header(const uint8_t *src, size_t src_size)
-{
+int apexsprite_is_header(const uint8_t *src, size_t src_size) {
     uint8_t b;
-    if (!src || src_size == 0) return 0;
+    if (!src || src_size == 0)
+        return 0;
     b = src[0];
     return b == 0x00u || b == 0xFDu || b == 0xFEu || b == 0xFFu;
 }
 
-int apexsprite_is_noheader(const uint8_t *src, size_t src_size)
-{
-    if (!src || src_size == 0) return 0;
+int apexsprite_is_noheader(const uint8_t *src, size_t src_size) {
+    if (!src || src_size == 0)
+        return 0;
     return src[0] >= 1u && src[0] <= APEX_SPRITE_MAX_WIDTH;
 }
 
 /* Header-format VSI decode.
    Layout: [hdr][y_off][x_off][height_px][width_px][raw bitmap]
    Pixel data is stored MSB-first, row-major: bit 7 of each byte = leftmost pixel. */
-int apexsprite_decode(const uint8_t *src, size_t src_size,
-                      uint8_t *dest,
-                      uint8_t *header_type_out,
-                      uint8_t *vert_offset_out,
-                      uint8_t *horiz_offset_out,
-                      uint8_t *width_out,
-                      uint8_t *height_out,
-                      uint8_t *enc_type_out,
-                      size_t  *consumed_out)
-{
+int apexsprite_decode(const uint8_t *src, size_t src_size, uint8_t *dest, uint8_t *header_type_out,
+                      uint8_t *vert_offset_out, uint8_t *horiz_offset_out, uint8_t *width_out,
+                      uint8_t *height_out, uint8_t *enc_type_out, size_t *consumed_out) {
     uint8_t hdr, vert, horiz, height, width, row_bytes, enc;
     size_t page_bytes, plane0_off, consumed;
 
-    if (!src || !dest || src_size < 5u) return 0;
+    if (!src || !dest || src_size < 5u)
+        return 0;
 
     hdr = src[0];
-    if (hdr != 0x00u && hdr != 0xFDu && hdr != 0xFEu && hdr != 0xFFu) return 0;
+    if (hdr != 0x00u && hdr != 0xFDu && hdr != 0xFEu && hdr != 0xFFu)
+        return 0;
 
-    vert   = src[1];
-    horiz  = src[2];
+    vert = src[1];
+    horiz = src[2];
     height = src[3];
-    width  = src[4];
+    width = src[4];
 
-    if (width == 0 || height == 0 ||
-        width > APEX_SPRITE_MAX_WIDTH || height > APEX_SPRITE_MAX_HEIGHT) {
+    if (width == 0 || height == 0 || width > APEX_SPRITE_MAX_WIDTH ||
+        height > APEX_SPRITE_MAX_HEIGHT) {
         return 0;
     }
 
-    row_bytes  = (uint8_t)((width + 7u) / 8u);
+    row_bytes = (uint8_t)((width + 7u) / 8u);
     page_bytes = (size_t)row_bytes * (size_t)height;
 
     /* Plane layout depends on the header byte (verified against real ROMs by
        the gap between consecutive VSI image addresses). */
     switch (hdr) {
     case 0xFFu: /* bicolor-direct: [plane1][plane0] both inline */
-        enc        = APEX_SPRITE_ENC_BICOLOR_DIRECT;
+        enc = APEX_SPRITE_ENC_BICOLOR_DIRECT;
         plane0_off = 5u + page_bytes;
-        consumed   = 5u + 2u * page_bytes;
+        consumed = 5u + 2u * page_bytes;
         break;
     case 0xFEu: /* bicolor-indirect: [2-byte ptr to plane1][plane0] */
-        enc        = APEX_SPRITE_ENC_BICOLOR_INDIRECT;
+        enc = APEX_SPRITE_ENC_BICOLOR_INDIRECT;
         plane0_off = 5u + 2u;
-        consumed   = 5u + 2u + page_bytes;
+        consumed = 5u + 2u + page_bytes;
         break;
     case 0xFDu:
-        enc        = APEX_SPRITE_ENC_FD;
+        enc = APEX_SPRITE_ENC_FD;
         plane0_off = 5u;
-        consumed   = 5u + page_bytes;
+        consumed = 5u + page_bytes;
         break;
-    default:    /* 0x00 monochrome */
-        enc        = APEX_SPRITE_ENC_MONO;
+    default: /* 0x00 monochrome */
+        enc = APEX_SPRITE_ENC_MONO;
         plane0_off = 5u;
-        consumed   = 5u + page_bytes;
+        consumed = 5u + page_bytes;
         break;
     }
 
-    if (src_size < consumed) return 0;
+    if (src_size < consumed)
+        return 0;
 
     memset(dest, 0, APEX_SPRITE_MAX_BYTES);
     memcpy(dest, src + plane0_off, page_bytes);
 
-    if (header_type_out)  *header_type_out  = hdr;
-    if (vert_offset_out)  *vert_offset_out  = vert;
-    if (horiz_offset_out) *horiz_offset_out = horiz;
-    if (width_out)        *width_out        = width;
-    if (height_out)       *height_out       = height;
-    if (enc_type_out)     *enc_type_out     = enc;
-    if (consumed_out)     *consumed_out     = consumed;
+    if (header_type_out)
+        *header_type_out = hdr;
+    if (vert_offset_out)
+        *vert_offset_out = vert;
+    if (horiz_offset_out)
+        *horiz_offset_out = horiz;
+    if (width_out)
+        *width_out = width;
+    if (height_out)
+        *height_out = height;
+    if (enc_type_out)
+        *enc_type_out = enc;
+    if (consumed_out)
+        *consumed_out = consumed;
     return 1;
 }
 
 /* No-header VSI decode.
    Layout: [width_px][raw bitmap]
    Height is not stored in the data — it must be supplied from the table descriptor. */
-int apexsprite_decode_noheader(const uint8_t *src, size_t src_size,
-                               uint8_t *dest,
-                               uint8_t table_height,
-                               uint8_t *width_out,
-                               size_t  *consumed_out)
-{
+int apexsprite_decode_noheader(const uint8_t *src, size_t src_size, uint8_t *dest,
+                               uint8_t table_height, uint8_t *width_out, size_t *consumed_out) {
     uint8_t width, row_bytes;
     size_t page_bytes;
 
-    if (!src || !dest || src_size < 1u || table_height == 0) return 0;
-    if (table_height > APEX_SPRITE_MAX_HEIGHT) return 0;
+    if (!src || !dest || src_size < 1u || table_height == 0)
+        return 0;
+    if (table_height > APEX_SPRITE_MAX_HEIGHT)
+        return 0;
 
     width = src[0];
-    if (width == 0 || width > APEX_SPRITE_MAX_WIDTH) return 0;
+    if (width == 0 || width > APEX_SPRITE_MAX_WIDTH)
+        return 0;
 
-    row_bytes  = (uint8_t)((width + 7u) / 8u);
+    row_bytes = (uint8_t)((width + 7u) / 8u);
     page_bytes = (size_t)row_bytes * (size_t)table_height;
 
-    if (src_size < 1u + page_bytes) return 0;
+    if (src_size < 1u + page_bytes)
+        return 0;
 
     memset(dest, 0, APEX_SPRITE_MAX_BYTES);
     memcpy(dest, src + 1u, page_bytes);
 
-    if (width_out)    *width_out    = width;
-    if (consumed_out) *consumed_out = 1u + page_bytes;
+    if (width_out)
+        *width_out = width;
+    if (consumed_out)
+        *consumed_out = 1u + page_bytes;
     return 1;
 }

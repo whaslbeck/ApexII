@@ -1,24 +1,23 @@
 #include "apeximgui_core.h"
 #include "cpu6809.h"
+
 #include <algorithm>
-#include <cstring>
-#include <strings.h>
 #include <cctype>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <strings.h>
 
 /* Bounded substring search within a single rendered line (line->text is NOT
    NUL-terminated — lines are '\n'-separated slices of one buffer, so strstr
    would run past the line). Defined below; forward-declared for early use. */
 static bool line_contains(const ApexRenderedLine *l, const char *needle);
 
-static int is_symbol_boundary_char(char ch)
-{
+static int is_symbol_boundary_char(char ch) {
     return !std::isalnum((unsigned char)ch) && ch != '_' && ch != '.' && ch != '$';
 }
 
-static std::string line_target_search_text(const ApexRenderedLine *line)
-{
+static std::string line_target_search_text(const ApexRenderedLine *line) {
     std::string text = line_to_string(line);
     size_t cp = text.find(';');
     if (cp == std::string::npos) {
@@ -27,7 +26,8 @@ static std::string line_target_search_text(const ApexRenderedLine *line)
     // Keep the full text for "; referenced_by ..." comment lines so that the
     // label tokens inside (e.g. "code:B20_A4007") are reachable by double-click.
     const char *after = text.c_str() + cp + 1;
-    while (*after == ' ' || *after == '\t') after++;
+    while (*after == ' ' || *after == '\t')
+        after++;
     if (strncmp(after, "referenced_by", 13) == 0) {
         return text;
     }
@@ -35,8 +35,7 @@ static std::string line_target_search_text(const ApexRenderedLine *line)
     return text;
 }
 
-static void update_label_index(const ApexRenderedDocument *document, UiState *state)
-{
+static void update_label_index(const ApexRenderedDocument *document, UiState *state) {
     state->cached_labels.clear();
     for (size_t i = 0; i < document->line_count; i++) {
         const ApexRenderedLine *l = &document->lines[i];
@@ -46,21 +45,29 @@ static void update_label_index(const ApexRenderedDocument *document, UiState *st
         state->cached_labels.push_back({i, l->bank, l->cpu_addr, label_name(l), l->block_kind});
     }
     std::sort(state->cached_labels.begin(), state->cached_labels.end(),
-        [](const LabelIndexEntry &a, const LabelIndexEntry &b) {
-            if (a.bank != b.bank) {
-                return a.bank < b.bank;
-            }
-            if (a.cpu_addr != b.cpu_addr) {
-                return a.cpu_addr < b.cpu_addr;
-            }
-            return a.name < b.name;
-        });
+              [](const LabelIndexEntry &a, const LabelIndexEntry &b) {
+                  if (a.bank != b.bank) {
+                      return a.bank < b.bank;
+                  }
+                  if (a.cpu_addr != b.cpu_addr) {
+                      return a.cpu_addr < b.cpu_addr;
+                  }
+                  return a.name < b.name;
+              });
+    state->cached_label_by_name.clear();
+    for (size_t i = 0; i < state->cached_labels.size(); i++) {
+        std::string key = state->cached_labels[i].name;
+        for (auto &ch : key) {
+            ch = (char)tolower((unsigned char)ch);
+        }
+        state->cached_label_by_name[key].push_back((uint32_t)i);
+    }
+    state->cached_labels_gen = document->generation;
     state->labels_valid = true;
 }
 
 static int get_or_create_graph_node(UiState *state, const ApexRenderedDocument *document,
-                                    uint8_t bank, uint32_t addr, int layer)
-{
+                                    uint8_t bank, uint32_t addr, int layer) {
     size_t lidx;
     if (!find_routine_start(document, bank, addr, &lidx)) {
         return -1;
@@ -86,13 +93,11 @@ static int get_or_create_graph_node(UiState *state, const ApexRenderedDocument *
 }
 
 static void traverse_graph_incoming(ApexProject *project, const ApexRenderedDocument *document,
-                                    UiState *state, int node_idx, int depth)
-{
+                                    UiState *state, int node_idx, int depth) {
     if (depth <= 0) {
         return;
     }
-    auto refs = find_incoming_refs(project, document, state,
-                                   state->graph_nodes[node_idx].bank,
+    auto refs = find_incoming_refs(project, document, state, state->graph_nodes[node_idx].bank,
                                    state->graph_nodes[node_idx].addr);
     for (auto &ref : refs) {
         int p_idx = get_or_create_graph_node(state, document, ref.bank, ref.cpu_addr,
@@ -114,8 +119,7 @@ static void traverse_graph_incoming(ApexProject *project, const ApexRenderedDocu
 }
 
 static void traverse_graph_outgoing(ApexProject *project, const ApexRenderedDocument *document,
-                                    UiState *state, int node_idx, int depth)
-{
+                                    UiState *state, int node_idx, int depth) {
     if (depth <= 0) {
         return;
     }
@@ -157,8 +161,8 @@ static void traverse_graph_outgoing(ApexProject *project, const ApexRenderedDocu
     }
 }
 
-static const SnapshotLabel *find_snapshot_label(const OriginalSnapshot *s, int hb, uint8_t b, uint32_t a)
-{
+static const SnapshotLabel *find_snapshot_label(const OriginalSnapshot *s, int hb, uint8_t b,
+                                                uint32_t a) {
     for (auto &i : s->labels) {
         if (i.has_bank == hb && i.bank == b && i.addr == a) {
             return &i;
@@ -167,8 +171,8 @@ static const SnapshotLabel *find_snapshot_label(const OriginalSnapshot *s, int h
     return NULL;
 }
 
-static const SnapshotEntry *find_snapshot_entry(const OriginalSnapshot *s, int hb, uint8_t b, uint32_t a)
-{
+static const SnapshotEntry *find_snapshot_entry(const OriginalSnapshot *s, int hb, uint8_t b,
+                                                uint32_t a) {
     for (auto &i : s->entries) {
         if (i.has_bank == hb && i.bank == b && i.addr == a) {
             return &i;
@@ -177,8 +181,7 @@ static const SnapshotEntry *find_snapshot_entry(const OriginalSnapshot *s, int h
     return NULL;
 }
 
-static const SnapshotData *find_snapshot_data(const OriginalSnapshot *s, uint8_t b, uint32_t a)
-{
+static const SnapshotData *find_snapshot_data(const OriginalSnapshot *s, uint8_t b, uint32_t a) {
     for (auto &i : s->data) {
         if (i.bank == b && i.addr == a) {
             return &i;
@@ -187,8 +190,7 @@ static const SnapshotData *find_snapshot_data(const OriginalSnapshot *s, uint8_t
     return NULL;
 }
 
-static const SnapshotTable *find_snapshot_table(const OriginalSnapshot *s, uint8_t b, uint32_t a)
-{
+static const SnapshotTable *find_snapshot_table(const OriginalSnapshot *s, uint8_t b, uint32_t a) {
     for (auto &i : s->tables) {
         if (i.bank == b && i.addr == a) {
             return &i;
@@ -197,8 +199,8 @@ static const SnapshotTable *find_snapshot_table(const OriginalSnapshot *s, uint8
     return NULL;
 }
 
-static const SnapshotDoc *find_snapshot_doc(const std::vector<SnapshotDoc> &ds, int hb, uint8_t b, uint32_t a)
-{
+static const SnapshotDoc *find_snapshot_doc(const std::vector<SnapshotDoc> &ds, int hb, uint8_t b,
+                                            uint32_t a) {
     for (auto &i : ds) {
         if (i.has_bank == hb && i.bank == b && i.addr == a) {
             return &i;
@@ -207,14 +209,11 @@ static const SnapshotDoc *find_snapshot_doc(const std::vector<SnapshotDoc> &ds, 
     return NULL;
 }
 
-static const char *basename_ptr(const char *p)
-{
-    const char *s = strrchr(p, '/');
-    return s ? s + 1 : p;
+static const char *basename_ptr(const char *p) {
+    return apex_path_basename(p);
 }
 
-static void write_config_address(FILE *o, int hb, uint8_t b, uint32_t a)
-{
+static void write_config_address(FILE *o, int hb, uint8_t b, uint32_t a) {
     if (hb) {
         fprintf(o, "B%02x_A%04x", b, (unsigned)a & 0xffff);
     } else if ((a & 0xffff) >= 0x8000u) {
@@ -226,8 +225,7 @@ static void write_config_address(FILE *o, int hb, uint8_t b, uint32_t a)
     }
 }
 
-static void write_escaped_value(FILE *o, const char *v)
-{
+static void write_escaped_value(FILE *o, const char *v) {
     int q = 0;
     for (const char *p = v; *p; p++) {
         if (*p == '\n' || *p == ';' || *p == '#' || *p == '\\' || *p == '"' ||
@@ -243,53 +241,79 @@ static void write_escaped_value(FILE *o, const char *v)
     fputc('"', o);
     for (const char *p = v; *p; p++) {
         switch (*p) {
-        case '\n': fputs("\\n", o);  break;
-        case ';':  fputs("\\;", o);  break;
-        case '#':  fputs("\\#", o);  break;
-        case '\\': fputs("\\\\", o); break;
-        case '"':  fputs("\\\"", o); break;
-        default:   fputc(*p, o);     break;
+        case '\n':
+            fputs("\\n", o);
+            break;
+        case ';':
+            fputs("\\;", o);
+            break;
+        case '#':
+            fputs("\\#", o);
+            break;
+        case '\\':
+            fputs("\\\\", o);
+            break;
+        case '"':
+            fputs("\\\"", o);
+            break;
+        default:
+            fputc(*p, o);
+            break;
         }
     }
     fputc('"', o);
 }
 
-static const char *table_field_kind_name(TableFieldKind k)
-{
+static const char *table_field_kind_name(TableFieldKind k) {
     switch (k) {
-    case TABLE_PTR16_STRING:      return "ptr16_string";
-    case TABLE_PTR16_DATA:        return "ptr16_data";
-    case TABLE_PTR16_CODE:        return "ptr16_code";
-    case TABLE_PTR16_TABLE:       return "ptr16_table";
-    case TABLE_PTR16_DMD_FULLFRAME: return "ptr16_dmd_fullframe";
-    case TABLE_PTR16_SPRITE:      return "ptr16_sprite";
-    case TABLE_FAR_SPRITE:        return "far_sprite";
-    case TABLE_FAR_STRING:        return "far_string";
-    case TABLE_FAR_DATA:          return "far_data";
-    case TABLE_FAR_TABLE:         return "far_table";
-    case TABLE_FAR_CODE:          return "far_code";
-    case TABLE_FAR_DMD_FULLFRAME: return "far_dmd_fullframe";
-    case TABLE_BYTE:              return "byte";
-    case TABLE_WORD:              return "word";
-    case TABLE_BYTES_UNTIL:       return "bytes_until";
-    case TABLE_COUNTED_BYTES:     return "counted_bytes";
-    default:                      return "byte";
+    case TABLE_PTR16_STRING:
+        return "ptr16_string";
+    case TABLE_PTR16_DATA:
+        return "ptr16_data";
+    case TABLE_PTR16_CODE:
+        return "ptr16_code";
+    case TABLE_PTR16_TABLE:
+        return "ptr16_table";
+    case TABLE_PTR16_DMD_FULLFRAME:
+        return "ptr16_dmd_fullframe";
+    case TABLE_PTR16_SPRITE:
+        return "ptr16_sprite";
+    case TABLE_FAR_SPRITE:
+        return "far_sprite";
+    case TABLE_FAR_STRING:
+        return "far_string";
+    case TABLE_FAR_DATA:
+        return "far_data";
+    case TABLE_FAR_TABLE:
+        return "far_table";
+    case TABLE_FAR_CODE:
+        return "far_code";
+    case TABLE_FAR_DMD_FULLFRAME:
+        return "far_dmd_fullframe";
+    case TABLE_BYTE:
+        return "byte";
+    case TABLE_WORD:
+        return "word";
+    case TABLE_BYTES_UNTIL:
+        return "bytes_until";
+    case TABLE_COUNTED_BYTES:
+        return "counted_bytes";
+    default:
+        return "byte";
     }
 }
 
-static std::string table_schema_to_string(const TableSchema *s)
-{
+static std::string table_schema_to_string(const TableSchema *s) {
     std::string t;
     for (size_t i = 0; i < s->count; i++) {
         if (i != 0) {
             t += ", ";
         }
-        const char *name = s->items[i].type_name ? s->items[i].type_name
-                                                  : table_field_kind_name(s->items[i].kind);
+        const char *name =
+            s->items[i].type_name ? s->items[i].type_name : table_field_kind_name(s->items[i].kind);
         t += name;
         if (!s->items[i].type_name && s->items[i].param &&
-            (s->items[i].kind == TABLE_PTR16_SPRITE ||
-             s->items[i].kind == TABLE_FAR_SPRITE)) {
+            (s->items[i].kind == TABLE_PTR16_SPRITE || s->items[i].kind == TABLE_FAR_SPRITE)) {
             t += "(" + std::to_string(s->items[i].param) + ")";
         }
         if (!s->items[i].type_name && s->items[i].kind == TABLE_BYTES_UNTIL) {
@@ -304,14 +328,12 @@ static std::string table_schema_to_string(const TableSchema *s)
     return t;
 }
 
-static std::string data_range_spec_string(const DataRange *r)
-{
+static std::string data_range_spec_string(const DataRange *r) {
     char buf[48];
     return data_range_spec(r, buf, sizeof(buf));
 }
 
-std::string table_def_spec_string(const TableDef *t)
-{
+std::string table_def_spec_string(const TableDef *t) {
     std::string s = table_schema_to_string(&t->schema);
     if (t->has_header) {
         return "counted(" + s + ")";
@@ -319,33 +341,34 @@ std::string table_def_spec_string(const TableDef *t)
     return "rows[" + std::to_string(t->rows) + "](" + s + ")";
 }
 
-std::string inline_sig_spec_string(const InlineSignature *s)
-{
+std::string inline_sig_spec_string(const InlineSignature *s) {
     if (!s) {
         return "";
     }
     return table_schema_to_string(&s->schema);
 }
 
-void select_line(UiState *s, size_t i, int r)
-{
+void select_line(UiState *s, size_t i, int r) {
     if (r) {
         s->request_scroll_to_selection = 1;
     }
     if (s->selected_line == i) {
         return;
     }
-    if (!s->suppress_history_push) {
+    if (!s->suppress_history_push &&
+        (s->history_back.empty() || s->history_back.back() != s->selected_line)) {
         s->history_back.push_back(s->selected_line);
         s->history_forward.clear();
+        /* bounded: drop the oldest entries in one batch */
+        if (s->history_back.size() > 256)
+            s->history_back.erase(s->history_back.begin(), s->history_back.begin() + 56);
     }
     s->selected_line = i;
     if (!s->graph_pinned)
         s->graph_needs_rebuild = true;
 }
 
-void handle_line_selection(UiState *s, size_t i, bool sh)
-{
+void handle_line_selection(UiState *s, size_t i, bool sh) {
     if (sh) {
         /* Shift-click sets/extends the explicit block, anchored at the cursor. */
         if (!s->block_active) {
@@ -353,15 +376,14 @@ void handle_line_selection(UiState *s, size_t i, bool sh)
             s->block_active = true;
         }
         s->block_b = i;
-        s->selected_line = i;              /* cursor follows the extend */
+        s->selected_line = i; /* cursor follows the extend */
         s->request_scroll_to_selection = 1;
     } else {
-        select_line(s, i, 0);              /* cursor only; block untouched */
+        select_line(s, i, 0); /* cursor only; block untouched */
     }
 }
 
-void history_jump(UiState *s, int b)
-{
+void history_jump(UiState *s, int b) {
     size_t t;
     if (b) {
         if (s->history_back.empty()) {
@@ -386,13 +408,11 @@ void history_jump(UiState *s, int b)
     s->suppress_history_push = 0;
 }
 
-void set_status(UiState *s, const char *m)
-{
+void set_status(UiState *s, const char *m) {
     snprintf(s->status_message, sizeof(s->status_message), "%s", m);
 }
 
-int selected_address(const ApexRenderedDocument *d, const UiState *s, uint8_t *b, uint32_t *a)
-{
+int selected_address(const ApexRenderedDocument *d, const UiState *s, uint8_t *b, uint32_t *a) {
     if (!d || s->selected_line >= d->line_count) {
         return 0;
     }
@@ -405,8 +425,8 @@ int selected_address(const ApexRenderedDocument *d, const UiState *s, uint8_t *b
     return 1;
 }
 
-LineByteSpan selected_line_span(const ApexProject *p, const ApexRenderedDocument *d, const UiState *s)
-{
+LineByteSpan selected_line_span(const ApexProject *p, const ApexRenderedDocument *d,
+                                const UiState *s) {
     LineByteSpan sp = {0, 0, 0};
     if (!p || !d || s->selected_line >= d->line_count || !d->lines[s->selected_line].has_location) {
         return sp;
@@ -431,9 +451,8 @@ LineByteSpan selected_line_span(const ApexProject *p, const ApexRenderedDocument
     return sp;
 }
 
-int project_locate_rom_bytes(const ApexProject *p, uint8_t b, uint32_t a,
-                             const uint8_t **s, size_t *l, size_t *ro)
-{
+int project_locate_rom_bytes(const ApexProject *p, uint8_t b, uint32_t a, const uint8_t **s,
+                             size_t *l, size_t *ro) {
     size_t o;
     if (b == 0xffu) {
         if (a < 0x8000 || a >= 0x10000) {
@@ -461,13 +480,11 @@ int project_locate_rom_bytes(const ApexProject *p, uint8_t b, uint32_t a,
     return 1;
 }
 
-std::string line_to_string(const ApexRenderedLine *l)
-{
+std::string line_to_string(const ApexRenderedLine *l) {
     return std::string(l->text, l->length);
 }
 
-std::string label_name(const ApexRenderedLine *l)
-{
+std::string label_name(const ApexRenderedLine *l) {
     std::string n;
     for (size_t i = 0; i < l->length; i++) {
         char c = l->text[i];
@@ -479,15 +496,13 @@ std::string label_name(const ApexRenderedLine *l)
     return n;
 }
 
-void ensure_label_index(const ApexRenderedDocument *d, UiState *s)
-{
-    if (!s->labels_valid) {
+void ensure_label_index(const ApexRenderedDocument *d, UiState *s) {
+    if (!s->labels_valid || s->cached_labels_gen != d->generation) {
         update_label_index(d, s);
     }
 }
 
-int label_entry_matches_filter(const LabelIndexEntry &e, const char *f)
-{
+int label_entry_matches_filter(const LabelIndexEntry &e, const char *f) {
     if (!f || !*f) {
         return 1;
     }
@@ -498,7 +513,7 @@ int label_entry_matches_filter(const LabelIndexEntry &e, const char *f)
     for (size_t i = 0; i + fl <= e.name.size(); i++) {
         size_t j;
         for (j = 0; j < fl; j++) {
-            if (tolower((unsigned char)e.name[i+j]) != tolower((unsigned char)f[j])) {
+            if (tolower((unsigned char)e.name[i + j]) != tolower((unsigned char)f[j])) {
                 break;
             }
         }
@@ -509,8 +524,7 @@ int label_entry_matches_filter(const LabelIndexEntry &e, const char *f)
     return 0;
 }
 
-std::string label_at_address(const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a)
-{
+std::string label_at_address(const ApexRenderedDocument *d, UiState *s, uint8_t b, uint32_t a) {
     ensure_label_index(d, s);
     /* Binary search — cached_labels is sorted by (bank, cpu_addr). */
     const auto &cl = s->cached_labels;
@@ -528,8 +542,7 @@ std::string label_at_address(const ApexRenderedDocument *d, UiState *s, uint8_t 
 }
 
 std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, UiState *s,
-                                               const ApexRenderedLine *l)
-{
+                                               const ApexRenderedLine *l) {
     std::vector<LineTargetEntry> ts;
     std::string t = line_target_search_text(l);
     size_t p = 0;
@@ -547,11 +560,14 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
         }
         size_t en = p;
         bool matched = false;
-        for (auto &e : s->cached_labels) {
-            if (e.name.size() != en - st ||
-                strncasecmp(t.data() + st, e.name.data(), en - st) != 0) {
-                continue;
-            }
+        std::string key(t, st, en - st);
+        for (auto &ch : key) {
+            ch = (char)tolower((unsigned char)ch);
+        }
+        auto hit = s->cached_label_by_name.find(key);
+        const std::vector<uint32_t> no_hits;
+        for (uint32_t idx : hit != s->cached_label_by_name.end() ? hit->second : no_hits) {
+            const auto &e = s->cached_labels[idx];
             if (l->kind == APEX_RENDER_LINE_LABEL && e.line_index == (size_t)(l - d->lines)) {
                 continue;
             }
@@ -575,15 +591,18 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
             tok_buf[9] = '\0';
             if (sscanf(tok_buf, "B%2x_A%4x", &tok_bank, &tok_addr) == 2) {
                 size_t tli = 0;
-                if (apex_render_find_line_by_address(d, (uint8_t)tok_bank,
-                                                     (uint32_t)tok_addr, &tli)) {
+                if (apex_render_find_line_by_address(d, (uint8_t)tok_bank, (uint32_t)tok_addr,
+                                                     &tli)) {
                     bool dupe = false;
                     for (auto &ti : ts) {
-                        if (ti.line_index == tli) { dupe = true; break; }
+                        if (ti.line_index == tli) {
+                            dupe = true;
+                            break;
+                        }
                     }
                     if (!dupe) {
-                        ts.push_back({tli, (uint8_t)tok_bank, (uint32_t)tok_addr,
-                                      std::string(tok_buf), st});
+                        ts.push_back(
+                            {tli, (uint8_t)tok_bank, (uint32_t)tok_addr, std::string(tok_buf), st});
                     }
                 }
             }
@@ -601,8 +620,7 @@ std::vector<LineTargetEntry> find_line_targets(const ApexRenderedDocument *d, Ui
 /* Whole-buffer strchr/strstr would overrun: ApexRenderedLine.text is NOT
    NUL-terminated (lines are '\n'-separated slices of one buffer), so search
    only within the line's own length. */
-static bool line_contains(const ApexRenderedLine *l, const char *needle)
-{
+static bool line_contains(const ApexRenderedLine *l, const char *needle) {
     size_t nl = strlen(needle);
     if (nl == 0 || nl > l->length) {
         return false;
@@ -615,9 +633,8 @@ static bool line_contains(const ApexRenderedLine *l, const char *needle)
     return false;
 }
 
-int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l,
-                           uint8_t *tb, uint32_t *ta, int *f)
-{
+int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l, uint8_t *tb,
+                           uint32_t *ta, int *f) {
     const uint8_t *src;
     size_t len;
     if (!l->has_location) {
@@ -637,15 +654,15 @@ int resolve_pointer_target(const ApexProject *p, const ApexRenderedLine *l,
             *tb = src[2];
             *f = 1;
         } else if (*ta >= 0x8000u) {
-            *tb = 0xffu;  /* a 2-byte pointer into 0x8000+ targets the system bank */
+            *tb = 0xffu; /* a 2-byte pointer into 0x8000+ targets the system bank */
         }
         return 1;
     }
     return 0;
 }
 
-int jump_to_first_line_target(const ApexRenderedDocument *d, UiState *s, const ApexRenderedLine *l)
-{
+int jump_to_first_line_target(const ApexRenderedDocument *d, UiState *s,
+                              const ApexRenderedLine *l) {
     auto ts = find_line_targets(d, s, l);
     if (ts.empty()) {
         return 0;
@@ -654,16 +671,14 @@ int jump_to_first_line_target(const ApexRenderedDocument *d, UiState *s, const A
     return 1;
 }
 
-void follow_selected_link(const ApexRenderedDocument *d, UiState *s)
-{
+void follow_selected_link(const ApexRenderedDocument *d, UiState *s) {
     if (d && s->selected_line < d->line_count) {
         jump_to_first_line_target(d, s, &d->lines[s->selected_line]);
     }
 }
 
 std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRenderedDocument *d,
-                                         UiState *s, uint8_t b, uint32_t a)
-{
+                                         UiState *s, uint8_t b, uint32_t a) {
     std::vector<RefEntry> rs;
     /* Use binary search when sorted (always true after analysis). */
     size_t start = p->refs.sorted ? refs_lower_bound(&p->refs, b, a) : 0;
@@ -679,38 +694,44 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
         if (apex_render_find_line_by_address(d, r.source_bank, r.source_addr, &li)) {
             rs.push_back({li, r.source_bank, r.source_addr,
                           label_at_address(d, s, r.source_bank, r.source_addr),
-                          r.kind ? r.kind : "",
-                          r.row_index, r.row_cpu_addr});
+                          r.kind ? r.kind : "", r.row_index, r.row_cpu_addr});
         }
     }
     std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank) return a.bank < b.bank;
-        if (a.cpu_addr != b.cpu_addr) return a.cpu_addr < b.cpu_addr;
-        if (a.kind != b.kind) return a.kind < b.kind;
+        if (a.bank != b.bank)
+            return a.bank < b.bank;
+        if (a.cpu_addr != b.cpu_addr)
+            return a.cpu_addr < b.cpu_addr;
+        if (a.kind != b.kind)
+            return a.kind < b.kind;
         return a.row_index < b.row_index;
     });
     /* Collapse multiple references from the same source+kind into one (e.g. a
        text table that points at the same string from several rows) — they all
        navigate to the same source line, so distinct row indices are just noise
        and would also produce duplicate-looking popup rows. */
-    rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
-    }), rs.end());
+    rs.erase(std::unique(rs.begin(), rs.end(),
+                         [](const RefEntry &a, const RefEntry &b) {
+                             return a.bank == b.bank && a.cpu_addr == b.cpu_addr &&
+                                    a.kind == b.kind;
+                         }),
+             rs.end());
     return rs;
 }
 
 std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRenderedDocument *d,
-                                         UiState *s, uint8_t b, uint32_t a)
-{
+                                         UiState *s, uint8_t b, uint32_t a) {
     std::vector<RefEntry> rs;
     /* Rebuild the (source_bank, source_addr) index when the analysis changed. */
     if (s->cached_out_ref_gen != d->generation) {
         std::vector<uint32_t> &ord = s->cached_out_ref_order;
         ord.resize(p->refs.count);
-        for (size_t i = 0; i < p->refs.count; i++) ord[i] = (uint32_t)i;
+        for (size_t i = 0; i < p->refs.count; i++)
+            ord[i] = (uint32_t)i;
         std::sort(ord.begin(), ord.end(), [&](uint32_t x, uint32_t y) {
             const auto &rx = p->refs.items[x], &ry = p->refs.items[y];
-            if (rx.source_bank != ry.source_bank) return rx.source_bank < ry.source_bank;
+            if (rx.source_bank != ry.source_bank)
+                return rx.source_bank < ry.source_bank;
             return rx.source_addr < ry.source_addr;
         });
         s->cached_out_ref_gen = d->generation;
@@ -721,8 +742,10 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
     while (lo < hi) {
         size_t mid = lo + (hi - lo) / 2;
         const auto &r = p->refs.items[ord[mid]];
-        if (r.source_bank < b || (r.source_bank == b && r.source_addr < a)) lo = mid + 1;
-        else hi = mid;
+        if (r.source_bank < b || (r.source_bank == b && r.source_addr < a))
+            lo = mid + 1;
+        else
+            hi = mid;
     }
     for (size_t k = lo; k < ord.size(); k++) {
         const auto &r = p->refs.items[ord[k]];
@@ -731,24 +754,27 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
             break;
         }
         if (apex_render_find_line_by_address(d, r.bank, r.addr, &li)) {
-            rs.push_back({li, r.bank, r.addr,
-                          label_at_address(d, s, r.bank, r.addr),
+            rs.push_back({li, r.bank, r.addr, label_at_address(d, s, r.bank, r.addr),
                           r.kind ? r.kind : "", -1, 0u});
         }
     }
     std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank) return a.bank < b.bank;
-        if (a.cpu_addr != b.cpu_addr) return a.cpu_addr < b.cpu_addr;
+        if (a.bank != b.bank)
+            return a.bank < b.bank;
+        if (a.cpu_addr != b.cpu_addr)
+            return a.cpu_addr < b.cpu_addr;
         return a.kind < b.kind;
     });
-    rs.erase(std::unique(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        return a.bank == b.bank && a.cpu_addr == b.cpu_addr && a.kind == b.kind;
-    }), rs.end());
+    rs.erase(std::unique(rs.begin(), rs.end(),
+                         [](const RefEntry &a, const RefEntry &b) {
+                             return a.bank == b.bank && a.cpu_addr == b.cpu_addr &&
+                                    a.kind == b.kind;
+                         }),
+             rs.end());
     return rs;
 }
 
-int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, size_t *o)
-{
+int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, size_t *o) {
     size_t li;
     if (!apex_render_find_line_by_address(d, b, a, &li)) {
         return 0;
@@ -765,7 +791,8 @@ int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, siz
     for (size_t fwd = li; fwd < d->line_count; fwd++) {
         const ApexRenderedLine *fl = &d->lines[fwd];
         if (fl->has_location) {
-            if (fl->bank != b || fl->cpu_addr != a) break;
+            if (fl->bank != b || fl->cpu_addr != a)
+                break;
             if (fl->kind == APEX_RENDER_LINE_LABEL) {
                 *o = fwd;
                 return 1;
@@ -785,26 +812,27 @@ int find_routine_start(const ApexRenderedDocument *d, uint8_t b, uint32_t a, siz
     return 1;
 }
 
-void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
+void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
     uint8_t b;
     uint32_t a;
     if (s->graph_pinned) {
         b = s->graph_pinned_bank;
         a = s->graph_pinned_addr;
     } else {
-        if (!d || s->selected_line >= d->line_count) return;
+        if (!d || s->selected_line >= d->line_count)
+            return;
         size_t li = s->selected_line;
 
         /* Step 1: find the nearest has_location line at or before the cursor.
            This resolves the reference address even when the cursor sits on a
            non-located doc-comment line (has_location=false). */
         size_t ref = li;
-        while (ref > 0 && !d->lines[ref].has_location) ref--;
+        while (ref > 0 && !d->lines[ref].has_location)
+            ref--;
 
         bool found = false;
         if (d->lines[ref].has_location) {
-            uint8_t  cb = d->lines[ref].bank;
+            uint8_t cb = d->lines[ref].bank;
             uint32_t ca = d->lines[ref].cpu_addr;
 
             /* Step 2: scan forward from ref looking for a LABEL at address
@@ -814,7 +842,8 @@ void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *
             for (size_t fwd = ref; fwd < d->line_count; fwd++) {
                 const ApexRenderedLine *fl = &d->lines[fwd];
                 if (fl->has_location) {
-                    if (fl->bank != cb || fl->cpu_addr != ca) break;
+                    if (fl->bank != cb || fl->cpu_addr != ca)
+                        break;
                     if (fl->kind == APEX_RENDER_LINE_LABEL) {
                         b = fl->bank;
                         a = fl->cpu_addr;
@@ -829,9 +858,9 @@ void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *
         if (!found) {
             /* Step 3: cursor is mid-function — walk backward to the nearest
                preceding label. */
-            while (!(d->lines[li].kind == APEX_RENDER_LINE_LABEL &&
-                     d->lines[li].has_location)) {
-                if (li == 0) return;
+            while (!(d->lines[li].kind == APEX_RENDER_LINE_LABEL && d->lines[li].has_location)) {
+                if (li == 0)
+                    return;
                 li--;
             }
             b = d->lines[li].bank;
@@ -848,8 +877,7 @@ void rebuild_call_graph(ApexProject *p, const ApexRenderedDocument *d, UiState *
     s->graph_needs_rebuild = false;
 }
 
-bool select_line_by_address(const ApexRenderedDocument *d, UiState *s)
-{
+bool select_line_by_address(const ApexRenderedDocument *d, UiState *s) {
     uint8_t b;
     uint32_t a;
     size_t li;
@@ -882,19 +910,21 @@ bool select_line_by_address(const ApexRenderedDocument *d, UiState *s)
     return false;
 }
 
-void jump_to_transition(const ApexRenderedDocument *d, UiState *s,
-                        ApexRenderedTransitionKind k, int f)
-{
+void jump_to_transition(const ApexRenderedDocument *d, UiState *s, ApexRenderedTransitionKind k,
+                        int f) {
     size_t li = s->selected_line;
+    /* find_prev_transition includes its start line; start one above the
+       selection so "previous" moves off a transition line instead of sticking. */
+    if (!f && li == 0)
+        return;
     const auto *l = f ? apex_render_find_next_transition(d, li, k, &li)
-                      : apex_render_find_prev_transition(d, li, k, &li);
+                      : apex_render_find_prev_transition(d, li - 1u, k, &li);
     if (l) {
         select_line(s, li, 1);
     }
 }
 
-void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delta)
-{
+void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delta) {
     if (!d || d->line_count == 0) {
         return;
     }
@@ -908,7 +938,12 @@ void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delt
             n = d->line_count - 1;
         }
     }
+    /* Line-by-line / page scrolling is not a jump: keep it out of the history
+       (otherwise Back would step one line at a time). */
+    int prev_suppress = s->suppress_history_push;
+    s->suppress_history_push = 1;
     select_line(s, n, 1);
+    s->suppress_history_push = prev_suppress;
 }
 
 /* First located line of a distinct classification region — the anchor the N/P
@@ -916,8 +951,7 @@ void move_selection_relative(const ApexRenderedDocument *d, UiState *s, int delt
    code / data / table / sprite / unclassified / free) or the start of a new
    bank, so every region (incl. data sitting between a sprite and a table, and
    the first byte of each bank after an end-of-bank fill) is reachable. */
-static bool nav_is_boundary(const ApexRenderedDocument *d, size_t i)
-{
+static bool nav_is_boundary(const ApexRenderedDocument *d, size_t i) {
     const ApexRenderedLine *l = &d->lines[i];
     if (!l->has_location) {
         return false; /* anchors are real addresses so the hex view can follow */
@@ -935,8 +969,7 @@ static bool nav_is_boundary(const ApexRenderedDocument *d, size_t i)
     return true; /* very first located line = start of the first bank */
 }
 
-void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
-{
+void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f) {
     if (!d || d->line_count == 0) {
         return;
     }
@@ -957,14 +990,20 @@ void jump_primary_transition(const ApexRenderedDocument *d, UiState *s, int f)
     }
 }
 
-void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
+void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
     uint8_t b;
     uint32_t a;
-    if (s->editor_bound_line == s->selected_line) {
+    /* The editor acts on the exact hex byte when the hex view is the edit
+       target (see render_editor), so its fields must be filled for that byte,
+       not for the start of the disassembly line. */
+    size_t hex = (s->hex_is_edit_target && s->hex_selected_offset < p->rom.size)
+                     ? s->hex_selected_offset
+                     : (size_t)-1;
+    if (s->editor_bound_line == s->selected_line && s->editor_bound_hex == hex) {
         return;
     }
     s->editor_bound_line = s->selected_line;
+    s->editor_bound_hex = hex;
     s->edit_label_input[0] = '\0';
     s->edit_inline_count = 0;
     s->edit_inline_flow_stop = false;
@@ -972,7 +1011,8 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
     s->edit_data_length = 1;
     s->edit_table_rows = 1;
     s->edit_table_is_rows = 0;
-    if (!selected_address(d, s, &b, &a)) {
+    if (hex != (size_t)-1 ? !rom_offset_to_cpu_address(p, hex, &b, &a)
+                          : !selected_address(d, s, &b, &a)) {
         s->edit_doc_input[0] = '\0';
         return;
     }
@@ -999,21 +1039,19 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
         }
     }
     load_doc_editor_buffer(p, s, b, a);
-    const char *m = strstr(d->lines[s->selected_line].text, "; data type=");
-    if (m) {
-        m += 12;
-        const char *end = m;
-        while (*end && *end != '\n') end++;
-        char sp[128];
-        size_t len = (size_t)(end - m);
-        if (len >= sizeof(sp)) len = sizeof(sp) - 1;
-        memcpy(sp, m, len);
-        sp[len] = '\0';
-        if (strcmp(sp, "string") == 0) {
-            s->edit_data_length = 0;
-        } else if (strncmp(sp, "bytes[", 6) == 0) {
-            s->edit_data_length = atoi(sp + 6);
-            if (s->edit_data_length < 1) s->edit_data_length = 1;
+    /* Pre-fill the data length (D key) from the [data] range starting here.
+       (This used to parse the rendered "; data type=" comment with strstr on
+       the non-NUL-terminated line text, which ran into later lines, and it
+       expected a "bytes[N]" form the renderer never emits.) */
+    for (size_t i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *r = &p->data_ranges.items[i];
+        if (r->bank == b && r->addr == a) {
+            if (r->kind == DATA_STRING) {
+                s->edit_data_length = 0;
+            } else if (r->kind == DATA_BYTES) {
+                s->edit_data_length = r->length > 0 ? (int)r->length : 1;
+            }
+            break;
         }
     }
 }
@@ -1024,28 +1062,76 @@ void sync_editor_state(const ApexProject *p, const ApexRenderedDocument *d, UiSt
    thread (showing a busy overlay meanwhile) and calls finish_async_rerender()
    when it completes. Deferring to the main loop keeps the render off the UI
    thread without any mid-frame project access from a button handler. */
-void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
-                           uint8_t b, uint32_t a)
-{
+static UiState::LineLoc line_loc(const ApexRenderedDocument *d, size_t li) {
+    UiState::LineLoc l = {false, 0, 0};
+    if (d && li < d->line_count && d->lines[li].has_location) {
+        l.has = true;
+        l.bank = d->lines[li].bank;
+        l.addr = d->lines[li].cpu_addr;
+    }
+    return l;
+}
+
+static bool line_from_loc(const ApexRenderedDocument *d, const UiState::LineLoc &l, size_t *li) {
+    return l.has && d && apex_render_find_line_by_address(d, l.bank, l.addr, li);
+}
+
+void rerender_and_reselect(ApexProject *p, const ApexRenderedDocument **dp, UiState *s, uint8_t b,
+                           uint32_t a) {
     (void)p;
-    (void)dp;
+    /* Save line-index state as locations while the old document is alive
+       (skipped if an earlier request in this frame already did). */
+    if (!s->line_locs_pending && dp && *dp) {
+        const ApexRenderedDocument *od = *dp;
+        s->history_back_loc.clear();
+        s->history_forward_loc.clear();
+        for (size_t li : s->history_back)
+            s->history_back_loc.push_back(line_loc(od, li));
+        for (size_t li : s->history_forward)
+            s->history_forward_loc.push_back(line_loc(od, li));
+        s->block_a_loc = line_loc(od, s->block_a);
+        s->block_b_loc = line_loc(od, s->block_b);
+        s->line_locs_pending = true;
+    }
     s->async_b = b;
     s->async_a = a;
     s->async_pending = true;
-    s->inline_edit_line = (size_t)-1;  /* line indices change on re-render */
+    s->inline_edit_line = (size_t)-1; /* line indices change on re-render */
 }
 
 /* Runs on the main thread after the worker finishes; *dp is the fresh document.
    Mirrors the old post-render tail of rerender_and_reselect. */
-void finish_async_rerender(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void finish_async_rerender(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     const ApexRenderedDocument *doc = *dp;
     size_t li = 0;
+    if (s->line_locs_pending) {
+        /* map history and block anchors onto the new document; entries whose
+           location no longer exists are dropped */
+        s->history_back.clear();
+        s->history_forward.clear();
+        for (const auto &l : s->history_back_loc)
+            if (line_from_loc(doc, l, &li))
+                s->history_back.push_back(li);
+        for (const auto &l : s->history_forward_loc)
+            if (line_from_loc(doc, l, &li))
+                s->history_forward.push_back(li);
+        if (s->block_active) {
+            size_t la, lb;
+            if (line_from_loc(doc, s->block_a_loc, &la) &&
+                line_from_loc(doc, s->block_b_loc, &lb)) {
+                s->block_a = la;
+                s->block_b = lb;
+            } else {
+                s->block_active = false;
+            }
+        }
+        s->line_locs_pending = false;
+        li = 0;
+    }
     s->labels_valid = false;
-    s->code_candidates_stale   = true;
-    s->inline_candidates_stale = true;
-    s->warnings_stale          = true;
-    s->flow_breaks_stale       = true;
+    s->code_candidates_stale = true;
+    s->warnings_stale = true;
+    s->flow_breaks_stale = true;
     if (doc && apex_render_find_line_by_address(doc, s->async_b, s->async_a, &li)) {
         s->suppress_history_push = 1;
         s->selected_line = li;
@@ -1053,13 +1139,11 @@ void finish_async_rerender(ApexProject *p, const ApexRenderedDocument **dp, UiSt
         s->editor_bound_line = (size_t)-1;
         s->suppress_history_push = 0;
     }
-    s->overlay_dirty = true;
     sync_editor_state(p, doc, s);
 }
 
 ApexRenderedBlockKind get_offset_kind(const ApexProject *project,
-                                      const ApexRenderedDocument *document, size_t offset)
-{
+                                      const ApexRenderedDocument *document, size_t offset) {
     (void)project;
     size_t line_idx;
     if (find_line_by_rom_offset(document, offset, &line_idx)) {
@@ -1068,8 +1152,7 @@ ApexRenderedBlockKind get_offset_kind(const ApexProject *project,
     return APEX_RENDER_BLOCK_DATA;
 }
 
-void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     s->last_classify_op = APEX_LAST_CLASSIFY_CODE;
     uint8_t b;
     uint32_t a;
@@ -1091,16 +1174,14 @@ void apply_code_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
 }
 
 void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
-                             const char *sp)
-{
+                             const char *sp) {
     s->last_classify_op = APEX_LAST_CLASSIFY_DATA;
     s->last_classify_spec = sp ? sp : "";
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
-        size_t base = s->hex_has_range
-            ? std::min(s->hex_anchor_offset, s->hex_block_end)
-            : s->hex_selected_offset;
+        size_t base = s->hex_has_range ? std::min(s->hex_anchor_offset, s->hex_block_end)
+                                       : s->hex_selected_offset;
         if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
         }
@@ -1112,19 +1193,18 @@ void apply_data_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
     if (apex_project_set_kind(p, 1, b, a, APEX_KIND_DATA, sp) == 0) {
         rerender_and_reselect(p, dp, s, b, a);
     } else {
-        set_status(s, "set data failed");
+        set_status(s,
+                   apex_project_last_error(p)[0] ? apex_project_last_error(p) : "set data failed");
     }
 }
 
-void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     s->last_classify_op = APEX_LAST_CLASSIFY_STRING;
     uint8_t b;
     uint32_t a;
     if (s->hex_is_edit_target) {
-        size_t base = s->hex_has_range
-            ? std::min(s->hex_anchor_offset, s->hex_block_end)
-            : s->hex_selected_offset;
+        size_t base = s->hex_has_range ? std::min(s->hex_anchor_offset, s->hex_block_end)
+                                       : s->hex_selected_offset;
         if (!rom_offset_to_cpu_address(p, base, &b, &a)) {
             return;
         }
@@ -1139,8 +1219,7 @@ void apply_string_at_selection(ApexProject *p, const ApexRenderedDocument **dp, 
 }
 
 void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s,
-                              const char *sp)
-{
+                              const char *sp) {
     s->last_classify_op = APEX_LAST_CLASSIFY_TABLE;
     s->last_classify_spec = sp ? sp : "";
     uint8_t b;
@@ -1156,11 +1235,13 @@ void apply_table_at_selection(ApexProject *p, const ApexRenderedDocument **dp, U
     }
     if (apex_project_set_kind(p, 1, b, a, APEX_KIND_TABLE, sp) == 0) {
         rerender_and_reselect(p, dp, s, b, a);
+    } else {
+        set_status(s,
+                   apex_project_last_error(p)[0] ? apex_project_last_error(p) : "set table failed");
     }
 }
 
-void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     s->last_classify_op = APEX_LAST_CLASSIFY_CLEAR;
     uint8_t b;
     uint32_t a;
@@ -1182,24 +1263,35 @@ void clear_kind_at_selection(ApexProject *p, const ApexRenderedDocument **dp, Ui
    to the "1" hotkey so classifying a run of individual entries (e.g. a block of
    far_code pointers) becomes: classify once, then n,1,n,1,…  The apply_* helpers
    re-record the same op, so repeating stays idempotent. */
-void repeat_last_classify(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void repeat_last_classify(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     /* Copy the spec into a local first: the apply_* helpers re-record into
        s->last_classify_spec, so passing the member directly would let the
        assignment mutate the string mid-use. */
     std::string spec = s->last_classify_spec;
     switch (s->last_classify_op) {
-    case APEX_LAST_CLASSIFY_DATA:      apply_data_at_selection(p, dp, s, spec.c_str()); break;
-    case APEX_LAST_CLASSIFY_STRING:    apply_string_at_selection(p, dp, s); break;
-    case APEX_LAST_CLASSIFY_TABLE:     apply_table_at_selection(p, dp, s, spec.c_str()); break;
-    case APEX_LAST_CLASSIFY_CODE:      apply_code_at_selection(p, dp, s); break;
-    case APEX_LAST_CLASSIFY_CLEAR:     clear_kind_at_selection(p, dp, s); break;
-    default:                           set_status(s, "no previous classification to repeat"); break;
+    case APEX_LAST_CLASSIFY_DATA:
+        apply_data_at_selection(p, dp, s, spec.c_str());
+        break;
+    case APEX_LAST_CLASSIFY_STRING:
+        apply_string_at_selection(p, dp, s);
+        break;
+    case APEX_LAST_CLASSIFY_TABLE:
+        apply_table_at_selection(p, dp, s, spec.c_str());
+        break;
+    case APEX_LAST_CLASSIFY_CODE:
+        apply_code_at_selection(p, dp, s);
+        break;
+    case APEX_LAST_CLASSIFY_CLEAR:
+        clear_kind_at_selection(p, dp, s);
+        break;
+    default:
+        set_status(s, "no previous classification to repeat");
+        break;
     }
 }
 
-const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *d, uint8_t b, size_t *li)
-{
+const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *d, uint8_t b,
+                                                size_t *li) {
     for (size_t i = 0; i < d->line_count; i++) {
         if (d->lines[i].has_location && d->lines[i].bank == b) {
             if (li) {
@@ -1211,31 +1303,59 @@ const ApexRenderedLine *find_first_line_in_bank(const ApexRenderedDocument *d, u
     return NULL;
 }
 
-int find_line_by_rom_offset(const ApexRenderedDocument *d, size_t o, size_t *li)
-{
-    for (size_t i = 0; i < d->line_count; i++) {
-        if (!d->lines[i].has_location) {
-            continue;
+/* Located lines ordered by ROM offset, cached per document generation: the
+   hex view and pattern search call find_line_by_rom_offset for every visible
+   row each frame, which was a full document scan per call. */
+struct RomOffsetIndex {
+    const ApexRenderedDocument *doc = nullptr;
+    unsigned long gen = (unsigned long)-1;
+    size_t line_count = 0;
+    std::vector<std::pair<size_t, size_t>> entries; /* (rom_addr, line index) */
+};
+
+static const RomOffsetIndex &rom_offset_index(const ApexRenderedDocument *d) {
+    static RomOffsetIndex idx;
+    if (idx.doc != d || idx.gen != d->generation || idx.line_count != d->line_count) {
+        idx.doc = d;
+        idx.gen = d->generation;
+        idx.line_count = d->line_count;
+        idx.entries.clear();
+        for (size_t i = 0; i < d->line_count; i++) {
+            if (d->lines[i].has_location) {
+                idx.entries.push_back({d->lines[i].rom_addr, i});
+            }
         }
-        if (o == d->lines[i].rom_addr) {
-            *li = i;
-            return 1;
-        }
-        if (o < d->lines[i].rom_addr && i > 0 && d->lines[i-1].has_location) {
-            *li = i - 1;
-            return 1;
-        }
+        std::stable_sort(idx.entries.begin(), idx.entries.end(),
+                         [](const std::pair<size_t, size_t> &a,
+                            const std::pair<size_t, size_t> &b) { return a.first < b.first; });
     }
-    if (d->line_count > 0 && d->lines[d->line_count-1].has_location) {
-        *li = d->line_count - 1;
-        return 1;
-    }
-    return 0;
+    return idx;
 }
 
-int rom_offset_to_cpu_address(const ApexProject *project, size_t offset,
-                              uint8_t *bank, uint32_t *cpu_addr)
-{
+/* The first line starting exactly at offset o (e.g. its label), else the last
+   line of the item that starts before o and so contains it. */
+int find_line_by_rom_offset(const ApexRenderedDocument *d, size_t o, size_t *li) {
+    const auto &e = rom_offset_index(d).entries;
+    if (e.empty()) {
+        return 0;
+    }
+    auto it =
+        std::lower_bound(e.begin(), e.end(), o,
+                         [](const std::pair<size_t, size_t> &a, size_t v) { return a.first < v; });
+    if (it != e.end() && it->first == o) {
+        *li = it->second;
+        return 1;
+    }
+    if (it == e.begin()) {
+        *li = e.front().second;
+        return 1;
+    }
+    *li = (it - 1)->second;
+    return 1;
+}
+
+int rom_offset_to_cpu_address(const ApexProject *project, size_t offset, uint8_t *bank,
+                              uint32_t *cpu_addr) {
     if (offset >= project->rom.size) {
         return 0;
     }
@@ -1250,9 +1370,33 @@ int rom_offset_to_cpu_address(const ApexProject *project, size_t offset,
     return 1;
 }
 
-void save_session(const char *rp, const char *cp, const UiState *s, const ApexRenderedDocument *d)
-{
-    FILE *f = fopen(".apeximgui_session", "w");
+/* Sections of the session file other than [Global] and [rom], verbatim, so
+   saving one ROM's session keeps the other ROMs' sections. */
+static std::string other_session_sections(const char *rom) {
+    FILE *f = fopen(".apeximgui_session", "r");
+    std::string keep, sec = std::string("[") + rom + "]";
+    char l[4096];
+    bool skip = true;
+    if (!f) {
+        return keep;
+    }
+    while (fgets(l, sizeof(l), f)) {
+        if (l[0] == '[') {
+            std::string h(l);
+            h.erase(h.find_last_not_of("\r\n") + 1);
+            skip = (h == "[Global]" || h == sec);
+        }
+        if (!skip) {
+            keep += l;
+        }
+    }
+    fclose(f);
+    return keep;
+}
+
+void save_session(const char *rp, const char *cp, const UiState *s, const ApexRenderedDocument *d) {
+    std::string others = other_session_sections(rp);
+    FILE *f = fopen(".apeximgui_session.tmp", "w");
     if (!f) {
         return;
     }
@@ -1262,9 +1406,11 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
     if (selected_address(d, s, &b, &a)) {
         fprintf(f, "selected=0x%02x:%04x\n", b, a);
     }
-    fprintf(f, "filter=%s\nlabel_filter=%s\ndmd_scrub=%d\ngraph_depth_in=%d\ngraph_depth_out=%d\nhistory=",
-            s->filter_input, s->label_filter_input, s->dmd_scrub_offset,
-            s->graph_depth_in, s->graph_depth_out);
+    fprintf(
+        f,
+        "filter=%s\nlabel_filter=%s\ndmd_scrub=%d\ngraph_depth_in=%d\ngraph_depth_out=%d\nhistory=",
+        s->filter_input, s->label_filter_input, s->dmd_scrub_offset, s->graph_depth_in,
+        s->graph_depth_out);
     for (size_t i = 0; i < s->history_back.size(); i++) {
         if (s->history_back[i] < d->line_count && d->lines[s->history_back[i]].has_location) {
             fprintf(f, "0x%02x:%04x,", d->lines[s->history_back[i]].bank,
@@ -1286,32 +1432,41 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_ref_exclusions=%d\nshow_search_window=%d\nshow_rom_map=%d\n"
             "show_dmd_list=%d\nshow_sprite_list=%d\n"
             "show_flow_arrows=%d\nshow_symbols=%d\n"
-            "show_code_candidates=%d\nshow_inline_candidates=%d\n"
+            "show_code_candidates=%d\nshow_inline_detect=%d\n"
             "show_strings_list=%d\nshow_sprite_gallery=%d\n"
             "show_rom_info=%d\nshow_match_window=%d\nshow_rom_compare=%d\n"
             "show_coverage=%d\n",
-            s->show_navigator, s->show_disasm, s->show_labels, s->show_banks,
-            s->show_bookmarks, s->show_transitions, s->show_details, s->show_refs,
-            s->show_dmd, s->show_edit, s->show_hex, s->show_call_graph,
-            s->show_hardware, s->show_tables, s->show_types_editor, s->show_inline_list,
-            s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
-            s->show_imm_loads, s->show_change_log, s->show_pinmame,
-            s->show_pinmame_dmd, s->show_pinmame_switches, s->show_pinmame_coverage,
-            s->show_ref_exclusions, s->show_search_window, s->show_rom_map,
-            s->show_dmd_list, s->show_sprite_list,
-            s->show_flow_arrows, s->show_symbols_editor,
-            s->show_code_candidates, s->show_inline_candidates,
-            s->show_strings_list, s->show_sprite_gallery,
-            s->show_rom_info, s->show_match_window, s->show_rom_compare,
-            s->show_coverage);
+            s->show_navigator, s->show_disasm, s->show_labels, s->show_banks, s->show_bookmarks,
+            s->show_transitions, s->show_details, s->show_refs, s->show_dmd, s->show_edit,
+            s->show_hex, s->show_call_graph, s->show_hardware, s->show_tables, s->show_types_editor,
+            s->show_inline_list, s->show_entries_list, s->show_pattern_search, s->show_ram_refs,
+            s->show_imm_loads, s->show_change_log, s->show_pinmame, s->show_pinmame_dmd,
+            s->show_pinmame_switches, s->show_pinmame_coverage, s->show_ref_exclusions,
+            s->show_search_window, s->show_rom_map, s->show_dmd_list, s->show_sprite_list,
+            s->show_flow_arrows, s->show_symbols_editor, s->show_code_candidates,
+            s->show_inline_detect, s->show_strings_list, s->show_sprite_gallery, s->show_rom_info,
+            s->show_match_window, s->show_rom_compare, s->show_coverage);
     /* PinMAME integration config (paths/port kept as separate key=value lines). */
     fprintf(f, "pinmame_bin=%s\npinmame_rompath=%s\npinmame_game=%s\npinmame_port=%d\n",
             s->pinmame.bin_path, s->pinmame.rompath, s->pinmame.game, s->pinmame.port);
-    fclose(f);
+    if (!others.empty()) {
+        fputc('\n', f);
+        fputs(others.c_str(), f);
+    }
+    bool ok = ferror(f) == 0;
+    ok = fclose(f) == 0 && ok;
+    if (ok) {
+#ifdef _WIN32
+        remove(".apeximgui_session"); /* rename() does not replace on Windows */
+#endif
+        ok = rename(".apeximgui_session.tmp", ".apeximgui_session") == 0;
+    }
+    if (!ok) {
+        remove(".apeximgui_session.tmp");
+    }
 }
 
-int load_global_session(char *rp, char *cp)
-{
+int load_global_session(char *rp, char *cp) {
     FILE *f = fopen(".apeximgui_session", "r");
     char l[1024];
     int fo = 0;
@@ -1319,12 +1474,14 @@ int load_global_session(char *rp, char *cp)
         return 0;
     }
     while (fgets(l, 1024, f)) {
+        /* rp/cp are the 1024-byte path buffers in main(); l is 1024 bytes too,
+           so the copies below cannot overflow them. */
         if (strncmp(l, "last_rom=", 9) == 0) {
-            strcpy(rp, l + 9);
+            snprintf(rp, 1024, "%s", l + 9);
             rp[strcspn(rp, "\r\n")] = 0;
             fo++;
         } else if (strncmp(l, "last_config=", 12) == 0) {
-            strcpy(cp, l + 12);
+            snprintf(cp, 1024, "%s", l + 12);
             cp[strcspn(cp, "\r\n")] = 0;
             fo++;
         }
@@ -1336,8 +1493,7 @@ int load_global_session(char *rp, char *cp)
     return fo == 2;
 }
 
-void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
-{
+void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d) {
     FILE *f = fopen(".apeximgui_session", "r");
     char l[1024], sec[1024];
     int in = 0;
@@ -1485,21 +1641,22 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
         } else if (strncmp(l, "show_code_candidates=", 21) == 0) {
             s->show_code_candidates = atoi(l + 21) != 0;
         } else if (strncmp(l, "show_inline_candidates=", 23) == 0) {
-            s->show_inline_candidates = atoi(l + 23) != 0;
+            /* the old Inline Candidates window was replaced by Inline Detection */
+            s->show_inline_detect = s->show_inline_detect || atoi(l + 23) != 0;
+        } else if (strncmp(l, "show_inline_detect=", 19) == 0) {
+            s->show_inline_detect = atoi(l + 19) != 0;
         }
     }
     fclose(f);
 }
 
-void clear_session()
-{
+void clear_session() {
     remove(".apeximgui_session");
 }
 
 // --- Table Search (from apextab.c) ---
 
-static bool is_valid_string_internal(const uint8_t *rom, uint32_t size, uint32_t offset)
-{
+static bool is_valid_string_internal(const uint8_t *rom, uint32_t size, uint32_t offset) {
     if (offset >= size) {
         return false;
     }
@@ -1517,8 +1674,7 @@ static bool is_valid_string_internal(const uint8_t *rom, uint32_t size, uint32_t
     return false;
 }
 
-static uint32_t translate_ptr16_internal(uint16_t ptr, int phys_bank, int total_banks)
-{
+static uint32_t translate_ptr16_internal(uint16_t ptr, int phys_bank, int total_banks) {
     if (ptr >= 0x4000 && ptr <= 0x7FFF) {
         return (uint32_t)phys_bank * 0x4000 + (ptr - 0x4000);
     }
@@ -1536,8 +1692,7 @@ static uint32_t translate_ptr16_internal(uint16_t ptr, int phys_bank, int total_
 }
 
 static bool is_text_table_at_internal(const uint8_t *rom, uint32_t size, uint32_t offset,
-                                      int total_banks)
-{
+                                      int total_banks) {
     if (offset + 3 > size) {
         return false;
     }
@@ -1564,8 +1719,7 @@ static bool is_text_table_at_internal(const uint8_t *rom, uint32_t size, uint32_
 /* Resolve a 3-byte far pointer (CPU addr + bank byte) to a ROM file offset,
    mirroring the resolution used for far_data tables above. */
 static uint32_t resolve_far_off_internal(const ApexProject *p, uint16_t addr, uint8_t bid,
-                                         int total_banks)
-{
+                                         int total_banks) {
     for (int b = 0; b < total_banks; b++) {
         if (p->rom.data[b * 0x4000] == bid && addr >= 0x4000 && addr <= 0x7FFF) {
             return (uint32_t)b * 0x4000 + (addr - 0x4000);
@@ -1579,24 +1733,24 @@ static uint32_t resolve_far_off_internal(const ApexProject *p, uint16_t addr, ui
 
 /* True if the 3-byte far pointer at ROM offset `off` targets a decodable DMD
    full-frame.  Used to discover far_dmd pointer tables. */
-static bool far_ptr_is_dmd_internal(const ApexProject *p, uint32_t off, int total_banks)
-{
-    if ((size_t)off + 3u > p->rom.size) return false;
+static bool far_ptr_is_dmd_internal(const ApexProject *p, uint32_t off, int total_banks) {
+    if ((size_t)off + 3u > p->rom.size)
+        return false;
     uint16_t addr = (uint16_t)((p->rom.data[off] << 8) | p->rom.data[off + 1]);
-    uint8_t  bid  = p->rom.data[off + 2];
+    uint8_t bid = p->rom.data[off + 2];
     uint32_t toff = resolve_far_off_internal(p, addr, bid, total_banks);
-    if (toff == 0xFFFFFFFFu || (size_t)toff >= p->rom.size) return false;
+    if (toff == 0xFFFFFFFFu || (size_t)toff >= p->rom.size)
+        return false;
     uint8_t plane[APEX_DMD_PAGE_BYTES];
     size_t consumed = 0;
     uint8_t type = 0;
-    return apexdmd_decode_fullframe(p->rom.data + toff, p->rom.size - (size_t)toff,
-                                    plane, &consumed, &type) != 0;
+    return apexdmd_decode_fullframe(p->rom.data + toff, p->rom.size - (size_t)toff, plane,
+                                    &consumed, &type) != 0;
 }
 
 /* Given a ROM offset, compute the (bank_id, cpu_addr) the disassembler uses. */
 static void off_to_bank_addr_internal(const ApexProject *p, uint32_t off, int total_banks,
-                                      uint8_t *bank_id, uint16_t *addr)
-{
+                                      uint8_t *bank_id, uint16_t *addr) {
     int phys_bank = (int)(off / 0x4000);
     if (phys_bank >= total_banks - 2) {
         *bank_id = 0xFF;
@@ -1613,11 +1767,11 @@ static void off_to_bank_addr_internal(const ApexProject *p, uint32_t off, int to
    is a run of consecutive rows that each hold a valid far pointer to a decodable
    DMD full-frame — the run length is the discriminator that separates a real
    table from the many isolated byte sequences that happen to decode. */
-void scan_table_candidates(ApexProject *p, UiState *s)
-{
+void scan_table_candidates(ApexProject *p, UiState *s) {
     s->table_candidates.clear();
     s->table_scan_done = true;
-    if (!p->rom.data || p->rom.size < 9u) return;
+    if (!p->rom.data || p->rom.size < 9u)
+        return;
 
     /* table_def_at() (used below for the 'already' flag) binary-searches the
        table list, so it must be sorted. Accept appends via add_table_def and the
@@ -1645,11 +1799,12 @@ void scan_table_candidates(ApexProject *p, UiState *s)
     for (uint32_t i = 0; i <= p->rom.size - 3; i++) {
         if (is_text_table_at_internal(p->rom.data, (uint32_t)p->rom.size, i, total_banks)) {
             int phys_bank = i / 0x4000;
-            uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
+            uint8_t bank_id =
+                (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
             uint16_t addr = 0x4000 + (i % 0x4000);
             if (phys_bank >= total_banks - 2) {
-                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000)
-                                                       : 0xC000 + (i % 0x4000);
+                addr =
+                    (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000) : 0xC000 + (i % 0x4000);
             }
             found_text_table_offsets.push_back(i);
             push_cand(bank_id, addr, "counted(ptr16_string)", 0, "text");
@@ -1690,11 +1845,12 @@ void scan_table_candidates(ApexProject *p, UiState *s)
         }
         if (match) {
             int phys_bank = i / 0x4000;
-            uint8_t bank_id = (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
+            uint8_t bank_id =
+                (phys_bank >= total_banks - 2) ? 0xFF : p->rom.data[phys_bank * 0x4000];
             uint16_t addr = 0x4000 + (i % 0x4000);
             if (phys_bank >= total_banks - 2) {
-                addr = (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000)
-                                                       : 0xC000 + (i % 0x4000);
+                addr =
+                    (phys_bank == total_banks - 2) ? 0x8000 + (i % 0x4000) : 0xC000 + (i % 0x4000);
             }
             push_cand(bank_id, addr, "rows[3](far_data)", 3, "far_ptr");
             i += 8;
@@ -1711,10 +1867,10 @@ void scan_table_candidates(ApexProject *p, UiState *s)
        candidate list stays short and reviewable (the user still confirms). */
     static const int kMinDmdRun = 5;
     if (p->rom.size >= 6) {
-        for (uint32_t i = 0; i + 3u <= p->rom.size; ) {
+        for (uint32_t i = 0; i + 3u <= p->rom.size;) {
             // (a) counted header: [count_hi count_lo width=3]
             uint16_t hdr_count = (uint16_t)((p->rom.data[i] << 8) | p->rom.data[i + 1]);
-            uint8_t  hdr_width = p->rom.data[i + 2];
+            uint8_t hdr_width = p->rom.data[i + 2];
             if (hdr_width == 3u && hdr_count >= 2u &&
                 (size_t)i + 3u + (size_t)hdr_count * 3u <= p->rom.size) {
                 bool all_dmd = true;
@@ -1723,10 +1879,11 @@ void scan_table_candidates(ApexProject *p, UiState *s)
                         all_dmd = false;
                 }
                 if (all_dmd) {
-                    uint8_t bank_id; uint16_t addr;
+                    uint8_t bank_id;
+                    uint16_t addr;
                     off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
-                    push_cand(bank_id, addr, "counted(far_dmd_fullframe)",
-                              (int)hdr_count, "far_dmd");
+                    push_cand(bank_id, addr, "counted(far_dmd_fullframe)", (int)hdr_count,
+                              "far_dmd");
                     i += 3u + (uint32_t)hdr_count * 3u;
                     continue;
                 }
@@ -1739,7 +1896,8 @@ void scan_table_candidates(ApexProject *p, UiState *s)
                 k += 3u;
             }
             if (n >= kMinDmdRun) {
-                uint8_t bank_id; uint16_t addr;
+                uint8_t bank_id;
+                uint16_t addr;
                 off_to_bank_addr_internal(p, i, total_banks, &bank_id, &addr);
                 char spec[40];
                 snprintf(spec, sizeof(spec), "rows[%d](far_dmd_fullframe)", n);
@@ -1753,10 +1911,11 @@ void scan_table_candidates(ApexProject *p, UiState *s)
 
     /* Newest/most-specific first: DMD then far-ptr then text, longer runs first. */
     std::stable_sort(s->table_candidates.begin(), s->table_candidates.end(),
-        [](const UiState::TableCandidate &a, const UiState::TableCandidate &b) {
-            if (a.kind != b.kind) return a.kind < b.kind; /* far_dmd < far_ptr < text */
-            return a.rows > b.rows;
-        });
+                     [](const UiState::TableCandidate &a, const UiState::TableCandidate &b) {
+                         if (a.kind != b.kind)
+                             return a.kind < b.kind; /* far_dmd < far_ptr < text */
+                         return a.rows > b.rows;
+                     });
 
     char msg[64];
     snprintf(msg, sizeof(msg), "%zu table candidate(s) — review and Accept",
@@ -1765,8 +1924,7 @@ void scan_table_candidates(ApexProject *p, UiState *s)
 }
 
 std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,
-                                                    const ApexRenderedDocument *document)
-{
+                                                   const ApexRenderedDocument *document) {
     std::vector<HardwareAccess> accesses;
     std::map<uint32_t, std::vector<size_t>> mapping;
 
@@ -1775,7 +1933,8 @@ std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,
         const Reference &ref = project->refs.items[i];
         if (ref.addr >= 0x3F00 && ref.addr <= 0x3FFF) {
             size_t lidx;
-            if (apex_render_find_line_by_address(document, ref.source_bank, ref.source_addr, &lidx)) {
+            if (apex_render_find_line_by_address(document, ref.source_bank, ref.source_addr,
+                                                 &lidx)) {
                 bool exists = false;
                 for (size_t ex : mapping[ref.addr]) {
                     if (ex == lidx) {
@@ -1802,10 +1961,11 @@ std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,
         // A simple way is to check every possible 16-bit big-endian word in the first 5 bytes.
         const uint8_t *rom_ptr;
         size_t rom_len;
-        if (project_locate_rom_bytes(project, line->bank, line->cpu_addr, &rom_ptr, &rom_len, NULL)) {
+        if (project_locate_rom_bytes(project, line->bank, line->cpu_addr, &rom_ptr, &rom_len,
+                                     NULL)) {
             size_t scan_len = (rom_len < 5) ? rom_len : 5;
             for (size_t b = 0; b + 1 < scan_len; b++) {
-                uint16_t word = (uint16_t)((rom_ptr[b] << 8) | rom_ptr[b+1]);
+                uint16_t word = (uint16_t)((rom_ptr[b] << 8) | rom_ptr[b + 1]);
                 if (word >= 0x3F00 && word <= 0x3FFF) {
                     bool exists = false;
                     for (size_t ex : mapping[word]) {
@@ -1825,15 +1985,14 @@ std::vector<HardwareAccess> find_hardware_accesses(const ApexProject *project,
     for (size_t i = 0; i < reg_count; i++) {
         const auto *reg = get_hardware_register(i);
         std::sort(mapping[reg->addr].begin(), mapping[reg->addr].end());
-        HardwareAccess acc = { reg, mapping[reg->addr] };
+        HardwareAccess acc = {reg, mapping[reg->addr]};
         accesses.push_back(acc);
     }
 
     return accesses;
 }
 
-void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s)
-{
+void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s) {
     /* Copy the explicit block when set, otherwise just the cursor line. */
     size_t st = s->block_active ? std::min(s->block_a, s->block_b) : s->selected_line;
     size_t en = s->block_active ? std::max(s->block_a, s->block_b) : s->selected_line;
@@ -1859,8 +2018,7 @@ void copy_selection_to_clipboard(const ApexRenderedDocument *d, const UiState *s
     ImGui::SetClipboardText(t.c_str());
 }
 
-void copy_hex_block_to_clipboard(const ApexProject *p, const UiState *s)
-{
+void copy_hex_block_to_clipboard(const ApexProject *p, const UiState *s) {
     if (!p || !p->rom.data || p->rom.size == 0) {
         return;
     }
@@ -1878,14 +2036,14 @@ void copy_hex_block_to_clipboard(const ApexProject *p, const UiState *s)
     char b[4];
     for (size_t o = lo; o <= hi; o++) {
         snprintf(b, sizeof(b), "%02X", p->rom.data[o]);
-        if (!t.empty()) t += ' ';
+        if (!t.empty())
+            t += ' ';
         t += b;
     }
     ImGui::SetClipboardText(t.c_str());
 }
 
-int address_is_dmd_fullframe_start(const ApexProject *p, uint8_t b, uint32_t a)
-{
+int address_is_dmd_fullframe_start(const ApexProject *p, uint8_t b, uint32_t a) {
     if (data_range_at(b, a, &p->data_ranges) &&
         (data_range_at(b, a, &p->data_ranges)->kind == DATA_DMD_FULLFRAME ||
          data_range_at(b, a, &p->data_ranges)->kind == DATA_FAR_DMD_FULLFRAME)) {
@@ -1911,8 +2069,7 @@ int address_is_dmd_fullframe_start(const ApexProject *p, uint8_t b, uint32_t a)
     return 0;
 }
 
-int decode_dmd_preview_at(const ApexProject *p, uint8_t b, uint32_t a, DmdPreviewInfo *pr)
-{
+int decode_dmd_preview_at(const ApexProject *p, uint8_t b, uint32_t a, DmdPreviewInfo *pr) {
     const uint8_t *src;
     size_t len, con, ro;
     uint8_t type;
@@ -1948,8 +2105,7 @@ int decode_dmd_preview_at(const ApexProject *p, uint8_t b, uint32_t a, DmdPrevie
     return 1;
 }
 
-DmdPreviewInfo find_dmd_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
+DmdPreviewInfo find_dmd_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s) {
     DmdPreviewInfo pr = {};
     uint8_t b;
     uint32_t a;
@@ -1981,8 +2137,7 @@ DmdPreviewInfo find_dmd_preview(const ApexProject *p, const ApexRenderedDocument
     return pr;
 }
 
-int address_is_sprite_start(const ApexProject *p, uint8_t b, uint32_t a)
-{
+int address_is_sprite_start(const ApexProject *p, uint8_t b, uint32_t a) {
     if (data_range_at(b, a, &p->data_ranges) &&
         (data_range_at(b, a, &p->data_ranges)->kind == DATA_SPRITE ||
          data_range_at(b, a, &p->data_ranges)->kind == DATA_FAR_SPRITE ||
@@ -2009,8 +2164,7 @@ int address_is_sprite_start(const ApexProject *p, uint8_t b, uint32_t a)
     return 0;
 }
 
-int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, SpritePreviewInfo *pr)
-{
+int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, SpritePreviewInfo *pr) {
     const uint8_t *src;
     size_t len, ro;
     uint8_t hdr = 0, vert = 0, horiz = 0, width = 0, height = 0, enc_type = 0;
@@ -2028,34 +2182,35 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
         if (!apexsprite_decode_noheader(src, len, pr->pixels, nh_height, &width, &consumed)) {
             return 0;
         }
-        pr->valid        = true;
-        pr->bank         = b;
-        pr->cpu_addr     = a;
-        pr->rom_offset   = ro;
-        pr->header_type  = 0;
-        pr->enc_type     = 0;
-        pr->consumed     = consumed;
-        pr->vert_offset  = 0;
+        pr->valid = true;
+        pr->bank = b;
+        pr->cpu_addr = a;
+        pr->rom_offset = ro;
+        pr->header_type = 0;
+        pr->enc_type = 0;
+        pr->consumed = consumed;
+        pr->vert_offset = 0;
         pr->horiz_offset = 0;
-        pr->width        = width;
-        pr->height       = nh_height;
+        pr->width = width;
+        pr->height = nh_height;
         return 1;
     }
 
-    if (!apexsprite_decode(src, len, pr->pixels, &hdr, &vert, &horiz, &width, &height, &enc_type, &consumed)) {
+    if (!apexsprite_decode(src, len, pr->pixels, &hdr, &vert, &horiz, &width, &height, &enc_type,
+                           &consumed)) {
         return 0;
     }
-    pr->valid       = true;
-    pr->bank        = b;
-    pr->cpu_addr    = a;
-    pr->rom_offset  = ro;
+    pr->valid = true;
+    pr->bank = b;
+    pr->cpu_addr = a;
+    pr->rom_offset = ro;
     pr->header_type = hdr;
-    pr->enc_type    = enc_type;
-    pr->consumed    = consumed;
-    pr->vert_offset  = vert;
+    pr->enc_type = enc_type;
+    pr->consumed = consumed;
+    pr->vert_offset = vert;
     pr->horiz_offset = horiz;
-    pr->width       = width;
-    pr->height      = height;
+    pr->width = width;
+    pr->height = height;
 
     /* Bicolor: fetch plane 1 so the preview can show 4 grey levels. */
     if (enc_type == APEX_SPRITE_ENC_BICOLOR_DIRECT ||
@@ -2069,9 +2224,10 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
                 pr->two_plane = true;
             }
         } else if (len >= 7u) {
-            uint32_t p1cpu  = ((uint32_t)src[5] << 8) | src[6];
-            uint8_t  p1bank = (p1cpu >= 0x8000u) ? 0xffu : b;
-            const uint8_t *p1; size_t p1len, p1ro;
+            uint32_t p1cpu = ((uint32_t)src[5] << 8) | src[6];
+            uint8_t p1bank = (p1cpu >= 0x8000u) ? 0xffu : b;
+            const uint8_t *p1;
+            size_t p1len, p1ro;
             if (project_locate_rom_bytes(p, p1bank, (uint32_t)p1cpu, &p1, &p1len, &p1ro) &&
                 p1len >= page) {
                 memcpy(pr->pixels1, p1, page);
@@ -2087,8 +2243,7 @@ int decode_sprite_preview_at(const ApexProject *p, uint8_t b, uint32_t a, Sprite
    (first byte = width) needs the height, which is supplied by the caller from
    the sprite table field.  Used by the table-row tooltip preview. */
 int decode_sprite_preview_with_height(const ApexProject *p, uint8_t b, uint32_t a,
-                                      unsigned hint_height, SpritePreviewInfo *pr)
-{
+                                      unsigned hint_height, SpritePreviewInfo *pr) {
     const uint8_t *src;
     size_t len, ro;
     uint8_t b0;
@@ -2108,28 +2263,28 @@ int decode_sprite_preview_with_height(const ApexProject *p, uint8_t b, uint32_t 
     {
         uint8_t width = 0;
         size_t consumed = 0;
-        if (!apexsprite_decode_noheader(src, len, pr->pixels, (uint8_t)hint_height,
-                                        &width, &consumed)) {
+        if (!apexsprite_decode_noheader(src, len, pr->pixels, (uint8_t)hint_height, &width,
+                                        &consumed)) {
             return 0;
         }
-        pr->two_plane    = false;
-        pr->valid        = true;
-        pr->bank         = b;
-        pr->cpu_addr     = a;
-        pr->rom_offset   = ro;
-        pr->header_type  = 0;
-        pr->enc_type     = 0;
-        pr->consumed     = consumed;
-        pr->vert_offset  = 0;
+        pr->two_plane = false;
+        pr->valid = true;
+        pr->bank = b;
+        pr->cpu_addr = a;
+        pr->rom_offset = ro;
+        pr->header_type = 0;
+        pr->enc_type = 0;
+        pr->consumed = consumed;
+        pr->vert_offset = 0;
         pr->horiz_offset = 0;
-        pr->width        = width;
-        pr->height       = (uint8_t)hint_height;
+        pr->width = width;
+        pr->height = (uint8_t)hint_height;
     }
     return 1;
 }
 
-SpritePreviewInfo find_sprite_preview(const ApexProject *p, const ApexRenderedDocument *d, UiState *s)
-{
+SpritePreviewInfo find_sprite_preview(const ApexProject *p, const ApexRenderedDocument *d,
+                                      UiState *s) {
     SpritePreviewInfo pr = {};
     uint8_t b;
     uint32_t a;
@@ -2154,8 +2309,7 @@ SpritePreviewInfo find_sprite_preview(const ApexProject *p, const ApexRenderedDo
     return pr;
 }
 
-int parse_target_address(const char *i, uint8_t *b, uint32_t *a)
-{
+int parse_target_address(const char *i, uint8_t *b, uint32_t *a) {
     unsigned pb, pa;
     while (*i == ' ' || *i == '\t') {
         i++;
@@ -2175,29 +2329,31 @@ int parse_target_address(const char *i, uint8_t *b, uint32_t *a)
 
 /* Wildcard match: * = any sequence, ? = any single char, case-insensitive.
    Matches pattern against the entire string (not substring). */
-static int wildcard_match_ci(const char *pat, const char *text)
-{
+static int wildcard_match_ci(const char *pat, const char *text) {
     const char *star = NULL;
     const char *mark = text;
     while (*text) {
         if (*pat == '*') {
-            star = pat++; mark = text;
+            star = pat++;
+            mark = text;
         } else if (*pat == '?' || tolower((unsigned char)*pat) == tolower((unsigned char)*text)) {
-            pat++; text++;
+            pat++;
+            text++;
         } else if (star) {
-            pat = star + 1; text = ++mark;
+            pat = star + 1;
+            text = ++mark;
         } else {
             return 0;
         }
     }
-    while (*pat == '*') pat++;
+    while (*pat == '*')
+        pat++;
     return !*pat;
 }
 
 /* Returns true if the line text contains a substring matching pat
    (wildcards: * = any chars, ? = any single char, case-insensitive). */
-static int line_matches_wildcard(const ApexRenderedLine *l, const char *pat)
-{
+static int line_matches_wildcard(const ApexRenderedLine *l, const char *pat) {
     /* Build null-terminated line text */
     char buf[512];
     size_t len = l->length < sizeof(buf) - 1 ? l->length : sizeof(buf) - 1;
@@ -2210,8 +2366,7 @@ static int line_matches_wildcard(const ApexRenderedLine *l, const char *pat)
     return wildcard_match_ci(wrapped, buf);
 }
 
-int line_matches_filter(const ApexRenderedLine *l, const char *f)
-{
+int line_matches_filter(const ApexRenderedLine *l, const char *f) {
     if (!f || !*f) {
         return 1;
     }
@@ -2229,7 +2384,7 @@ int line_matches_filter(const ApexRenderedLine *l, const char *f)
     for (size_t i = 0; i + fl <= l->length; i++) {
         size_t j;
         for (j = 0; j < fl; j++) {
-            if (tolower((unsigned char)l->text[i+j]) != tolower((unsigned char)f[j])) {
+            if (tolower((unsigned char)l->text[i + j]) != tolower((unsigned char)f[j])) {
                 break;
             }
         }
@@ -2243,22 +2398,22 @@ int line_matches_filter(const ApexRenderedLine *l, const char *f)
 /* Sequence search: split query on literal \n, match each part against
    consecutive instruction lines (skipping labels/blanks between them).
    Pushes the line index of the first instruction in each match into results. */
-static void run_sequence_search(const ApexRenderedDocument *d,
-                                 const char *const parts[], int nparts,
-                                 std::vector<size_t> &results)
-{
+static void run_sequence_search(const ApexRenderedDocument *d, const char *const parts[],
+                                int nparts, std::vector<size_t> &results) {
     for (size_t i = 0; i < d->line_count; i++) {
-        if (d->lines[i].kind != APEX_RENDER_LINE_INSTRUCTION) continue;
+        if (d->lines[i].kind != APEX_RENDER_LINE_INSTRUCTION)
+            continue;
 
         size_t cur = i;
         int p;
         for (p = 0; p < nparts; p++) {
             /* advance to next instruction line (skip labels/blanks) */
-            while (cur < d->line_count &&
-                   d->lines[cur].kind != APEX_RENDER_LINE_INSTRUCTION)
+            while (cur < d->line_count && d->lines[cur].kind != APEX_RENDER_LINE_INSTRUCTION)
                 cur++;
-            if (cur >= d->line_count) break;
-            if (!line_matches_filter(&d->lines[cur], parts[p])) break;
+            if (cur >= d->line_count)
+                break;
+            if (!line_matches_filter(&d->lines[cur], parts[p]))
+                break;
             cur++;
         }
         if (p == nparts)
@@ -2268,12 +2423,11 @@ static void run_sequence_search(const ApexRenderedDocument *d,
 
 /* Top-level search: handles plain, wildcard, and multi-line (\n-separated)
    patterns.  Clears and fills results. */
-void run_global_search(const ApexRenderedDocument *d,
-                       const char *query,
-                       std::vector<size_t> &results)
-{
+void run_global_search(const ApexRenderedDocument *d, const char *query,
+                       std::vector<size_t> &results) {
     results.clear();
-    if (!query || !*query) return;
+    if (!query || !*query)
+        return;
 
     /* Split on literal \n (backslash + n) */
     /* Max 5 parts for sequence search */
@@ -2286,12 +2440,14 @@ void run_global_search(const ApexRenderedDocument *d,
     while (*p && nparts < MAX_PARTS) {
         const char *next = strstr(p, "\\n");
         size_t len = next ? (size_t)(next - p) : strlen(p);
-        if (len >= sizeof(parts_buf[0])) len = sizeof(parts_buf[0]) - 1;
+        if (len >= sizeof(parts_buf[0]))
+            len = sizeof(parts_buf[0]) - 1;
         memcpy(parts_buf[nparts], p, len);
         parts_buf[nparts][len] = '\0';
         parts[nparts] = parts_buf[nparts];
         nparts++;
-        if (!next) break;
+        if (!next)
+            break;
         p = next + 2;
     }
 
@@ -2307,61 +2463,81 @@ void run_global_search(const ApexRenderedDocument *d,
     }
 }
 
-const char *block_name(ApexRenderedBlockKind k)
-{
+const char *block_name(ApexRenderedBlockKind k) {
     switch (k) {
-    case APEX_RENDER_BLOCK_CODE:         return "code";
-    case APEX_RENDER_BLOCK_DATA:         return "data";
-    case APEX_RENDER_BLOCK_SPRITE:       return "sprite";
-    case APEX_RENDER_BLOCK_TABLE:        return "table";
-    case APEX_RENDER_BLOCK_UNCLASSIFIED: return "?";
-    case APEX_RENDER_BLOCK_FREE:         return "free";
-    default:                             return "-";
+    case APEX_RENDER_BLOCK_CODE:
+        return "code";
+    case APEX_RENDER_BLOCK_DATA:
+        return "data";
+    case APEX_RENDER_BLOCK_SPRITE:
+        return "sprite";
+    case APEX_RENDER_BLOCK_TABLE:
+        return "table";
+    case APEX_RENDER_BLOCK_UNCLASSIFIED:
+        return "?";
+    case APEX_RENDER_BLOCK_FREE:
+        return "free";
+    default:
+        return "-";
     }
 }
 
-const char *transition_name(ApexRenderedTransitionKind k)
-{
+const char *transition_name(ApexRenderedTransitionKind k) {
     switch (k) {
-    case APEX_RENDER_TRANSITION_CODE_TO_DATA:           return "code_to_data";
-    case APEX_RENDER_TRANSITION_DATA_TO_CODE:           return "data_to_code";
-    case APEX_RENDER_TRANSITION_CODE_TO_TABLE:          return "code_to_table";
-    case APEX_RENDER_TRANSITION_TABLE_TO_CODE:          return "table_to_code";
-    case APEX_RENDER_TRANSITION_TABLE_TO_DATA:          return "table_to_data";
-    case APEX_RENDER_TRANSITION_DATA_TO_TABLE:          return "data_to_table";
-    case APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED:   return "code_to_unclassified";
-    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_CODE:   return "unclassified_to_code";
-    case APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED:  return "table_to_unclassified";
-    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_TABLE:  return "unclassified_to_table";
-    case APEX_RENDER_TRANSITION_DATA_TO_UNCLASSIFIED:   return "data_to_unclassified";
-    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_DATA:   return "unclassified_to_data";
-    default:                                            return "-";
+    case APEX_RENDER_TRANSITION_CODE_TO_DATA:
+        return "code_to_data";
+    case APEX_RENDER_TRANSITION_DATA_TO_CODE:
+        return "data_to_code";
+    case APEX_RENDER_TRANSITION_CODE_TO_TABLE:
+        return "code_to_table";
+    case APEX_RENDER_TRANSITION_TABLE_TO_CODE:
+        return "table_to_code";
+    case APEX_RENDER_TRANSITION_TABLE_TO_DATA:
+        return "table_to_data";
+    case APEX_RENDER_TRANSITION_DATA_TO_TABLE:
+        return "data_to_table";
+    case APEX_RENDER_TRANSITION_CODE_TO_UNCLASSIFIED:
+        return "code_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_CODE:
+        return "unclassified_to_code";
+    case APEX_RENDER_TRANSITION_TABLE_TO_UNCLASSIFIED:
+        return "table_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_TABLE:
+        return "unclassified_to_table";
+    case APEX_RENDER_TRANSITION_DATA_TO_UNCLASSIFIED:
+        return "data_to_unclassified";
+    case APEX_RENDER_TRANSITION_UNCLASSIFIED_TO_DATA:
+        return "unclassified_to_data";
+    default:
+        return "-";
     }
 }
 
 /* Canonical kind names in the same order as TableFieldKind. */
-static const struct { int kind; const char *name; } kKindNames[] = {
-    { TABLE_BYTE,              "byte"         },
-    { TABLE_WORD,              "word"         },
-    { TABLE_PTR16_STRING,      "ptr16_string" },
-    { TABLE_PTR16_DATA,        "ptr16_data"   },
-    { TABLE_PTR16_CODE,        "ptr16_code"   },
-    { TABLE_PTR16_TABLE,       "ptr16_table"  },
-    { TABLE_PTR16_DMD_FULLFRAME,"ptr16_dmd_fullframe" },
-    { TABLE_PTR16_SPRITE,      "ptr16_sprite" },
-    { TABLE_FAR_STRING,        "far_string"   },
-    { TABLE_FAR_DATA,          "far_data"     },
-    { TABLE_FAR_TABLE,         "far_table"    },
-    { TABLE_FAR_CODE,          "far_code"     },
-    { TABLE_FAR_DMD_FULLFRAME, "far_dmd_fullframe" },
-    { TABLE_FAR_SPRITE,        "far_sprite"   },
-    { TABLE_BYTES_UNTIL,       "bytes_until"  },
-    { TABLE_COUNTED_BYTES,     "counted_bytes" },
+static const struct {
+    int kind;
+    const char *name;
+} kKindNames[] = {
+    {TABLE_BYTE, "byte"},
+    {TABLE_WORD, "word"},
+    {TABLE_PTR16_STRING, "ptr16_string"},
+    {TABLE_PTR16_DATA, "ptr16_data"},
+    {TABLE_PTR16_CODE, "ptr16_code"},
+    {TABLE_PTR16_TABLE, "ptr16_table"},
+    {TABLE_PTR16_DMD_FULLFRAME, "ptr16_dmd_fullframe"},
+    {TABLE_PTR16_SPRITE, "ptr16_sprite"},
+    {TABLE_FAR_STRING, "far_string"},
+    {TABLE_FAR_DATA, "far_data"},
+    {TABLE_FAR_TABLE, "far_table"},
+    {TABLE_FAR_CODE, "far_code"},
+    {TABLE_FAR_DMD_FULLFRAME, "far_dmd_fullframe"},
+    {TABLE_FAR_SPRITE, "far_sprite"},
+    {TABLE_BYTES_UNTIL, "bytes_until"},
+    {TABLE_COUNTED_BYTES, "counted_bytes"},
 };
 static const int kKindCount = (int)(sizeof(kKindNames) / sizeof(kKindNames[0]));
 
-static const char *kind_to_name(int kind)
-{
+static const char *kind_to_name(int kind) {
     for (int i = 0; i < kKindCount; i++) {
         if (kKindNames[i].kind == kind) {
             return kKindNames[i].name;
@@ -2370,51 +2546,67 @@ static const char *kind_to_name(int kind)
     return "byte";
 }
 
-void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int count)
-{
+void fields_to_spec(char *buf, size_t cap, const ApexEditField *fields, int count) {
     size_t pos = 0;
     for (int i = 0; i < count; i++) {
         if (i > 0 && pos + 2 < cap) {
             buf[pos++] = ',';
             buf[pos++] = ' ';
         }
-        const char *name = (fields[i].kind < 0) ? fields[i].type_name
-                                                 : kind_to_name(fields[i].kind);
+        const char *name =
+            (fields[i].kind < 0) ? fields[i].type_name : kind_to_name(fields[i].kind);
         size_t nlen = strlen(name);
-        if (pos + nlen >= cap) { break; }
+        if (pos + nlen >= cap) {
+            break;
+        }
         memcpy(buf + pos, name, nlen);
         pos += nlen;
         if (fields[i].param > 0 &&
             (fields[i].kind == TABLE_PTR16_SPRITE || fields[i].kind == TABLE_FAR_SPRITE)) {
             int written = snprintf(buf + pos, cap - pos, "(%d)", fields[i].param);
-            if (written > 0) { pos += (size_t)written; }
+            if (written > 0) {
+                pos += (size_t)written;
+            }
         }
         if (fields[i].kind == TABLE_BYTES_UNTIL) {
             int written = snprintf(buf + pos, cap - pos, "(0x%02x)", fields[i].param & 0xff);
-            if (written > 0) { pos += (size_t)written; }
+            if (written > 0) {
+                pos += (size_t)written;
+            }
         }
         if (fields[i].count > 1) {
             int written = snprintf(buf + pos, cap - pos, "[%d]", fields[i].count);
-            if (written > 0) { pos += (size_t)written; }
+            if (written > 0) {
+                pos += (size_t)written;
+            }
         }
     }
-    if (pos < cap) { buf[pos] = '\0'; }
+    if (pos < cap) {
+        buf[pos] = '\0';
+    }
 }
 
 void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max,
-                    const ApexProject *p)
-{
+                    const ApexProject *p) {
     *count = 0;
-    if (!spec || !*spec) { return; }
+    if (!spec || !*spec) {
+        return;
+    }
     char buf[256];
     snprintf(buf, sizeof(buf), "%s", spec);
     char *tok = buf;
     while (tok && *tok && *count < max) {
         char *comma = strchr(tok, ',');
-        if (comma) { *comma = '\0'; }
-        while (*tok == ' ') { tok++; }
+        if (comma) {
+            *comma = '\0';
+        }
+        while (*tok == ' ') {
+            tok++;
+        }
         char *end = tok + strlen(tok);
-        while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+        while (end > tok && end[-1] == ' ') {
+            *--end = '\0';
+        }
         int cnt = 1;
         char *bracket = strchr(tok, '[');
         if (bracket) {
@@ -2422,9 +2614,13 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
             if (close) {
                 *bracket = '\0';
                 cnt = atoi(bracket + 1);
-                if (cnt < 1) { cnt = 1; }
+                if (cnt < 1) {
+                    cnt = 1;
+                }
                 end = bracket;
-                while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+                while (end > tok && end[-1] == ' ') {
+                    *--end = '\0';
+                }
             }
         }
         int param = 0;
@@ -2433,10 +2629,14 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
             char *close = strchr(paren, ')');
             if (close) {
                 *paren = '\0';
-                param = (int)strtol(paren + 1, NULL, 0);  /* base 0: decimal or 0x hex */
-                if (param < 0) { param = 0; }
+                param = (int)strtol(paren + 1, NULL, 0); /* base 0: decimal or 0x hex */
+                if (param < 0) {
+                    param = 0;
+                }
                 end = paren;
-                while (end > tok && end[-1] == ' ') { *--end = '\0'; }
+                while (end > tok && end[-1] == ' ') {
+                    *--end = '\0';
+                }
             }
         }
         if (*tok) {
@@ -2472,8 +2672,7 @@ void spec_to_fields(const char *spec, ApexEditField *fields, int *count, int max
     }
 }
 
-void load_doc_editor_buffer(const ApexProject *p, UiState *s, uint8_t b, uint32_t a)
-{
+void load_doc_editor_buffer(const ApexProject *p, UiState *s, uint8_t b, uint32_t a) {
     const char *d = config_doc_at(&p->docs, b, a);
     s->edit_doc_input[0] = '\0';
     if (d) {
@@ -2481,39 +2680,32 @@ void load_doc_editor_buffer(const ApexProject *p, UiState *s, uint8_t b, uint32_
     }
 }
 
-OriginalSnapshot build_original_snapshot(const ApexProject *p)
-{
+OriginalSnapshot build_original_snapshot(const ApexProject *p) {
     OriginalSnapshot s;
     for (size_t i = 0; i < p->config_labels.count; i++) {
-        s.labels.push_back({p->config_labels.items[i].has_bank,
-                            p->config_labels.items[i].bank,
-                            p->config_labels.items[i].addr,
-                            p->config_labels.items[i].name});
+        s.labels.push_back({p->config_labels.items[i].has_bank, p->config_labels.items[i].bank,
+                            p->config_labels.items[i].addr, p->config_labels.items[i].name});
     }
     for (size_t i = 0; i < p->config_entries.count; i++) {
-        s.entries.push_back({p->config_entries.items[i].has_bank,
-                             p->config_entries.items[i].bank,
+        s.entries.push_back({p->config_entries.items[i].has_bank, p->config_entries.items[i].bank,
                              p->config_entries.items[i].addr});
     }
     for (size_t i = 0; i < p->data_ranges.count; i++) {
-        s.data.push_back({p->data_ranges.items[i].bank,
-                          p->data_ranges.items[i].addr,
+        if (p->data_ranges.items[i].derived)
+            continue; /* analysis output, not config */
+        s.data.push_back({p->data_ranges.items[i].bank, p->data_ranges.items[i].addr,
                           data_range_spec_string(&p->data_ranges.items[i])});
     }
     for (size_t i = 0; i < p->tables.count; i++) {
-        s.tables.push_back({p->tables.items[i].bank,
-                            p->tables.items[i].addr,
+        s.tables.push_back({p->tables.items[i].bank, p->tables.items[i].addr,
                             table_def_spec_string(&p->tables.items[i])});
     }
     for (size_t i = 0; i < p->docs.count; i++) {
-        s.docs.push_back({p->docs.items[i].has_bank,
-                          p->docs.items[i].bank,
-                          p->docs.items[i].addr,
+        s.docs.push_back({p->docs.items[i].has_bank, p->docs.items[i].bank, p->docs.items[i].addr,
                           p->docs.items[i].text});
     }
     for (size_t i = 0; i < p->inline_sigs.count; i++) {
-        s.inline_sigs.push_back({p->inline_sigs.items[i].has_bank,
-                                 p->inline_sigs.items[i].bank,
+        s.inline_sigs.push_back({p->inline_sigs.items[i].has_bank, p->inline_sigs.items[i].bank,
                                  p->inline_sigs.items[i].addr,
                                  inline_sig_spec_string(&p->inline_sigs.items[i])});
     }
@@ -2523,27 +2715,22 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
                                     p->ref_exclusions.items[i].addr});
     }
     for (size_t i = 0; i < p->literals.count; i++) {
-        s.literals.push_back({p->literals.items[i].has_bank,
-                              p->literals.items[i].bank,
-                              p->literals.items[i].addr});
+        s.literals.push_back(
+            {p->literals.items[i].has_bank, p->literals.items[i].bank, p->literals.items[i].addr});
     }
     for (size_t i = 0; i < p->ack_warnings.count; i++) {
-        s.ack_warnings.push_back({p->ack_warnings.items[i].has_bank,
-                                  p->ack_warnings.items[i].bank,
+        s.ack_warnings.push_back({p->ack_warnings.items[i].has_bank, p->ack_warnings.items[i].bank,
                                   p->ack_warnings.items[i].addr});
     }
     for (size_t i = 0; i < p->far_imms.count; i++) {
-        s.far_imms.push_back({p->far_imms.items[i].has_bank,
-                              p->far_imms.items[i].bank,
-                              p->far_imms.items[i].addr,
-                              p->far_imms.items[i].value,
-                              p->far_imms.items[i].value2,
-                              p->far_imms.items[i].aux_addr});
+        s.far_imms.push_back({p->far_imms.items[i].has_bank, p->far_imms.items[i].bank,
+                              p->far_imms.items[i].addr, p->far_imms.items[i].value,
+                              p->far_imms.items[i].value2, p->far_imms.items[i].aux_addr});
     }
     for (size_t i = 0; i < p->config_types.count; i++) {
         const ConfigType *ct = &p->config_types.items[i];
         SnapshotType st;
-        st.name    = ct->name;
+        st.name = ct->name;
         st.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
         for (size_t j = 0; j < ct->value_count; j++) {
             st.values.push_back({ct->values[j].value, ct->values[j].name});
@@ -2551,14 +2738,13 @@ OriginalSnapshot build_original_snapshot(const ApexProject *p)
         s.types.push_back(std::move(st));
     }
     for (size_t i = 0; i < p->symbols.count; i++) {
-        s.symbols.push_back({p->symbols.items[i].name, p->symbols.items[i].value,
-                             p->symbols.items[i].length});
+        s.symbols.push_back(
+            {p->symbols.items[i].name, p->symbols.items[i].value, p->symbols.items[i].length});
     }
     return s;
 }
 
-OriginalSnapshot build_config_snapshot(const char *config_path)
-{
+OriginalSnapshot build_config_snapshot(const char *config_path) {
     OriginalSnapshot s;
     if (!config_path || !*config_path) {
         return s;
@@ -2578,69 +2764,54 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
     ConfigEntries literals = {};
     ConfigEntries ack_warnings = {};
     ConfigEntries far_imms = {};
-    load_config(config_path, &sigs, &labels, &entries, &tables, &schemas,
-                &docs, &symbols, &data_ranges, &options, &types,
-                &ref_exclusions, &literals, &ack_warnings, &far_imms);
+    load_config(config_path, &sigs, &labels, &entries, &tables, &schemas, &docs, &symbols,
+                &data_ranges, &options, &types, &ref_exclusions, &literals, &ack_warnings,
+                &far_imms);
     for (size_t i = 0; i < labels.count; i++) {
-        s.labels.push_back({labels.items[i].has_bank,
-                            labels.items[i].bank,
-                            labels.items[i].addr,
+        s.labels.push_back({labels.items[i].has_bank, labels.items[i].bank, labels.items[i].addr,
                             labels.items[i].name});
     }
     for (size_t i = 0; i < entries.count; i++) {
-        s.entries.push_back({entries.items[i].has_bank,
-                             entries.items[i].bank,
-                             entries.items[i].addr});
+        s.entries.push_back(
+            {entries.items[i].has_bank, entries.items[i].bank, entries.items[i].addr});
     }
     for (size_t i = 0; i < data_ranges.count; i++) {
-        s.data.push_back({data_ranges.items[i].bank,
-                          data_ranges.items[i].addr,
+        s.data.push_back({data_ranges.items[i].bank, data_ranges.items[i].addr,
                           data_range_spec_string(&data_ranges.items[i])});
     }
     for (size_t i = 0; i < tables.count; i++) {
-        s.tables.push_back({tables.items[i].bank,
-                            tables.items[i].addr,
-                            table_def_spec_string(&tables.items[i])});
+        s.tables.push_back(
+            {tables.items[i].bank, tables.items[i].addr, table_def_spec_string(&tables.items[i])});
     }
     for (size_t i = 0; i < docs.count; i++) {
-        s.docs.push_back({docs.items[i].has_bank,
-                          docs.items[i].bank,
-                          docs.items[i].addr,
-                          docs.items[i].text});
+        s.docs.push_back(
+            {docs.items[i].has_bank, docs.items[i].bank, docs.items[i].addr, docs.items[i].text});
     }
     for (size_t i = 0; i < sigs.count; i++) {
-        s.inline_sigs.push_back({sigs.items[i].has_bank,
-                                 sigs.items[i].bank,
-                                 sigs.items[i].addr,
+        s.inline_sigs.push_back({sigs.items[i].has_bank, sigs.items[i].bank, sigs.items[i].addr,
                                  inline_sig_spec_string(&sigs.items[i])});
     }
     for (size_t i = 0; i < ref_exclusions.count; i++) {
-        s.ref_exclusions.push_back({ref_exclusions.items[i].has_bank,
-                                    ref_exclusions.items[i].bank,
+        s.ref_exclusions.push_back({ref_exclusions.items[i].has_bank, ref_exclusions.items[i].bank,
                                     ref_exclusions.items[i].addr});
     }
     for (size_t i = 0; i < literals.count; i++) {
-        s.literals.push_back({literals.items[i].has_bank,
-                              literals.items[i].bank,
-                              literals.items[i].addr});
+        s.literals.push_back(
+            {literals.items[i].has_bank, literals.items[i].bank, literals.items[i].addr});
     }
     for (size_t i = 0; i < ack_warnings.count; i++) {
-        s.ack_warnings.push_back({ack_warnings.items[i].has_bank,
-                                  ack_warnings.items[i].bank,
+        s.ack_warnings.push_back({ack_warnings.items[i].has_bank, ack_warnings.items[i].bank,
                                   ack_warnings.items[i].addr});
     }
     for (size_t i = 0; i < far_imms.count; i++) {
-        s.far_imms.push_back({far_imms.items[i].has_bank,
-                              far_imms.items[i].bank,
-                              far_imms.items[i].addr,
-                              far_imms.items[i].value,
-                              far_imms.items[i].value2,
-                              far_imms.items[i].aux_addr});
+        s.far_imms.push_back({far_imms.items[i].has_bank, far_imms.items[i].bank,
+                              far_imms.items[i].addr, far_imms.items[i].value,
+                              far_imms.items[i].value2, far_imms.items[i].aux_addr});
     }
     for (size_t i = 0; i < types.count; i++) {
         const ConfigType *ct = &types.items[i];
         SnapshotType stype;
-        stype.name    = ct->name;
+        stype.name = ct->name;
         stype.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
         for (size_t j = 0; j < ct->value_count; j++) {
             stype.values.push_back({ct->values[j].value, ct->values[j].name});
@@ -2656,8 +2827,7 @@ OriginalSnapshot build_config_snapshot(const char *config_path)
 }
 
 int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const char *path,
-                        const char *include_path, std::string *st)
-{
+                        const char *include_path, std::string *st) {
     std::vector<SnapshotLabel> cl;
     std::vector<SnapshotEntry> ce;
     std::vector<SnapshotEntry> cexcl;
@@ -2686,29 +2856,28 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
     for (size_t i = 0; i < p->config_labels.count; i++) {
-        const auto *o = find_snapshot_label(s, p->config_labels.items[i].has_bank,
-                                            p->config_labels.items[i].bank,
-                                            p->config_labels.items[i].addr);
+        const auto *o =
+            find_snapshot_label(s, p->config_labels.items[i].has_bank,
+                                p->config_labels.items[i].bank, p->config_labels.items[i].addr);
         if (!o || o->name != p->config_labels.items[i].name) {
-            cl.push_back({p->config_labels.items[i].has_bank,
-                          p->config_labels.items[i].bank,
-                          p->config_labels.items[i].addr,
-                          p->config_labels.items[i].name});
+            cl.push_back({p->config_labels.items[i].has_bank, p->config_labels.items[i].bank,
+                          p->config_labels.items[i].addr, p->config_labels.items[i].name});
         }
     }
     for (size_t i = 0; i < p->config_entries.count; i++) {
         if (!find_snapshot_entry(s, p->config_entries.items[i].has_bank,
                                  p->config_entries.items[i].bank,
                                  p->config_entries.items[i].addr)) {
-            ce.push_back({p->config_entries.items[i].has_bank,
-                          p->config_entries.items[i].bank,
+            ce.push_back({p->config_entries.items[i].has_bank, p->config_entries.items[i].bank,
                           p->config_entries.items[i].addr});
         }
     }
     for (size_t i = 0; i < p->data_ranges.count; i++) {
+        if (p->data_ranges.items[i].derived)
+            continue; /* analysis output, not config */
         std::string spec = data_range_spec_string(&p->data_ranges.items[i]);
-        const auto *o = find_snapshot_data(s, p->data_ranges.items[i].bank,
-                                           p->data_ranges.items[i].addr);
+        const auto *o =
+            find_snapshot_data(s, p->data_ranges.items[i].bank, p->data_ranges.items[i].addr);
         if (!o || o->spec != spec) {
             cd.push_back({p->data_ranges.items[i].bank, p->data_ranges.items[i].addr, spec});
         }
@@ -2721,14 +2890,11 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         }
     }
     for (size_t i = 0; i < p->docs.count; i++) {
-        const auto *o = find_snapshot_doc(s->docs, p->docs.items[i].has_bank,
-                                          p->docs.items[i].bank,
+        const auto *o = find_snapshot_doc(s->docs, p->docs.items[i].has_bank, p->docs.items[i].bank,
                                           p->docs.items[i].addr);
         if (!o || o->text != p->docs.items[i].text) {
-            cdocs.push_back({p->docs.items[i].has_bank,
-                             p->docs.items[i].bank,
-                             p->docs.items[i].addr,
-                             p->docs.items[i].text});
+            cdocs.push_back({p->docs.items[i].has_bank, p->docs.items[i].bank,
+                             p->docs.items[i].addr, p->docs.items[i].text});
         }
     }
 
@@ -2737,8 +2903,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         int found = 0;
         for (auto &o : s->inline_sigs) {
             if (o.has_bank == p->inline_sigs.items[i].has_bank &&
-                o.bank == p->inline_sigs.items[i].bank &&
-                o.addr == p->inline_sigs.items[i].addr) {
+                o.bank == p->inline_sigs.items[i].bank && o.addr == p->inline_sigs.items[i].addr) {
                 if (o.spec != spec) {
                     ci.push_back({o.has_bank, o.bank, o.addr, spec});
                 }
@@ -2747,10 +2912,8 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             }
         }
         if (!found) {
-            ci.push_back({p->inline_sigs.items[i].has_bank,
-                          p->inline_sigs.items[i].bank,
-                          p->inline_sigs.items[i].addr,
-                          spec});
+            ci.push_back({p->inline_sigs.items[i].has_bank, p->inline_sigs.items[i].bank,
+                          p->inline_sigs.items[i].addr, spec});
         }
     }
 
@@ -2781,8 +2944,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             }
         }
         if (!found) {
-            cexcl.push_back({p->ref_exclusions.items[i].has_bank,
-                             p->ref_exclusions.items[i].bank,
+            cexcl.push_back({p->ref_exclusions.items[i].has_bank, p->ref_exclusions.items[i].bank,
                              p->ref_exclusions.items[i].addr});
         }
     }
@@ -2792,8 +2954,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         bool still_there = false;
         for (size_t j = 0; j < p->literals.count; j++) {
             if (p->literals.items[j].has_bank == o.has_bank &&
-                p->literals.items[j].bank == o.bank &&
-                p->literals.items[j].addr == o.addr) {
+                p->literals.items[j].bank == o.bank && p->literals.items[j].addr == o.addr) {
                 still_there = true;
                 break;
             }
@@ -2807,15 +2968,13 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         bool found = false;
         for (auto &o : s->literals) {
             if (o.has_bank == p->literals.items[i].has_bank &&
-                o.bank == p->literals.items[i].bank &&
-                o.addr == p->literals.items[i].addr) {
+                o.bank == p->literals.items[i].bank && o.addr == p->literals.items[i].addr) {
                 found = true;
                 break;
             }
         }
         if (!found) {
-            clits.push_back({p->literals.items[i].has_bank,
-                             p->literals.items[i].bank,
+            clits.push_back({p->literals.items[i].has_bank, p->literals.items[i].bank,
                              p->literals.items[i].addr});
         }
     }
@@ -2847,8 +3006,7 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
             }
         }
         if (!found) {
-            cacks.push_back({p->ack_warnings.items[i].has_bank,
-                             p->ack_warnings.items[i].bank,
+            cacks.push_back({p->ack_warnings.items[i].has_bank, p->ack_warnings.items[i].bank,
                              p->ack_warnings.items[i].addr});
         }
     }
@@ -2859,10 +3017,8 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         bool still_there = false;
         for (size_t j = 0; j < p->far_imms.count; j++) {
             if (p->far_imms.items[j].has_bank == o.has_bank &&
-                p->far_imms.items[j].bank == o.bank &&
-                p->far_imms.items[j].addr == o.addr &&
-                p->far_imms.items[j].value == o.value &&
-                p->far_imms.items[j].value2 == o.value2 &&
+                p->far_imms.items[j].bank == o.bank && p->far_imms.items[j].addr == o.addr &&
+                p->far_imms.items[j].value == o.value && p->far_imms.items[j].value2 == o.value2 &&
                 p->far_imms.items[j].aux_addr == o.aux_addr) {
                 still_there = true;
                 break;
@@ -2877,22 +3033,17 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         bool found = false;
         for (auto &o : s->far_imms) {
             if (o.has_bank == p->far_imms.items[i].has_bank &&
-                o.bank == p->far_imms.items[i].bank &&
-                o.addr == p->far_imms.items[i].addr &&
-                o.value == p->far_imms.items[i].value &&
-                o.value2 == p->far_imms.items[i].value2 &&
+                o.bank == p->far_imms.items[i].bank && o.addr == p->far_imms.items[i].addr &&
+                o.value == p->far_imms.items[i].value && o.value2 == p->far_imms.items[i].value2 &&
                 o.aux_addr == p->far_imms.items[i].aux_addr) {
                 found = true;
                 break;
             }
         }
         if (!found) {
-            cfar.push_back({p->far_imms.items[i].has_bank,
-                            p->far_imms.items[i].bank,
-                            p->far_imms.items[i].addr,
-                            p->far_imms.items[i].value,
-                            p->far_imms.items[i].value2,
-                            p->far_imms.items[i].aux_addr});
+            cfar.push_back({p->far_imms.items[i].has_bank, p->far_imms.items[i].bank,
+                            p->far_imms.items[i].addr, p->far_imms.items[i].value,
+                            p->far_imms.items[i].value2, p->far_imms.items[i].aux_addr});
         }
     }
 
@@ -2901,21 +3052,24 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         const ConfigType *ct = &p->config_types.items[i];
         const SnapshotType *orig = nullptr;
         for (auto &snt : s->types) {
-            if (snt.name == ct->name) { orig = &snt; break; }
+            if (snt.name == ct->name) {
+                orig = &snt;
+                break;
+            }
         }
         bool changed = !orig || (int)(ct->kind == TABLE_WORD) != orig->is_word ||
                        ct->value_count != orig->values.size();
         if (!changed && orig) {
             for (size_t j = 0; j < ct->value_count && !changed; j++) {
                 if (ct->values[j].value != orig->values[j].value ||
-                    orig->values[j].name  != ct->values[j].name) {
+                    orig->values[j].name != ct->values[j].name) {
                     changed = true;
                 }
             }
         }
         if (changed) {
             SnapshotType stype;
-            stype.name    = ct->name;
+            stype.name = ct->name;
             stype.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
             for (size_t j = 0; j < ct->value_count; j++) {
                 stype.values.push_back({ct->values[j].value, ct->values[j].name});
@@ -2927,7 +3081,10 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     for (auto &snt : s->types) {
         bool still_there = false;
         for (size_t j = 0; j < p->config_types.count; j++) {
-            if (p->config_types.items[j].name == snt.name) { still_there = true; break; }
+            if (p->config_types.items[j].name == snt.name) {
+                still_there = true;
+                break;
+            }
         }
         if (!still_there) {
             *st = "type deletion needs full snapshot";
@@ -2939,24 +3096,32 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     std::vector<SnapshotSymbol> csym;
     for (size_t i = 0; i < p->symbols.count; i++) {
         const char *sname = p->symbols.items[i].name;
-        uint32_t    sval  = p->symbols.items[i].value;
-        uint32_t    slen  = p->symbols.items[i].length;
+        uint32_t sval = p->symbols.items[i].value;
+        uint32_t slen = p->symbols.items[i].length;
         bool found = false;
         for (auto &ss : s->symbols) {
             if (ss.name == sname) {
                 found = true;
-                if (ss.value != sval || ss.length != slen) csym.push_back({sname, sval, slen});
+                if (ss.value != sval || ss.length != slen)
+                    csym.push_back({sname, sval, slen});
                 break;
             }
         }
-        if (!found) csym.push_back({sname, sval, slen});
+        if (!found)
+            csym.push_back({sname, sval, slen});
     }
     for (auto &ss : s->symbols) {
         bool still_there = false;
         for (size_t j = 0; j < p->symbols.count; j++) {
-            if (p->symbols.items[j].name == ss.name) { still_there = true; break; }
+            if (p->symbols.items[j].name == ss.name) {
+                still_there = true;
+                break;
+            }
         }
-        if (!still_there) { *st = "symbol deletion needs full snapshot"; return 0; }
+        if (!still_there) {
+            *st = "symbol deletion needs full snapshot";
+            return 0;
+        }
     }
 
     FILE *o = fopen(path, "w");
@@ -2976,8 +3141,8 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
         for (auto &t : ctype) {
             fprintf(o, "%s:%s =\n", t.name.c_str(), t.is_word ? "word" : "byte");
             for (size_t vi = 0; vi < t.values.size(); vi++) {
-                fprintf(o, t.is_word ? "\t0x%04x:%s\n" : "\t0x%02x:%s\n",
-                        t.values[vi].value, t.values[vi].name.c_str());
+                fprintf(o, t.is_word ? "\t0x%04x:%s\n" : "\t0x%02x:%s\n", t.values[vi].value,
+                        t.values[vi].name.c_str());
             }
         }
     }
@@ -3078,8 +3243,29 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
     return 1;
 }
 
-int write_full_config(ApexProject *p, const char *path, std::string *st)
-{
+bool save_overlay(ApexProject *p, const OriginalSnapshot *sn, UiState *s) {
+    std::string st;
+    int rc = write_delta_overlay(p, sn, s->save_path_input, s->base_config_path, &st);
+    if (rc > 0) {
+        set_status(s, st.c_str());
+        s->overlay_dirty = false;
+        return true;
+    }
+    if (rc == 0) {
+        /* The delta cannot express a removal, so write every section instead.
+           An item removed from the base INI still comes back through the
+           overlay's `include`; only Consolidate can drop it for good. */
+        if (apex_project_save_overlay(p, s->save_path_input, s->base_config_path) == 0) {
+            set_status(s, "saved full overlay (removals of base-INI entries need Consolidate)");
+            s->overlay_dirty = false;
+            return true;
+        }
+    }
+    set_status(s, "save failed: cannot write overlay");
+    return false;
+}
+
+int write_full_config(ApexProject *p, const char *path, std::string *st) {
     apex_project_sort_config(p);
     FILE *o = fopen(path, "w");
     if (!o) {
@@ -3087,24 +3273,8 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         return -1;
     }
     fputs("; Apex ImGui config\n", o);
-    {
-        const ConfigOptions *op = &p->options;
-        if (op->labels_are_entries || op->min_immediate_symbol || op->reference_counts ||
-            op->hex_index_offsets || op->instruction_addresses || op->far_code_allow_null ||
-            op->report_code_in_data || op->check_inline_length || op->report_dmd_short) {
-            fputs("\n[options]\n", o);
-            if (op->labels_are_entries)     fputs("labels_are_entries = true\n", o);
-            if (op->min_immediate_symbol)
-                fprintf(o, "min_immediate_symbol = 0x%04x\n", op->min_immediate_symbol);
-            if (op->reference_counts)       fputs("reference_counts = true\n", o);
-            if (op->hex_index_offsets)      fputs("hex_index_offsets = true\n", o);
-            if (op->instruction_addresses)  fputs("instruction_addresses = true\n", o);
-            if (op->far_code_allow_null)    fputs("far_code_allow_null = true\n", o);
-            if (op->report_code_in_data)    fputs("report_code_in_data = true\n", o);
-            if (op->check_inline_length)    fputs("check_inline_length = true\n", o);
-            if (op->report_dmd_short)       fputs("report_dmd_short = true\n", o);
-        }
-    }
+    fputc('\n', o);
+    config_write_options(o, &p->options);
     if (p->config_types.count > 0) {
         fputs("\n[types]\n", o);
         for (size_t i = 0; i < p->config_types.count; i++) {
@@ -3127,8 +3297,8 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         fputs("\n[symbols]\n", o);
         for (size_t i = 0; i < p->symbols.count; i++) {
             if (p->symbols.items[i].length > 1u)
-                fprintf(o, "%s = 0x%04x, %u\n", p->symbols.items[i].name,
-                        p->symbols.items[i].value, (unsigned)p->symbols.items[i].length);
+                fprintf(o, "%s = 0x%04x, %u\n", p->symbols.items[i].name, p->symbols.items[i].value,
+                        (unsigned)p->symbols.items[i].length);
             else
                 fprintf(o, "%s = 0x%04x\n", p->symbols.items[i].name, p->symbols.items[i].value);
         }
@@ -3137,8 +3307,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         fputs("\n[labels]\n", o);
         for (size_t i = 0; i < p->config_labels.count; i++) {
             write_config_address(o, p->config_labels.items[i].has_bank,
-                                 p->config_labels.items[i].bank,
-                                 p->config_labels.items[i].addr);
+                                 p->config_labels.items[i].bank, p->config_labels.items[i].addr);
             fputs(" = ", o);
             write_escaped_value(o, p->config_labels.items[i].name);
             fputc('\n', o);
@@ -3148,8 +3317,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         fputs("\n[entries]\n", o);
         for (size_t i = 0; i < p->config_entries.count; i++) {
             write_config_address(o, p->config_entries.items[i].has_bank,
-                                 p->config_entries.items[i].bank,
-                                 p->config_entries.items[i].addr);
+                                 p->config_entries.items[i].bank, p->config_entries.items[i].addr);
             fputs(" = code\n", o);
         }
     }
@@ -3157,16 +3325,14 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         fputs("\n[exclude_refs]\n", o);
         for (size_t i = 0; i < p->ref_exclusions.count; i++) {
             write_config_address(o, p->ref_exclusions.items[i].has_bank,
-                                 p->ref_exclusions.items[i].bank,
-                                 p->ref_exclusions.items[i].addr);
+                                 p->ref_exclusions.items[i].bank, p->ref_exclusions.items[i].addr);
             fputs(" = 1\n", o);
         }
     }
     if (p->literals.count > 0) {
         fputs("\n[literals]\n", o);
         for (size_t i = 0; i < p->literals.count; i++) {
-            write_config_address(o, p->literals.items[i].has_bank,
-                                 p->literals.items[i].bank,
+            write_config_address(o, p->literals.items[i].has_bank, p->literals.items[i].bank,
                                  p->literals.items[i].addr);
             fputs(" = literal\n", o);
         }
@@ -3175,8 +3341,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
         fputs("\n[ack_warnings]\n", o);
         for (size_t i = 0; i < p->ack_warnings.count; i++) {
             write_config_address(o, p->ack_warnings.items[i].has_bank,
-                                 p->ack_warnings.items[i].bank,
-                                 p->ack_warnings.items[i].addr);
+                                 p->ack_warnings.items[i].bank, p->ack_warnings.items[i].addr);
             fputs(" = ack\n", o);
         }
     }
@@ -3195,19 +3360,20 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
     if (p->inline_sigs.count > 0) {
         fputs("\n[inline]\n", o);
         for (size_t i = 0; i < p->inline_sigs.count; i++) {
-            write_config_address(o, p->inline_sigs.items[i].has_bank,
-                                 p->inline_sigs.items[i].bank,
+            write_config_address(o, p->inline_sigs.items[i].has_bank, p->inline_sigs.items[i].bank,
                                  p->inline_sigs.items[i].addr);
             fprintf(o, " = %s", inline_sig_spec_string(&p->inline_sigs.items[i]).c_str());
-            if (p->inline_sigs.items[i].flow_stop) fputs(", flow_stop", o);
+            if (p->inline_sigs.items[i].flow_stop)
+                fputs(", flow_stop", o);
             fputc('\n', o);
         }
     }
     if (p->data_ranges.count > 0) {
         fputs("\n[data]\n", o);
         for (size_t i = 0; i < p->data_ranges.count; i++) {
-            write_config_address(o, 1, p->data_ranges.items[i].bank,
-                                 p->data_ranges.items[i].addr);
+            if (p->data_ranges.items[i].derived)
+                continue; /* analysis output, not config */
+            write_config_address(o, 1, p->data_ranges.items[i].bank, p->data_ranges.items[i].addr);
             fprintf(o, " = %s\n", data_range_spec_string(&p->data_ranges.items[i]).c_str());
         }
     }
@@ -3221,8 +3387,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
     if (p->docs.count > 0) {
         fputs("\n[docs]\n", o);
         for (size_t i = 0; i < p->docs.count; i++) {
-            write_config_address(o, p->docs.items[i].has_bank,
-                                 p->docs.items[i].bank,
+            write_config_address(o, p->docs.items[i].has_bank, p->docs.items[i].bank,
                                  p->docs.items[i].addr);
             fputs(" = ", o);
             write_escaped_value(o, p->docs.items[i].text);
@@ -3234,8 +3399,7 @@ int write_full_config(ApexProject *p, const char *path, std::string *st)
     return 1;
 }
 
-std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input)
-{
+std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *input) {
     /* Parse space-separated hex tokens; '??' is a wildcard byte. */
     std::vector<std::pair<uint8_t, bool>> pattern;
     const char *p = input;
@@ -3297,12 +3461,14 @@ std::vector<size_t> search_hex_pattern(const ApexProject *project, const char *i
 /* Change listener registered on the ApexProject: appends one row per recorded
    edit to the GUI's change log.  Runs on the main thread (mutations only happen
    there), so touching the std::vector needs no locking. */
-void ui_change_listener(void *ctx, const ApexChangeEvent *ev)
-{
+void ui_change_listener(void *ctx, const ApexChangeEvent *ev) {
     UiState *s = (UiState *)ctx;
     if (!s || !ev) {
         return;
     }
+    /* Every recorded config edit (and only those) makes the overlay dirty; a
+       plain re-render (F5, startup) does not. */
+    s->overlay_dirty = true;
     ChangeLogEntry e;
     e.seq = ev->seq;
     e.action = ev->action ? ev->action : "";
@@ -3320,8 +3486,7 @@ void ui_change_listener(void *ctx, const ApexChangeEvent *ev)
 }
 
 std::vector<ImmLoadRef> find_imm_loads(const ApexProject *project,
-                                       const ApexRenderedDocument *document)
-{
+                                       const ApexRenderedDocument *document) {
     std::vector<ImmLoadRef> results;
     if (!project || !document) {
         return results;
@@ -3337,8 +3502,7 @@ std::vector<ImmLoadRef> find_imm_loads(const ApexProject *project,
             continue;
         }
         char buf[64];
-        Cpu6809InstrInfo info =
-            cpu6809_disassemble_info(src, len, l->cpu_addr, buf, sizeof(buf));
+        Cpu6809InstrInfo info = cpu6809_disassemble_info(src, len, l->cpu_addr, buf, sizeof(buf));
         if (!info.has_addr_ref || !strchr(buf, '#')) {
             continue; /* not a 16-bit immediate operand */
         }
@@ -3374,8 +3538,7 @@ std::vector<ImmLoadRef> find_imm_loads(const ApexProject *project,
     return results;
 }
 
-std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const char *addr_input)
-{
+std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const char *addr_input) {
     std::vector<size_t> results;
     if (!document || !addr_input || !*addr_input) {
         return results;
@@ -3450,8 +3613,7 @@ std::vector<size_t> find_ram_refs(const ApexRenderedDocument *document, const ch
     return results;
 }
 
-void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState *s)
-{
+void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState *s) {
     uint8_t cur_bank;
     uint32_t cur_addr;
     if (!selected_address(*dp, s, &cur_bank, &cur_addr)) {
@@ -3538,12 +3700,24 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
             size_t tli;
             if (apex_render_find_line_by_address(*dp, tgt_bank, addr_val, &tli)) {
                 switch ((*dp)->lines[tli].block_kind) {
-                case APEX_RENDER_BLOCK_CODE:         prefix = "Sub_"; break;
-                case APEX_RENDER_BLOCK_DATA:         prefix = "Dat_"; break;
-                case APEX_RENDER_BLOCK_SPRITE:       prefix = "Spr_"; break;
-                case APEX_RENDER_BLOCK_TABLE:        prefix = "Tab_"; break;
-                case APEX_RENDER_BLOCK_UNCLASSIFIED: prefix = "Unc_"; break;
-                default:                             prefix = "Loc_"; break;
+                case APEX_RENDER_BLOCK_CODE:
+                    prefix = "Sub_";
+                    break;
+                case APEX_RENDER_BLOCK_DATA:
+                    prefix = "Dat_";
+                    break;
+                case APEX_RENDER_BLOCK_SPRITE:
+                    prefix = "Spr_";
+                    break;
+                case APEX_RENDER_BLOCK_TABLE:
+                    prefix = "Tab_";
+                    break;
+                case APEX_RENDER_BLOCK_UNCLASSIFIED:
+                    prefix = "Unc_";
+                    break;
+                default:
+                    prefix = "Loc_";
+                    break;
                 }
             }
         }
@@ -3568,4 +3742,3 @@ void auto_label_targets(ApexProject *p, const ApexRenderedDocument **dp, UiState
         set_status(s, "no unlabeled address targets found");
     }
 }
-

@@ -1,5 +1,6 @@
-#include "apex.h"
 #include "apex_config.h"
+
+#include "apex.h"
 
 #include <ctype.h>
 #include <stdlib.h>
@@ -11,10 +12,37 @@
    average ~20 chars per "value:name" entry that is room for ~3000 enum values.
    CONFIG_MAX_LINE bounds a single physical config line, which matters for the
    one-line [types] form.  Enlarge both together if even bigger enums appear. */
-#define CONFIG_MAX_LINE        65536u
+#define CONFIG_MAX_LINE 65536u
 #define CONFIG_MAX_TYPE_VALUES 65536u
+#define CONFIG_MAX_INCLUDE_DEPTH 16
 
 static int parse_table_field(char *value, TableField *field, const ConfigTypes *types);
+
+/* Reentrant replacement for strtok(s, " \t"): returns the next blank-separated
+   token of *rest (NUL-terminating it in place) and advances *rest, or NULL.
+   strtok's hidden state is shared by all threads, and configs may be loaded
+   on a worker thread. */
+static char *next_token(char **rest) {
+    char *p = *rest;
+    char *tok;
+
+    while (*p == ' ' || *p == '\t') {
+        p++;
+    }
+    if (*p == '\0') {
+        *rest = p;
+        return NULL;
+    }
+    tok = p;
+    while (*p && *p != ' ' && *p != '\t') {
+        p++;
+    }
+    if (*p) {
+        *p++ = '\0';
+    }
+    *rest = p;
+    return tok;
+}
 
 /* When set, a later [symbols]/[labels] definition that conflicts with an earlier
    one (same name, different value/address) replaces it instead of aborting.
@@ -22,14 +50,12 @@ static int parse_table_field(char *value, TableField *field, const ConfigTypes *
    default so ordinary loads still catch genuine contradictions. */
 static int g_config_override;
 
-void config_set_override(int enabled)
-{
+void config_set_override(int enabled) {
     g_config_override = enabled ? 1 : 0;
 }
 
 static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t item_addr,
-                               int has_bank, uint8_t bank, uint32_t addr)
-{
+                               int has_bank, uint8_t bank, uint32_t addr) {
     if (item_addr != addr) {
         return 0;
     }
@@ -44,8 +70,7 @@ static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t it
     return 0;
 }
 
-static char *dup_string(const char *s)
-{
+static char *dup_string(const char *s) {
     size_t len = strlen(s) + 1u;
     char *copy = xmalloc(len);
 
@@ -53,8 +78,7 @@ static char *dup_string(const char *s)
     return copy;
 }
 
-static void strip_config_comment(char *line)
-{
+static void strip_config_comment(char *line) {
     int in_quote = 0;
     int escaped = 0;
     char *p;
@@ -79,8 +103,7 @@ static void strip_config_comment(char *line)
     }
 }
 
-static char *dup_config_value(const char *s)
-{
+static char *dup_config_value(const char *s) {
     char *raw = dup_string(s);
     char *trimmed = trim(raw);
     size_t len = strlen(trimmed);
@@ -120,8 +143,7 @@ static char *dup_config_value(const char *s)
     return copy;
 }
 
-static int parse_config_bool(const char *value, int *out)
-{
+static int parse_config_bool(const char *value, int *out) {
     if (strcmp(value, "1") == 0 || strcmp(value, "true") == 0 || strcmp(value, "yes") == 0 ||
         strcmp(value, "on") == 0) {
         *out = 1;
@@ -135,8 +157,7 @@ static int parse_config_bool(const char *value, int *out)
     return 0;
 }
 
-static void copy_inline_schema(TableSchema *dst, const TableSchema *src)
-{
+static void copy_inline_schema(TableSchema *dst, const TableSchema *src) {
     size_t i;
 
     memset(dst, 0, sizeof(*dst));
@@ -148,8 +169,7 @@ static void copy_inline_schema(TableSchema *dst, const TableSchema *src)
 }
 
 static void add_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_t addr,
-                           const char *text)
-{
+                           const char *text) {
     size_t i;
 
     if (!text || !*text) {
@@ -181,8 +201,7 @@ static void add_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_
     docs->sorted = 0;
 }
 
-static int valid_symbol_name(const char *s)
-{
+static int valid_symbol_name(const char *s) {
     if (!isalpha((unsigned char)*s) && *s != '_') {
         return 0;
     }
@@ -194,20 +213,59 @@ static int valid_symbol_name(const char *s)
     return 1;
 }
 
-static int reserved_symbol_name(const char *s)
-{
-    static const char *reserved[] = {
-        "BANK_ID", "FILL_TO_BANK_END", "INLINE_BYTE", "INLINE_WORD", "INLINE_PTR",
-        "INLINE_STRING_PTR", "INLINE_CODE_PTR", "INLINE_TABLE_PTR", "INLINE_FAR_CODE",
-        "INLINE_FAR_STRING", "INLINE_FAR_PTR", "INLINE_FAR_TABLE",
-        "INLINE_PTR_DMD_FULLFRAME", "INLINE_FAR_DMD_FULLFRAME",
-        "TABLE_PTR", "TABLE_FAR_CODE", "TABLE_FAR_STRING", "TABLE_FAR_PTR",
-        "TABLE_FAR_TABLE", "TABLE_PTR_DMD_FULLFRAME", "TABLE_FAR_DMD_FULLFRAME",
-        "FAR_CODE", "FAR_STRING", "FAR_PTR", "FAR_TABLE", "FAR_DMD_FULLFRAME",
-        "STRING", "LDA", "LDB", "LDD", "LDX", "LDY", "LDU", "LDS", "STA", "STB",
-        "STD", "STX", "STY", "STU", "STS", "JSR", "JMP", "RTS", "RTI", "BRA",
-        "BSR", "PULS", "PULU", "PSHS", "PSHU", NULL
-    };
+static int reserved_symbol_name(const char *s) {
+    static const char *reserved[] = {"BANK_ID",
+                                     "FILL_TO_BANK_END",
+                                     "INLINE_BYTE",
+                                     "INLINE_WORD",
+                                     "INLINE_PTR",
+                                     "INLINE_STRING_PTR",
+                                     "INLINE_CODE_PTR",
+                                     "INLINE_TABLE_PTR",
+                                     "INLINE_FAR_CODE",
+                                     "INLINE_FAR_STRING",
+                                     "INLINE_FAR_PTR",
+                                     "INLINE_FAR_TABLE",
+                                     "INLINE_PTR_DMD_FULLFRAME",
+                                     "INLINE_FAR_DMD_FULLFRAME",
+                                     "TABLE_PTR",
+                                     "TABLE_FAR_CODE",
+                                     "TABLE_FAR_STRING",
+                                     "TABLE_FAR_PTR",
+                                     "TABLE_FAR_TABLE",
+                                     "TABLE_PTR_DMD_FULLFRAME",
+                                     "TABLE_FAR_DMD_FULLFRAME",
+                                     "FAR_CODE",
+                                     "FAR_STRING",
+                                     "FAR_PTR",
+                                     "FAR_TABLE",
+                                     "FAR_DMD_FULLFRAME",
+                                     "STRING",
+                                     "LDA",
+                                     "LDB",
+                                     "LDD",
+                                     "LDX",
+                                     "LDY",
+                                     "LDU",
+                                     "LDS",
+                                     "STA",
+                                     "STB",
+                                     "STD",
+                                     "STX",
+                                     "STY",
+                                     "STU",
+                                     "STS",
+                                     "JSR",
+                                     "JMP",
+                                     "RTS",
+                                     "RTI",
+                                     "BRA",
+                                     "BSR",
+                                     "PULS",
+                                     "PULU",
+                                     "PSHS",
+                                     "PSHU",
+                                     NULL};
     size_t i;
 
     for (i = 0; reserved[i]; i++) {
@@ -219,8 +277,7 @@ static int reserved_symbol_name(const char *s)
 }
 
 static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t value,
-                              uint32_t length)
-{
+                              uint32_t length) {
     size_t i;
 
     if (!name || !*name) {
@@ -247,7 +304,7 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
                 if (!g_config_override) {
                     die("symbol '%s' is defined more than once", name);
                 }
-                symbols->items[i].value = value;   /* later definition wins */
+                symbols->items[i].value = value; /* later definition wins */
                 symbols->items[i].length = length;
             }
             return;
@@ -269,13 +326,11 @@ static void add_config_symbol(ConfigSymbols *symbols, const char *name, uint32_t
     symbols->count++;
 }
 
-int config_valid_symbol_name(const char *name)
-{
+int config_valid_symbol_name(const char *name) {
     return name && *name && valid_symbol_name(name) && !reserved_symbol_name(name);
 }
 
-int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, uint32_t length)
-{
+int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, uint32_t length) {
     size_t i;
     ConfigSymbol *new_items;
     size_t new_cap;
@@ -297,24 +352,24 @@ int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, 
         }
     }
     if (symbols->count == symbols->cap) {
-        new_cap  = symbols->cap == 0 ? 8 : symbols->cap * 2;
-        new_items = (ConfigSymbol *)realloc(symbols->items,
-                                            new_cap * sizeof(symbols->items[0]));
-        if (!new_items) return 1;
+        new_cap = symbols->cap == 0 ? 8 : symbols->cap * 2;
+        new_items = (ConfigSymbol *)realloc(symbols->items, new_cap * sizeof(symbols->items[0]));
+        if (!new_items)
+            return 1;
         symbols->items = new_items;
-        symbols->cap   = new_cap;
+        symbols->cap = new_cap;
     }
-    symbols->items[symbols->count].name  = dup_string(name);
+    symbols->items[symbols->count].name = dup_string(name);
     symbols->items[symbols->count].value = value;
     symbols->items[symbols->count].length = length;
     symbols->count++;
     return 0;
 }
 
-int config_clear_symbol(ConfigSymbols *symbols, const char *name)
-{
+int config_clear_symbol(ConfigSymbols *symbols, const char *name) {
     size_t i;
-    if (!symbols || !name) return 1;
+    if (!symbols || !name)
+        return 1;
     for (i = 0; i < symbols->count; i++) {
         if (strcmp(symbols->items[i].name, name) == 0) {
             free((void *)symbols->items[i].name);
@@ -328,8 +383,7 @@ int config_clear_symbol(ConfigSymbols *symbols, const char *name)
 }
 
 static void add_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, uint32_t addr,
-                             const char *name)
-{
+                             const char *name) {
     size_t i;
 
     if (!name || !*name) {
@@ -378,17 +432,16 @@ static void add_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, u
     labels->count++;
 }
 
-static const struct { const char *name; FarImmType type; } k_far_imm_types[] = {
-    { "far_data",          FAR_IMM_DATA },
-    { "far_code",          FAR_IMM_CODE },
-    { "far_table",         FAR_IMM_TABLE },
-    { "far_string",        FAR_IMM_STRING },
-    { "far_sprite",        FAR_IMM_SPRITE },
-    { "far_dmd_fullframe", FAR_IMM_DMD_FULLFRAME },
+static const struct {
+    const char *name;
+    FarImmType type;
+} k_far_imm_types[] = {
+    {"far_data", FAR_IMM_DATA},     {"far_code", FAR_IMM_CODE},
+    {"far_table", FAR_IMM_TABLE},   {"far_string", FAR_IMM_STRING},
+    {"far_sprite", FAR_IMM_SPRITE}, {"far_dmd_fullframe", FAR_IMM_DMD_FULLFRAME},
 };
 
-int far_imm_type_from_str(const char *s, FarImmType *out)
-{
+int far_imm_type_from_str(const char *s, FarImmType *out) {
     size_t i;
     for (i = 0; i < sizeof(k_far_imm_types) / sizeof(k_far_imm_types[0]); i++) {
         if (strcmp(s, k_far_imm_types[i].name) == 0) {
@@ -399,8 +452,7 @@ int far_imm_type_from_str(const char *s, FarImmType *out)
     return 0;
 }
 
-const char *far_imm_type_name(FarImmType type)
-{
+const char *far_imm_type_name(FarImmType type) {
     size_t i;
     for (i = 0; i < sizeof(k_far_imm_types) / sizeof(k_far_imm_types[0]); i++) {
         if (k_far_imm_types[i].type == type) {
@@ -410,9 +462,36 @@ const char *far_imm_type_name(FarImmType type)
     return "far_data";
 }
 
-static void add_config_entry_full(ConfigEntries *entries, int has_bank, uint8_t bank,
-                                  uint32_t addr, uint8_t value, uint8_t value2, uint32_t aux_addr)
-{
+int config_write_options(FILE *out, const ConfigOptions *op) {
+    if (!op->labels_are_entries && !op->min_immediate_symbol && !op->reference_counts &&
+        !op->hex_index_offsets && !op->instruction_addresses && !op->far_code_allow_null &&
+        !op->report_code_in_data && !op->check_inline_length && !op->report_dmd_short) {
+        return 0;
+    }
+    fputs("[options]\n", out);
+    if (op->labels_are_entries)
+        fputs("labels_are_entries = true\n", out);
+    if (op->min_immediate_symbol)
+        fprintf(out, "min_immediate_symbol = 0x%04x\n", (unsigned)op->min_immediate_symbol);
+    if (op->reference_counts)
+        fputs("reference_counts = true\n", out);
+    if (op->hex_index_offsets)
+        fputs("hex_index_offsets = true\n", out);
+    if (op->instruction_addresses)
+        fputs("instruction_addresses = true\n", out);
+    if (op->far_code_allow_null)
+        fputs("far_code_allow_null = true\n", out);
+    if (op->report_code_in_data)
+        fputs("report_code_in_data = true\n", out);
+    if (op->check_inline_length)
+        fputs("check_inline_length = true\n", out);
+    if (op->report_dmd_short)
+        fputs("report_dmd_short = true\n", out);
+    return 1;
+}
+
+static void add_config_entry_full(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                                  uint8_t value, uint8_t value2, uint32_t aux_addr) {
     size_t i;
 
     for (i = 0; i < entries->count; i++) {
@@ -443,19 +522,16 @@ static void add_config_entry_full(ConfigEntries *entries, int has_bank, uint8_t 
     entries->count++;
 }
 
-static void add_config_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank,
-                                 uint32_t addr, uint8_t value)
-{
+static void add_config_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
+                                 uint8_t value) {
     add_config_entry_full(entries, has_bank, bank, addr, value, 0, 0);
 }
 
-static void add_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
-{
+static void add_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr) {
     add_config_entry_full(entries, has_bank, bank, addr, 0, 0, 0);
 }
 
-static int remove_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
-{
+static int remove_config_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr) {
     size_t i;
 
     for (i = 0; i < entries->count; i++) {
@@ -470,8 +546,7 @@ static int remove_config_entry(ConfigEntries *entries, int has_bank, uint8_t ban
     return 0;
 }
 
-void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count)
-{
+void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count) {
     if (count == 0) {
         return;
     }
@@ -492,8 +567,7 @@ void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count)
     schema->count++;
 }
 
-static TableSchema copy_table_schema(const TableSchema *src)
-{
+static TableSchema copy_table_schema(const TableSchema *src) {
     TableSchema copy;
     size_t i;
 
@@ -506,8 +580,7 @@ static TableSchema copy_table_schema(const TableSchema *src)
     return copy;
 }
 
-static void add_schema_def(SchemaDefs *schemas, const char *name, TableSchema schema)
-{
+static void add_schema_def(SchemaDefs *schemas, const char *name, TableSchema schema) {
     size_t i;
 
     if (!valid_symbol_name(name)) {
@@ -535,8 +608,7 @@ static void add_schema_def(SchemaDefs *schemas, const char *name, TableSchema sc
     schemas->count++;
 }
 
-static int schema_def_named(const SchemaDefs *schemas, const char *name, TableSchema *schema)
-{
+static int schema_def_named(const SchemaDefs *schemas, const char *name, TableSchema *schema) {
     size_t i;
 
     for (i = 0; i < schemas->count; i++) {
@@ -549,8 +621,7 @@ static int schema_def_named(const SchemaDefs *schemas, const char *name, TableSc
 }
 
 static void add_table_def(TableDefs *tables, uint8_t bank, uint32_t addr, TableSchema schema,
-                          int has_header, size_t rows)
-{
+                          int has_header, size_t rows) {
     size_t i;
 
     if (table_schema_is_variable(&schema)) {
@@ -584,8 +655,7 @@ static void add_table_def(TableDefs *tables, uint8_t bank, uint32_t addr, TableS
     tables->sorted = 0; /* appended out of order; table_def_at re-sorts/linear-scans */
 }
 
-static int remove_table_def(TableDefs *tables, uint8_t bank, uint32_t addr)
-{
+static int remove_table_def(TableDefs *tables, uint8_t bank, uint32_t addr) {
     size_t i;
 
     for (i = 0; i < tables->count; i++) {
@@ -600,9 +670,7 @@ static int remove_table_def(TableDefs *tables, uint8_t bank, uint32_t addr)
     return 0;
 }
 
-void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind kind,
-                    size_t length)
-{
+void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind kind, size_t length) {
     size_t i;
 
     if (kind == DATA_BYTES && length == 0) {
@@ -612,6 +680,7 @@ void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind ki
         if (ranges->items[i].bank == bank && ranges->items[i].addr == addr) {
             ranges->items[i].kind = kind;
             ranges->items[i].length = length;
+            ranges->items[i].derived = 0; /* now set explicitly */
             return;
         }
     }
@@ -629,11 +698,11 @@ void add_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr, DataKind ki
     ranges->items[ranges->count].addr = addr;
     ranges->items[ranges->count].kind = kind;
     ranges->items[ranges->count].length = length;
+    ranges->items[ranges->count].derived = 0;
     ranges->count++;
 }
 
-static int remove_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr)
-{
+static int remove_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr) {
     size_t i;
 
     for (i = 0; i < ranges->count; i++) {
@@ -647,8 +716,7 @@ static int remove_data_range(DataRanges *ranges, uint8_t bank, uint32_t addr)
     return 0;
 }
 
-static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr)
-{
+static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr) {
     char bank_text[5];
     char addr_text[7];
     uint32_t bank_value;
@@ -665,8 +733,7 @@ static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr)
     addr_text[1] = 'x';
     memcpy(addr_text + 2, text + 5, 4);
     addr_text[6] = '\0';
-    if (!parse_u32(bank_text, &bank_value) || bank_value > 0xffu ||
-        !parse_u32(addr_text, addr)) {
+    if (!parse_u32(bank_text, &bank_value) || bank_value > 0xffu || !parse_u32(addr_text, addr)) {
         return 0;
     }
     *bank = (uint8_t)bank_value;
@@ -676,8 +743,7 @@ static int parse_bank_label_ref(const char *text, uint8_t *bank, uint32_t *addr)
 /* Remove any 'flow_stop' token from a comma-separated inline spec list, in
    place.  Returns 1 if the token was present.  The remaining string is the
    plain field schema, ready for parse_table_schema. */
-static int extract_flow_stop(char *value)
-{
+static int extract_flow_stop(char *value) {
     char buf[512];
     char *p = value;
     size_t outlen = 0;
@@ -716,9 +782,8 @@ static int extract_flow_stop(char *value)
     return found;
 }
 
-void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema, int flow_stop)
-{
+void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
+                                 const TableSchema *schema, int flow_stop) {
     size_t i;
     unsigned length = (unsigned)table_schema_width(schema);
 
@@ -726,8 +791,8 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
         return;
     }
     for (i = 0; i < sigs->count; i++) {
-        if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank,
-                                sigs->items[i].addr, has_bank, bank, addr)) {
+        if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank, sigs->items[i].addr,
+                                has_bank, bank, addr)) {
             sigs->items[i].length = length;
             sigs->items[i].flow_stop = flow_stop;
             free(sigs->items[i].schema.items);
@@ -755,8 +820,7 @@ void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t b
 }
 
 void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                             unsigned length, TableFieldKind kind)
-{
+                             unsigned length, TableFieldKind kind) {
     TableSchema schema;
 
     memset(&schema, 0, sizeof(schema));
@@ -765,13 +829,13 @@ void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank,
     free(schema.items);
 }
 
-static int remove_inline_signature(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr)
-{
+static int remove_inline_signature(InlineSignatures *sigs, int has_bank, uint8_t bank,
+                                   uint32_t addr) {
     size_t i;
 
     for (i = 0; i < sigs->count; i++) {
-        if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank,
-                                sigs->items[i].addr, has_bank, bank, addr)) {
+        if (config_addr_matches(sigs->items[i].has_bank, sigs->items[i].bank, sigs->items[i].addr,
+                                has_bank, bank, addr)) {
             free(sigs->items[i].schema.items);
             memmove(&sigs->items[i], &sigs->items[i + 1],
                     (sigs->count - i - 1u) * sizeof(sigs->items[0]));
@@ -782,8 +846,7 @@ static int remove_inline_signature(InlineSignatures *sigs, int has_bank, uint8_t
     return 0;
 }
 
-static int parse_table_kind(char *value, TableFieldKind *kind)
-{
+static int parse_table_kind(char *value, TableFieldKind *kind) {
     value = trim(value);
     if (strcmp(value, "byte") == 0) {
         *kind = TABLE_BYTE;
@@ -823,8 +886,7 @@ static int parse_table_kind(char *value, TableFieldKind *kind)
     return 1;
 }
 
-static int parse_table_field(char *value, TableField *field, const ConfigTypes *types)
-{
+static int parse_table_field(char *value, TableField *field, const ConfigTypes *types) {
     char *open;
     char *close;
     uint32_t count;
@@ -892,8 +954,7 @@ static int parse_table_field(char *value, TableField *field, const ConfigTypes *
     return 0;
 }
 
-static int parse_table_schema(char *value, TableSchema *schema, const ConfigTypes *types)
-{
+static int parse_table_schema(char *value, TableSchema *schema, const ConfigTypes *types) {
     char *p = value;
 
     free(schema->items);
@@ -917,8 +978,7 @@ static int parse_table_schema(char *value, TableSchema *schema, const ConfigType
     return schema->count > 0;
 }
 
-static int parse_wrapped_table_format(char *value, const char *prefix, char **inner)
-{
+static int parse_wrapped_table_format(char *value, const char *prefix, char **inner) {
     size_t prefix_len = strlen(prefix);
     char *close;
 
@@ -940,8 +1000,7 @@ static int parse_wrapped_table_format(char *value, const char *prefix, char **in
     return 1;
 }
 
-static int parse_far_code_table_format(char *value, size_t *rows)
-{
+static int parse_far_code_table_format(char *value, size_t *rows) {
     char *open;
     char *close;
     uint32_t parsed_rows;
@@ -964,8 +1023,7 @@ static int parse_far_code_table_format(char *value, size_t *rows)
 }
 
 static int parse_rows_table_format(char *value, size_t *rows, TableSchema *schema,
-                                   const SchemaDefs *schemas, const ConfigTypes *types)
-{
+                                   const SchemaDefs *schemas, const ConfigTypes *types) {
     char *open;
     char *close;
     char *inner;
@@ -997,8 +1055,7 @@ static int parse_rows_table_format(char *value, size_t *rows, TableSchema *schem
     return 1;
 }
 
-static int parse_count_format(char *value, const char *prefix, size_t *count)
-{
+static int parse_count_format(char *value, const char *prefix, size_t *count) {
     size_t prefix_len = strlen(prefix);
     char *open;
     char *close;
@@ -1024,18 +1081,21 @@ static int parse_count_format(char *value, const char *prefix, size_t *count)
 /* Canonical `[data]` spec string for a data range (the single source of truth
    shared by every writer: apexini, apex_project overlay, and the GUI).  Writes
    into buf and returns it. */
-const char *data_range_spec(const DataRange *r, char *buf, size_t bufsz)
-{
+const char *data_range_spec(const DataRange *r, char *buf, size_t bufsz) {
     const char *name;
     switch (r->kind) {
     case DATA_BYTES:
-        snprintf(buf, bufsz, "bytes[%lu]", (unsigned long)r->length);      return buf;
+        snprintf(buf, bufsz, "bytes[%lu]", (unsigned long)r->length);
+        return buf;
     case DATA_STRING_FIXED:
-        snprintf(buf, bufsz, "string[%lu]", (unsigned long)r->length);     return buf;
+        snprintf(buf, bufsz, "string[%lu]", (unsigned long)r->length);
+        return buf;
     case DATA_BCD:
-        snprintf(buf, bufsz, "bcd[%lu]", (unsigned long)r->length);        return buf;
+        snprintf(buf, bufsz, "bcd[%lu]", (unsigned long)r->length);
+        return buf;
     case DATA_SPRITE_NOHEADER:
-        snprintf(buf, bufsz, "sprite_noheader[%lu]", (unsigned long)r->length); return buf;
+        snprintf(buf, bufsz, "sprite_noheader[%lu]", (unsigned long)r->length);
+        return buf;
     case DATA_DMD_FULLFRAME:
         /* r->length holds the bit-plane count; omit [1] for the common case. */
         if (r->length > 1u) {
@@ -1044,58 +1104,82 @@ const char *data_range_spec(const DataRange *r, char *buf, size_t bufsz)
             snprintf(buf, bufsz, "dmd_fullframe");
         }
         return buf;
-    case DATA_STRING:            name = "string";           break;
-    case DATA_PTR16_STRING:      name = "ptr16_string";     break;
-    case DATA_PTR16_DATA:        name = "ptr16_data";       break;
-    case DATA_PTR16_CODE:        name = "ptr16_code";       break;
-    case DATA_PTR16_TABLE:       name = "ptr16_table";      break;
-    case DATA_PTR16_SPRITE:      name = "ptr16_sprite";     break;
-    case DATA_FAR_STRING:        name = "far_string";       break;
-    case DATA_FAR_DATA:          name = "far_data";         break;
-    case DATA_FAR_TABLE:         name = "far_table";        break;
-    case DATA_FAR_CODE:          name = "far_code";         break;
-    case DATA_FAR_DMD_FULLFRAME: name = "far_dmd_fullframe"; break;
-    case DATA_FAR_SPRITE:        name = "far_sprite";       break;
-    case DATA_SPRITE:            name = "sprite";           break;
-    default:                     name = "bytes[1]";         break;
+    case DATA_STRING:
+        name = "string";
+        break;
+    case DATA_PTR16_STRING:
+        name = "ptr16_string";
+        break;
+    case DATA_PTR16_DATA:
+        name = "ptr16_data";
+        break;
+    case DATA_PTR16_CODE:
+        name = "ptr16_code";
+        break;
+    case DATA_PTR16_TABLE:
+        name = "ptr16_table";
+        break;
+    case DATA_PTR16_SPRITE:
+        name = "ptr16_sprite";
+        break;
+    case DATA_FAR_STRING:
+        name = "far_string";
+        break;
+    case DATA_FAR_DATA:
+        name = "far_data";
+        break;
+    case DATA_FAR_TABLE:
+        name = "far_table";
+        break;
+    case DATA_FAR_CODE:
+        name = "far_code";
+        break;
+    case DATA_FAR_DMD_FULLFRAME:
+        name = "far_dmd_fullframe";
+        break;
+    case DATA_FAR_SPRITE:
+        name = "far_sprite";
+        break;
+    case DATA_SPRITE:
+        name = "sprite";
+        break;
+    default:
+        name = "bytes[1]";
+        break;
     }
     snprintf(buf, bufsz, "%s", name);
     return buf;
 }
 
-static char *resolve_include_path(const char *from_path, const char *include_path)
-{
+static char *resolve_include_path(const char *from_path, const char *include_path) {
     const char *slash;
     size_t dir_len;
     char *resolved;
 
-    if (include_path[0] == '/') {
+    if (apex_path_is_absolute(include_path)) {
         return dup_string(include_path);
     }
-    slash = strrchr(from_path, '/');
-    if (!slash) {
+    slash = apex_path_basename(from_path);
+    if (slash == from_path) {
         return dup_string(include_path);
     }
-    dir_len = (size_t)(slash - from_path + 1);
+    dir_len = (size_t)(slash - from_path); /* includes the separator */
     resolved = xmalloc(dir_len + strlen(include_path) + 1u);
     memcpy(resolved, from_path, dir_len);
     strcpy(resolved + dir_len, include_path);
     return resolved;
 }
 
-int table_kind_is_far(TableFieldKind kind)
-{
+int table_kind_is_far(TableFieldKind kind) {
     return kind == TABLE_FAR_STRING || kind == TABLE_FAR_DATA || kind == TABLE_FAR_TABLE ||
            kind == TABLE_FAR_CODE || kind == TABLE_FAR_DMD_FULLFRAME || kind == TABLE_FAR_SPRITE;
 }
 
-int table_kind_is_variable(TableFieldKind kind)
-{
+int table_kind_is_variable(TableFieldKind kind) {
     return kind == TABLE_BYTES_UNTIL || kind == TABLE_COUNTED_BYTES;
 }
 
-int table_schema_is_variable(const TableSchema *schema)
-{
+int table_schema_is_variable(const TableSchema *schema) {
     size_t i;
     for (i = 0; i < schema->count; i++) {
         if (table_kind_is_variable(schema->items[i].kind)) {
@@ -1105,16 +1189,14 @@ int table_schema_is_variable(const TableSchema *schema)
     return 0;
 }
 
-static size_t table_field_width(TableFieldKind kind)
-{
+static size_t table_field_width(TableFieldKind kind) {
     if (table_kind_is_variable(kind)) {
-        return 1u;  /* minimum footprint; real size is resolved per call site */
+        return 1u; /* minimum footprint; real size is resolved per call site */
     }
     return kind == TABLE_BYTE ? 1u : table_kind_is_far(kind) ? 3u : 2u;
 }
 
-size_t table_schema_width(const TableSchema *schema)
-{
+size_t table_schema_width(const TableSchema *schema) {
     size_t i;
     size_t width = 0;
 
@@ -1124,8 +1206,7 @@ size_t table_schema_width(const TableSchema *schema)
     return width;
 }
 
-void free_config_types(ConfigTypes *types)
-{
+void free_config_types(ConfigTypes *types) {
     size_t i, j;
 
     if (!types) {
@@ -1142,8 +1223,7 @@ void free_config_types(ConfigTypes *types)
     memset(types, 0, sizeof(*types));
 }
 
-const ConfigType *find_config_type(const ConfigTypes *types, const char *name)
-{
+const ConfigType *find_config_type(const ConfigTypes *types, const char *name) {
     size_t i;
 
     if (!types || !name) {
@@ -1157,8 +1237,7 @@ const ConfigType *find_config_type(const ConfigTypes *types, const char *name)
     return NULL;
 }
 
-const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value)
-{
+const char *config_type_enum_name(const ConfigTypes *types, const char *type_name, uint32_t value) {
     const ConfigType *type = find_config_type(types, type_name);
     size_t i;
 
@@ -1174,8 +1253,7 @@ const char *config_type_enum_name(const ConfigTypes *types, const char *type_nam
 }
 
 void config_set_type(ConfigTypes *types, const char *name, TableFieldKind kind,
-                     const char *values_str)
-{
+                     const char *values_str) {
     ConfigType *type;
     char *values_copy;
     char *p;
@@ -1257,8 +1335,7 @@ parse_values:
     free(values_copy);
 }
 
-int config_remove_type(ConfigTypes *types, const char *name)
-{
+int config_remove_type(ConfigTypes *types, const char *name) {
     size_t i, j;
 
     if (!types || !name) {
@@ -1282,16 +1359,24 @@ int config_remove_type(ConfigTypes *types, const char *name)
     return 0;
 }
 
-void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
-                 ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
-                 ConfigDocs *docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
-                 ConfigEntries *ref_exclusions, ConfigEntries *literals,
-                 ConfigEntries *ack_warnings, ConfigEntries *far_imms)
-{
+/* inc_stack[0..inc_depth) holds the configs currently being loaded (outermost
+   first) for include-cycle detection.  It lives in load_config's frame, so a
+   load aborted by die() leaves nothing stale behind. */
+static void load_config_file(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
+                             ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
+                             ConfigDocs *docs, ConfigSymbols *symbols, DataRanges *data_ranges,
+                             ConfigOptions *options, ConfigTypes *types,
+                             ConfigEntries *ref_exclusions, ConfigEntries *literals,
+                             ConfigEntries *ack_warnings, ConfigEntries *far_imms,
+                             const char **inc_stack, size_t inc_depth) {
     FILE *f;
-    /* Max length of a single config line (e.g. a one-line [types] enum list). */
-    char line[CONFIG_MAX_LINE];
+    /* Max length of a single config line (e.g. a one-line [types] enum list).
+       Heap, not stack: includes recurse and may run on a worker thread. */
+    char *line;
+    unsigned long lineno = 0;
+    const char *prev_ctx_path;
+    unsigned long prev_ctx_line;
+    size_t k;
     int in_options = 0;
     int in_inline = 0;
     int in_labels = 0;
@@ -1306,26 +1391,42 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
     int in_literals = 0;
     int in_ack_warnings = 0;
     int in_far_imm = 0;
+    int in_unknown = 0; /* inside an unknown (already reported) section */
     /* pending multi-line [types] entry: all enum values of one type are
        accumulated here before being parsed, so this bounds the total size of a
        single type's enum list (see CONFIG_MAX_TYPE_VALUES). */
     char pt_name[256];
     TableFieldKind pt_kind;
-    char pt_vals[CONFIG_MAX_TYPE_VALUES];
-    pt_name[0] = '\0';
-    pt_kind = TABLE_BYTE;
-    pt_vals[0] = '\0';
+    char *pt_vals;
 
     if (!path) {
         return;
+    }
+    /* include cycle / runaway nesting guard */
+    for (k = 0; k < inc_depth; k++) {
+        if (strcmp(inc_stack[k], path) == 0) {
+            die("include cycle: %s includes itself (directly or indirectly)", path);
+        }
+    }
+    if (inc_depth >= CONFIG_MAX_INCLUDE_DEPTH) {
+        die("includes nested deeper than %d levels at %s", CONFIG_MAX_INCLUDE_DEPTH, path);
     }
     f = fopen(path, "r");
     if (!f) {
         die("failed to open config %s", path);
     }
-    while (fgets(line, sizeof(line), f)) {
+    inc_stack[inc_depth] = path;
+    apex_get_die_context(&prev_ctx_path, &prev_ctx_line);
+    line = xmalloc(CONFIG_MAX_LINE);
+    pt_vals = xmalloc(CONFIG_MAX_TYPE_VALUES);
+    pt_name[0] = '\0';
+    pt_kind = TABLE_BYTE;
+    pt_vals[0] = '\0';
+    while (fgets(line, CONFIG_MAX_LINE, f)) {
         char *s;
         char *eq;
+
+        apex_set_die_context(path, ++lineno); /* die() reports path:line */
 
         strip_config_comment(line);
         /* continuation line: leading whitespace in [types] appends to pending entry */
@@ -1334,8 +1435,11 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *cv = trim(line);
             if (*cv) {
                 size_t vl = strlen(pt_vals);
-                if (vl) { strncat(pt_vals, ", ", sizeof(pt_vals) - vl - 1); vl += 2; }
-                strncat(pt_vals, cv, sizeof(pt_vals) - strlen(pt_vals) - 1);
+                if (vl) {
+                    strncat(pt_vals, ", ", CONFIG_MAX_TYPE_VALUES - vl - 1);
+                    vl += 2;
+                }
+                strncat(pt_vals, cv, CONFIG_MAX_TYPE_VALUES - strlen(pt_vals) - 1);
             }
             continue;
         }
@@ -1352,7 +1456,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             /* flush any pending multi-line type before leaving [types] */
             if (pt_name[0]) {
                 config_set_type(types, pt_name, pt_kind, pt_vals);
-                pt_name[0] = '\0'; pt_vals[0] = '\0';
+                pt_name[0] = '\0';
+                pt_vals[0] = '\0';
             }
             *end = '\0';
             in_options = strcmp(s + 1, "options") == 0;
@@ -1362,8 +1467,7 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_schemas = strcmp(s + 1, "schemas") == 0;
             in_tables = strcmp(s + 1, "tables") == 0;
             /* [docs], [routine_docs], [table_docs] all map to the same set */
-            in_docs = strcmp(s + 1, "docs") == 0 ||
-                      strcmp(s + 1, "routine_docs") == 0 ||
+            in_docs = strcmp(s + 1, "docs") == 0 || strcmp(s + 1, "routine_docs") == 0 ||
                       strcmp(s + 1, "table_docs") == 0;
             in_symbols = strcmp(s + 1, "symbols") == 0;
             in_data = strcmp(s + 1, "data") == 0;
@@ -1372,6 +1476,14 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             in_literals = strcmp(s + 1, "literals") == 0;
             in_ack_warnings = strcmp(s + 1, "ack_warnings") == 0;
             in_far_imm = strcmp(s + 1, "far_imm") == 0;
+            in_unknown = !in_options && !in_inline && !in_labels && !in_entries && !in_schemas &&
+                         !in_tables && !in_docs && !in_symbols && !in_data && !in_types &&
+                         !in_exclude_refs && !in_literals && !in_ack_warnings && !in_far_imm;
+            if (in_unknown) {
+                /* a typo like [lables] would otherwise drop the whole section */
+                fprintf(stderr, "%s:%lu: warning: unknown section [%s]; its entries are ignored\n",
+                        path, lineno, s + 1);
+            }
             continue;
         }
         eq = strchr(s, '=');
@@ -1384,11 +1496,21 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *value = dup_config_value(eq + 1);
             char *include_path = resolve_include_path(path, value);
 
-            load_config(include_path, sigs, labels, entries, tables, schemas, docs,
-                        symbols, data_ranges, options, types, ref_exclusions, literals,
-                        ack_warnings, far_imms);
+            load_config_file(include_path, sigs, labels, entries, tables, schemas, docs, symbols,
+                             data_ranges, options, types, ref_exclusions, literals, ack_warnings,
+                             far_imms, inc_stack, inc_depth + 1u);
             free(value);
             free(include_path);
+            apex_set_die_context(path, lineno);
+            continue;
+        }
+        if (!in_options && !in_inline && !in_labels && !in_entries && !in_schemas && !in_tables &&
+            !in_docs && !in_symbols && !in_data && !in_types && !in_exclude_refs && !in_literals &&
+            !in_ack_warnings && !in_far_imm) {
+            if (!in_unknown) {
+                fprintf(stderr, "%s:%lu: warning: '%s' is not in a known section; ignored\n", path,
+                        lineno, s);
+            }
             continue;
         }
         if (in_options) {
@@ -1702,20 +1824,21 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             char *key = s;
             char *value = dup_config_value(eq + 1);
             char *tok;
+            char *rest = value;
 
             if (parse_bank_label_ref(key, &bank, &addr)) {
                 has_bank = 1;
             } else if (!parse_u32(key, &addr)) {
                 die("invalid far_imm config '%s'", key);
             }
-            tok = strtok(value, " \t");
+            tok = next_token(&rest);
             if (tok && far_imm_type_from_str(tok, &type)) {
-                tok = strtok(NULL, " \t"); /* type consumed; bank is next */
+                tok = next_token(&rest); /* type consumed; bank is next */
             }
             if (!tok || !parse_u32(tok, &target_bank) || target_bank > 0xffu) {
                 die("invalid far_imm target bank for '%s'", key);
             }
-            tok = strtok(NULL, " \t");
+            tok = next_token(&rest);
             if (tok) {
                 uint8_t bl_bank;
                 uint32_t bl_addr;
@@ -1742,7 +1865,8 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
             /* flush previous pending multi-line type */
             if (pt_name[0]) {
                 config_set_type(types, pt_name, pt_kind, pt_vals);
-                pt_name[0] = '\0'; pt_vals[0] = '\0';
+                pt_name[0] = '\0';
+                pt_vals[0] = '\0';
             }
             if (!colon) {
                 die("invalid type '%s': expected name:byte or name:word", key);
@@ -1776,36 +1900,46 @@ void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
         die("failed to read config %s", path);
     }
     fclose(f);
+    free(line);
+    free(pt_vals);
+    apex_set_die_context(prev_ctx_path, prev_ctx_line);
 }
 
-int config_set_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
-{
+void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
+                 ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas, ConfigDocs *docs,
+                 ConfigSymbols *symbols, DataRanges *data_ranges, ConfigOptions *options,
+                 ConfigTypes *types, ConfigEntries *ref_exclusions, ConfigEntries *literals,
+                 ConfigEntries *ack_warnings, ConfigEntries *far_imms) {
+    const char *inc_stack[CONFIG_MAX_INCLUDE_DEPTH];
+
+    load_config_file(path, sigs, labels, entries, tables, schemas, docs, symbols, data_ranges,
+                     options, types, ref_exclusions, literals, ack_warnings, far_imms, inc_stack,
+                     0);
+}
+
+int config_set_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr) {
     add_config_entry(entries, has_bank, bank, addr);
     return 0;
 }
 
 int config_set_entry_val(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
-                         uint8_t value)
-{
+                         uint8_t value) {
     add_config_entry_val(entries, has_bank, bank, addr, value);
     return 0;
 }
 
 int config_set_far_imm(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr,
-                       uint8_t target_bank, uint8_t type, uint32_t bank_load_addr)
-{
+                       uint8_t target_bank, uint8_t type, uint32_t bank_load_addr) {
     add_config_entry_full(entries, has_bank, bank, addr, target_bank, type, bank_load_addr);
     return 0;
 }
 
-int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr)
-{
+int config_clear_entry(ConfigEntries *entries, int has_bank, uint8_t bank, uint32_t addr) {
     return remove_config_entry(entries, has_bank, bank, addr) ? 0 : 1;
 }
 
 int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
-                           const char *spec, const ConfigTypes *types)
-{
+                           const char *spec, const ConfigTypes *types) {
     char *value;
     TableSchema schema;
 
@@ -1826,13 +1960,11 @@ int config_set_inline_spec(InlineSignatures *sigs, int has_bank, uint8_t bank, u
     return 0;
 }
 
-int config_clear_inline(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr)
-{
+int config_clear_inline(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr) {
     return remove_inline_signature(sigs, has_bank, bank, addr) ? 0 : 1;
 }
 
-int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const char *spec)
-{
+int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const char *spec) {
     char *value;
     size_t length;
 
@@ -1851,7 +1983,10 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
     } else if (strcmp(value, "dmd_fullframe") == 0) {
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, 1);
     } else if (parse_count_format(value, "dmd_fullframe", &length)) {
-        if (length == 0u) { free(value); return 1; }
+        if (length == 0u) {
+            free(value);
+            return 1;
+        }
         add_data_range(ranges, bank, addr, DATA_DMD_FULLFRAME, length);
     } else if (strcmp(value, "ptr16_string") == 0) {
         add_data_range(ranges, bank, addr, DATA_PTR16_STRING, 2);
@@ -1887,14 +2022,12 @@ int config_set_data_spec(DataRanges *ranges, uint8_t bank, uint32_t addr, const 
     return 0;
 }
 
-int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr)
-{
+int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr) {
     return remove_data_range(ranges, bank, addr) ? 0 : 1;
 }
 
 int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t bank, uint32_t addr,
-                          const char *spec, const ConfigTypes *types)
-{
+                          const char *spec, const ConfigTypes *types) {
     char *value;
     TableSchema schema;
     int has_header = 1;
@@ -1918,7 +2051,8 @@ int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t 
     } else if (parse_wrapped_table_format(value, "counted", &inner)) {
         free(schema.items);
         memset(&schema, 0, sizeof(schema));
-        if (!parse_table_schema(inner, &schema, types) && !schema_def_named(schemas, inner, &schema)) {
+        if (!parse_table_schema(inner, &schema, types) &&
+            !schema_def_named(schemas, inner, &schema)) {
             free(value);
             return 1;
         }
@@ -1939,7 +2073,6 @@ int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t 
     return 0;
 }
 
-int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr)
-{
+int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr) {
     return remove_table_def(tables, bank, addr) ? 0 : 1;
 }

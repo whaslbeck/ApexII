@@ -1,17 +1,16 @@
 #include "apex_project.h"
 #include "apex_render.h"
+#include "cpu6809.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-static int contains(const char *haystack, const char *needle)
-{
+static int contains(const char *haystack, const char *needle) {
     return strstr(haystack, needle) != NULL;
 }
 
-static int line_contains(const ApexRenderedLine *line, const char *needle)
-{
+static int line_contains(const ApexRenderedLine *line, const char *needle) {
     size_t needle_len = strlen(needle);
     size_t i;
 
@@ -26,8 +25,49 @@ static int line_contains(const ApexRenderedLine *line, const char *needle)
     return 0;
 }
 
-int main(int argc, char **argv)
-{
+/* Every rendered line's address must agree with the listing itself: a ".DB"
+   line documents its address in its "; 0xADDR" comment, and with
+   instruction_addresses on each instruction follows a "; addr Bxx_Ayyyy" line.
+   (The old text re-parse mis-sized comment and INLINE_BYTES_UNTIL lines and
+   shifted every following address.)  Returns the number of mismatches. */
+static size_t check_line_addresses(const ApexRenderedDocument *d) {
+    size_t i, bad = 0;
+    int want_next = -1;
+
+    for (i = 0; i < d->line_count; i++) {
+        const ApexRenderedLine *l = &d->lines[i];
+        char buf[256];
+        const char *c;
+        unsigned b, a;
+        size_t n = l->length < sizeof(buf) - 1u ? l->length : sizeof(buf) - 1u;
+
+        memcpy(buf, l->text, n);
+        buf[n] = '\0';
+        if (want_next >= 0 && l->kind == APEX_RENDER_LINE_INSTRUCTION) {
+            if (!l->has_location || (int)(l->cpu_addr & 0xffffu) != want_next) {
+                if (bad++ < 3)
+                    fprintf(stderr, "  line %lu: expected 0x%04x: %s\n", (unsigned long)i + 1u,
+                            (unsigned)want_next, buf);
+            }
+            want_next = -1;
+        }
+        if (sscanf(buf, "    ; addr B%2x_A%4x", &b, &a) == 2) {
+            want_next = (int)a;
+            continue;
+        }
+        if (strncmp(buf, "    .DB ", 8) == 0 && (c = strstr(buf, "; 0x")) != NULL &&
+            sscanf(c + 4, "%4x", &a) == 1) {
+            if (!l->has_location || (l->cpu_addr & 0xffffu) != a) {
+                if (bad++ < 3)
+                    fprintf(stderr, "  line %lu: at 0x%04x, comment says 0x%04x: %s\n",
+                            (unsigned long)i + 1u, (unsigned)l->cpu_addr, a, buf);
+            }
+        }
+    }
+    return bad;
+}
+
+int main(int argc, char **argv) {
     const ApexRenderedDocument *doc1;
     const ApexRenderedDocument *doc2;
     const ApexRenderedDocument *doc3;
@@ -49,12 +89,17 @@ int main(int argc, char **argv)
     size_t overlay_len;
 
     if (argc != 3 && argc != 5 && argc != 7 && argc != 9) {
-        fprintf(stderr, "usage: %s ROM CONFIG [BANK_ROM BANK_CONFIG] [PRUNE_ROM PRUNE_CONFIG]"
-                        " [SCOPED_DMD_ROM SCOPED_DMD_CONFIG]\n",
+        fprintf(stderr,
+                "usage: %s ROM CONFIG [BANK_ROM BANK_CONFIG] [PRUNE_ROM PRUNE_CONFIG]"
+                " [SCOPED_DMD_ROM SCOPED_DMD_CONFIG]\n",
                 argv[0]);
         return 2;
     }
 
+    if (!cpu6809_selfcheck()) {
+        fprintf(stderr, "cpu6809 opcode lookup index is out of sync with the opcode table\n");
+        return 1;
+    }
     project = apex_project_open(argv[1], argv[2]);
     if (apex_project_analyze(project) != 0) {
         fprintf(stderr, "analyze failed\n");
@@ -85,12 +130,12 @@ int main(int argc, char **argv)
             doc1->lines[i].bank == 0xffu && doc1->lines[i].cpu_addr >= 0x8000u) {
             saw_location_line = 1;
         }
-        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION &&
-            doc1->lines[i].has_location && line_contains(&doc1->lines[i], "JSR Helper")) {
+        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION && doc1->lines[i].has_location &&
+            line_contains(&doc1->lines[i], "JSR Helper")) {
             saw_located_instruction = 1;
         }
-        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION &&
-            doc1->lines[i].has_location && line_contains(&doc1->lines[i], "RTS") &&
+        if (doc1->lines[i].kind == APEX_RENDER_LINE_INSTRUCTION && doc1->lines[i].has_location &&
+            line_contains(&doc1->lines[i], "RTS") &&
             doc1->lines[i].block_kind == APEX_RENDER_BLOCK_CODE) {
             saw_code_block_line = 1;
         }
@@ -220,8 +265,7 @@ int main(int argc, char **argv)
     }
     doc4 = apex_project_render(project, 0, 0);
     if (!doc4 || !contains(doc4->text, "HelperInline:") ||
-        !contains(doc4->text, "JSR HelperInline") ||
-        !contains(doc4->text, "INLINE_BYTE 0x42")) {
+        !contains(doc4->text, "JSR HelperInline") || !contains(doc4->text, "INLINE_BYTE 0x42")) {
         fprintf(stderr, "inline update not reflected in render\n");
         apex_project_free(project);
         return 1;
@@ -246,6 +290,71 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    if (check_line_addresses(apex_project_render(project, 0, 0)) != 0) {
+        fprintf(stderr, "rendered line addresses disagree with the listing\n");
+        apex_project_free(project);
+        return 1;
+    }
+
+    /* ---- a clone renders the same listing as the original ---- */
+    {
+        ApexProject *clone = apex_project_clone(project);
+        const ApexRenderedDocument *od = apex_project_render(project, 0, 0);
+        const char *ot = od ? strstr(od->text, ".ROM_SIZE") : NULL; /* skip timestamp */
+        const ApexRenderedDocument *cd;
+        const char *ct;
+        if (!clone || apex_project_analyze(clone) != 0) {
+            fprintf(stderr, "clone: analyze failed\n");
+            apex_project_free(project);
+            return 1;
+        }
+        cd = apex_project_render(clone, 0, 0);
+        ct = cd ? strstr(cd->text, ".ROM_SIZE") : NULL;
+        if (!ot || !ct || strcmp(ot, ct) != 0) {
+            fprintf(stderr, "clone: listing differs from the original\n");
+            apex_project_free(clone);
+            apex_project_free(project);
+            return 1;
+        }
+        apex_project_free(clone);
+    }
+
+    /* ---- malformed specs are rejected without exiting or clobbering ---- */
+    {
+        static const char *bad_data[] = {"bytes[0]", "bytes[x", "nonsense"};
+        static const char *bad_table[] = {"counted(byte[0])", "rows[a](byte)",
+                                          "counted(bytes_until)"};
+        size_t k;
+        for (k = 0; k < sizeof(bad_data) / sizeof(bad_data[0]); k++) {
+            if (apex_project_set_kind(project, 1, 0xffu, 0x8004u, APEX_KIND_DATA, bad_data[k]) ==
+                    0 ||
+                !apex_project_last_error(project)[0]) {
+                fprintf(stderr, "bad data spec '%s' accepted\n", bad_data[k]);
+                apex_project_free(project);
+                return 1;
+            }
+        }
+        for (k = 0; k < sizeof(bad_table) / sizeof(bad_table[0]); k++) {
+            if (apex_project_set_kind(project, 1, 0xffu, 0x8004u, APEX_KIND_TABLE, bad_table[k]) ==
+                0) {
+                fprintf(stderr, "bad table spec '%s' accepted\n", bad_table[k]);
+                apex_project_free(project);
+                return 1;
+            }
+        }
+        if (apex_project_set_type(project, "BadType", 0, "0x01:ok, nocolon") == 0) {
+            fprintf(stderr, "bad type values accepted\n");
+            apex_project_free(project);
+            return 1;
+        }
+        doc4 = apex_project_render(project, 0, 0);
+        if (!doc4 || !contains(doc4->text, "; data type=bytes length=1")) {
+            fprintf(stderr, "rejected spec clobbered the existing classification\n");
+            apex_project_free(project);
+            return 1;
+        }
+    }
+
     /* ---- undo / redo ---- */
     if (apex_project_set_label(project, 0, 0xffu, 0x8005u, "UndoProbeLabel") != 0) {
         fprintf(stderr, "undo: set_label failed\n");
@@ -266,6 +375,15 @@ int main(int argc, char **argv)
     doc4 = apex_project_render(project, 0, 0);
     if (!doc4 || contains(doc4->text, "UndoProbeLabel") || !apex_project_can_redo(project)) {
         fprintf(stderr, "undo: edit not reverted\n");
+        apex_project_free(project);
+        return 1;
+    }
+    /* A clear that finds nothing to clear is not an edit: it must fail without
+       adding an undo step or dropping the redo history. */
+    if (apex_project_clear_doc(project, 1, 0xffu, 0x8ffeu) == 0 ||
+        apex_project_clear_inline(project, 1, 0xffu, 0x8ffeu) == 0 ||
+        !apex_project_can_redo(project)) {
+        fprintf(stderr, "undo: failed clear wiped the redo history\n");
         apex_project_free(project);
         return 1;
     }
@@ -327,6 +445,20 @@ int main(int argc, char **argv)
         doc1 = apex_project_render(project, 0, 0);
         if (!doc1 || !contains(doc1->text, "INLINE_BYTE 0x42")) {
             fprintf(stderr, "bank inline update not reflected in render\n");
+            apex_project_free(project);
+            return 1;
+        }
+        apex_project_free(project);
+
+        /* A bank edit followed by a system-bank edit before the next analyze
+           needs a full re-analysis: neither scoped pass covers both. */
+        project = apex_project_open(argv[3], argv[4]);
+        if (apex_project_analyze(project) != 0 ||
+            apex_project_set_inline(project, 1, 0x20u, 0x4006u, "byte") != 0 ||
+            apex_project_set_doc(project, 1, 0xffu, 0x8000u, "sys doc") != 0 ||
+            apex_project_set_kind(project, 1, 0xffu, 0xfff0u, APEX_KIND_DATA, "bytes[2]") != 0 ||
+            project->analysis_scope != APEX_ANALYZE_SCOPE_FULL) {
+            fprintf(stderr, "bank + system edit did not escalate to a full analysis\n");
             apex_project_free(project);
             return 1;
         }
@@ -483,11 +615,21 @@ int main(int argc, char **argv)
             fprintf(stderr, "scoped_dmd: analyze failed\n");
             return 1;
         }
+        /* DMD/sprite comment lines and ; addr lines must not shift addresses */
+        pr->options.instruction_addresses = 1;
+        if (check_line_addresses(apex_project_render(pr, 0, 0)) != 0) {
+            fprintf(stderr, "scoped_dmd: rendered line addresses disagree with the listing\n");
+            apex_project_free(pr);
+            return 1;
+        }
+        pr->options.instruction_addresses = 0;
         bidx = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
         ls = &pr->bank_labels[bidx];
         for (k = 0; k < ls->count; k++) {
-            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data) dmd_before = 1;
-            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data) spr_before = 1;
+            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data)
+                dmd_before = 1;
+            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data)
+                spr_before = 1;
         }
         if (!dmd_before || !spr_before) {
             fprintf(stderr, "scoped_dmd: dmd/sprite label missing in full analysis\n");
@@ -504,8 +646,10 @@ int main(int argc, char **argv)
         bidx = bank_index_for_id(pr->rom.data, pr->banks, 0x21u);
         ls = &pr->bank_labels[bidx];
         for (k = 0; k < ls->count; k++) {
-            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data) dmd_after = 1;
-            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data) spr_after = 1;
+            if (ls->items[k].addr == 0x4001u && ls->items[k].is_data)
+                dmd_after = 1;
+            if (ls->items[k].addr == 0x4100u && ls->items[k].is_data)
+                spr_after = 1;
         }
         if (!dmd_after || !spr_after) {
             fprintf(stderr, "scoped_dmd: dmd/sprite label dropped by scoped re-analysis\n");

@@ -2,20 +2,21 @@
    MinGW <thread> implementations do), or windows.h drags in the legacy winsock.h
    and clashes with winsock2.h.  So include them first, before apex_pinmame.h. */
 #ifdef _WIN32
-#  ifndef WIN32_LEAN_AND_MEAN
-#    define WIN32_LEAN_AND_MEAN
-#  endif
-#  include <winsock2.h>
-#  include <ws2tcpip.h>
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #endif
 
 #include "apex_pinmame.h"
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cstdio>
-#include <cstring>
 #include <cstdlib>
+#include <cstring>
 #include <thread>
 
 /* ---- platform abstraction (POSIX sockets/process vs Winsock) --------------
@@ -24,53 +25,59 @@
    graceful stubs and the user starts the emulator manually. */
 #ifdef _WIN32
 typedef SOCKET apex_sock_t;
-static inline bool sock_valid(apex_sock_t s) { return s != INVALID_SOCKET; }
-static inline void sock_close(apex_sock_t s) { closesocket(s); }
-static inline void sock_startup(void)
-{
-    static bool done = false;
-    if (!done) { WSADATA w; if (WSAStartup(MAKEWORD(2, 2), &w) == 0) done = true; }
+static inline bool sock_valid(apex_sock_t s) {
+    return s != INVALID_SOCKET;
 }
-static inline void sock_set_timeout(apex_sock_t s, int ms)
-{
+static inline void sock_close(apex_sock_t s) {
+    closesocket(s);
+}
+static inline void sock_startup(void) {
+    static bool done = false;
+    if (!done) {
+        WSADATA w;
+        if (WSAStartup(MAKEWORD(2, 2), &w) == 0)
+            done = true;
+    }
+}
+static inline void sock_set_timeout(apex_sock_t s, int ms) {
     DWORD t = (DWORD)ms;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&t, sizeof(t));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&t, sizeof(t));
 }
-static inline bool sock_recv_timed_out(void)
-{
+static inline bool sock_recv_timed_out(void) {
     int e = WSAGetLastError();
     return e == WSAETIMEDOUT || e == WSAEWOULDBLOCK;
 }
 #else
-#  include <errno.h>
-#  include <fcntl.h>
-#  include <signal.h>
-#  include <unistd.h>
-#  include <sys/socket.h>
-#  include <sys/wait.h>
-#  include <netinet/in.h>
-#  include <arpa/inet.h>
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <signal.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
 typedef int apex_sock_t;
-static inline bool sock_valid(apex_sock_t s) { return s >= 0; }
-static inline void sock_close(apex_sock_t s) { close(s); }
+static inline bool sock_valid(apex_sock_t s) {
+    return s >= 0;
+}
+static inline void sock_close(apex_sock_t s) {
+    close(s);
+}
 static inline void sock_startup(void) {}
-static inline void sock_set_timeout(apex_sock_t s, int ms)
-{
+static inline void sock_set_timeout(apex_sock_t s, int ms) {
     struct timeval tv;
     tv.tv_sec = ms / 1000;
     tv.tv_usec = (ms % 1000) * 1000;
     setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
-static inline bool sock_recv_timed_out(void)
-{
+static inline bool sock_recv_timed_out(void) {
     return errno == EAGAIN || errno == EWOULDBLOCK;
 }
 #endif
 
-static inline void apex_sleep_ms(int ms)
-{
+static inline void apex_sleep_ms(int ms) {
     std::this_thread::sleep_for(std::chrono::milliseconds(ms));
 }
 
@@ -80,8 +87,7 @@ static std::vector<std::string> json_objects(const std::string &json, const char
 /* ---- JSON (flat objects, decimal numbers — matches the xpinmamed API) ---- */
 
 /* Position just past the ':' following the "key" token, or npos. */
-static size_t json_value_pos(const std::string &json, const char *key)
-{
+static size_t json_value_pos(const std::string &json, const char *key) {
     std::string tok = std::string("\"") + key + "\"";
     size_t k = json.find(tok);
     if (k == std::string::npos) {
@@ -98,8 +104,7 @@ static size_t json_value_pos(const std::string &json, const char *key)
     return c;
 }
 
-bool apex_json_int(const std::string &json, const char *key, long &out)
-{
+bool apex_json_int(const std::string &json, const char *key, long &out) {
     size_t p = json_value_pos(json, key);
     if (p == std::string::npos) {
         return false;
@@ -113,8 +118,7 @@ bool apex_json_int(const std::string &json, const char *key, long &out)
     return true;
 }
 
-bool apex_json_str(const std::string &json, const char *key, std::string &out)
-{
+bool apex_json_str(const std::string &json, const char *key, std::string &out) {
     size_t p = json_value_pos(json, key);
     if (p == std::string::npos || json[p] != '"') {
         return false;
@@ -127,8 +131,7 @@ bool apex_json_str(const std::string &json, const char *key, std::string &out)
     return true;
 }
 
-bool apex_json_int_array(const std::string &json, const char *key, std::vector<long> &out)
-{
+bool apex_json_int_array(const std::string &json, const char *key, std::vector<long> &out) {
     size_t p = json_value_pos(json, key);
     if (p == std::string::npos || json[p] != '[') {
         return false;
@@ -154,8 +157,7 @@ bool apex_json_int_array(const std::string &json, const char *key, std::vector<l
 
 /* ---- HTTP/1.0 GET against 127.0.0.1 ---- */
 
-bool apex_pinmame_http_get(int port, const std::string &path, std::string &body, int timeout_ms)
-{
+bool apex_pinmame_http_get(int port, const std::string &path, std::string &body, int timeout_ms) {
     sock_startup();
     apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!sock_valid(fd)) {
@@ -186,7 +188,10 @@ bool apex_pinmame_http_get(int port, const std::string &path, std::string &body,
         resp.append(buf, (size_t)n);
     }
     sock_close(fd);
-    if (resp.empty()) {
+    /* "Connection: close": a complete response ends with an orderly close
+       (n == 0).  A timeout or error (n < 0) means a truncated body, which must
+       not be parsed as if it were whole. */
+    if (n < 0 || resp.empty()) {
         return false;
     }
     /* Require a 2xx status, then return the body after the header block. */
@@ -198,13 +203,25 @@ bool apex_pinmame_http_get(int port, const std::string &path, std::string &body,
     }
     size_t hdr = resp.find("\r\n\r\n");
     body = (hdr == std::string::npos) ? resp : resp.substr(hdr + 4);
+    if (hdr != std::string::npos) {
+        /* Honour Content-Length when the server sends one. */
+        std::string head = resp.substr(0, hdr);
+        for (auto &ch : head)
+            ch = (char)tolower((unsigned char)ch);
+        size_t cl = head.find("\r\ncontent-length:");
+        if (cl != std::string::npos) {
+            unsigned long want = strtoul(head.c_str() + cl + 17, nullptr, 10);
+            if (body.size() < want) {
+                return false;
+            }
+        }
+    }
     return true;
 }
 
 /* ---- process control ---- */
 
-bool apex_pinmame_port_in_use(int port)
-{
+bool apex_pinmame_port_in_use(int port) {
     sock_startup();
     apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (!sock_valid(fd)) {
@@ -221,8 +238,7 @@ bool apex_pinmame_port_in_use(int port)
     return listening;
 }
 
-std::string apex_pinmame_log_tail(const ApexPinmame &pm, size_t max)
-{
+std::string apex_pinmame_log_tail(const ApexPinmame &pm, size_t max) {
     if (pm.log_path.empty()) {
         return "";
     }
@@ -246,9 +262,8 @@ std::string apex_pinmame_log_tail(const ApexPinmame &pm, size_t max)
     return out;
 }
 
-bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
-                         const std::string &rompath, const std::string &game, int port)
-{
+bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin, const std::string &rompath,
+                         const std::string &game, int port) {
     if (bin.empty() || game.empty()) {
         pm.last_error = "binary path and game name are required";
         return false;
@@ -263,6 +278,9 @@ bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
         pm.last_error = "already running";
         return false;
     }
+    /* A reader left over from a previous (crashed) emulator still reads
+       pm.port; stop it before the port changes. */
+    apex_pinmame_events_stop(pm);
     if (apex_pinmame_port_in_use(port)) {
         pm.last_error = "port " + std::to_string(port) + " is already in use";
         return false;
@@ -325,13 +343,12 @@ bool apex_pinmame_launch(ApexPinmame &pm, const std::string &bin,
 #endif
 }
 
-bool apex_pinmame_is_alive(ApexPinmame &pm)
-{
+bool apex_pinmame_is_alive(ApexPinmame &pm) {
     if (pm.pid <= 0) {
         return false;
     }
 #ifdef _WIN32
-    return false;  /* no child is ever spawned on Windows */
+    return false; /* no child is ever spawned on Windows */
 #else
     int st;
     pid_t r = waitpid(pm.pid, &st, WNOHANG);
@@ -347,13 +364,13 @@ bool apex_pinmame_is_alive(ApexPinmame &pm)
 
 /* ---- /api/events SSE reader (halt notifications) ---- */
 
-static void events_loop(ApexPinmame *pm)
-{
+static void events_loop(ApexPinmame *pm) {
     int fails = 0;
     while (!pm->ev_stop.load()) {
         sock_startup();
         apex_sock_t fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (!sock_valid(fd)) break;
+        if (!sock_valid(fd))
+            break;
         sock_set_timeout(fd, 400); /* 400 ms recv timeout → checks ev_stop */
         struct sockaddr_in sa;
         memset(&sa, 0, sizeof(sa));
@@ -362,7 +379,8 @@ static void events_loop(ApexPinmame *pm)
         sa.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
         if (connect(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
             sock_close(fd);
-            if (++fails > 25) break; /* emulator gone: stop retrying (~8s) */
+            if (++fails > 25)
+                break; /* emulator gone: stop retrying (~8s) */
             apex_sleep_ms(300);
             continue;
         }
@@ -381,10 +399,12 @@ static void events_loop(ApexPinmame *pm)
                     std::string line = buf.substr(0, nl);
                     buf.erase(0, nl + 1);
                     size_t d = line.find("data:");
-                    if (d == std::string::npos) continue;
+                    if (d == std::string::npos)
+                        continue;
                     std::string js = line.substr(d + 5);
                     std::string ev;
-                    if (!apex_json_str(js, "event", ev) || ev != "halt") continue;
+                    if (!apex_json_str(js, "event", ev) || ev != "halt")
+                        continue;
                     long v;
                     std::lock_guard<std::mutex> lk(pm->ev_mtx);
                     pm->ev_halt.seq++;
@@ -402,47 +422,57 @@ static void events_loop(ApexPinmame *pm)
         }
         sock_close(fd);
     }
+    pm->ev_exited = true;
 }
 
-void apex_pinmame_events_start(ApexPinmame &pm)
-{
-    if (pm.ev_running) return;
+void apex_pinmame_events_start(ApexPinmame &pm) {
+    if (pm.ev_running) {
+        if (!pm.ev_exited.load())
+            return;
+        /* The reader gave up (e.g. the emulator was restarted): reap it so a
+           new one can start. */
+        if (pm.ev_thread.joinable())
+            pm.ev_thread.join();
+        pm.ev_running = false;
+    }
     pm.ev_stop = false;
+    pm.ev_exited = false;
     pm.ev_running = true;
     pm.ev_thread = std::thread(events_loop, &pm);
 }
 
-void apex_pinmame_events_stop(ApexPinmame &pm)
-{
+bool apex_pinmame_events_active(const ApexPinmame &pm) {
+    return pm.ev_running && !pm.ev_exited.load();
+}
+
+void apex_pinmame_events_stop(ApexPinmame &pm) {
     pm.ev_stop = true;
-    if (pm.ev_thread.joinable()) pm.ev_thread.join();
+    if (pm.ev_thread.joinable())
+        pm.ev_thread.join();
     pm.ev_running = false;
 }
 
-bool apex_pinmame_get_halt(ApexPinmame &pm, ApexPinmameHalt &out)
-{
+bool apex_pinmame_get_halt(ApexPinmame &pm, ApexPinmameHalt &out) {
     std::lock_guard<std::mutex> lk(pm.ev_mtx);
     out = pm.ev_halt;
     return pm.ev_halt.seq != 0;
 }
 
-bool apex_pinmame_instrument(int port, const char *cmd, unsigned addr, int bank)
-{
+bool apex_pinmame_instrument(int port, const char *cmd, unsigned addr, int bank) {
     char path[128];
     if (!strcmp(cmd, "clear")) {
         snprintf(path, sizeof(path), "/api/debugger/instrument?cmd=clear");
     } else if (bank < 0) {
         snprintf(path, sizeof(path), "/api/debugger/instrument?cmd=%s&addr=0x%x", cmd, addr);
     } else {
-        snprintf(path, sizeof(path), "/api/debugger/instrument?cmd=%s&addr=0x%x&bank=0x%x",
-                 cmd, addr, (unsigned)bank);
+        snprintf(path, sizeof(path), "/api/debugger/instrument?cmd=%s&addr=0x%x&bank=0x%x", cmd,
+                 addr, (unsigned)bank);
     }
     std::string body;
     return apex_pinmame_http_get(port, path, body);
 }
 
-bool apex_pinmame_instrument_read(int port, std::vector<ApexPinmameCount> &out)
-{
+bool apex_pinmame_instrument_read(int port, std::vector<ApexPinmameCount> &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/debugger/instrument", body)) {
         return false;
@@ -458,14 +488,12 @@ bool apex_pinmame_instrument_read(int port, std::vector<ApexPinmameCount> &out)
     return true;
 }
 
-bool apex_pinmame_exectrace_cmd(int port, const char *cmd)
-{
+bool apex_pinmame_exectrace_cmd(int port, const char *cmd) {
     std::string body;
     return apex_pinmame_http_get(port, std::string("/api/debugger/exectrace?cmd=") + cmd, body);
 }
 
-bool apex_pinmame_exectrace(int port, std::vector<ApexPinmameTrace> &out)
-{
+bool apex_pinmame_exectrace(int port, std::vector<ApexPinmameTrace> &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/debugger/exectrace", body, 5000)) {
         return false;
@@ -483,15 +511,13 @@ bool apex_pinmame_exectrace(int port, std::vector<ApexPinmameTrace> &out)
     return true;
 }
 
-bool apex_pinmame_memory(int port, unsigned addr, int size, int bank,
-                         std::vector<uint8_t> &out)
-{
+bool apex_pinmame_memory(int port, unsigned addr, int size, int bank, std::vector<uint8_t> &out) {
     char path[128];
     if (bank < 0) {
         snprintf(path, sizeof(path), "/api/debugger/memory?addr=0x%x&size=%d", addr, size);
     } else {
-        snprintf(path, sizeof(path), "/api/debugger/memory?addr=0x%x&size=%d&bank=0x%x",
-                 addr, size, (unsigned)bank);
+        snprintf(path, sizeof(path), "/api/debugger/memory?addr=0x%x&size=%d&bank=0x%x", addr, size,
+                 (unsigned)bank);
     }
     std::string body;
     if (!apex_pinmame_http_get(port, path, body)) {
@@ -507,15 +533,14 @@ bool apex_pinmame_memory(int port, unsigned addr, int size, int bank,
     return true;
 }
 
-bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum)
-{
+bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum) {
     std::string info;
     if (!apex_pinmame_http_get(port, "/api/dmd/info", info)) {
         return false;
     }
     long lw, lh;
-    if (!apex_json_int(info, "width", lw) || !apex_json_int(info, "height", lh) ||
-        lw <= 0 || lh <= 0 || lw * lh > (1 << 20)) {
+    if (!apex_json_int(info, "width", lw) || !apex_json_int(info, "height", lh) || lw <= 0 ||
+        lh <= 0 || lw * lh > (1 << 20)) {
         return false;
     }
     std::string raw;
@@ -531,8 +556,7 @@ bool apex_pinmame_dmd(int port, int &w, int &h, std::vector<uint8_t> &lum)
     return true;
 }
 
-void apex_pinmame_stop(ApexPinmame &pm)
-{
+void apex_pinmame_stop(ApexPinmame &pm) {
     apex_pinmame_events_stop(pm);
 #ifndef _WIN32
     if (pm.pid > 0) {
@@ -556,8 +580,7 @@ void apex_pinmame_stop(ApexPinmame &pm)
 
 /* ---- parsed endpoints ---- */
 
-bool apex_pinmame_get_info(int port, ApexPinmameInfo &out)
-{
+bool apex_pinmame_get_info(int port, ApexPinmameInfo &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/info", body)) {
         return false;
@@ -565,14 +588,15 @@ bool apex_pinmame_get_info(int port, ApexPinmameInfo &out)
     long v;
     apex_json_str(body, "game", out.game);
     apex_json_str(body, "description", out.description);
-    if (apex_json_int(body, "paused", v)) out.paused = (int)v;
-    if (apex_json_int(body, "wpc_bank", v)) out.wpc_bank = (int)v;
+    if (apex_json_int(body, "paused", v))
+        out.paused = (int)v;
+    if (apex_json_int(body, "wpc_bank", v))
+        out.wpc_bank = (int)v;
     out.valid = !out.game.empty();
     return out.valid;
 }
 
-bool apex_pinmame_get_cpu0(int port, ApexPinmameCpu &out)
-{
+bool apex_pinmame_get_cpu0(int port, ApexPinmameCpu &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/debugger/state", body)) {
         return false;
@@ -586,28 +610,35 @@ bool apex_pinmame_get_cpu0(int port, ApexPinmameCpu &out)
     }
     std::string cpu0 = body.substr(open, close - open + 1);
     long v;
-    if (apex_json_int(cpu0, "pc", v)) out.pc = v;
-    if (apex_json_int(cpu0, "sp", v)) out.sp = v;
-    if (apex_json_int(cpu0, "a",  v)) out.a  = v;
-    if (apex_json_int(cpu0, "b",  v)) out.b  = v;
-    if (apex_json_int(cpu0, "x",  v)) out.x  = v;
-    if (apex_json_int(cpu0, "y",  v)) out.y  = v;
-    if (apex_json_int(cpu0, "u",  v)) out.u  = v;
-    if (apex_json_int(cpu0, "dp", v)) out.dp = v;
-    if (apex_json_int(cpu0, "cc", v)) out.cc = v;
+    if (apex_json_int(cpu0, "pc", v))
+        out.pc = v;
+    if (apex_json_int(cpu0, "sp", v))
+        out.sp = v;
+    if (apex_json_int(cpu0, "a", v))
+        out.a = v;
+    if (apex_json_int(cpu0, "b", v))
+        out.b = v;
+    if (apex_json_int(cpu0, "x", v))
+        out.x = v;
+    if (apex_json_int(cpu0, "y", v))
+        out.y = v;
+    if (apex_json_int(cpu0, "u", v))
+        out.u = v;
+    if (apex_json_int(cpu0, "dp", v))
+        out.dp = v;
+    if (apex_json_int(cpu0, "cc", v))
+        out.cc = v;
     out.valid = true;
     return true;
 }
 
-bool apex_pinmame_control(int port, const char *cmd)
-{
+bool apex_pinmame_control(int port, const char *cmd) {
     std::string body;
     return apex_pinmame_http_get(port, std::string("/api/debugger/control?cmd=") + cmd, body);
 }
 
 /* Return each flat {...} object substring inside the array named `key`. */
-static std::vector<std::string> json_objects(const std::string &json, const char *key)
-{
+static std::vector<std::string> json_objects(const std::string &json, const char *key) {
     std::vector<std::string> out;
     std::string tok = std::string("\"") + key + "\"";
     size_t k = json.find(tok);
@@ -622,7 +653,8 @@ static std::vector<std::string> json_objects(const std::string &json, const char
     while (i < json.size() && json[i] != ']') {
         if (json[i] == '{') {
             size_t e = json.find('}', i); /* objects here have no nested braces */
-            if (e == std::string::npos) break;
+            if (e == std::string::npos)
+                break;
             out.push_back(json.substr(i, e - i + 1));
             i = e + 1;
         } else {
@@ -633,14 +665,13 @@ static std::vector<std::string> json_objects(const std::string &json, const char
 }
 
 /* Percent-encode a query-parameter value (condition expressions have =, <, >, …). */
-static std::string url_encode(const char *s)
-{
+static std::string url_encode(const char *s) {
     static const char *hex = "0123456789ABCDEF";
     std::string o;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         unsigned char c = *p;
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
-            (c >= 'A' && c <= 'Z') || c == '_' || c == '.' || c == '-') {
+        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+            c == '_' || c == '.' || c == '-') {
             o += (char)c;
         } else {
             o += '%';
@@ -651,15 +682,13 @@ static std::string url_encode(const char *s)
     return o;
 }
 
-bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank,
-                             const char *cond)
-{
+bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond) {
     char path[256];
     if (bank < 0) {
         snprintf(path, sizeof(path), "/api/debugger/breakpoints?cmd=%s&addr=0x%x", cmd, addr);
     } else {
-        snprintf(path, sizeof(path), "/api/debugger/breakpoints?cmd=%s&addr=0x%x&bank=0x%x",
-                 cmd, addr, (unsigned)bank);
+        snprintf(path, sizeof(path), "/api/debugger/breakpoints?cmd=%s&addr=0x%x&bank=0x%x", cmd,
+                 addr, (unsigned)bank);
     }
     std::string p = path;
     if (cond && *cond) {
@@ -667,10 +696,15 @@ bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank,
            prefix (e.g. A==7F); normalise so "a==0x7f" is accepted too. */
         std::string cc;
         for (const char *q = cond; *q;) {
-            if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) { q += 2; continue; }
+            if (q[0] == '0' && (q[1] == 'x' || q[1] == 'X')) {
+                q += 2;
+                continue;
+            }
             char ch = *q++;
-            if (ch == ' ' || ch == '\t') continue; /* the parser rejects whitespace */
-            if (ch >= 'a' && ch <= 'z') ch = (char)(ch - 32);
+            if (ch == ' ' || ch == '\t')
+                continue; /* the parser rejects whitespace */
+            if (ch >= 'a' && ch <= 'z')
+                ch = (char)(ch - 32);
             cc += ch;
         }
         p += "&cond=";
@@ -680,24 +714,22 @@ bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank,
     return apex_pinmame_http_get(port, p, body);
 }
 
-bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank,
-                             int len, int mode)
-{
+bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len,
+                             int mode) {
     char path[256];
     if (bank < 0) {
-        snprintf(path, sizeof(path),
-                 "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d", cmd, addr, len, mode);
+        snprintf(path, sizeof(path), "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d",
+                 cmd, addr, len, mode);
     } else {
         snprintf(path, sizeof(path),
-                 "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d&bank=0x%x",
-                 cmd, addr, len, mode, (unsigned)bank);
+                 "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d&bank=0x%x", cmd, addr,
+                 len, mode, (unsigned)bank);
     }
     std::string body;
     return apex_pinmame_http_get(port, path, body);
 }
 
-bool apex_pinmame_input(int port, int sw, int val, int pulse_ms)
-{
+bool apex_pinmame_input(int port, int sw, int val, int pulse_ms) {
     char path[128];
     if (pulse_ms > 0) {
         snprintf(path, sizeof(path), "/api/input?sw=%d&val=%d&pulse=%d", sw, val, pulse_ms);
@@ -708,8 +740,7 @@ bool apex_pinmame_input(int port, int sw, int val, int pulse_ms)
     return apex_pinmame_http_get(port, path, body);
 }
 
-bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out)
-{
+bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/debugger/points", body)) {
         return false;
@@ -718,29 +749,37 @@ bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out)
     for (const std::string &o : json_objects(body, "breakpoints")) {
         ApexPinmamePoint p;
         p.is_wp = 0;
-        if (apex_json_int(o, "idx", v))  p.idx = (int)v;
-        if (apex_json_int(o, "addr", v)) p.addr = v;
-        if (apex_json_int(o, "bank", v)) p.bank = (int)v;
-        if (apex_json_int(o, "hits", v)) p.hits = v;
+        if (apex_json_int(o, "idx", v))
+            p.idx = (int)v;
+        if (apex_json_int(o, "addr", v))
+            p.addr = v;
+        if (apex_json_int(o, "bank", v))
+            p.bank = (int)v;
+        if (apex_json_int(o, "hits", v))
+            p.hits = v;
         apex_json_str(o, "cond", p.cond);
         out.push_back(p);
     }
     for (const std::string &o : json_objects(body, "watchpoints")) {
         ApexPinmamePoint p;
         p.is_wp = 1;
-        if (apex_json_int(o, "idx", v))  p.idx = (int)v;
-        if (apex_json_int(o, "addr", v)) p.addr = v;
-        if (apex_json_int(o, "bank", v)) p.bank = (int)v;
-        if (apex_json_int(o, "mode", v)) p.mode = (int)v;
-        if (apex_json_int(o, "len", v))  p.len = (int)v;
+        if (apex_json_int(o, "idx", v))
+            p.idx = (int)v;
+        if (apex_json_int(o, "addr", v))
+            p.addr = v;
+        if (apex_json_int(o, "bank", v))
+            p.bank = (int)v;
+        if (apex_json_int(o, "mode", v))
+            p.mode = (int)v;
+        if (apex_json_int(o, "len", v))
+            p.len = (int)v;
         apex_json_str(o, "cond", p.cond);
         out.push_back(p);
     }
     return true;
 }
 
-bool apex_pinmame_point_delete(int port, int is_wp, int idx)
-{
+bool apex_pinmame_point_delete(int port, int is_wp, int idx) {
     std::vector<ApexPinmamePoint> pts;
     if (!apex_pinmame_points(port, pts)) {
         return false;
@@ -756,8 +795,8 @@ bool apex_pinmame_point_delete(int port, int is_wp, int idx)
             continue;
         }
         if (is_wp) {
-            apex_pinmame_watchpoint(port, "add", (unsigned)p.addr, p.bank,
-                                    p.len > 0 ? p.len : 1, p.mode);
+            apex_pinmame_watchpoint(port, "add", (unsigned)p.addr, p.bank, p.len > 0 ? p.len : 1,
+                                    p.mode);
         } else {
             apex_pinmame_breakpoint(port, "add", (unsigned)p.addr, p.bank,
                                     p.cond.empty() ? nullptr : p.cond.c_str());
@@ -766,8 +805,43 @@ bool apex_pinmame_point_delete(int port, int is_wp, int idx)
     return true;
 }
 
-bool apex_pinmame_switches(int port, std::vector<ApexPinmameSwitch> &out)
-{
+bool apex_pinmame_points_stash(int port, int is_wp, std::vector<ApexPinmamePoint> &saved) {
+    std::vector<ApexPinmamePoint> pts;
+    saved.clear();
+    if (!apex_pinmame_points(port, pts)) {
+        return false;
+    }
+    for (const ApexPinmamePoint &p : pts) {
+        if (p.is_wp == is_wp) {
+            saved.push_back(p);
+        }
+    }
+    if (is_wp) {
+        apex_pinmame_watchpoint(port, "clear", 0, -1, 1, 2);
+    } else {
+        apex_pinmame_breakpoint(port, "clear", 0, -1, nullptr);
+    }
+    return true;
+}
+
+void apex_pinmame_points_restore(int port, int is_wp, const std::vector<ApexPinmamePoint> &saved) {
+    if (is_wp) {
+        apex_pinmame_watchpoint(port, "clear", 0, -1, 1, 2);
+    } else {
+        apex_pinmame_breakpoint(port, "clear", 0, -1, nullptr);
+    }
+    for (const ApexPinmamePoint &p : saved) {
+        if (is_wp) {
+            apex_pinmame_watchpoint(port, "add", (unsigned)p.addr, p.bank, p.len > 0 ? p.len : 1,
+                                    p.mode);
+        } else {
+            apex_pinmame_breakpoint(port, "add", (unsigned)p.addr, p.bank,
+                                    p.cond.empty() ? nullptr : p.cond.c_str());
+        }
+    }
+}
+
+bool apex_pinmame_switches(int port, std::vector<ApexPinmameSwitch> &out) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/switches", body)) {
         return false;
@@ -775,24 +849,26 @@ bool apex_pinmame_switches(int port, std::vector<ApexPinmameSwitch> &out)
     long v;
     for (const std::string &o : json_objects(body, "switches")) {
         ApexPinmameSwitch s;
-        if (apex_json_int(o, "num", v))    s.num = (int)v;
-        if (apex_json_int(o, "col", v))    s.col = (int)v;
-        if (apex_json_int(o, "row", v))    s.row = (int)v;
-        if (apex_json_int(o, "active", v)) s.active = (int)v;
+        if (apex_json_int(o, "num", v))
+            s.num = (int)v;
+        if (apex_json_int(o, "col", v))
+            s.col = (int)v;
+        if (apex_json_int(o, "row", v))
+            s.row = (int)v;
+        if (apex_json_int(o, "active", v))
+            s.active = (int)v;
         apex_json_str(o, "name", s.name);
         out.push_back(s);
     }
     return true;
 }
 
-bool apex_pinmame_coverage_cmd(int port, const char *cmd)
-{
+bool apex_pinmame_coverage_cmd(int port, const char *cmd) {
     std::string body;
     return apex_pinmame_http_get(port, std::string("/api/debugger/coverage?cmd=") + cmd, body);
 }
 
-bool apex_pinmame_coverage_summary(int port, long &executed, long &addressable)
-{
+bool apex_pinmame_coverage_summary(int port, long &executed, long &addressable) {
     std::string body;
     if (!apex_pinmame_http_get(port, "/api/debugger/coverage", body)) {
         return false;
@@ -802,27 +878,24 @@ bool apex_pinmame_coverage_summary(int port, long &executed, long &addressable)
 }
 
 bool apex_pinmame_coverage_window(int port, int bank, unsigned addr, unsigned size,
-                                  std::vector<uint8_t> &flags)
-{
+                                  std::vector<uint8_t> &flags) {
     const unsigned CHUNK = 2048; /* mirrors the memory endpoint's per-call cap */
     for (unsigned off = 0; off < size; off += CHUNK) {
         unsigned n = std::min(CHUNK, size - off);
         char path[128];
         if (bank < 0) {
-            snprintf(path, sizeof(path),
-                     "/api/debugger/coverage?addr=0x%x&size=%u", addr + off, n);
+            snprintf(path, sizeof(path), "/api/debugger/coverage?addr=0x%x&size=%u", addr + off, n);
         } else {
-            snprintf(path, sizeof(path),
-                     "/api/debugger/coverage?addr=0x%x&size=%u&bank=0x%x", addr + off, n,
-                     (unsigned)bank);
+            snprintf(path, sizeof(path), "/api/debugger/coverage?addr=0x%x&size=%u&bank=0x%x",
+                     addr + off, n, (unsigned)bank);
         }
         std::string body;
         if (!apex_pinmame_http_get(port, path, body)) {
             return false;
         }
         std::vector<long> arr;
-        if (!apex_json_int_array(body, "executed", arr)) {
-            return false;
+        if (!apex_json_int_array(body, "executed", arr) || arr.size() != n) {
+            return false; /* a short chunk would shift every later address */
         }
         for (long v : arr) {
             flags.push_back(v ? 1 : 0);

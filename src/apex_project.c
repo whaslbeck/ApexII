@@ -1,4 +1,5 @@
 #include "apex_project.h"
+
 #include "apex_render.h"
 
 #include <ctype.h>
@@ -6,38 +7,74 @@
 #include <string.h>
 
 void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t vector_count,
-                         InlineSignatures *inline_sigs, const uint8_t *paged_rom,
-                         size_t banks, LabelSet *bank_labels, LabelSet *labels,
-                         const ConfigLabels *config_labels,
-                         const ConfigEntries *config_entries,
-                         const DataRanges *data_ranges, const ConfigOptions *options,
-                         ReferenceSet *refs);
+                         InlineSignatures *inline_sigs, const uint8_t *paged_rom, size_t banks,
+                         LabelSet *bank_labels, LabelSet *labels, const ConfigLabels *config_labels,
+                         const ConfigEntries *config_entries, const DataRanges *data_ranges,
+                         const ConfigOptions *options, ReferenceSet *refs,
+                         const ConfigEntries *ref_exclusions, const ConfigEntries *literals,
+                         const ConfigEntries *far_imms);
 void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
-                               const InlineSignatures *inline_sigs,
-                               LabelSet *bank_labels, LabelSet *system_labels,
-                               const DataRanges *data_ranges, ReferenceSet *refs,
-                               const ConfigEntries *ref_exclusions,
+                               const InlineSignatures *inline_sigs, LabelSet *bank_labels,
+                               LabelSet *system_labels, const DataRanges *data_ranges,
+                               ReferenceSet *refs, const ConfigEntries *ref_exclusions,
                                const ConfigEntries *literals, const ConfigEntries *far_imms);
 void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
-                              size_t banks, LabelSet *bank_labels,
-                              const ConfigOptions *options);
+                              size_t banks, LabelSet *bank_labels, const ConfigOptions *options);
 void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_t *paged_rom,
                                size_t banks, LabelSet *bank_labels);
-void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged_rom,
-                             size_t banks, const uint8_t *system_rom,
-                             LabelSet *bank_labels, LabelSet *system_labels,
-                             ReferenceSet *refs);
+void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged_rom, size_t banks,
+                             const uint8_t *system_rom, LabelSet *bank_labels,
+                             LabelSet *system_labels, ReferenceSet *refs);
 void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_t banks,
-                        LabelSet *bank_labels, LabelSet *system_labels,
-                        const uint8_t *system_rom, ReferenceSet *refs);
+                        LabelSet *bank_labels, LabelSet *system_labels, const uint8_t *system_rom,
+                        ReferenceSet *refs);
 static void analyze_full_project(ApexProject *project);
+
+static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr, const uint8_t **out,
+                         size_t *out_len);
+
+/* Add an analysis-derived data range for a table/pointer target.  It never
+   touches a range that already covers (bank, addr) (the ranges may be unsorted
+   mid-analysis, so this scans instead of binary-searching), is skipped for an
+   unmapped target (e.g. a null far entry 00 00 00), and is flagged derived so
+   it is not saved and is rebuilt by the next full analysis. */
+static void add_derived_data_range(ApexProject *p, uint8_t bank, uint16_t addr, DataKind kind,
+                                   size_t length) {
+    const uint8_t *data;
+    size_t len, i;
+
+    if (!sprite_locate(p, bank, addr, &data, &len)) {
+        return;
+    }
+    for (i = 0; i < p->data_ranges.count; i++) {
+        const DataRange *r = &p->data_ranges.items[i];
+        if (r->bank == bank &&
+            (r->addr == addr || (addr > r->addr && r->length > 0 && addr < r->addr + r->length))) {
+            return;
+        }
+    }
+    add_data_range(&p->data_ranges, bank, addr, kind, length);
+    p->data_ranges.items[p->data_ranges.count - 1u].derived = 1;
+}
+
+/* Drop the derived ranges so a full analysis recomputes them from the current
+   tables (a deleted table's targets must not linger). */
+static void strip_derived_data_ranges(ApexProject *p) {
+    size_t r, w = 0;
+
+    for (r = 0; r < p->data_ranges.count; r++) {
+        if (!p->data_ranges.items[r].derived) {
+            p->data_ranges.items[w++] = p->data_ranges.items[r];
+        }
+    }
+    p->data_ranges.count = w;
+}
 
 /* For every TABLE_FAR_DMD_FULLFRAME / TABLE_PTR16_DMD_FULLFRAME field in all
    configured tables, add a DATA_DMD_FULLFRAME data-range entry for the target
    if none exists yet.  Called after apply_table_labels so the far pointers can
    be read from ROM. */
-static void inject_dmd_table_data_ranges(ApexProject *project)
-{
+static void inject_dmd_table_data_ranges(ApexProject *project) {
     size_t i;
 
     for (i = 0; i < project->tables.count; i++) {
@@ -46,23 +83,23 @@ static void inject_dmd_table_data_ranges(ApexProject *project)
         size_t bank_data_len;
         size_t pos;
         uint16_t row_count;
-        uint8_t row_width;
+        size_t row_width; /* schema widths can exceed 255 */
         size_t row;
 
         if (table->bank == 0xffu) {
             if (!in_system_addr(table->addr))
                 continue;
-            bank_data     = project->rom.data + project->paged_size;
-            bank_data_len = project->rom.size  - project->paged_size;
-            pos           = (size_t)(table->addr - APEX_SYSTEM_ORG);
+            bank_data = project->rom.data + project->paged_size;
+            bank_data_len = project->rom.size - project->paged_size;
+            pos = (size_t)(table->addr - APEX_SYSTEM_ORG);
         } else {
             int bidx = bank_index_for_id(project->rom.data, project->banks, table->bank);
 
             if (bidx < 0 || table->addr < APEX_PAGED_ORG || table->addr >= 0x8000u)
                 continue;
-            bank_data     = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
+            bank_data = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
             bank_data_len = APEX_BANK_SIZE;
-            pos           = (size_t)(table->addr - APEX_PAGED_ORG);
+            pos = (size_t)(table->addr - APEX_PAGED_ORG);
         }
 
         if (table->has_header) {
@@ -73,7 +110,7 @@ static void inject_dmd_table_data_ranges(ApexProject *project)
             pos += 3u;
         } else {
             row_count = (uint16_t)table->rows;
-            row_width = (uint8_t)table_schema_width(&table->schema);
+            row_width = table_schema_width(&table->schema);
         }
 
         for (row = 0; row < row_count && pos + row_width <= bank_data_len; row++) {
@@ -86,20 +123,16 @@ static void inject_dmd_table_data_ranges(ApexProject *project)
 
                 for (n = 0; n < table->schema.items[fi].count; n++) {
                     if (kind == TABLE_FAR_DMD_FULLFRAME && fp + 3u <= bank_data_len) {
-                        uint16_t addr    = read_be16(bank_data + fp);
+                        uint16_t addr = read_be16(bank_data + fp);
                         uint8_t tgt_bank = bank_data[fp + 2u];
 
-                        if (!data_range_at(tgt_bank, addr, &project->data_ranges))
-                            add_data_range(&project->data_ranges, tgt_bank, addr,
-                                           DATA_DMD_FULLFRAME, 0);
+                        add_derived_data_range(project, tgt_bank, addr, DATA_DMD_FULLFRAME, 0);
                         fp += 3u;
                     } else if (kind == TABLE_PTR16_DMD_FULLFRAME && fp + 2u <= bank_data_len) {
-                        uint16_t ptr     = read_be16(bank_data + fp);
+                        uint16_t ptr = read_be16(bank_data + fp);
                         uint8_t tgt_bank = in_system_addr(ptr) ? 0xffu : table->bank;
 
-                        if (!data_range_at(tgt_bank, ptr, &project->data_ranges))
-                            add_data_range(&project->data_ranges, tgt_bank, ptr,
-                                           DATA_DMD_FULLFRAME, 0);
+                        add_derived_data_range(project, tgt_bank, ptr, DATA_DMD_FULLFRAME, 0);
                         fp += 2u;
                     } else if (kind == TABLE_BYTE) {
                         fp++;
@@ -120,9 +153,8 @@ static void inject_dmd_table_data_ranges(ApexProject *project)
 /* Locate the ROM bytes of a sprite/pointer target at (bank, addr).  Returns 0
    if the address is not mapped; otherwise *out points at the bytes and *out_len
    is the remaining byte count. */
-static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr,
-                         const uint8_t **out, size_t *out_len)
-{
+static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr, const uint8_t **out,
+                         size_t *out_len) {
     size_t off;
 
     if (bank == 0xffu || in_system_addr(addr)) {
@@ -140,7 +172,7 @@ static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr,
     if (off >= p->rom.size) {
         return 0;
     }
-    *out     = p->rom.data + off;
+    *out = p->rom.data + off;
     *out_len = p->rom.size - off;
     return 1;
 }
@@ -148,8 +180,7 @@ static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr,
 /* Read the first byte of a sprite target at (bank, addr).  Returns 0 if the
    address is not mapped. */
 static int sprite_target_first_byte(const ApexProject *p, uint8_t bank, uint16_t addr,
-                                    uint8_t *out)
-{
+                                    uint8_t *out) {
     const uint8_t *data;
     size_t len;
 
@@ -164,20 +195,16 @@ static int sprite_target_first_byte(const ApexProject *p, uint8_t bank, uint16_t
    describing (DATA_SPRITE); no-header images need the height carried on the
    table field (DATA_SPRITE_NOHEADER[height]).  Never overrides an existing
    classification. */
-static void inject_one_sprite(ApexProject *p, uint8_t bank, uint16_t addr, unsigned height)
-{
+static void inject_one_sprite(ApexProject *p, uint8_t bank, uint16_t addr, unsigned height) {
     uint8_t b0;
 
-    if (data_range_at(bank, addr, &p->data_ranges)) {
-        return;
-    }
     if (!sprite_target_first_byte(p, bank, addr, &b0)) {
         return;
     }
     if (b0 == 0x00u || b0 == 0xFDu || b0 == 0xFEu || b0 == 0xFFu) {
-        add_data_range(&p->data_ranges, bank, addr, DATA_SPRITE, 0);
+        add_derived_data_range(p, bank, addr, DATA_SPRITE, 0);
     } else if (b0 >= 1u && b0 <= 128u && height > 0u) {
-        add_data_range(&p->data_ranges, bank, addr, DATA_SPRITE_NOHEADER, height);
+        add_derived_data_range(p, bank, addr, DATA_SPRITE_NOHEADER, height);
     }
     /* no-header without a known height, or implausible first byte: leave it */
 }
@@ -186,8 +213,7 @@ static void inject_one_sprite(ApexProject *p, uint8_t bank, uint16_t addr, unsig
    tables, classify the pointed-to image as a sprite data range if not already
    classified.  Mirrors inject_dmd_table_data_ranges; the field's param carries
    the no-header image height from the VSI sub-table descriptor. */
-static void inject_sprite_table_data_ranges(ApexProject *project)
-{
+static void inject_sprite_table_data_ranges(ApexProject *project) {
     size_t i;
 
     for (i = 0; i < project->tables.count; i++) {
@@ -196,23 +222,23 @@ static void inject_sprite_table_data_ranges(ApexProject *project)
         size_t bank_data_len;
         size_t pos;
         uint16_t row_count;
-        uint8_t row_width;
+        size_t row_width; /* schema widths can exceed 255 */
         size_t row;
 
         if (table->bank == 0xffu) {
             if (!in_system_addr(table->addr))
                 continue;
-            bank_data     = project->rom.data + project->paged_size;
-            bank_data_len = project->rom.size  - project->paged_size;
-            pos           = (size_t)(table->addr - APEX_SYSTEM_ORG);
+            bank_data = project->rom.data + project->paged_size;
+            bank_data_len = project->rom.size - project->paged_size;
+            pos = (size_t)(table->addr - APEX_SYSTEM_ORG);
         } else {
             int bidx = bank_index_for_id(project->rom.data, project->banks, table->bank);
 
             if (bidx < 0 || table->addr < APEX_PAGED_ORG || table->addr >= 0x8000u)
                 continue;
-            bank_data     = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
+            bank_data = project->rom.data + (size_t)bidx * APEX_BANK_SIZE;
             bank_data_len = APEX_BANK_SIZE;
-            pos           = (size_t)(table->addr - APEX_PAGED_ORG);
+            pos = (size_t)(table->addr - APEX_PAGED_ORG);
         }
 
         if (table->has_header) {
@@ -223,7 +249,7 @@ static void inject_sprite_table_data_ranges(ApexProject *project)
             pos += 3u;
         } else {
             row_count = (uint16_t)table->rows;
-            row_width = (uint8_t)table_schema_width(&table->schema);
+            row_width = table_schema_width(&table->schema);
         }
 
         for (row = 0; row < row_count && pos + row_width <= bank_data_len; row++) {
@@ -233,17 +259,17 @@ static void inject_sprite_table_data_ranges(ApexProject *project)
             for (fi = 0; fi < table->schema.count; fi++) {
                 size_t n;
                 TableFieldKind kind = table->schema.items[fi].kind;
-                unsigned param      = table->schema.items[fi].param;
+                unsigned param = table->schema.items[fi].param;
 
                 for (n = 0; n < table->schema.items[fi].count; n++) {
                     if (kind == TABLE_FAR_SPRITE && fp + 3u <= bank_data_len) {
-                        uint16_t addr    = read_be16(bank_data + fp);
+                        uint16_t addr = read_be16(bank_data + fp);
                         uint8_t tgt_bank = bank_data[fp + 2u];
 
                         inject_one_sprite(project, tgt_bank, addr, param);
                         fp += 3u;
                     } else if (kind == TABLE_PTR16_SPRITE && fp + 2u <= bank_data_len) {
-                        uint16_t ptr     = read_be16(bank_data + fp);
+                        uint16_t ptr = read_be16(bank_data + fp);
                         uint8_t tgt_bank = in_system_addr(ptr) ? 0xffu : table->bank;
 
                         inject_one_sprite(project, tgt_bank, ptr, param);
@@ -268,8 +294,7 @@ static void inject_sprite_table_data_ranges(ApexProject *project)
    range (e.g. set via the Edit panel's "spr"/"far_spr" buttons), the same way
    table fields do.  range->length carries the no-header image height (0 = none,
    header-format only). */
-static void inject_sprite_pointer_data_ranges(ApexProject *project)
-{
+static void inject_sprite_pointer_data_ranges(ApexProject *project) {
     size_t i;
     size_t n = project->data_ranges.count; /* snapshot: add_data_range may realloc/append */
 
@@ -300,8 +325,7 @@ static void inject_sprite_pointer_data_ranges(ApexProject *project)
    address-loading instruction to find the target address and seed the matching
    data range in the target bank so it renders as that type (code/data targets
    need no range — they become code/data labels during collect_code_targets). */
-static void inject_far_imm_data_ranges(ApexProject *project)
-{
+static void inject_far_imm_data_ranges(ApexProject *project) {
     size_t i;
 
     for (i = 0; i < project->far_imms.count; i++) {
@@ -315,10 +339,17 @@ static void inject_far_imm_data_ranges(ApexProject *project)
         DataKind kind;
 
         switch ((FarImmType)e->value2) {
-        case FAR_IMM_STRING:        kind = DATA_STRING; break;
-        case FAR_IMM_SPRITE:        kind = DATA_SPRITE; break;
-        case FAR_IMM_DMD_FULLFRAME: kind = DATA_DMD_FULLFRAME; break;
-        default:                    continue;
+        case FAR_IMM_STRING:
+            kind = DATA_STRING;
+            break;
+        case FAR_IMM_SPRITE:
+            kind = DATA_SPRITE;
+            break;
+        case FAR_IMM_DMD_FULLFRAME:
+            kind = DATA_DMD_FULLFRAME;
+            break;
+        default:
+            continue;
         }
         lb = e->has_bank ? e->bank : 0xffu;
         if (!sprite_locate(project, lb, (uint16_t)e->addr, &rb, &rl)) {
@@ -330,25 +361,15 @@ static void inject_far_imm_data_ranges(ApexProject *project)
         }
         taddr = (uint16_t)li.addr_ref;
         tbank = e->value;
-        if (!data_range_at(tbank, taddr, &project->data_ranges)) {
-            add_data_range(&project->data_ranges, tbank, taddr, kind, 0);
-        }
+        add_derived_data_range(project, tbank, taddr, kind, 0);
     }
 }
 
-static const char *basename_ptr(const char *path)
-{
-    const char *slash;
-
-    if (!path || !*path) {
-        return "";
-    }
-    slash = strrchr(path, '/');
-    return slash ? slash + 1 : path;
+static const char *basename_ptr(const char *path) {
+    return apex_path_basename(path);
 }
 
-static void write_config_address(FILE *out, int has_bank, uint8_t bank, uint32_t addr)
-{
+static void write_config_address(FILE *out, int has_bank, uint8_t bank, uint32_t addr) {
     if (has_bank) {
         fprintf(out, "B%02x_A%04x", bank, (unsigned)addr & 0xffffu);
     } else if ((addr & 0xffffu) >= 0x8000u) {
@@ -360,8 +381,7 @@ static void write_config_address(FILE *out, int has_bank, uint8_t bank, uint32_t
     }
 }
 
-static void write_escaped_value(FILE *out, const char *value)
-{
+static void write_escaped_value(FILE *out, const char *value) {
     int needs_quotes = 0;
     const char *p;
 
@@ -406,8 +426,7 @@ static void write_escaped_value(FILE *out, const char *value)
     fputc('"', out);
 }
 
-static const char *table_field_kind_name(TableFieldKind kind)
-{
+static const char *table_field_kind_name(TableFieldKind kind) {
     switch (kind) {
     case TABLE_PTR16_STRING:
         return "ptr16_string";
@@ -445,8 +464,7 @@ static const char *table_field_kind_name(TableFieldKind kind)
     return "byte";
 }
 
-static void write_table_schema_text(FILE *out, const TableSchema *schema)
-{
+static void write_table_schema_text(FILE *out, const TableSchema *schema) {
     size_t i;
 
     for (i = 0; i < schema->count; i++) {
@@ -454,7 +472,8 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
             fputs(", ", out);
         }
         fputs(schema->items[i].type_name ? schema->items[i].type_name
-                                         : table_field_kind_name(schema->items[i].kind), out);
+                                         : table_field_kind_name(schema->items[i].kind),
+              out);
         if (!schema->items[i].type_name && schema->items[i].param &&
             (schema->items[i].kind == TABLE_PTR16_SPRITE ||
              schema->items[i].kind == TABLE_FAR_SPRITE)) {
@@ -469,22 +488,19 @@ static void write_table_schema_text(FILE *out, const TableSchema *schema)
     }
 }
 
-static void write_inline_signature_value(FILE *out, const InlineSignature *sig)
-{
+static void write_inline_signature_value(FILE *out, const InlineSignature *sig) {
     write_table_schema_text(out, &sig->schema);
     if (sig->flow_stop) {
         fputs(", flow_stop", out);
     }
 }
 
-static void write_data_range_value(FILE *out, const DataRange *range)
-{
+static void write_data_range_value(FILE *out, const DataRange *range) {
     char buf[48];
     fputs(data_range_spec(range, buf, sizeof(buf)), out);
 }
 
-static void write_table_def_value(FILE *out, const TableDef *table)
-{
+static void write_table_def_value(FILE *out, const TableDef *table) {
     if (table->has_header) {
         fputs("counted(", out);
         write_table_schema_text(out, &table->schema);
@@ -496,8 +512,7 @@ static void write_table_def_value(FILE *out, const TableDef *table)
     }
 }
 
-static void write_labels_section(FILE *out, const ConfigLabels *labels)
-{
+static void write_labels_section(FILE *out, const ConfigLabels *labels) {
     size_t i;
 
     if (labels->count == 0) {
@@ -513,8 +528,7 @@ static void write_labels_section(FILE *out, const ConfigLabels *labels)
     }
 }
 
-static void write_entries_section(FILE *out, const ConfigEntries *entries)
-{
+static void write_entries_section(FILE *out, const ConfigEntries *entries) {
     size_t i;
 
     if (entries->count == 0) {
@@ -528,8 +542,7 @@ static void write_entries_section(FILE *out, const ConfigEntries *entries)
     }
 }
 
-static void write_inline_section(FILE *out, const InlineSignatures *sigs)
-{
+static void write_inline_section(FILE *out, const InlineSignatures *sigs) {
     size_t i;
 
     if (sigs->count == 0) {
@@ -537,15 +550,15 @@ static void write_inline_section(FILE *out, const InlineSignatures *sigs)
     }
     fputs("\n[inline]\n", out);
     for (i = 0; i < sigs->count; i++) {
-        write_config_address(out, sigs->items[i].has_bank, sigs->items[i].bank, sigs->items[i].addr);
+        write_config_address(out, sigs->items[i].has_bank, sigs->items[i].bank,
+                             sigs->items[i].addr);
         fputs(" = ", out);
         write_inline_signature_value(out, &sigs->items[i]);
         fputc('\n', out);
     }
 }
 
-static void write_data_section(FILE *out, const DataRanges *ranges)
-{
+static void write_data_section(FILE *out, const DataRanges *ranges) {
     size_t i;
 
     if (ranges->count == 0) {
@@ -553,6 +566,9 @@ static void write_data_section(FILE *out, const DataRanges *ranges)
     }
     fputs("\n[data]\n", out);
     for (i = 0; i < ranges->count; i++) {
+        if (ranges->items[i].derived) {
+            continue;
+        }
         write_config_address(out, 1, ranges->items[i].bank, ranges->items[i].addr);
         fputs(" = ", out);
         write_data_range_value(out, &ranges->items[i]);
@@ -560,8 +576,7 @@ static void write_data_section(FILE *out, const DataRanges *ranges)
     }
 }
 
-static void write_tables_section(FILE *out, const TableDefs *tables)
-{
+static void write_tables_section(FILE *out, const TableDefs *tables) {
     size_t i;
 
     if (tables->count == 0) {
@@ -576,8 +591,7 @@ static void write_tables_section(FILE *out, const TableDefs *tables)
     }
 }
 
-static void write_types_section(FILE *out, const ConfigTypes *types)
-{
+static void write_types_section(FILE *out, const ConfigTypes *types) {
     size_t i, j;
 
     if (types->count == 0) {
@@ -586,8 +600,7 @@ static void write_types_section(FILE *out, const ConfigTypes *types)
     fputs("\n[types]\n", out);
     for (i = 0; i < types->count; i++) {
         const ConfigType *t = &types->items[i];
-        fprintf(out, "%s:%s =", t->name,
-                t->kind == TABLE_BYTE ? "byte" : "word");
+        fprintf(out, "%s:%s =", t->name, t->kind == TABLE_BYTE ? "byte" : "word");
         for (j = 0; j < t->value_count; j++) {
             if (j > 0) {
                 fputc(',', out);
@@ -598,8 +611,7 @@ static void write_types_section(FILE *out, const ConfigTypes *types)
     }
 }
 
-static void write_docs_section(FILE *out, const char *name, const ConfigDocs *docs)
-{
+static void write_docs_section(FILE *out, const char *name, const ConfigDocs *docs) {
     size_t i;
 
     if (docs->count == 0) {
@@ -607,25 +619,91 @@ static void write_docs_section(FILE *out, const char *name, const ConfigDocs *do
     }
     fprintf(out, "\n[%s]\n", name);
     for (i = 0; i < docs->count; i++) {
-        write_config_address(out, docs->items[i].has_bank, docs->items[i].bank, docs->items[i].addr);
+        write_config_address(out, docs->items[i].has_bank, docs->items[i].bank,
+                             docs->items[i].addr);
         fputs(" = ", out);
         write_escaped_value(out, docs->items[i].text);
         fputc('\n', out);
     }
 }
 
-static int config_item_is_system(int has_bank, uint8_t bank, uint32_t addr)
-{
+static void write_schemas_section(FILE *out, const SchemaDefs *schemas) {
+    size_t i;
+
+    if (schemas->count == 0) {
+        return;
+    }
+    fputs("\n[schemas]\n", out);
+    for (i = 0; i < schemas->count; i++) {
+        fprintf(out, "%s = ", schemas->items[i].name);
+        write_table_schema_text(out, &schemas->items[i].schema);
+        fputc('\n', out);
+    }
+}
+
+static void write_symbols_section(FILE *out, const ConfigSymbols *symbols) {
+    size_t i;
+
+    if (symbols->count == 0) {
+        return;
+    }
+    fputs("\n[symbols]\n", out);
+    for (i = 0; i < symbols->count; i++) {
+        if (symbols->items[i].length > 1u) {
+            fprintf(out, "%s = 0x%04x, %u\n", symbols->items[i].name,
+                    (unsigned)symbols->items[i].value, (unsigned)symbols->items[i].length);
+        } else {
+            fprintf(out, "%s = 0x%04x\n", symbols->items[i].name,
+                    (unsigned)symbols->items[i].value);
+        }
+    }
+}
+
+/* [exclude_refs], [literals] and [ack_warnings]: address-only entry sections. */
+static void write_marker_section(FILE *out, const char *name, const ConfigEntries *entries,
+                                 const char *value) {
+    size_t i;
+
+    if (entries->count == 0) {
+        return;
+    }
+    fprintf(out, "\n[%s]\n", name);
+    for (i = 0; i < entries->count; i++) {
+        write_config_address(out, entries->items[i].has_bank, entries->items[i].bank,
+                             entries->items[i].addr);
+        fprintf(out, " = %s\n", value);
+    }
+}
+
+static void write_far_imm_section(FILE *out, const ConfigEntries *far_imms) {
+    size_t i;
+
+    if (far_imms->count == 0) {
+        return;
+    }
+    fputs("\n[far_imm]\n", out);
+    for (i = 0; i < far_imms->count; i++) {
+        const ConfigEntry *e = &far_imms->items[i];
+        write_config_address(out, e->has_bank, e->bank, e->addr);
+        fprintf(out, " = %s 0x%02x", far_imm_type_name((FarImmType)e->value2), e->value);
+        if (e->aux_addr) {
+            fprintf(out, " B%02x_A%04x", (unsigned)(e->has_bank ? e->bank : 0xffu),
+                    (unsigned)e->aux_addr);
+        }
+        fputc('\n', out);
+    }
+}
+
+static int config_item_is_system(int has_bank, uint8_t bank, uint32_t addr) {
     return in_system_addr(addr) && (!has_bank || bank == 0xffu);
 }
 
-static int config_item_is_bank_local(int has_bank, uint8_t bank, uint32_t addr, uint8_t target_bank)
-{
+static int config_item_is_bank_local(int has_bank, uint8_t bank, uint32_t addr,
+                                     uint8_t target_bank) {
     return has_bank && bank == target_bank && addr >= APEX_PAGED_ORG && addr < 0x8000u;
 }
 
-static ConfigLabels filter_config_labels_for_system(const ConfigLabels *src)
-{
+static ConfigLabels filter_config_labels_for_system(const ConfigLabels *src) {
     ConfigLabels dst = {0};
     size_t i;
 
@@ -648,8 +726,7 @@ static ConfigLabels filter_config_labels_for_system(const ConfigLabels *src)
     return dst;
 }
 
-static ConfigLabels filter_config_labels_for_bank(const ConfigLabels *src, uint8_t bank_id)
-{
+static ConfigLabels filter_config_labels_for_bank(const ConfigLabels *src, uint8_t bank_id) {
     ConfigLabels dst = {0};
     size_t i;
 
@@ -674,8 +751,7 @@ static ConfigLabels filter_config_labels_for_bank(const ConfigLabels *src, uint8
     return dst;
 }
 
-static ConfigEntries filter_config_entries_for_system(const ConfigEntries *src)
-{
+static ConfigEntries filter_config_entries_for_system(const ConfigEntries *src) {
     ConfigEntries dst = {0};
     size_t i;
 
@@ -698,8 +774,7 @@ static ConfigEntries filter_config_entries_for_system(const ConfigEntries *src)
     return dst;
 }
 
-static ConfigEntries filter_config_entries_for_bank(const ConfigEntries *src, uint8_t bank_id)
-{
+static ConfigEntries filter_config_entries_for_bank(const ConfigEntries *src, uint8_t bank_id) {
     ConfigEntries dst = {0};
     size_t i;
 
@@ -724,14 +799,13 @@ static ConfigEntries filter_config_entries_for_bank(const ConfigEntries *src, ui
     return dst;
 }
 
-static DataRanges filter_data_ranges_for_bank(const DataRanges *src, uint8_t bank_id)
-{
+static DataRanges filter_data_ranges_for_bank(const DataRanges *src, uint8_t bank_id) {
     DataRanges dst = {0};
     size_t i;
 
     for (i = 0; i < src->count; i++) {
-        if (src->items[i].bank == bank_id &&
-            src->items[i].addr >= APEX_PAGED_ORG && src->items[i].addr < 0x8000u) {
+        if (src->items[i].bank == bank_id && src->items[i].addr >= APEX_PAGED_ORG &&
+            src->items[i].addr < 0x8000u) {
             dst.count++;
         }
     }
@@ -742,16 +816,15 @@ static DataRanges filter_data_ranges_for_bank(const DataRanges *src, uint8_t ban
     dst.cap = dst.count;
     dst.count = 0;
     for (i = 0; i < src->count; i++) {
-        if (src->items[i].bank == bank_id &&
-            src->items[i].addr >= APEX_PAGED_ORG && src->items[i].addr < 0x8000u) {
+        if (src->items[i].bank == bank_id && src->items[i].addr >= APEX_PAGED_ORG &&
+            src->items[i].addr < 0x8000u) {
             dst.items[dst.count++] = src->items[i];
         }
     }
     return dst;
 }
 
-static DataRanges filter_data_ranges_for_system(const DataRanges *src)
-{
+static DataRanges filter_data_ranges_for_system(const DataRanges *src) {
     DataRanges dst = {0};
     size_t i;
 
@@ -774,14 +847,13 @@ static DataRanges filter_data_ranges_for_system(const DataRanges *src)
     return dst;
 }
 
-static TableDefs filter_tables_for_bank(const TableDefs *src, uint8_t bank_id)
-{
+static TableDefs filter_tables_for_bank(const TableDefs *src, uint8_t bank_id) {
     TableDefs dst = {0};
     size_t i;
 
     for (i = 0; i < src->count; i++) {
-        if (src->items[i].bank == bank_id &&
-            src->items[i].addr >= APEX_PAGED_ORG && src->items[i].addr < 0x8000u) {
+        if (src->items[i].bank == bank_id && src->items[i].addr >= APEX_PAGED_ORG &&
+            src->items[i].addr < 0x8000u) {
             dst.count++;
         }
     }
@@ -792,16 +864,15 @@ static TableDefs filter_tables_for_bank(const TableDefs *src, uint8_t bank_id)
     dst.cap = dst.count;
     dst.count = 0;
     for (i = 0; i < src->count; i++) {
-        if (src->items[i].bank == bank_id &&
-            src->items[i].addr >= APEX_PAGED_ORG && src->items[i].addr < 0x8000u) {
+        if (src->items[i].bank == bank_id && src->items[i].addr >= APEX_PAGED_ORG &&
+            src->items[i].addr < 0x8000u) {
             dst.items[dst.count++] = src->items[i];
         }
     }
     return dst;
 }
 
-static TableDefs filter_tables_for_system(const TableDefs *src)
-{
+static TableDefs filter_tables_for_system(const TableDefs *src) {
     TableDefs dst = {0};
     size_t i;
 
@@ -824,32 +895,27 @@ static TableDefs filter_tables_for_system(const TableDefs *src)
     return dst;
 }
 
-static void free_filtered_config_labels(ConfigLabels *labels)
-{
+static void free_filtered_config_labels(ConfigLabels *labels) {
     free(labels->items);
     memset(labels, 0, sizeof(*labels));
 }
 
-static void free_filtered_config_entries(ConfigEntries *entries)
-{
+static void free_filtered_config_entries(ConfigEntries *entries) {
     free(entries->items);
     memset(entries, 0, sizeof(*entries));
 }
 
-static void free_filtered_data_ranges(DataRanges *ranges)
-{
+static void free_filtered_data_ranges(DataRanges *ranges) {
     free(ranges->items);
     memset(ranges, 0, sizeof(*ranges));
 }
 
-static void free_filtered_table_defs(TableDefs *tables)
-{
+static void free_filtered_table_defs(TableDefs *tables) {
     free(tables->items);
     memset(tables, 0, sizeof(*tables));
 }
 
-static char *project_dup_string(const char *s)
-{
+static char *project_dup_string(const char *s) {
     size_t len = strlen(s) + 1u;
     char *copy = xmalloc(len);
 
@@ -857,16 +923,14 @@ static char *project_dup_string(const char *s)
     return copy;
 }
 
-static void free_table_schema(TableSchema *schema)
-{
+static void free_table_schema(TableSchema *schema) {
     free(schema->items);
     schema->items = NULL;
     schema->count = 0;
     schema->cap = 0;
 }
 
-static void free_inline_signatures(InlineSignatures *sigs)
-{
+static void free_inline_signatures(InlineSignatures *sigs) {
     size_t i;
 
     for (i = 0; i < sigs->count; i++) {
@@ -876,8 +940,7 @@ static void free_inline_signatures(InlineSignatures *sigs)
     memset(sigs, 0, sizeof(*sigs));
 }
 
-static void free_config_labels(ConfigLabels *labels)
-{
+static void free_config_labels(ConfigLabels *labels) {
     size_t i;
 
     for (i = 0; i < labels->count; i++) {
@@ -887,8 +950,7 @@ static void free_config_labels(ConfigLabels *labels)
     memset(labels, 0, sizeof(*labels));
 }
 
-static void free_table_defs(TableDefs *tables)
-{
+static void free_table_defs(TableDefs *tables) {
     size_t i;
 
     for (i = 0; i < tables->count; i++) {
@@ -898,14 +960,12 @@ static void free_table_defs(TableDefs *tables)
     memset(tables, 0, sizeof(*tables));
 }
 
-static void free_config_entries(ConfigEntries *entries)
-{
+static void free_config_entries(ConfigEntries *entries) {
     free(entries->items);
     memset(entries, 0, sizeof(*entries));
 }
 
-static void free_schema_defs(SchemaDefs *schemas)
-{
+static void free_schema_defs(SchemaDefs *schemas) {
     size_t i;
 
     for (i = 0; i < schemas->count; i++) {
@@ -916,8 +976,7 @@ static void free_schema_defs(SchemaDefs *schemas)
     memset(schemas, 0, sizeof(*schemas));
 }
 
-static void free_config_docs(ConfigDocs *docs)
-{
+static void free_config_docs(ConfigDocs *docs) {
     size_t i;
 
     for (i = 0; i < docs->count; i++) {
@@ -927,8 +986,7 @@ static void free_config_docs(ConfigDocs *docs)
     memset(docs, 0, sizeof(*docs));
 }
 
-static void free_config_symbols(ConfigSymbols *symbols)
-{
+static void free_config_symbols(ConfigSymbols *symbols) {
     size_t i;
 
     for (i = 0; i < symbols->count; i++) {
@@ -938,8 +996,7 @@ static void free_config_symbols(ConfigSymbols *symbols)
     memset(symbols, 0, sizeof(*symbols));
 }
 
-static void free_label_set(LabelSet *labels)
-{
+static void free_label_set(LabelSet *labels) {
     size_t i;
     for (i = 0; i < labels->count; i++) {
         if (labels->items[i].owns_name && labels->items[i].name) {
@@ -947,18 +1004,18 @@ static void free_label_set(LabelSet *labels)
         }
     }
     free(labels->items);
+    label_set_invalidate_index(labels);
     memset(labels, 0, sizeof(*labels));
 }
 
-static void free_reference_set(ReferenceSet *refs)
-{
+static void free_reference_set(ReferenceSet *refs) {
+    free_reference_sources(refs);
     free(refs->items);
     memset(refs, 0, sizeof(*refs));
 }
 
 static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t item_addr,
-                               int has_bank, uint8_t bank, uint32_t addr)
-{
+                               int has_bank, uint8_t bank, uint32_t addr) {
     if (item_addr != addr) {
         return 0;
     }
@@ -973,31 +1030,31 @@ static int config_addr_matches(int item_has_bank, uint8_t item_bank, uint32_t it
     return 0;
 }
 
-static int project_addr_is_system(int has_bank, uint8_t bank, uint32_t addr)
-{
+static int project_addr_is_system(int has_bank, uint8_t bank, uint32_t addr) {
     return in_system_addr(addr) && (!has_bank || bank == 0xffu);
 }
 
-static int project_addr_is_bank_local(int has_bank, uint8_t bank, uint32_t addr)
-{
+static int project_addr_is_bank_local(int has_bank, uint8_t bank, uint32_t addr) {
     return has_bank && bank != 0xffu && addr >= APEX_PAGED_ORG && addr < 0x8000u;
 }
 
-static void mark_analysis_scope(ApexProject *project, ApexAnalyzeScope scope)
-{
+static void mark_analysis_scope(ApexProject *project, ApexAnalyzeScope scope) {
     if (!project) {
         return;
     }
     if (project->analysis_scope == APEX_ANALYZE_SCOPE_FULL || scope == APEX_ANALYZE_SCOPE_NONE) {
         return;
     }
-    if (scope == APEX_ANALYZE_SCOPE_FULL || project->analysis_scope == APEX_ANALYZE_SCOPE_NONE) {
+    if (project->analysis_scope == APEX_ANALYZE_SCOPE_NONE) {
         project->analysis_scope = scope;
+    } else if (project->analysis_scope != scope) {
+        /* Two different pending scopes (e.g. a bank edit, then a system-bank
+           edit before the next analyze): neither covers the other. */
+        project->analysis_scope = APEX_ANALYZE_SCOPE_FULL;
     }
 }
 
-static void mark_bank_analysis_scope(ApexProject *project, uint8_t bank)
-{
+static void mark_bank_analysis_scope(ApexProject *project, uint8_t bank) {
     if (!project || project->analysis_scope == APEX_ANALYZE_SCOPE_FULL) {
         return;
     }
@@ -1013,8 +1070,8 @@ static void mark_bank_analysis_scope(ApexProject *project, uint8_t bank)
     project->analysis_scope = APEX_ANALYZE_SCOPE_FULL;
 }
 
-static LabelSet *project_label_set(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+static LabelSet *project_label_set(ApexProject *project, int has_bank, uint8_t bank,
+                                   uint32_t addr) {
     int bank_index;
 
     if (!has_bank || (bank == 0xffu && in_system_addr(addr))) {
@@ -1027,8 +1084,7 @@ static LabelSet *project_label_set(ApexProject *project, int has_bank, uint8_t b
     return &project->bank_labels[bank_index];
 }
 
-static void remove_runtime_label(LabelSet *labels, uint32_t addr, const char *name)
-{
+static void remove_runtime_label(LabelSet *labels, uint32_t addr, const char *name) {
     size_t i;
 
     if (!labels || !name) {
@@ -1042,14 +1098,14 @@ static void remove_runtime_label(LabelSet *labels, uint32_t addr, const char *na
             memmove(&labels->items[i], &labels->items[i + 1],
                     (labels->count - i - 1u) * sizeof(labels->items[0]));
             labels->count--;
+            label_set_invalidate_index(labels);
             return;
         }
     }
 }
 
 static ConfigLabel *upsert_config_label(ConfigLabels *labels, int has_bank, uint8_t bank,
-                                        uint32_t addr, const char *name, char **old_name)
-{
+                                        uint32_t addr, const char *name, char **old_name) {
     size_t i;
 
     if (old_name) {
@@ -1086,8 +1142,7 @@ static ConfigLabel *upsert_config_label(ConfigLabels *labels, int has_bank, uint
     return &labels->items[labels->count - 1u];
 }
 
-static char *remove_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, uint32_t addr)
-{
+static char *remove_config_label(ConfigLabels *labels, int has_bank, uint8_t bank, uint32_t addr) {
     size_t i;
     char *removed;
 
@@ -1105,8 +1160,7 @@ static char *remove_config_label(ConfigLabels *labels, int has_bank, uint8_t ban
 }
 
 static ConfigDoc *upsert_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_t addr,
-                                    const char *text)
-{
+                                    const char *text) {
     size_t i;
 
     for (i = 0; i < docs->count; i++) {
@@ -1136,8 +1190,7 @@ static ConfigDoc *upsert_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank
     return &docs->items[docs->count - 1u];
 }
 
-static int remove_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_t addr)
-{
+static int remove_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint32_t addr) {
     size_t i;
 
     for (i = 0; i < docs->count; i++) {
@@ -1171,34 +1224,33 @@ static int remove_config_doc(ConfigDocs *docs, int has_bank, uint8_t bank, uint3
 
 typedef struct {
     InlineSignatures inline_sigs;
-    ConfigLabels     config_labels;
-    ConfigEntries    config_entries;
-    TableDefs        tables;
-    SchemaDefs       schemas;
-    ConfigDocs       docs;
-    ConfigSymbols    symbols;
-    DataRanges       data_ranges;
-    ConfigTypes      config_types;
-    ConfigEntries    ref_exclusions;
-    ConfigEntries    literals;
-    ConfigEntries    ack_warnings;
-    ConfigEntries    far_imms;
-    ConfigOptions    options;
-    char             action[24];
+    ConfigLabels config_labels;
+    ConfigEntries config_entries;
+    TableDefs tables;
+    SchemaDefs schemas;
+    ConfigDocs docs;
+    ConfigSymbols symbols;
+    DataRanges data_ranges;
+    ConfigTypes config_types;
+    ConfigEntries ref_exclusions;
+    ConfigEntries literals;
+    ConfigEntries ack_warnings;
+    ConfigEntries far_imms;
+    ConfigOptions options;
+    char action[24];
 } ApexConfigSnapshot;
 
 struct ApexUndo {
     ApexConfigSnapshot undo[APEX_UNDO_MAX];
-    size_t             undo_count;
+    size_t undo_count;
     ApexConfigSnapshot redo[APEX_UNDO_MAX];
-    size_t             redo_count;
-    int                group_depth;
-    int                group_captured;
-    char               group_label[24];
+    size_t redo_count;
+    int group_depth;
+    int group_captured;
+    char group_label[24];
 };
 
-static const char *rebind_type_name(const ConfigTypes *types, const char *old_name)
-{
+static const char *rebind_type_name(const ConfigTypes *types, const char *old_name) {
     size_t i;
 
     if (!old_name) {
@@ -1212,8 +1264,7 @@ static const char *rebind_type_name(const ConfigTypes *types, const char *old_na
     return NULL; /* type no longer exists — degrade to raw kind */
 }
 
-static TableSchema copy_schema_rebind(const TableSchema *src, const ConfigTypes *types)
-{
+static TableSchema copy_schema_rebind(const TableSchema *src, const ConfigTypes *types) {
     TableSchema dst;
     size_t i;
 
@@ -1225,8 +1276,7 @@ static TableSchema copy_schema_rebind(const TableSchema *src, const ConfigTypes 
     return dst;
 }
 
-static ConfigTypes copy_config_types(const ConfigTypes *src)
-{
+static ConfigTypes copy_config_types(const ConfigTypes *src) {
     ConfigTypes dst;
     size_t i, j;
 
@@ -1254,8 +1304,7 @@ static ConfigTypes copy_config_types(const ConfigTypes *src)
     return dst;
 }
 
-static InlineSignatures copy_inline_sigs(const InlineSignatures *src, const ConfigTypes *types)
-{
+static InlineSignatures copy_inline_sigs(const InlineSignatures *src, const ConfigTypes *types) {
     InlineSignatures dst;
     size_t i;
 
@@ -1277,8 +1326,7 @@ static InlineSignatures copy_inline_sigs(const InlineSignatures *src, const Conf
     return dst;
 }
 
-static TableDefs copy_table_defs(const TableDefs *src, const ConfigTypes *types)
-{
+static TableDefs copy_table_defs(const TableDefs *src, const ConfigTypes *types) {
     TableDefs dst;
     size_t i;
 
@@ -1299,8 +1347,7 @@ static TableDefs copy_table_defs(const TableDefs *src, const ConfigTypes *types)
     return dst;
 }
 
-static SchemaDefs copy_schema_defs(const SchemaDefs *src, const ConfigTypes *types)
-{
+static SchemaDefs copy_schema_defs(const SchemaDefs *src, const ConfigTypes *types) {
     SchemaDefs dst;
     size_t i;
 
@@ -1318,8 +1365,7 @@ static SchemaDefs copy_schema_defs(const SchemaDefs *src, const ConfigTypes *typ
     return dst;
 }
 
-static ConfigLabels copy_config_labels(const ConfigLabels *src)
-{
+static ConfigLabels copy_config_labels(const ConfigLabels *src) {
     ConfigLabels dst;
     size_t i;
 
@@ -1337,8 +1383,7 @@ static ConfigLabels copy_config_labels(const ConfigLabels *src)
     return dst;
 }
 
-static ConfigDocs copy_config_docs(const ConfigDocs *src)
-{
+static ConfigDocs copy_config_docs(const ConfigDocs *src) {
     ConfigDocs dst;
     size_t i;
 
@@ -1356,8 +1401,7 @@ static ConfigDocs copy_config_docs(const ConfigDocs *src)
     return dst;
 }
 
-static ConfigSymbols copy_config_symbols(const ConfigSymbols *src)
-{
+static ConfigSymbols copy_config_symbols(const ConfigSymbols *src) {
     ConfigSymbols dst;
     size_t i;
 
@@ -1375,8 +1419,7 @@ static ConfigSymbols copy_config_symbols(const ConfigSymbols *src)
     return dst;
 }
 
-static ConfigEntries copy_config_entries(const ConfigEntries *src)
-{
+static ConfigEntries copy_config_entries(const ConfigEntries *src) {
     ConfigEntries dst;
 
     memset(&dst, 0, sizeof(dst));
@@ -1390,8 +1433,7 @@ static ConfigEntries copy_config_entries(const ConfigEntries *src)
     return dst;
 }
 
-static DataRanges copy_data_ranges(const DataRanges *src)
-{
+static DataRanges copy_data_ranges(const DataRanges *src) {
     DataRanges dst;
 
     memset(&dst, 0, sizeof(dst));
@@ -1405,28 +1447,26 @@ static DataRanges copy_data_ranges(const DataRanges *src)
     return dst;
 }
 
-static void snapshot_capture(const ApexProject *p, const char *action, ApexConfigSnapshot *out)
-{
+static void snapshot_capture(const ApexProject *p, const char *action, ApexConfigSnapshot *out) {
     memset(out, 0, sizeof(*out));
-    out->config_types   = copy_config_types(&p->config_types);
-    out->inline_sigs    = copy_inline_sigs(&p->inline_sigs, &out->config_types);
-    out->tables         = copy_table_defs(&p->tables, &out->config_types);
-    out->schemas        = copy_schema_defs(&p->schemas, &out->config_types);
-    out->config_labels  = copy_config_labels(&p->config_labels);
+    out->config_types = copy_config_types(&p->config_types);
+    out->inline_sigs = copy_inline_sigs(&p->inline_sigs, &out->config_types);
+    out->tables = copy_table_defs(&p->tables, &out->config_types);
+    out->schemas = copy_schema_defs(&p->schemas, &out->config_types);
+    out->config_labels = copy_config_labels(&p->config_labels);
     out->config_entries = copy_config_entries(&p->config_entries);
-    out->docs           = copy_config_docs(&p->docs);
-    out->symbols        = copy_config_symbols(&p->symbols);
-    out->data_ranges    = copy_data_ranges(&p->data_ranges);
+    out->docs = copy_config_docs(&p->docs);
+    out->symbols = copy_config_symbols(&p->symbols);
+    out->data_ranges = copy_data_ranges(&p->data_ranges);
     out->ref_exclusions = copy_config_entries(&p->ref_exclusions);
-    out->literals       = copy_config_entries(&p->literals);
-    out->ack_warnings   = copy_config_entries(&p->ack_warnings);
-    out->far_imms       = copy_config_entries(&p->far_imms);
-    out->options        = p->options;
+    out->literals = copy_config_entries(&p->literals);
+    out->ack_warnings = copy_config_entries(&p->ack_warnings);
+    out->far_imms = copy_config_entries(&p->far_imms);
+    out->options = p->options;
     snprintf(out->action, sizeof(out->action), "%s", action ? action : "edit");
 }
 
-static void snapshot_free(ApexConfigSnapshot *s)
-{
+static void snapshot_free(ApexConfigSnapshot *s) {
     free_inline_signatures(&s->inline_sigs);
     free_config_labels(&s->config_labels);
     free_config_entries(&s->config_entries);
@@ -1445,8 +1485,7 @@ static void snapshot_free(ApexConfigSnapshot *s)
 
 /* Free the project's current config and move the snapshot's owned arrays in.
    Leaves *s zeroed (ownership transferred to the project). */
-static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
-{
+static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s) {
     free_inline_signatures(&p->inline_sigs);
     free_config_labels(&p->config_labels);
     free_config_entries(&p->config_entries);
@@ -1462,25 +1501,24 @@ static void snapshot_apply(ApexProject *p, ApexConfigSnapshot *s)
     free_config_entries(&p->ack_warnings);
     free_config_entries(&p->far_imms);
 
-    p->inline_sigs    = s->inline_sigs;
-    p->config_labels  = s->config_labels;
+    p->inline_sigs = s->inline_sigs;
+    p->config_labels = s->config_labels;
     p->config_entries = s->config_entries;
-    p->tables         = s->tables;
-    p->schemas        = s->schemas;
-    p->docs           = s->docs;
-    p->symbols        = s->symbols;
-    p->data_ranges    = s->data_ranges;
-    p->config_types   = s->config_types;
+    p->tables = s->tables;
+    p->schemas = s->schemas;
+    p->docs = s->docs;
+    p->symbols = s->symbols;
+    p->data_ranges = s->data_ranges;
+    p->config_types = s->config_types;
     p->ref_exclusions = s->ref_exclusions;
-    p->literals       = s->literals;
-    p->ack_warnings   = s->ack_warnings;
-    p->far_imms       = s->far_imms;
-    p->options        = s->options;
+    p->literals = s->literals;
+    p->ack_warnings = s->ack_warnings;
+    p->far_imms = s->far_imms;
+    p->options = s->options;
     memset(s, 0, sizeof(*s));
 }
 
-static struct ApexUndo *undo_ensure(ApexProject *p)
-{
+static struct ApexUndo *undo_ensure(ApexProject *p) {
     if (!p->undo) {
         p->undo = xmalloc(sizeof(*p->undo));
         memset(p->undo, 0, sizeof(*p->undo));
@@ -1490,8 +1528,7 @@ static struct ApexUndo *undo_ensure(ApexProject *p)
 
 /* Push *snap onto a fixed-capacity stack, dropping the oldest entry on
    overflow. Moves ownership: *snap is zeroed. */
-static void undo_stack_push(ApexConfigSnapshot *stack, size_t *count, ApexConfigSnapshot *snap)
-{
+static void undo_stack_push(ApexConfigSnapshot *stack, size_t *count, ApexConfigSnapshot *snap) {
     if (*count == APEX_UNDO_MAX) {
         snapshot_free(&stack[0]);
         memmove(&stack[0], &stack[1], (APEX_UNDO_MAX - 1u) * sizeof(stack[0]));
@@ -1501,8 +1538,7 @@ static void undo_stack_push(ApexConfigSnapshot *stack, size_t *count, ApexConfig
     memset(snap, 0, sizeof(*snap));
 }
 
-static void undo_clear_redo(struct ApexUndo *u)
-{
+static void undo_clear_redo(struct ApexUndo *u) {
     while (u->redo_count) {
         snapshot_free(&u->redo[--u->redo_count]);
     }
@@ -1514,12 +1550,19 @@ static void undo_clear_redo(struct ApexUndo *u)
    `addr` describe the affected location for the listener's log (pass has_addr=0
    for name-scoped edits like set type / set symbol). Edits grouped via
    begin/end_edit_group capture — and log — only once, under the group label. */
-static void project_record_edit_at(ApexProject *p, const char *action,
-                                   int has_addr, int has_bank, uint8_t bank, uint32_t addr)
-{
-    struct ApexUndo *u;
+/* Edits are recorded in two steps so a failed edit leaves no trace: begin
+   captures the pre-edit snapshot, commit pushes it onto the undo stack (and
+   drops the redo history and notifies the listener), abort discards it.  In an
+   edit group only the first edit captures; the group label names it. */
+typedef struct {
+    int active;
     ApexConfigSnapshot snap;
+} PendingEdit;
 
+static void edit_begin(ApexProject *p, const char *action, PendingEdit *pe) {
+    struct ApexUndo *u;
+
+    pe->active = 0;
     if (!p) {
         return;
     }
@@ -1528,13 +1571,37 @@ static void project_record_edit_at(ApexProject *p, const char *action,
         if (u->group_captured) {
             return;
         }
+        if (u->group_label[0]) {
+            action = u->group_label;
+        }
+    }
+    snapshot_capture(p, action, &pe->snap);
+    pe->active = 1;
+}
+
+static void edit_abort(PendingEdit *pe) {
+    if (pe->active) {
+        snapshot_free(&pe->snap);
+        pe->active = 0;
+    }
+}
+
+static void edit_commit(ApexProject *p, PendingEdit *pe, const char *action, int has_addr,
+                        int has_bank, uint8_t bank, uint32_t addr) {
+    struct ApexUndo *u;
+
+    if (!p || !pe->active) {
+        return;
+    }
+    u = undo_ensure(p);
+    if (u->group_depth > 0) {
         u->group_captured = 1;
         if (u->group_label[0]) {
             action = u->group_label;
         }
     }
-    snapshot_capture(p, action, &snap);
-    undo_stack_push(u->undo, &u->undo_count, &snap);
+    undo_stack_push(u->undo, &u->undo_count, &pe->snap);
+    pe->active = 0;
     undo_clear_redo(u);
 
     if (p->change_cb) {
@@ -1549,14 +1616,21 @@ static void project_record_edit_at(ApexProject *p, const char *action,
     }
 }
 
+/* Record an edit that cannot fail (or whose failure leaves the config as is). */
+static void project_record_edit_at(ApexProject *p, const char *action, int has_addr, int has_bank,
+                                   uint8_t bank, uint32_t addr) {
+    PendingEdit pe;
+
+    edit_begin(p, action, &pe);
+    edit_commit(p, &pe, action, has_addr, has_bank, bank, addr);
+}
+
 /* Back-compat shim for name-scoped edits with no address. */
-static void project_record_edit(ApexProject *p, const char *action)
-{
+static void project_record_edit(ApexProject *p, const char *action) {
     project_record_edit_at(p, action, 0, 0, 0, 0);
 }
 
-void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx)
-{
+void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx) {
     if (!project) {
         return;
     }
@@ -1564,8 +1638,7 @@ void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, voi
     project->change_ctx = ctx;
 }
 
-void apex_project_begin_edit_group(ApexProject *project, const char *label)
-{
+void apex_project_begin_edit_group(ApexProject *project, const char *label) {
     struct ApexUndo *u;
 
     if (!project) {
@@ -1579,8 +1652,7 @@ void apex_project_begin_edit_group(ApexProject *project, const char *label)
     u->group_depth++;
 }
 
-void apex_project_end_edit_group(ApexProject *project)
-{
+void apex_project_end_edit_group(ApexProject *project) {
     struct ApexUndo *u;
 
     if (!project || !project->undo) {
@@ -1596,34 +1668,29 @@ void apex_project_end_edit_group(ApexProject *project)
     }
 }
 
-int apex_project_can_undo(const ApexProject *project)
-{
+int apex_project_can_undo(const ApexProject *project) {
     return project && project->undo && project->undo->undo_count > 0;
 }
 
-int apex_project_can_redo(const ApexProject *project)
-{
+int apex_project_can_redo(const ApexProject *project) {
     return project && project->undo && project->undo->redo_count > 0;
 }
 
-const char *apex_project_undo_label(const ApexProject *project)
-{
+const char *apex_project_undo_label(const ApexProject *project) {
     if (!apex_project_can_undo(project)) {
         return NULL;
     }
     return project->undo->undo[project->undo->undo_count - 1u].action;
 }
 
-const char *apex_project_redo_label(const ApexProject *project)
-{
+const char *apex_project_redo_label(const ApexProject *project) {
     if (!apex_project_can_redo(project)) {
         return NULL;
     }
     return project->undo->redo[project->undo->redo_count - 1u].action;
 }
 
-int apex_project_undo(ApexProject *project)
-{
+int apex_project_undo(ApexProject *project) {
     struct ApexUndo *u;
     ApexConfigSnapshot cur, snap;
 
@@ -1639,8 +1706,7 @@ int apex_project_undo(ApexProject *project)
     return 0;
 }
 
-int apex_project_redo(ApexProject *project)
-{
+int apex_project_redo(ApexProject *project) {
     struct ApexUndo *u;
     ApexConfigSnapshot cur, snap;
 
@@ -1656,8 +1722,7 @@ int apex_project_redo(ApexProject *project)
     return 0;
 }
 
-ApexProject *apex_project_open(const char *rom_path, const char *config_path)
-{
+ApexProject *apex_project_open(const char *rom_path, const char *config_path) {
     ApexProject *project = xmalloc(sizeof(*project));
 
     memset(project, 0, sizeof(*project));
@@ -1666,9 +1731,8 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
     project->options.labels_are_entries = 0;
 
     load_config(project->config_path, &project->inline_sigs, &project->config_labels,
-                &project->config_entries, &project->tables, &project->schemas,
-                &project->docs, &project->symbols,
-                &project->data_ranges, &project->options, &project->config_types,
+                &project->config_entries, &project->tables, &project->schemas, &project->docs,
+                &project->symbols, &project->data_ranges, &project->options, &project->config_types,
                 &project->ref_exclusions, &project->literals, &project->ack_warnings,
                 &project->far_imms);
     validate_config_classification(&project->config_entries, &project->tables,
@@ -1696,8 +1760,34 @@ ApexProject *apex_project_open(const char *rom_path, const char *config_path)
     return project;
 }
 
-void apex_project_free(ApexProject *project)
-{
+ApexProject *apex_project_clone(const ApexProject *src) {
+    ApexProject *p;
+    ApexConfigSnapshot snap;
+
+    if (!src) {
+        return NULL;
+    }
+    p = xmalloc(sizeof(*p));
+    memset(p, 0, sizeof(*p));
+    p->rom_path = src->rom_path ? project_dup_string(src->rom_path) : NULL;
+    p->config_path = src->config_path ? project_dup_string(src->config_path) : NULL;
+    p->rom.size = src->rom.size;
+    p->rom.data = xmalloc(src->rom.size);
+    memcpy(p->rom.data, src->rom.data, src->rom.size);
+    p->paged_size = src->paged_size;
+    p->banks = src->banks;
+    p->bank_labels = xmalloc(p->banks * sizeof(p->bank_labels[0]));
+    memset(p->bank_labels, 0, p->banks * sizeof(p->bank_labels[0]));
+    memcpy(p->vectors, src->vectors, sizeof(p->vectors));
+    /* the undo snapshot is exactly a deep copy of the config */
+    snapshot_capture(src, "clone", &snap);
+    snapshot_apply(p, &snap);
+    p->dirty_flags = APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
+    p->analysis_scope = APEX_ANALYZE_SCOPE_FULL;
+    return p;
+}
+
+void apex_project_free(ApexProject *project) {
     size_t i;
 
     if (!project) {
@@ -1741,8 +1831,7 @@ void apex_project_free(ApexProject *project)
     free(project);
 }
 
-void apex_project_invalidate(ApexProject *project, unsigned dirty_flags)
-{
+void apex_project_invalidate(ApexProject *project, unsigned dirty_flags) {
     if (!project) {
         return;
     }
@@ -1752,10 +1841,10 @@ void apex_project_invalidate(ApexProject *project, unsigned dirty_flags)
     }
 }
 
-static void analyze_system_region(ApexProject *project)
-{
+static void analyze_system_region(ApexProject *project) {
     ConfigLabels system_config_labels = filter_config_labels_for_system(&project->config_labels);
-    ConfigEntries system_config_entries = filter_config_entries_for_system(&project->config_entries);
+    ConfigEntries system_config_entries =
+        filter_config_entries_for_system(&project->config_entries);
     DataRanges system_data_ranges = filter_data_ranges_for_system(&project->data_ranges);
     TableDefs system_tables = filter_tables_for_system(&project->tables);
 
@@ -1764,7 +1853,7 @@ static void analyze_system_region(ApexProject *project)
        rescan the paged banks, so code reached only via cross-bank references
        into the system region would otherwise be lost. */
     uint32_t *code_seed = NULL;
-    size_t    code_seed_count = 0;
+    size_t code_seed_count = 0;
     {
         const LabelSet *old = &project->system_labels;
         size_t i;
@@ -1781,12 +1870,12 @@ static void analyze_system_region(ApexProject *project)
     free_label_set(&project->system_labels);
     remove_references_from_source_range(&project->refs, 0xffu, APEX_SYSTEM_ORG, 0xffffu);
 
-    build_system_labels(project->rom.data + project->paged_size, project->vectors,
-                        sizeof(project->vectors) / sizeof(project->vectors[0]),
-                        &project->inline_sigs, project->rom.data, project->banks,
-                        project->bank_labels, &project->system_labels, &system_config_labels,
-                        &system_config_entries, &system_data_ranges, &project->options,
-                        &project->refs);
+    build_system_labels(
+        project->rom.data + project->paged_size, project->vectors,
+        sizeof(project->vectors) / sizeof(project->vectors[0]), &project->inline_sigs,
+        project->rom.data, project->banks, project->bank_labels, &project->system_labels,
+        &system_config_labels, &system_config_entries, &system_data_ranges, &project->options,
+        &project->refs, &project->ref_exclusions, &project->literals, &project->far_imms);
     sort_table_defs(&project->tables);
     sort_inline_signatures(&project->inline_sigs);
     sort_data_ranges(&project->data_ranges);
@@ -1804,6 +1893,7 @@ static void analyze_system_region(ApexProject *project)
     inject_sprite_table_data_ranges(project);
     inject_sprite_pointer_data_ranges(project);
     inject_far_imm_data_ranges(project);
+    sort_data_ranges(&project->data_ranges);
     sort_data_ranges(&project->data_ranges);
     /* Replay snapshotted code entry points unless reclassified as data. */
     {
@@ -1825,14 +1915,14 @@ static void analyze_system_region(ApexProject *project)
         }
     }
     free(code_seed);
-    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
-                         APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
-                         project->rom.data, project->banks, project->bank_labels,
-                         &project->system_labels, &project->data_ranges, 0xffu, &project->refs,
-                         &project->ref_exclusions, &project->literals, &project->far_imms);
-    apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
-                                last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
-                                APEX_SYSTEM_ORG);
+    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE, APEX_SYSTEM_ORG,
+                         &project->system_labels, &project->inline_sigs, project->rom.data,
+                         project->banks, project->bank_labels, &project->system_labels,
+                         &project->data_ranges, 0xffu, &project->refs, &project->ref_exclusions,
+                         &project->literals, &project->far_imms);
+    apply_string_content_labels(
+        &project->system_labels, project->rom.data + project->paged_size,
+        last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE), APEX_SYSTEM_ORG);
     sort_label_set(&project->system_labels);
     sort_and_dedup_refs(&project->refs);
     prune_unreferenced_generated_labels(&project->system_labels, 0xffu, &project->refs);
@@ -1849,12 +1939,12 @@ static void analyze_system_region(ApexProject *project)
     free_filtered_config_labels(&system_config_labels);
 }
 
-static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
-{
+static void analyze_bank_region(ApexProject *project, uint8_t bank_id) {
     int bank_index = bank_index_for_id(project->rom.data, project->banks, bank_id);
     const uint8_t *bank;
     size_t used;
-    ConfigLabels bank_config_labels = filter_config_labels_for_bank(&project->config_labels, bank_id);
+    ConfigLabels bank_config_labels =
+        filter_config_labels_for_bank(&project->config_labels, bank_id);
     ConfigEntries bank_config_entries =
         filter_config_entries_for_bank(&project->config_entries, bank_id);
     DataRanges bank_data_ranges = filter_data_ranges_for_bank(&project->data_ranges, bank_id);
@@ -1877,7 +1967,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
        is_code labels currently in the bank, so we replay those addresses as
        code seeds below and let the intra-bank flow scan rediscover the rest. */
     uint32_t *code_seed = NULL;
-    size_t    code_seed_count = 0;
+    size_t code_seed_count = 0;
     {
         const LabelSet *old = &project->bank_labels[bank_index];
         size_t i;
@@ -1914,6 +2004,7 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     inject_sprite_pointer_data_ranges(project);
     inject_far_imm_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
+    sort_data_ranges(&project->data_ranges);
 
     /* Replay the snapshotted code entry points (see above) as code seeds, unless
        they have since been reclassified as data. */
@@ -1943,8 +2034,8 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
         collect_code_targets(bank, used, APEX_PAGED_ORG, &project->bank_labels[bank_index],
                              &project->inline_sigs, project->rom.data, project->banks,
                              project->bank_labels, &project->system_labels, &project->data_ranges,
-                             bank_id, &project->refs, &project->ref_exclusions,
-                             &project->literals, &project->far_imms);
+                             bank_id, &project->refs, &project->ref_exclusions, &project->literals,
+                             &project->far_imms);
     }
     apply_string_content_labels(&project->bank_labels[bank_index], bank, used, APEX_PAGED_ORG);
     sort_label_set(&project->bank_labels[bank_index]);
@@ -1968,10 +2059,11 @@ static void analyze_bank_region(ApexProject *project, uint8_t bank_id)
     free_filtered_config_labels(&bank_config_labels);
 }
 
-static void analyze_full_project(ApexProject *project)
-{
+static void analyze_full_project(ApexProject *project) {
     size_t i;
     size_t banks = project->banks;
+
+    strip_derived_data_ranges(project);
 
     sort_table_defs(&project->tables);
     sort_inline_signatures(&project->inline_sigs);
@@ -1985,7 +2077,8 @@ static void analyze_full_project(ApexProject *project)
                         sizeof(project->vectors) / sizeof(project->vectors[0]),
                         &project->inline_sigs, project->rom.data, banks, project->bank_labels,
                         &project->system_labels, &project->config_labels, &project->config_entries,
-                        &project->data_ranges, &project->options, &project->refs);
+                        &project->data_ranges, &project->options, &project->refs,
+                        &project->ref_exclusions, &project->literals, &project->far_imms);
     apply_config_bank_labels(&project->config_labels, project->rom.data, banks,
                              project->bank_labels, &project->options);
     apply_config_bank_entries(&project->config_entries, project->rom.data, banks,
@@ -2001,11 +2094,12 @@ static void analyze_full_project(ApexProject *project)
     inject_sprite_pointer_data_ranges(project);
     inject_far_imm_data_ranges(project);
     sort_data_ranges(&project->data_ranges);
-    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
-                         APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
-                         project->rom.data, banks, project->bank_labels, &project->system_labels,
-                         &project->data_ranges, 0xff, &project->refs, &project->ref_exclusions,
-                         &project->literals, &project->far_imms);
+    sort_data_ranges(&project->data_ranges);
+    collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE, APEX_SYSTEM_ORG,
+                         &project->system_labels, &project->inline_sigs, project->rom.data, banks,
+                         project->bank_labels, &project->system_labels, &project->data_ranges, 0xff,
+                         &project->refs, &project->ref_exclusions, &project->literals,
+                         &project->far_imms);
     /* Outer convergence over BOTH scans: a system-bank call into a paged bank
        creates a paged label (see collect_code_targets), and a paged-bank call
        into the system bank creates a system label — each can appear only after
@@ -2018,37 +2112,40 @@ static void analyze_full_project(ApexProject *project)
             prev_total = project->system_labels.count;
             prev_code = 0;
             for (j = 0; j < project->system_labels.count; j++)
-                if (project->system_labels.items[j].is_code) prev_code++;
+                if (project->system_labels.items[j].is_code)
+                    prev_code++;
             for (j = 0; j < banks; j++) {
                 size_t k;
                 prev_total += project->bank_labels[j].count;
                 for (k = 0; k < project->bank_labels[j].count; k++)
-                    if (project->bank_labels[j].items[k].is_code) prev_code++;
+                    if (project->bank_labels[j].items[k].is_code)
+                        prev_code++;
             }
 
-            collect_bank_code_targets(project->rom.data, banks, &project->inline_sigs,
-                                      project->bank_labels, &project->system_labels,
-                                      &project->data_ranges, &project->refs,
-                                      &project->ref_exclusions, &project->literals,
-                                      &project->far_imms);
-            collect_code_targets(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE,
-                                 APEX_SYSTEM_ORG, &project->system_labels, &project->inline_sigs,
-                                 project->rom.data, banks, project->bank_labels,
-                                 &project->system_labels, &project->data_ranges, 0xff,
-                                 &project->refs, &project->ref_exclusions, &project->literals,
-                                 &project->far_imms);
+            collect_bank_code_targets(
+                project->rom.data, banks, &project->inline_sigs, project->bank_labels,
+                &project->system_labels, &project->data_ranges, &project->refs,
+                &project->ref_exclusions, &project->literals, &project->far_imms);
+            collect_code_targets(
+                project->rom.data + project->paged_size, APEX_SYSTEM_SIZE, APEX_SYSTEM_ORG,
+                &project->system_labels, &project->inline_sigs, project->rom.data, banks,
+                project->bank_labels, &project->system_labels, &project->data_ranges, 0xff,
+                &project->refs, &project->ref_exclusions, &project->literals, &project->far_imms);
 
             {
                 size_t total = project->system_labels.count, code = 0;
                 for (j = 0; j < project->system_labels.count; j++)
-                    if (project->system_labels.items[j].is_code) code++;
+                    if (project->system_labels.items[j].is_code)
+                        code++;
                 for (j = 0; j < banks; j++) {
                     size_t k;
                     total += project->bank_labels[j].count;
                     for (k = 0; k < project->bank_labels[j].count; k++)
-                        if (project->bank_labels[j].items[k].is_code) code++;
+                        if (project->bank_labels[j].items[k].is_code)
+                            code++;
                 }
-                if (total == prev_total && code == prev_code) break;
+                if (total == prev_total && code == prev_code)
+                    break;
             }
         } while (1);
     }
@@ -2058,9 +2155,9 @@ static void analyze_full_project(ApexProject *project)
         apply_string_content_labels(&project->bank_labels[i], bank,
                                     last_non_ff(bank, APEX_BANK_SIZE), APEX_PAGED_ORG);
     }
-    apply_string_content_labels(&project->system_labels, project->rom.data + project->paged_size,
-                                last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE),
-                                APEX_SYSTEM_ORG);
+    apply_string_content_labels(
+        &project->system_labels, project->rom.data + project->paged_size,
+        last_non_ff(project->rom.data + project->paged_size, APEX_SYSTEM_SIZE), APEX_SYSTEM_ORG);
     for (i = 0; i < banks; i++) {
         sort_label_set(&project->bank_labels[i]);
     }
@@ -2068,14 +2165,16 @@ static void analyze_full_project(ApexProject *project)
     sort_and_dedup_refs(&project->refs);
 }
 
-int apex_project_analyze(ApexProject *project)
-{
+int apex_project_analyze(ApexProject *project) {
     if (!project) {
         return 1;
     }
     if (project->analysis_ready && !(project->dirty_flags & APEX_DIRTY_ANALYSIS)) {
         return 0;
     }
+    /* data_range_at() binary-searches; ranges appended by edits or an overlay
+       must be ordered before any pass (incl. the filtered copies) reads them. */
+    sort_data_ranges(&project->data_ranges);
     if (!project->analysis_ready || project->analysis_scope == APEX_ANALYZE_SCOPE_FULL ||
         project->analysis_scope == APEX_ANALYZE_SCOPE_NONE) {
         analyze_full_project(project);
@@ -2092,8 +2191,7 @@ int apex_project_analyze(ApexProject *project)
 }
 
 int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
-                           const char *name)
-{
+                           const char *name) {
     LabelSet *labels;
     ConfigLabel *config_label;
     char *old_name = NULL;
@@ -2108,7 +2206,8 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
         return 1;
     }
     project_record_edit_at(project, "set label", 1, has_bank, bank, addr);
-    config_label = upsert_config_label(&project->config_labels, has_bank, bank, addr, name, &old_name);
+    config_label =
+        upsert_config_label(&project->config_labels, has_bank, bank, addr, name, &old_name);
     /* Rename an existing runtime label at this address rather than adding a
        second one: when renaming match the previous config name, otherwise take
        over the auto-generated placeholder (Bxx_Ayyyy).  Without this a manual
@@ -2142,9 +2241,8 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
     }
     /* Drop any other now-redundant label at this address (a stray generated
        placeholder or a duplicate of the new name). */
-    for (i = 0; i < labels->count; ) {
-        if (labels->items[i].addr == addr &&
-            labels->items[i].name != config_label->name &&
+    for (i = 0; i < labels->count;) {
+        if (labels->items[i].addr == addr && labels->items[i].name != config_label->name &&
             (generated_any_label_name(labels->items[i].name) ||
              strcmp(labels->items[i].name, config_label->name) == 0)) {
             if (labels->items[i].owns_name && labels->items[i].name) {
@@ -2153,6 +2251,7 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
             memmove(&labels->items[i], &labels->items[i + 1],
                     (labels->count - i - 1u) * sizeof(labels->items[0]));
             labels->count--;
+            label_set_invalidate_index(labels);
         } else {
             i++;
         }
@@ -2162,8 +2261,7 @@ int apex_project_set_label(ApexProject *project, int has_bank, uint8_t bank, uin
     return 0;
 }
 
-int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     LabelSet *labels;
     char *removed_name;
 
@@ -2174,20 +2272,22 @@ int apex_project_clear_label(ApexProject *project, int has_bank, uint8_t bank, u
     if (!labels) {
         return 1;
     }
-    project_record_edit_at(project, "clear label", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear label", &pe);
     removed_name = remove_config_label(&project->config_labels, has_bank, bank, addr);
     if (!removed_name) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear label", 1, has_bank, bank, addr);
     remove_runtime_label(labels, addr, removed_name);
     free(removed_name);
     apex_project_invalidate(project, APEX_DIRTY_LABELS | APEX_DIRTY_RENDER);
     return 0;
 }
 
-int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
-                         uint32_t addr, const char *text)
-{
+int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
+                         const char *text) {
     if (!project || !text || !*text) {
         return 1;
     }
@@ -2197,25 +2297,95 @@ int apex_project_set_doc(ApexProject *project, int has_bank, uint8_t bank,
     return 0;
 }
 
-int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank,
-                           uint32_t addr)
-{
+int apex_project_clear_doc(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "clear doc", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear doc", &pe);
     if (!remove_config_doc(&project->docs, has_bank, bank, addr)) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear doc", 1, has_bank, bank, addr);
     apex_project_invalidate(project, APEX_DIRTY_DOCS | APEX_DIRTY_RENDER);
+    return 0;
+}
+
+const char *apex_project_last_error(const ApexProject *project) {
+    return project ? project->last_error : "";
+}
+
+/* Spec validation.  The config parsers die() on malformed input (fine while
+   loading an INI, fatal in the GUI), and the setters would also leave a
+   half-applied edit behind.  So every interactive spec is first parsed into a
+   throw-away collection under apex_try(); only a spec that parses cleanly is
+   then applied to the project. */
+typedef enum { SPEC_DATA, SPEC_TABLE, SPEC_INLINE, SPEC_TYPE_VALUES } SpecKind;
+
+typedef struct {
+    const ApexProject *project;
+    SpecKind kind;
+    const char *spec;
+    int rc;
+} SpecCheck;
+
+static void spec_check_run(void *ctx) {
+    SpecCheck *c = (SpecCheck *)ctx;
+    const ApexProject *p = c->project;
+
+    switch (c->kind) {
+    case SPEC_DATA: {
+        DataRanges r = {0};
+        c->rc = config_set_data_spec(&r, 0x20, 0x4000, c->spec);
+        free(r.items);
+        break;
+    }
+    case SPEC_TABLE: {
+        TableDefs t = {0};
+        c->rc = config_set_table_spec(&t, &p->schemas, 0x20, 0x4000, c->spec, &p->config_types);
+        free_table_defs(&t);
+        break;
+    }
+    case SPEC_INLINE: {
+        InlineSignatures sigs = {0};
+        c->rc = config_set_inline_spec(&sigs, 1, 0x20, 0x4000, c->spec, &p->config_types);
+        free_inline_signatures(&sigs);
+        break;
+    }
+    case SPEC_TYPE_VALUES: {
+        ConfigTypes types = {0};
+        config_set_type(&types, "_check", TABLE_WORD, c->spec);
+        free_config_types(&types);
+        c->rc = 0;
+        break;
+    }
+    }
+}
+
+/* Returns 0 if spec is valid for kind; otherwise 1 with project->last_error set. */
+static int validate_spec(ApexProject *project, SpecKind kind, const char *spec) {
+    SpecCheck c;
+
+    c.project = project;
+    c.kind = kind;
+    c.spec = spec;
+    c.rc = 1;
+    project->last_error[0] = '\0';
+    if (apex_try(spec_check_run, &c, project->last_error, sizeof(project->last_error)) != 0) {
+        return 1;
+    }
+    if (c.rc != 0) {
+        snprintf(project->last_error, sizeof(project->last_error), "invalid spec '%s'", spec);
+        return 1;
+    }
     return 0;
 }
 
 /* A far-pointer data range points into another bank, so classifying or clearing
    it must re-analyze the whole project (not just the pointer's own bank) for the
    target data to appear/disappear. */
-static int datakind_is_far(DataKind k)
-{
+static int datakind_is_far(DataKind k) {
     switch (k) {
     case DATA_FAR_STRING:
     case DATA_FAR_DATA:
@@ -2230,11 +2400,21 @@ static int datakind_is_far(DataKind k)
 }
 
 int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
-                          ApexConfigKind kind, const char *spec)
-{
+                          ApexConfigKind kind, const char *spec) {
     const char *effective_spec = spec;
 
     if (!project) {
+        return 1;
+    }
+    if (kind == APEX_KIND_DATA && (!effective_spec || !*effective_spec)) {
+        effective_spec = "bytes[1]";
+    } else if (kind == APEX_KIND_TABLE && (!effective_spec || !*effective_spec)) {
+        effective_spec = "counted(ptr16_data)";
+    }
+    /* Validate before touching anything: a rejected spec must leave the
+       existing classification (and the undo/redo history) untouched. */
+    if ((kind == APEX_KIND_DATA && validate_spec(project, SPEC_DATA, effective_spec) != 0) ||
+        (kind == APEX_KIND_TABLE && validate_spec(project, SPEC_TABLE, effective_spec) != 0)) {
         return 1;
     }
     project_record_edit_at(project, "set kind", 1, has_bank, bank, addr);
@@ -2249,9 +2429,6 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
         }
         break;
     case APEX_KIND_DATA:
-        if (!effective_spec || !*effective_spec) {
-            effective_spec = "bytes[1]";
-        }
         if (config_set_data_spec(&project->data_ranges, bank, addr, effective_spec) != 0) {
             return 1;
         }
@@ -2262,11 +2439,8 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
         }
         break;
     case APEX_KIND_TABLE:
-        if (!effective_spec || !*effective_spec) {
-            effective_spec = "counted(ptr16_data)";
-        }
-        if (config_set_table_spec(&project->tables, &project->schemas, bank, addr,
-                                  effective_spec, &project->config_types) != 0) {
+        if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, effective_spec,
+                                  &project->config_types) != 0) {
             return 1;
         }
         break;
@@ -2290,8 +2464,7 @@ int apex_project_set_kind(ApexProject *project, int has_bank, uint8_t bank, uint
     return 0;
 }
 
-int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
@@ -2317,9 +2490,11 @@ int apex_project_clear_kind(ApexProject *project, int has_bank, uint8_t bank, ui
 }
 
 int apex_project_set_inline(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
-                            const char *spec)
-{
+                            const char *spec) {
     if (!project || !spec || !*spec) {
+        return 1;
+    }
+    if (validate_spec(project, SPEC_INLINE, spec) != 0) {
         return 1;
     }
     project_record_edit_at(project, "set inline", 1, has_bank, bank, addr);
@@ -2338,15 +2513,17 @@ int apex_project_set_inline(ApexProject *project, int has_bank, uint8_t bank, ui
     return 0;
 }
 
-int apex_project_clear_inline(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_clear_inline(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "clear inline", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear inline", &pe);
     if (config_clear_inline(&project->inline_sigs, has_bank, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear inline", 1, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     if (project_addr_is_system(has_bank, bank, addr)) {
         mark_analysis_scope(project, APEX_ANALYZE_SCOPE_SYSTEM_ONLY);
@@ -2358,14 +2535,16 @@ int apex_project_clear_inline(ApexProject *project, int has_bank, uint8_t bank, 
     return 0;
 }
 
-int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, const char *spec)
-{
+int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, const char *spec) {
     if (!project || !spec || !*spec) {
+        return 1;
+    }
+    if (validate_spec(project, SPEC_TABLE, spec) != 0) {
         return 1;
     }
     project_record_edit_at(project, "set table", 1, (bank != 0xffu), bank, addr);
     if (config_set_table_spec(&project->tables, &project->schemas, bank, addr, spec,
-                               &project->config_types) != 0) {
+                              &project->config_types) != 0) {
         return 1;
     }
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
@@ -2383,15 +2562,17 @@ int apex_project_set_table(ApexProject *project, uint8_t bank, uint32_t addr, co
     return 0;
 }
 
-int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr)
-{
+int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "clear table", 1, (bank != 0xffu), bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear table", &pe);
     if (config_clear_table(&project->tables, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear table", 1, (bank != 0xffu), bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     if (project_addr_is_system(1, bank, addr)) {
         mark_analysis_scope(project, APEX_ANALYZE_SCOPE_SYSTEM_ONLY);
@@ -2404,8 +2585,7 @@ int apex_project_clear_table(ApexProject *project, uint8_t bank, uint32_t addr)
 }
 
 const ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_xrefs,
-                                                int emit_explain)
-{
+                                                int emit_explain) {
     if (!project) {
         return NULL;
     }
@@ -2429,8 +2609,7 @@ const ApexRenderedDocument *apex_project_render(ApexProject *project, int emit_x
 }
 
 ApexRenderedDocument *apex_project_render_detached(ApexProject *project, int emit_xrefs,
-                                                   int emit_explain)
-{
+                                                   int emit_explain) {
     ApexRenderedDocument *doc;
 
     if (!project) {
@@ -2458,8 +2637,7 @@ ApexRenderedDocument *apex_project_render_detached(ApexProject *project, int emi
 }
 
 void apex_project_adopt_render_cache(ApexProject *project, ApexRenderedDocument *doc,
-                                     int emit_xrefs, int emit_explain)
-{
+                                     int emit_xrefs, int emit_explain) {
     if (!project || !doc) {
         return;
     }
@@ -2476,59 +2654,53 @@ void apex_project_adopt_render_cache(ApexProject *project, ApexRenderedDocument 
 /* ---- deterministic config ordering (mirrors apexini's sorted output) ---- */
 
 /* Effective-bank address compare: a no-bank item sorts as the system bank. */
-static int cfg_addr_cmp(int ha, uint8_t ba, uint32_t aa, int hb, uint8_t bb, uint32_t ab)
-{
+static int cfg_addr_cmp(int ha, uint8_t ba, uint32_t aa, int hb, uint8_t bb, uint32_t ab) {
     uint8_t ea = ha ? ba : 0xffu;
     uint8_t eb = hb ? bb : 0xffu;
-    if (ea != eb) return (int)(unsigned)ea - (int)(unsigned)eb;
-    if (aa != ab) return aa < ab ? -1 : 1;
+    if (ea != eb)
+        return (int)(unsigned)ea - (int)(unsigned)eb;
+    if (aa != ab)
+        return aa < ab ? -1 : 1;
     return 0;
 }
 
-static int cfg_cmp_label(const void *a, const void *b)
-{
+static int cfg_cmp_label(const void *a, const void *b) {
     const ConfigLabel *x = (const ConfigLabel *)a, *y = (const ConfigLabel *)b;
     return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
 }
 
-static int cfg_cmp_entry(const void *a, const void *b)
-{
+static int cfg_cmp_entry(const void *a, const void *b) {
     const ConfigEntry *x = (const ConfigEntry *)a, *y = (const ConfigEntry *)b;
     return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
 }
 
-static int cfg_cmp_doc(const void *a, const void *b)
-{
+static int cfg_cmp_doc(const void *a, const void *b) {
     const ConfigDoc *x = (const ConfigDoc *)a, *y = (const ConfigDoc *)b;
     return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
 }
 
-static int cfg_cmp_sig(const void *a, const void *b)
-{
+static int cfg_cmp_sig(const void *a, const void *b) {
     const InlineSignature *x = (const InlineSignature *)a, *y = (const InlineSignature *)b;
     return cfg_addr_cmp(x->has_bank, x->bank, x->addr, y->has_bank, y->bank, y->addr);
 }
 
-static int cfg_cmp_type(const void *a, const void *b)
-{
+static int cfg_cmp_type(const void *a, const void *b) {
     return strcmp(((const ConfigType *)a)->name, ((const ConfigType *)b)->name);
 }
 
-static int cfg_cmp_typeval(const void *a, const void *b)
-{
+static int cfg_cmp_typeval(const void *a, const void *b) {
     uint32_t va = ((const ConfigTypeValue *)a)->value;
     uint32_t vb = ((const ConfigTypeValue *)b)->value;
-    if (va != vb) return va < vb ? -1 : 1;
+    if (va != vb)
+        return va < vb ? -1 : 1;
     return 0;
 }
 
-static int cfg_cmp_sym(const void *a, const void *b)
-{
+static int cfg_cmp_sym(const void *a, const void *b) {
     return strcmp(((const ConfigSymbol *)a)->name, ((const ConfigSymbol *)b)->name);
 }
 
-static int cfg_cmp_schema(const void *a, const void *b)
-{
+static int cfg_cmp_schema(const void *a, const void *b) {
     return strcmp(((const SchemaDef *)a)->name, ((const SchemaDef *)b)->name);
 }
 
@@ -2540,8 +2712,7 @@ static int cfg_cmp_schema(const void *a, const void *b)
  * inline/data/table sections reuse the analysis comparators so their order stays
  * compatible with the binary-search lookups built on them.
  */
-void apex_project_sort_config(ApexProject *project)
-{
+void apex_project_sort_config(ApexProject *project) {
     size_t i;
 
     if (!project) {
@@ -2558,12 +2729,12 @@ void apex_project_sort_config(ApexProject *project)
         }
     }
     if (project->schemas.count > 1) {
-        qsort(project->schemas.items, project->schemas.count,
-              sizeof(project->schemas.items[0]), cfg_cmp_schema);
+        qsort(project->schemas.items, project->schemas.count, sizeof(project->schemas.items[0]),
+              cfg_cmp_schema);
     }
     if (project->symbols.count > 1) {
-        qsort(project->symbols.items, project->symbols.count,
-              sizeof(project->symbols.items[0]), cfg_cmp_sym);
+        qsort(project->symbols.items, project->symbols.count, sizeof(project->symbols.items[0]),
+              cfg_cmp_sym);
     }
     if (project->config_labels.count > 1) {
         qsort(project->config_labels.items, project->config_labels.count,
@@ -2574,8 +2745,8 @@ void apex_project_sort_config(ApexProject *project)
               sizeof(project->config_entries.items[0]), cfg_cmp_entry);
     }
     if (project->docs.count > 1) {
-        qsort(project->docs.items, project->docs.count,
-              sizeof(project->docs.items[0]), cfg_cmp_doc);
+        qsort(project->docs.items, project->docs.count, sizeof(project->docs.items[0]),
+              cfg_cmp_doc);
         /* cfg_cmp_doc orders by (effective-bank, addr); config_doc_at's binary
            search needs addr-primary order. Clear the flag so the next lookup
            re-sorts (via sort_config_docs) or falls back to the linear scan. */
@@ -2595,8 +2766,7 @@ void apex_project_sort_config(ApexProject *project)
     sort_table_defs(&project->tables);
 }
 
-int apex_project_save_overlay(ApexProject *project, const char *path, const char *include_path)
-{
+int apex_project_save_overlay(ApexProject *project, const char *path, const char *include_path) {
     FILE *out;
     const char *inc;
 
@@ -2613,13 +2783,25 @@ int apex_project_save_overlay(ApexProject *project, const char *path, const char
     if (inc && *inc) {
         fprintf(out, "include = %s\n", basename_ptr(inc));
     }
+    fputc('\n', out);
+    config_write_options(out, &project->options);
     write_types_section(out, &project->config_types);
+    write_schemas_section(out, &project->schemas);
+    write_symbols_section(out, &project->symbols);
     write_labels_section(out, &project->config_labels);
     write_entries_section(out, &project->config_entries);
     write_inline_section(out, &project->inline_sigs);
     write_data_section(out, &project->data_ranges);
     write_tables_section(out, &project->tables);
     write_docs_section(out, "docs", &project->docs);
+    write_marker_section(out, "exclude_refs", &project->ref_exclusions, "exclude");
+    write_marker_section(out, "literals", &project->literals, "literal");
+    write_marker_section(out, "ack_warnings", &project->ack_warnings, "ack");
+    write_far_imm_section(out, &project->far_imms);
+    if (ferror(out)) {
+        fclose(out);
+        return 1;
+    }
     if (fclose(out) != 0) {
         return 1;
     }
@@ -2627,9 +2809,11 @@ int apex_project_save_overlay(ApexProject *project, const char *path, const char
 }
 
 int apex_project_set_type(ApexProject *project, const char *name, int is_word,
-                          const char *values_str)
-{
+                          const char *values_str) {
     if (!project || !name || !*name) {
+        return 1;
+    }
+    if (validate_spec(project, SPEC_TYPE_VALUES, values_str ? values_str : "") != 0) {
         return 1;
     }
     project_record_edit(project, "set type");
@@ -2639,18 +2823,62 @@ int apex_project_set_type(ApexProject *project, const char *name, int is_word,
     return 0;
 }
 
-int apex_project_remove_type(ApexProject *project, const char *name)
-{
+static int schema_uses_type(const TableSchema *schema, const char *name) {
+    size_t i;
+
+    for (i = 0; i < schema->count; i++) {
+        if (schema->items[i].type_name && strcmp(schema->items[i].type_name, name) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int apex_project_remove_type(ApexProject *project, const char *name) {
+    size_t i;
+
     if (!project || !name) {
         return 1;
     }
+    /* TableField.type_name borrows the type's name string, so a type that is
+       still in use must not be freed. */
+    for (i = 0; i < project->tables.count; i++) {
+        if (schema_uses_type(&project->tables.items[i].schema, name)) {
+            snprintf(project->last_error, sizeof(project->last_error),
+                     "type '%s' is used by a table", name);
+            return 1;
+        }
+    }
+    for (i = 0; i < project->inline_sigs.count; i++) {
+        if (schema_uses_type(&project->inline_sigs.items[i].schema, name)) {
+            snprintf(project->last_error, sizeof(project->last_error),
+                     "type '%s' is used by an inline signature", name);
+            return 1;
+        }
+    }
+    for (i = 0; i < project->schemas.count; i++) {
+        if (schema_uses_type(&project->schemas.items[i].schema, name)) {
+            snprintf(project->last_error, sizeof(project->last_error),
+                     "type '%s' is used by schema '%s'", name, project->schemas.items[i].name);
+            return 1;
+        }
+    }
+    for (i = 0; i < project->config_types.count; i++) {
+        if (strcmp(project->config_types.items[i].name, name) == 0) {
+            break;
+        }
+    }
+    if (i == project->config_types.count) {
+        return 1;
+    }
     project_record_edit(project, "remove type");
-    return config_remove_type(&project->config_types, name) ? 0 : 1;
+    config_remove_type(&project->config_types, name);
+    apex_project_invalidate(project, APEX_DIRTY_RENDER);
+    return 0;
 }
 
 int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
-                                   uint32_t addr)
-{
+                                   uint32_t addr) {
     if (!project) {
         return 1;
     }
@@ -2662,23 +2890,23 @@ int apex_project_add_ref_exclusion(ApexProject *project, int has_bank, uint8_t b
 }
 
 int apex_project_remove_ref_exclusion(ApexProject *project, int has_bank, uint8_t bank,
-                                      uint32_t addr)
-{
+                                      uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "remove exclusion", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "remove exclusion", &pe);
     if (config_clear_entry(&project->ref_exclusions, has_bank, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "remove exclusion", 1, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
 }
 
-int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
-                             uint32_t addr)
-{
+int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
@@ -2689,23 +2917,23 @@ int apex_project_add_literal(ApexProject *project, int has_bank, uint8_t bank,
     return 0;
 }
 
-int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank,
-                                uint32_t addr)
-{
+int apex_project_remove_literal(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "clear literal", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear literal", &pe);
     if (config_clear_entry(&project->literals, has_bank, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear literal", 1, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
 }
 
-int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr)
-{
+int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t addr) {
     size_t i;
 
     if (!project) {
@@ -2722,8 +2950,7 @@ int apex_project_is_literal(const ApexProject *project, uint8_t bank, uint32_t a
 
 /* Acking a warning only changes how it renders (WARNING -> WARNING_ACK); no
    re-analysis is needed, so mark render-dirty only. */
-int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
@@ -2733,21 +2960,22 @@ int apex_project_add_ack(ApexProject *project, int has_bank, uint8_t bank, uint3
     return 0;
 }
 
-int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_remove_ack(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "un-ack warning", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "un-ack warning", &pe);
     if (config_clear_entry(&project->ack_warnings, has_bank, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "un-ack warning", 1, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_RENDER;
     return 0;
 }
 
-int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr)
-{
+int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr) {
     size_t i;
 
     if (!project) {
@@ -2766,28 +2994,28 @@ int apex_project_is_ack(const ApexProject *project, uint8_t bank, uint32_t addr)
    bank, which seeds that label + an incoming ref there, so a full re-analysis is
    required (mirrors the literals annotation). */
 int apex_project_set_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr,
-                             uint8_t target_bank, uint8_t type, uint32_t bank_load_addr)
-{
+                             uint8_t target_bank, uint8_t type, uint32_t bank_load_addr) {
     if (!project) {
         return 1;
     }
     project_record_edit_at(project, "set far immediate", 1, has_bank, bank, addr);
-    config_set_far_imm(&project->far_imms, has_bank, bank, addr, target_bank, type,
-                       bank_load_addr);
+    config_set_far_imm(&project->far_imms, has_bank, bank, addr, target_bank, type, bank_load_addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
 }
 
-int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr)
-{
+int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank, uint32_t addr) {
     if (!project) {
         return 1;
     }
-    project_record_edit_at(project, "clear far immediate", 1, has_bank, bank, addr);
+    PendingEdit pe;
+    edit_begin(project, "clear far immediate", &pe);
     if (config_clear_entry(&project->far_imms, has_bank, bank, addr) != 0) {
+        edit_abort(&pe);
         return 1;
     }
+    edit_commit(project, &pe, "clear far immediate", 1, has_bank, bank, addr);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
@@ -2795,8 +3023,7 @@ int apex_project_clear_far_imm(ApexProject *project, int has_bank, uint8_t bank,
 
 int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32_t addr,
                                 uint8_t *out_target_bank, uint8_t *out_type,
-                                uint32_t *out_bank_load)
-{
+                                uint32_t *out_bank_load) {
     size_t i;
 
     if (!project) {
@@ -2805,30 +3032,44 @@ int apex_project_far_imm_target(const ApexProject *project, uint8_t bank, uint32
     for (i = 0; i < project->far_imms.count; i++) {
         const ConfigEntry *e = &project->far_imms.items[i];
         if (e->addr == addr && (!e->has_bank || e->bank == bank)) {
-            if (out_target_bank) *out_target_bank = e->value;
-            if (out_type)        *out_type = e->value2;
-            if (out_bank_load)   *out_bank_load = e->aux_addr;
+            if (out_target_bank)
+                *out_target_bank = e->value;
+            if (out_type)
+                *out_type = e->value2;
+            if (out_bank_load)
+                *out_bank_load = e->aux_addr;
             return 1;
         }
     }
     return 0;
 }
 
-int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value, uint32_t length)
-{
-    if (!project) return 1;
-    project_record_edit(project, "set symbol");
-    if (config_set_symbol(&project->symbols, name, value, length) != 0) return 1;
+int apex_project_set_symbol(ApexProject *project, const char *name, uint32_t value,
+                            uint32_t length) {
+    if (!project)
+        return 1;
+    PendingEdit pe;
+    edit_begin(project, "set symbol", &pe);
+    if (config_set_symbol(&project->symbols, name, value, length) != 0) {
+        edit_abort(&pe);
+        return 1;
+    }
+    edit_commit(project, &pe, "set symbol", 0, 0, 0, 0);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
 }
 
-int apex_project_clear_symbol(ApexProject *project, const char *name)
-{
-    if (!project) return 1;
-    project_record_edit(project, "clear symbol");
-    if (config_clear_symbol(&project->symbols, name) != 0) return 1;
+int apex_project_clear_symbol(ApexProject *project, const char *name) {
+    if (!project)
+        return 1;
+    PendingEdit pe;
+    edit_begin(project, "clear symbol", &pe);
+    if (config_clear_symbol(&project->symbols, name) != 0) {
+        edit_abort(&pe);
+        return 1;
+    }
+    edit_commit(project, &pe, "clear symbol", 0, 0, 0, 0);
     project->dirty_flags |= APEX_DIRTY_ANALYSIS | APEX_DIRTY_RENDER;
     mark_analysis_scope(project, APEX_ANALYZE_SCOPE_FULL);
     return 0;
@@ -2838,41 +3079,39 @@ int apex_project_clear_symbol(ApexProject *project, const char *name)
  * Code candidate scanner
  * ------------------------------------------------------------------------- */
 
-static void candidate_push(ApexCodeCandidates *out, uint8_t bank, uint32_t addr,
-                            int score, int tier, int instr_count, const char *preview)
-{
+static void candidate_push(ApexCodeCandidates *out, uint8_t bank, uint32_t addr, int score,
+                           int tier, int instr_count, const char *preview) {
     size_t i;
     /* deduplicate: if same address already present, keep higher score */
     for (i = 0; i < out->count; i++) {
         if (out->items[i].bank == bank && out->items[i].addr == addr) {
             if (score > out->items[i].score) {
-                out->items[i].score       = score;
-                out->items[i].tier        = tier;
+                out->items[i].score = score;
+                out->items[i].tier = tier;
                 out->items[i].instr_count = instr_count;
                 if (preview && preview[0])
-                    strncpy(out->items[i].preview, preview,
-                            APEX_CANDIDATE_PREVIEW - 1);
+                    strncpy(out->items[i].preview, preview, APEX_CANDIDATE_PREVIEW - 1);
             }
             return;
         }
     }
     if (out->count == out->cap) {
         size_t new_cap = out->cap == 0 ? 64 : out->cap * 2;
-        ApexCodeCandidate *ni = (ApexCodeCandidate *)realloc(
-            out->items, new_cap * sizeof(out->items[0]));
-        if (!ni) return;
+        ApexCodeCandidate *ni =
+            (ApexCodeCandidate *)realloc(out->items, new_cap * sizeof(out->items[0]));
+        if (!ni)
+            return;
         out->items = ni;
-        out->cap   = new_cap;
+        out->cap = new_cap;
     }
-    out->items[out->count].bank        = bank;
-    out->items[out->count].addr        = addr;
-    out->items[out->count].score       = score;
-    out->items[out->count].tier        = tier;
+    out->items[out->count].bank = bank;
+    out->items[out->count].addr = addr;
+    out->items[out->count].score = score;
+    out->items[out->count].tier = tier;
     out->items[out->count].instr_count = instr_count;
-    out->items[out->count].preview[0]  = '\0';
+    out->items[out->count].preview[0] = '\0';
     if (preview && preview[0])
-        strncpy(out->items[out->count].preview, preview,
-                APEX_CANDIDATE_PREVIEW - 1);
+        strncpy(out->items[out->count].preview, preview, APEX_CANDIDATE_PREVIEW - 1);
     out->count++;
 }
 
@@ -2880,8 +3119,8 @@ static void candidate_push(ApexCodeCandidates *out, uint8_t bank, uint32_t addr,
    Returns score 0-100; 0 means "not code".
    Sets *instr_count_out and writes first instruction text to preview. */
 #define SCAN_MAX_PROBE_BYTES 160
-#define SCAN_MAX_INSTRS      24
-#define SCAN_MIN_INSTRS_TERM  3   /* min instrs required if terminator found   */
+#define SCAN_MAX_INSTRS 24
+#define SCAN_MIN_INSTRS_TERM 3    /* min instrs required if terminator found   */
 #define SCAN_MIN_INSTRS_NOTERM 10 /* min instrs required without terminator    */
 
 /* PSHS (0x34) and PSHU (0x36) are classic 6809 function prologues —
@@ -2889,26 +3128,25 @@ static void candidate_push(ApexCodeCandidates *out, uint8_t bank, uint32_t addr,
 #define OPCODE_PSHS 0x34u
 #define OPCODE_PSHU 0x36u
 
-static int probe_code(const uint8_t *data, size_t len, uint32_t base_addr,
-                       int *instr_count_out, char *preview, size_t preview_size)
-{
-    int    instr_count   = 0;
-    size_t pos           = 0;
-    int    unique[256]   = {0};
-    int    unique_count  = 0;
-    int    prologue_bonus = 0;
-    char   buf[80];
+static int probe_code(const uint8_t *data, size_t len, uint32_t base_addr, int *instr_count_out,
+                      char *preview, size_t preview_size) {
+    int instr_count = 0;
+    size_t pos = 0;
+    int unique[256] = {0};
+    int unique_count = 0;
+    int prologue_bonus = 0;
+    char buf[80];
 
     /* Check for PSHS/PSHU at the very first byte — subroutine prologue */
-    if (len >= 2 &&
-        (data[0] == OPCODE_PSHS || data[0] == OPCODE_PSHU))
+    if (len >= 2 && (data[0] == OPCODE_PSHS || data[0] == OPCODE_PSHU))
         prologue_bonus = 15;
 
     while (pos < SCAN_MAX_PROBE_BYTES && pos < len && instr_count < SCAN_MAX_INSTRS) {
         Cpu6809InstrInfo info = cpu6809_disassemble_info(
             data + pos, len - pos, base_addr + (uint32_t)pos, buf, sizeof(buf));
 
-        if (info.size == 0) return 0;   /* invalid opcode → disqualify */
+        if (info.size == 0)
+            return 0; /* invalid opcode → disqualify */
 
         if (instr_count == 0 && preview && preview_size > 0) {
             strncpy(preview, buf, preview_size - 1);
@@ -2923,25 +3161,30 @@ static int probe_code(const uint8_t *data, size_t len, uint32_t base_addr,
         pos += info.size;
 
         if (info.flags & CPU6809_FLOW_STOP) {
-            if (instr_count < SCAN_MIN_INSTRS_TERM) return 0;
+            if (instr_count < SCAN_MIN_INSTRS_TERM)
+                return 0;
             int score = 50 + instr_count * 3 + unique_count * 2 + prologue_bonus;
-            if (score > 100) score = 100;
-            if (instr_count_out) *instr_count_out = instr_count;
+            if (score > 100)
+                score = 100;
+            if (instr_count_out)
+                *instr_count_out = instr_count;
             return score;
         }
     }
 
-    if (instr_count < SCAN_MIN_INSTRS_NOTERM) return 0;
+    if (instr_count < SCAN_MIN_INSTRS_NOTERM)
+        return 0;
     /* Long clean stream without explicit terminator: lower ceiling */
     int score = 20 + instr_count * 2 + unique_count * 3 + prologue_bonus;
-    if (score > 80) score = 80;
-    if (instr_count_out) *instr_count_out = instr_count;
+    if (score > 80)
+        score = 80;
+    if (instr_count_out)
+        *instr_count_out = instr_count;
     return score;
 }
 
 static int addr_is_classified(const ApexProject *p, uint8_t bank, uint32_t addr,
-                               const LabelSet *labels)
-{
+                              const LabelSet *labels) {
     if (code_label_at(addr, labels->items, labels->count, labels->sorted))
         return 1;
     if (data_range_at(bank, addr, &p->data_ranges))
@@ -2955,17 +3198,11 @@ static int addr_is_classified(const ApexProject *p, uint8_t bank, uint32_t addr,
    src_bank_id = the bank byte (0xff for system).
    data / size / base_addr describe the bank's ROM slice.
    valid_bank[256] = precomputed "this bank byte exists in ROM" table. */
-static void scan_bank(const ApexProject  *p,
-                       uint8_t             src_bank_id,
-                       const uint8_t      *data,
-                       size_t              size,
-                       uint32_t            base_addr,
-                       const LabelSet     *labels,
-                       const uint8_t       valid_bank[256],
-                       ApexCodeCandidates *out)
-{
-    size_t  i;
-    int     prev_classified = 1; /* treat bank start as "came from classified" */
+static void scan_bank(const ApexProject *p, uint8_t src_bank_id, const uint8_t *data, size_t size,
+                      uint32_t base_addr, const LabelSet *labels, const uint8_t valid_bank[256],
+                      ApexCodeCandidates *out) {
+    size_t i;
+    int prev_classified = 1; /* treat bank start as "came from classified" */
 
     for (i = 0; i + 2 < size; i++) {
         uint32_t addr = base_addr + (uint32_t)i;
@@ -2977,19 +3214,18 @@ static void scan_bank(const ApexProject  *p,
            to avoid blowing up the candidate count. */
         if (i + 2 < size) {
             uint16_t tgt_addr = ((uint16_t)data[i] << 8) | data[i + 1];
-            uint8_t  tgt_bank = data[i + 2];
+            uint8_t tgt_bank = data[i + 2];
 
             /* target must be a valid far-code address */
             if (valid_bank[tgt_bank] &&
                 ((tgt_bank == 0xffu && tgt_addr >= 0x8000u) ||
-                 (tgt_bank != 0xffu && tgt_addr >= APEX_PAGED_ORG &&
-                  tgt_addr < 0x8000u))) {
+                 (tgt_bank != 0xffu && tgt_addr >= APEX_PAGED_ORG && tgt_addr < 0x8000u))) {
 
                 /* resolve target */
-                const uint8_t  *tgt_data  = NULL;
-                size_t          tgt_size  = 0;
-                uint32_t        tgt_base  = 0;
-                const LabelSet *tgt_lbls  = NULL;
+                const uint8_t *tgt_data = NULL;
+                size_t tgt_size = 0;
+                uint32_t tgt_base = 0;
+                const LabelSet *tgt_lbls = NULL;
 
                 if (tgt_bank == 0xffu) {
                     tgt_data = p->rom.data + p->paged_size;
@@ -3010,14 +3246,14 @@ static void scan_bank(const ApexProject  *p,
                     size_t tgt_off = tgt_addr - tgt_base;
                     if (tgt_off < tgt_size) {
                         char preview[APEX_CANDIDATE_PREVIEW] = "";
-                        int  ic  = 0;
-                        int  sc  = probe_code(tgt_data + tgt_off, tgt_size - tgt_off,
-                                              tgt_addr, &ic, preview, sizeof(preview));
+                        int ic = 0;
+                        int sc = probe_code(tgt_data + tgt_off, tgt_size - tgt_off, tgt_addr, &ic,
+                                            preview, sizeof(preview));
                         if (sc >= 30) {
                             int boosted = sc + 20;
-                            if (boosted > 100) boosted = 100;
-                            candidate_push(out, tgt_bank, tgt_addr,
-                                           boosted, 1, ic, preview);
+                            if (boosted > 100)
+                                boosted = 100;
+                            candidate_push(out, tgt_bank, tgt_addr, boosted, 1, ic, preview);
                         }
                     }
                 }
@@ -3029,8 +3265,8 @@ static void scan_bank(const ApexProject  *p,
            the total number of probes and avoid mid-code probes. */
         if (!curr_classified && prev_classified) {
             char preview[APEX_CANDIDATE_PREVIEW] = "";
-            int  ic = 0;
-            int  sc = probe_code(data + i, size - i, addr, &ic, preview, sizeof(preview));
+            int ic = 0;
+            int sc = probe_code(data + i, size - i, addr, &ic, preview, sizeof(preview));
             if (sc >= 50) {
                 candidate_push(out, src_bank_id, addr, sc, 2, ic, preview);
             }
@@ -3040,48 +3276,40 @@ static void scan_bank(const ApexProject  *p,
     }
 }
 
-static int cand_cmp_score(const void *a, const void *b)
-{
+static int cand_cmp_score(const void *a, const void *b) {
     const ApexCodeCandidate *ca = (const ApexCodeCandidate *)a;
     const ApexCodeCandidate *cb = (const ApexCodeCandidate *)b;
-    return cb->score - ca->score;   /* descending */
+    return cb->score - ca->score; /* descending */
 }
 
-void apex_scan_code_candidates(const ApexProject *p, ApexCodeCandidates *out)
-{
-    size_t  i;
+void apex_scan_code_candidates(const ApexProject *p, ApexCodeCandidates *out) {
+    size_t i;
     uint8_t valid_bank[256];
 
-    if (!p || !out) return;
+    if (!p || !out)
+        return;
     out->items = NULL;
     out->count = 0;
-    out->cap   = 0;
+    out->cap = 0;
 
     /* precompute valid bank IDs */
-    for (i = 0; i < 256; i++) valid_bank[i] = 0;
+    for (i = 0; i < 256; i++)
+        valid_bank[i] = 0;
     valid_bank[0xffu] = 1;
     for (i = 0; i < p->banks; i++)
         valid_bank[bank_id_for_index(p->banks, (int)i)] = 1;
 
     /* scan paged banks */
     for (i = 0; i < p->banks; i++) {
-        uint8_t  bid  = bank_id_for_index(p->banks, (int)i);
-        scan_bank(p, bid,
-                  p->rom.data + i * APEX_BANK_SIZE,
-                  APEX_BANK_SIZE,
-                  APEX_PAGED_ORG,
-                  &p->bank_labels[i],
-                  valid_bank, out);
+        uint8_t bid = bank_id_for_index(p->banks, (int)i);
+        scan_bank(p, bid, p->rom.data + i * APEX_BANK_SIZE, APEX_BANK_SIZE, APEX_PAGED_ORG,
+                  &p->bank_labels[i], valid_bank, out);
     }
 
     /* scan system bank */
     if (p->rom.size > p->paged_size) {
-        scan_bank(p, 0xffu,
-                  p->rom.data + p->paged_size,
-                  p->rom.size  - p->paged_size,
-                  APEX_SYSTEM_ORG,
-                  &p->system_labels,
-                  valid_bank, out);
+        scan_bank(p, 0xffu, p->rom.data + p->paged_size, p->rom.size - p->paged_size,
+                  APEX_SYSTEM_ORG, &p->system_labels, valid_bank, out);
     }
 
     /* sort by score descending */
@@ -3089,393 +3317,11 @@ void apex_scan_code_candidates(const ApexProject *p, ApexCodeCandidates *out)
         qsort(out->items, out->count, sizeof(out->items[0]), cand_cmp_score);
 }
 
-void apex_free_code_candidates(ApexCodeCandidates *candidates)
-{
-    if (!candidates) return;
+void apex_free_code_candidates(ApexCodeCandidates *candidates) {
+    if (!candidates)
+        return;
     free(candidates->items);
     candidates->items = NULL;
     candidates->count = 0;
-    candidates->cap   = 0;
-}
-
-/* -------------------------------------------------------------------------
- * Inline-dispatcher candidate scanner
- *
- * Looks for functions matching the WPC 6809 inline-data convention:
- *   PULS X           ; pull return-addr into X (points at inline bytes)
- *   LDB  ,X+  ...    ; read inline fields with post-increment
- *   JMP  ,X          ; jump past inline data
- * or the PSHS X / RTS variant.
- * ------------------------------------------------------------------------- */
-
-/* 6809 opcodes used by the scanner */
-#define OPC_PULS  0x35u   /* PULS  rlist  (S-stack) */
-#define OPC_PULU  0x37u   /* PULU  rlist  (U-stack) */
-#define OPC_PSHS  0x34u   /* PSHS  rlist */
-#define OPC_PSHU  0x36u   /* PSHU  rlist */
-#define MASK_X    0x10u   /* X bit in PULS/PSHS register mask */
-#define OPC_LDA_IDX 0xA6u
-#define OPC_LDB_IDX 0xE6u
-#define OPC_LDD_IDX 0xECu
-#define OPC_LDX_IDX 0xAEu
-#define OPC_LDU_IDX 0xEEu
-#define OPC_LDY_IDX 0xAEu  /* prefix 0x10 + 0xAE */
-#define OPC_STD_IDX 0xEDu
-#define OPC_STX_IDX 0xAFu
-#define OPC_JMP_IDX 0x6Eu
-#define OPC_RTS     0x39u
-#define OPC_PREFIX  0x10u
-
-#define POSTBYTE_X_PLUS1 0x80u  /* ,X+  */
-#define POSTBYTE_X_PLUS2 0x81u  /* ,X++ */
-#define POSTBYTE_X_NONE  0x84u  /* ,X   (no offset) */
-
-/* Field kinds used to build spec strings */
-#define FKIND_BYTE  0
-#define FKIND_WORD  1
-#define FKIND_FAR   2   /* merged byte+word → far_code */
-#define MAX_FIELDS  8
-
-/* Build spec string from field array; returns 0 on success */
-static int build_spec(const int *fields, int nfields, char *out, size_t outsz)
-{
-    int pos = 0;
-    for (int i = 0; i < nfields && pos < (int)outsz - 1; i++) {
-        if (i > 0) {
-            int r = snprintf(out + pos, outsz - (size_t)pos, ", ");
-            if (r < 0) return 1;
-            pos += r;
-        }
-        const char *name = fields[i] == FKIND_BYTE ? "byte" :
-                           fields[i] == FKIND_WORD ? "word" : "far_code";
-        int r = snprintf(out + pos, outsz - (size_t)pos, "%s", name);
-        if (r < 0) return 1;
-        pos += r;
-    }
-    out[pos] = '\0';
-    return pos == 0 ? 1 : 0;
-}
-
-/* Analyse up to ~25 instructions of the function at (data, len, base_addr).
-   Returns 1 if this looks like an inline dispatcher; fills fields/nfields. */
-static int scan_detect_inline_dispatcher(const uint8_t *data, size_t len,
-                                     uint32_t base_addr,
-                                     int *fields, int *nfields)
-{
-    (void)base_addr;
-    size_t pos       = 0;
-    int found_puls_x = 0;     /* seen PULS/PULU with X bit */
-    int found_term   = 0;     /* seen JMP ,X or PSHS X;RTS */
-    int instr_cnt    = 0;
-    *nfields         = 0;
-
-    while (pos < len && instr_cnt < 25) {
-        uint8_t op = data[pos];
-        instr_cnt++;
-
-        /* PULS / PULU with X bit in mask */
-        if ((op == OPC_PULS || op == OPC_PULU) && pos + 1 < len) {
-            if (data[pos + 1] & MASK_X) found_puls_x = 1;
-            pos += 2;
-            continue;
-        }
-
-        /* Prefixed 2-byte opcode (0x10 prefix) */
-        if (op == OPC_PREFIX && pos + 2 < len) {
-            uint8_t op2  = data[pos + 1];
-            uint8_t pb   = data[pos + 2];
-            /* LDY ,X++ = 0x10 0xAE 0x81 */
-            if (op2 == 0xAEu && pb == POSTBYTE_X_PLUS2 && *nfields < MAX_FIELDS) {
-                fields[(*nfields)++] = FKIND_WORD;
-                pos += 3;
-                continue;
-            }
-            /* LDS ,X++ = 0x10 0xEE 0x81 */
-            if (op2 == 0xEEu && pb == POSTBYTE_X_PLUS2 && *nfields < MAX_FIELDS) {
-                fields[(*nfields)++] = FKIND_WORD;
-                pos += 3;
-                continue;
-            }
-            /* otherwise: advance past prefixed instruction (2+operand bytes) */
-            Cpu6809InstrInfo info = cpu6809_disassemble_info(
-                data + pos, len - pos, 0, NULL, 0);
-            pos += info.size > 0 ? info.size : 1;
-            continue;
-        }
-
-        /* Post-increment byte load: LDA/LDB ,X+ */
-        if ((op == OPC_LDA_IDX || op == OPC_LDB_IDX) &&
-            pos + 1 < len && data[pos + 1] == POSTBYTE_X_PLUS1) {
-            if (*nfields < MAX_FIELDS) fields[(*nfields)++] = FKIND_BYTE;
-            pos += 2;
-            continue;
-        }
-
-        /* Post-increment word load: LDD/LDX/LDU ,X++ */
-        if ((op == OPC_LDD_IDX || op == OPC_LDX_IDX || op == OPC_LDU_IDX) &&
-            pos + 1 < len && data[pos + 1] == POSTBYTE_X_PLUS2) {
-            if (*nfields < MAX_FIELDS) fields[(*nfields)++] = FKIND_WORD;
-            pos += 2;
-            continue;
-        }
-
-        /* JMP ,X — clean terminator */
-        if (op == OPC_JMP_IDX && pos + 1 < len &&
-            data[pos + 1] == POSTBYTE_X_NONE) {
-            found_term = 1;
-            break;
-        }
-
-        /* RTS — check if preceded by PSHS with X bit (other variant) */
-        if (op == OPC_RTS) {
-            found_term = (found_puls_x && *nfields > 0); /* lenient: accept if we saw fields */
-            break;
-        }
-
-        /* PSHS with X bit: sets up new return address past inline data */
-        if ((op == OPC_PSHS || op == OPC_PSHU) && pos + 1 < len &&
-            (data[pos + 1] & MASK_X)) {
-            pos += 2;
-            continue;   /* expect RTS to follow */
-        }
-
-        /* Any other instruction: advance generically */
-        Cpu6809InstrInfo info = cpu6809_disassemble_info(
-            data + pos, len - pos, 0, NULL, 0);
-        if (info.size == 0) return 0;   /* invalid opcode → not code */
-        pos += info.size;
-    }
-
-    if (!found_puls_x || *nfields == 0 || !found_term) return 0;
-
-    /* Merge consecutive (BYTE, WORD) pairs → FAR field */
-    int merged[MAX_FIELDS];
-    int nm = 0;
-    for (int i = 0; i < *nfields; ) {
-        if (i + 1 < *nfields &&
-            fields[i] == FKIND_BYTE && fields[i + 1] == FKIND_WORD) {
-            merged[nm++] = FKIND_FAR;
-            i += 2;
-        } else {
-            merged[nm++] = fields[i++];
-        }
-    }
-    for (int i = 0; i < nm; i++) fields[i] = merged[i];
-    *nfields = nm;
-
-    return 1;
-}
-
-/* Validate a single callsite: are the bytes after the JSR consistent
-   with the spec?  Returns 1 = valid, 0 = invalid / can't tell. */
-static int validate_callsite_bytes(const uint8_t *after, size_t avail,
-                                    const int *fields, int nfields,
-                                    const uint8_t valid_bank[256])
-{
-    size_t need = 0;
-    for (int i = 0; i < nfields; i++)
-        need += (fields[i] == FKIND_BYTE) ? 1 : (fields[i] == FKIND_WORD) ? 2 : 3;
-    if (avail < need) return 0;
-
-    size_t off = 0;
-    for (int i = 0; i < nfields; i++) {
-        if (fields[i] == FKIND_BYTE) {
-            off++;   /* any byte is valid */
-        } else if (fields[i] == FKIND_WORD) {
-            uint16_t v = ((uint16_t)after[off] << 8) | after[off + 1];
-            /* word must be a plausible ROM address */
-            if (v < APEX_PAGED_ORG) return 0;
-            off += 2;
-        } else { /* FKIND_FAR */
-            uint16_t addr = ((uint16_t)after[off] << 8) | after[off + 1];
-            uint8_t  bank = after[off + 2];
-            if (!valid_bank[bank]) return 0;
-            if (bank == 0xFFu) {
-                if (addr < APEX_SYSTEM_ORG) return 0;
-            } else {
-                if (addr < APEX_PAGED_ORG || addr >= 0x8000u) return 0;
-            }
-            off += 3;
-        }
-    }
-    return 1;
-}
-
-/* Count JSR-extended (0xBD hi lo) callsites for a system-bank function
-   (cpu_addr in 0x8000-0xFFFF); fills callsite_count and callsite_valid. */
-static void count_callsites(const ApexProject *p, uint32_t func_addr,
-                              const int *fields, int nfields,
-                              const uint8_t valid_bank[256],
-                              int *cnt, int *valid)
-{
-    *cnt   = 0;
-    *valid = 0;
-    if (p->rom.size < 3) return;
-
-    uint8_t hi = (uint8_t)((func_addr >> 8) & 0xFFu);
-    uint8_t lo = (uint8_t)( func_addr        & 0xFFu);
-
-    for (size_t i = 0; i + 2 < p->rom.size; i++) {
-        if (p->rom.data[i] == 0xBDu &&
-            p->rom.data[i + 1] == hi &&
-            p->rom.data[i + 2] == lo) {
-            (*cnt)++;
-            size_t after_off = i + 3;
-            size_t avail     = p->rom.size - after_off;
-            if (validate_callsite_bytes(p->rom.data + after_off, avail,
-                                         fields, nfields, valid_bank))
-                (*valid)++;
-        }
-    }
-}
-
-static int has_inline_sig(const InlineSignatures *sigs, int has_bank,
-                           uint8_t bank, uint32_t addr)
-{
-    size_t i;
-    for (i = 0; i < sigs->count; i++) {
-        if (sigs->items[i].addr == addr &&
-            (!has_bank || sigs->items[i].bank == bank)) return 1;
-    }
-    return 0;
-}
-
-static void inline_push(ApexInlineCandidates *out,
-                          uint8_t bank, uint32_t addr,
-                          const char *spec, int score,
-                          int callsite_count, int callsite_valid)
-{
-    /* deduplicate */
-    for (size_t i = 0; i < out->count; i++) {
-        if (out->items[i].bank == bank && out->items[i].addr == addr) {
-            if (score > out->items[i].score) {
-                out->items[i].score          = score;
-                out->items[i].callsite_count = callsite_count;
-                out->items[i].callsite_valid = callsite_valid;
-                snprintf(out->items[i].spec, APEX_INLINE_SPEC_MAX, "%s", spec);
-            }
-            return;
-        }
-    }
-    if (out->count == out->cap) {
-        size_t nc = out->cap == 0 ? 32 : out->cap * 2;
-        ApexInlineCandidate *ni = (ApexInlineCandidate *)realloc(
-            out->items, nc * sizeof(out->items[0]));
-        if (!ni) return;
-        out->items = ni;
-        out->cap   = nc;
-    }
-    ApexInlineCandidate *c = &out->items[out->count++];
-    c->bank           = bank;
-    c->addr           = addr;
-    c->score          = score;
-    c->callsite_count = callsite_count;
-    c->callsite_valid = callsite_valid;
-    strncpy(c->spec, spec, APEX_INLINE_SPEC_MAX - 1);
-    c->spec[APEX_INLINE_SPEC_MAX - 1] = '\0';
-}
-
-static int inline_cmp(const void *a, const void *b)
-{
-    return ((const ApexInlineCandidate *)b)->score -
-           ((const ApexInlineCandidate *)a)->score;
-}
-
-void apex_scan_inline_candidates(const ApexProject *p, ApexInlineCandidates *out)
-{
-    size_t  i, j;
-    uint8_t valid_bank[256];
-
-    if (!p || !out) return;
-    out->items = NULL;
-    out->count = 0;
-    out->cap   = 0;
-
-    for (i = 0; i < 256; i++) valid_bank[i] = 0;
-    valid_bank[0xFFu] = 1;
-    for (i = 0; i < p->banks; i++)
-        valid_bank[bank_id_for_index(p->banks, (int)i)] = 1;
-
-    /* Scan every known code label in every bank */
-    /* Helper: process one LabelSet */
-    for (int pass = 0; pass < 2; pass++) {
-        size_t lset_count = (pass == 0) ? p->banks : 1;
-
-        for (i = 0; i < lset_count; i++) {
-            const LabelSet *ls;
-            uint8_t  bank_id;
-            uint32_t base_addr;
-            const uint8_t *bdata;
-            size_t   bsize;
-
-            if (pass == 0) {
-                ls        = &p->bank_labels[i];
-                bank_id   = bank_id_for_index(p->banks, (int)i);
-                base_addr = APEX_PAGED_ORG;
-                bdata     = p->rom.data + i * APEX_BANK_SIZE;
-                bsize     = APEX_BANK_SIZE;
-            } else {
-                ls        = &p->system_labels;
-                bank_id   = 0xFFu;
-                base_addr = APEX_SYSTEM_ORG;
-                bdata     = p->rom.data + p->paged_size;
-                bsize     = p->rom.size - p->paged_size;
-            }
-
-            for (j = 0; j < ls->count; j++) {
-                const Label *lbl = &ls->items[j];
-                if (!lbl->is_code) continue;
-                if (lbl->addr < base_addr) continue;
-                size_t off = lbl->addr - base_addr;
-                if (off >= bsize) continue;
-
-                /* Skip if already has an inline sig defined */
-                if (has_inline_sig(&p->inline_sigs, 1, bank_id, lbl->addr))
-                    continue;
-
-                int fields[MAX_FIELDS];
-                int nfields = 0;
-                if (!scan_detect_inline_dispatcher(bdata + off, bsize - off,
-                                               lbl->addr, fields, &nfields))
-                    continue;
-
-                char spec[APEX_INLINE_SPEC_MAX] = "";
-                if (build_spec(fields, nfields, spec, sizeof(spec)) != 0)
-                    continue;
-
-                /* Score: base 40, +10 if >1 field, callsite factor */
-                int score = 40 + (nfields > 1 ? 10 : 0);
-
-                int cnt = 0, valid_cs = 0;
-                /* Callsite search only reliable for system-bank functions */
-                if (bank_id == 0xFFu)
-                    count_callsites(p, lbl->addr, fields, nfields,
-                                    valid_bank, &cnt, &valid_cs);
-
-                if (cnt > 0) {
-                    score += (cnt >= 3 ? 20 : 10);
-                    if (valid_cs == cnt)          score += 25;
-                    else if (valid_cs * 2 >= cnt) score += 12;
-                }
-                if (score > 100) score = 100;
-
-                /* Require at least some confidence */
-                if (cnt == 0 && score < 50) score = 45; /* show but mark uncertain */
-
-                inline_push(out, bank_id, lbl->addr, spec, score, cnt, valid_cs);
-            }
-        }
-    }
-
-    if (out->count > 0)
-        qsort(out->items, out->count, sizeof(out->items[0]), inline_cmp);
-}
-
-void apex_free_inline_candidates(ApexInlineCandidates *candidates)
-{
-    if (!candidates) return;
-    free(candidates->items);
-    candidates->items = NULL;
-    candidates->count = 0;
-    candidates->cap   = 0;
+    candidates->cap = 0;
 }

@@ -1,10 +1,10 @@
 #ifndef APEX_COMPARE_H
 #define APEX_COMPARE_H
 
+#include "apex_match.h"
+
 #include <stddef.h>
 #include <stdint.h>
-
-#include "apex_match.h"
 
 struct ApexProject;
 
@@ -28,11 +28,7 @@ struct ApexProject;
  * the same address (B table discovery needs B to carry its own config).
  */
 
-typedef enum {
-    APEX_CMP_CODE = 0,
-    APEX_CMP_STRING,
-    APEX_CMP_TABLE
-} ApexCompareKind;
+typedef enum { APEX_CMP_CODE = 0, APEX_CMP_STRING, APEX_CMP_TABLE } ApexCompareKind;
 
 typedef enum {
     APEX_CMP_IDENTICAL = 0,
@@ -42,27 +38,27 @@ typedef enum {
     APEX_CMP_ADDED
 } ApexCompareStatus;
 
-#define APEX_CMP_LABEL_MAX  64
+#define APEX_CMP_LABEL_MAX 64
 #define APEX_CMP_DETAIL_MAX 80
 
 typedef struct {
-    ApexCompareKind   kind;
+    ApexCompareKind kind;
     ApexCompareStatus status;
-    int      has_a;             /* a_bank/a_addr valid (false for ADDED) */
-    int      has_b;             /* b_bank/b_addr valid (false for REMOVED) */
-    uint8_t  a_bank;
+    int has_a; /* a_bank/a_addr valid (false for ADDED) */
+    int has_b; /* b_bank/b_addr valid (false for REMOVED) */
+    uint8_t a_bank;
     uint32_t a_addr;
-    uint8_t  b_bank;
+    uint8_t b_bank;
     uint32_t b_addr;
-    int      confidence;        /* 0-100; 100 = exact body match */
-    char     label[APEX_CMP_LABEL_MAX];
-    char     detail[APEX_CMP_DETAIL_MAX];
+    int confidence; /* 0-100; 100 = exact body match */
+    char label[APEX_CMP_LABEL_MAX];
+    char detail[APEX_CMP_DETAIL_MAX];
 } ApexCompareEntry;
 
 typedef struct {
     ApexCompareEntry *items;
-    size_t            count;
-    size_t            cap;
+    size_t count;
+    size_t cap;
     /* summary counts across all kinds */
     size_t n_identical;
     size_t n_moved;
@@ -75,8 +71,8 @@ typedef struct {
     int include_code;
     int include_strings;
     int include_tables;
-    int include_identical;  /* emit identical entries (false keeps the report short) */
-    int min_instrs;         /* skip code routines shorter than this (default 5) */
+    int include_identical; /* emit identical entries (false keeps the report short) */
+    int min_instrs;        /* skip code routines shorter than this (default 5) */
 } ApexCompareOptions;
 
 void apex_compare_default_options(ApexCompareOptions *o);
@@ -94,17 +90,16 @@ const char *apex_compare_kind_name(ApexCompareKind k);
 /* ---- cursor sidebar: top-N candidate matches in B for one A routine ---- */
 
 typedef struct {
-    uint8_t  bank;
+    uint8_t bank;
     uint32_t addr;
-    int      confidence;        /* 0-100 */
-    int      exact;             /* L1+L2 exact body match */
+    int confidence; /* 0-100 */
+    int exact;      /* L1+L2 exact body match */
 } ApexCompareCandidate;
 
 /* Rank up to max_out candidate routines in b_db for the routine at
    (a_bank, a_addr) in a_db, best first.  Returns the number written. */
-size_t apex_compare_candidates(const ApexFingerprintDB *a_db,
-                               const ApexFingerprintDB *b_db,
-                               uint8_t a_bank, uint32_t a_addr,
-                               ApexCompareCandidate *out, size_t max_out);
+size_t apex_compare_candidates(const ApexFingerprintDB *a_db, const ApexFingerprintDB *b_db,
+                               uint8_t a_bank, uint32_t a_addr, ApexCompareCandidate *out,
+                               size_t max_out);
 
 #endif /* APEX_COMPARE_H */

@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <stdint.h>
+#include <stdio.h>
 
 typedef enum {
     TABLE_PTR16_STRING,
@@ -21,18 +22,18 @@ typedef enum {
     TABLE_WORD,
     /* Variable-length inline-only kinds (invalid in [tables], which need a fixed
        row stride).  Their byte length is determined per call site from the ROM. */
-    TABLE_BYTES_UNTIL,   /* bytes up to and including a terminator byte (in .param) */
-    TABLE_COUNTED_BYTES  /* a leading count byte, then that many payload bytes */
+    TABLE_BYTES_UNTIL,  /* bytes up to and including a terminator byte (in .param) */
+    TABLE_COUNTED_BYTES /* a leading count byte, then that many payload bytes */
 } TableFieldKind;
 
 typedef struct {
-    const char *name;   /* owned string */
+    const char *name; /* owned string */
     uint32_t value;
 } ConfigTypeValue;
 
 typedef struct {
-    char *name;             /* owned */
-    TableFieldKind kind;    /* TABLE_BYTE or TABLE_WORD only */
+    char *name;          /* owned */
+    TableFieldKind kind; /* TABLE_BYTE or TABLE_WORD only */
     ConfigTypeValue *values;
     size_t value_count;
     size_t value_cap;
@@ -47,8 +48,8 @@ typedef struct {
 typedef struct {
     TableFieldKind kind;
     size_t count;
-    const char *type_name;  /* borrowed ptr into ConfigType.name, NULL if no type */
-    unsigned param;         /* *_sprite fields: image height for no-header targets; 0 = none */
+    const char *type_name; /* borrowed ptr into ConfigType.name, NULL if no type */
+    unsigned param;        /* *_sprite fields: image height for no-header targets; 0 = none */
 } TableField;
 
 typedef struct {
@@ -62,7 +63,7 @@ typedef struct {
     uint8_t bank;
     uint32_t addr;
     unsigned length;
-    int flow_stop;          /* tail-call helper: control never returns past inline data */
+    int flow_stop; /* tail-call helper: control never returns past inline data */
     TableSchema schema;
 } InlineSignature;
 
@@ -83,13 +84,13 @@ typedef struct {
     ConfigDoc *items;
     size_t count;
     size_t cap;
-    int sorted;   /* items sorted by addr → config_doc_at binary-searches */
+    int sorted; /* items sorted by addr → config_doc_at binary-searches */
 } ConfigDocs;
 
 typedef struct {
     const char *name;
     uint32_t value;
-    uint32_t length;   /* byte span of the named block; 1 = single byte (default) */
+    uint32_t length; /* byte span of the named block; 1 = single byte (default) */
 } ConfigSymbol;
 
 typedef struct ConfigSymbols {
@@ -113,11 +114,11 @@ typedef struct {
 
 /* Target kind of a [far_imm] far pointer (how the pointed-to bytes are seeded). */
 typedef enum {
-    FAR_IMM_DATA = 0,   /* plain data label (default) */
-    FAR_IMM_CODE,       /* code entry — disassembled as a routine */
-    FAR_IMM_TABLE,      /* data label (user classifies the table) */
-    FAR_IMM_STRING,     /* null-terminated string */
-    FAR_IMM_SPRITE,     /* sprite image */
+    FAR_IMM_DATA = 0, /* plain data label (default) */
+    FAR_IMM_CODE,     /* code entry — disassembled as a routine */
+    FAR_IMM_TABLE,    /* data label (user classifies the table) */
+    FAR_IMM_STRING,   /* null-terminated string */
+    FAR_IMM_SPRITE,   /* sprite image */
     FAR_IMM_DMD_FULLFRAME
 } FarImmType;
 
@@ -125,8 +126,8 @@ typedef struct {
     int has_bank;
     uint8_t bank;
     uint32_t addr;
-    uint8_t value;   /* auxiliary byte; used by [far_imm] as the target bank, else 0 */
-    uint8_t value2;  /* [far_imm]: FarImmType of the target */
+    uint8_t value;     /* auxiliary byte; used by [far_imm] as the target bank, else 0 */
+    uint8_t value2;    /* [far_imm]: FarImmType of the target */
     uint32_t aux_addr; /* [far_imm]: cpu addr of the paired bank-load instr, 0 = none */
 } ConfigEntry;
 
@@ -168,7 +169,7 @@ typedef struct {
     TableDef *items;
     size_t count;
     size_t cap;
-    int sorted;   /* items sorted by (bank,addr) → table_def_at binary-searches */
+    int sorted; /* items sorted by (bank,addr) → table_def_at binary-searches */
 } TableDefs;
 
 typedef struct {
@@ -185,8 +186,8 @@ typedef struct {
 typedef enum {
     DATA_BYTES,
     DATA_STRING,
-    DATA_STRING_FIXED,  /* fixed-length string: N bytes of ASCII, length in DataRange.length */
-    DATA_BCD,           /* binary-coded decimal: N bytes = 2N decimal digits, length in DataRange.length */
+    DATA_STRING_FIXED, /* fixed-length string: N bytes of ASCII, length in DataRange.length */
+    DATA_BCD, /* binary-coded decimal: N bytes = 2N decimal digits, length in DataRange.length */
     DATA_DMD_FULLFRAME,
     DATA_PTR16_STRING,
     DATA_PTR16_DATA,
@@ -200,7 +201,7 @@ typedef enum {
     DATA_SPRITE,
     DATA_PTR16_SPRITE,
     DATA_FAR_SPRITE,
-    DATA_SPRITE_NOHEADER   /* no-header VSI: byte 0 = width px, height in DataRange.length */
+    DATA_SPRITE_NOHEADER /* no-header VSI: byte 0 = width px, height in DataRange.length */
 } DataKind;
 
 typedef struct {
@@ -208,6 +209,8 @@ typedef struct {
     uint32_t addr;
     DataKind kind;
     size_t length;
+    int derived; /* added by analysis (DMD/sprite/far_imm targets), not by the
+                    user: never saved, rebuilt on every full analysis */
 } DataRange;
 
 typedef struct {
@@ -216,12 +219,7 @@ typedef struct {
     size_t cap;
 } DataRanges;
 
-typedef enum {
-    APEX_KIND_CODE,
-    APEX_KIND_DATA,
-    APEX_KIND_STRING,
-    APEX_KIND_TABLE
-} ApexConfigKind;
+typedef enum { APEX_KIND_CODE, APEX_KIND_DATA, APEX_KIND_STRING, APEX_KIND_TABLE } ApexConfigKind;
 
 void add_table_field(TableSchema *schema, TableFieldKind kind, size_t count);
 size_t table_schema_width(const TableSchema *schema);
@@ -231,16 +229,15 @@ int table_kind_is_variable(TableFieldKind kind);
 /* True if any field of the schema is variable-length. */
 int table_schema_is_variable(const TableSchema *schema);
 
-void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank,
-                                 uint32_t addr, const TableSchema *schema, int flow_stop);
+void add_inline_signature_schema(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
+                                 const TableSchema *schema, int flow_stop);
 void add_inline_signature_ex(InlineSignatures *sigs, int has_bank, uint8_t bank, uint32_t addr,
                              unsigned length, TableFieldKind kind);
 
 void load_config(const char *path, InlineSignatures *sigs, ConfigLabels *labels,
-                 ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas,
-                 ConfigDocs *docs, ConfigSymbols *symbols,
-                 DataRanges *data_ranges, ConfigOptions *options, ConfigTypes *types,
-                 ConfigEntries *ref_exclusions, ConfigEntries *literals,
+                 ConfigEntries *entries, TableDefs *tables, SchemaDefs *schemas, ConfigDocs *docs,
+                 ConfigSymbols *symbols, DataRanges *data_ranges, ConfigOptions *options,
+                 ConfigTypes *types, ConfigEntries *ref_exclusions, ConfigEntries *literals,
                  ConfigEntries *ack_warnings, ConfigEntries *far_imms);
 /* When enabled, a conflicting later [symbols]/[labels] definition (same name,
    different value/address) overrides the earlier one instead of aborting the
@@ -271,6 +268,10 @@ int config_clear_data(DataRanges *ranges, uint8_t bank, uint32_t addr);
 int config_set_table_spec(TableDefs *tables, const SchemaDefs *schemas, uint8_t bank, uint32_t addr,
                           const char *spec, const ConfigTypes *types);
 int config_clear_table(TableDefs *tables, uint8_t bank, uint32_t addr);
+
+/* Write an `[options]` section holding every option that differs from its
+   default; writes nothing (and returns 0) when all options are default. */
+int config_write_options(FILE *out, const ConfigOptions *options);
 
 int config_valid_symbol_name(const char *name);
 int config_set_symbol(ConfigSymbols *symbols, const char *name, uint32_t value, uint32_t length);

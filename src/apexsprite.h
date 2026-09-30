@@ -4,17 +4,19 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define APEX_SPRITE_MAX_WIDTH  128u
+#define APEX_SPRITE_MAX_WIDTH 128u
 #define APEX_SPRITE_MAX_HEIGHT 128u
 #define APEX_SPRITE_MAX_ROW_BYTES ((APEX_SPRITE_MAX_WIDTH + 7u) / 8u)
 #define APEX_SPRITE_MAX_BYTES (APEX_SPRITE_MAX_ROW_BYTES * APEX_SPRITE_MAX_HEIGHT)
 
 /* VSI image encodings, distinguished by the header byte (see apexsprite_decode).
    enc_type_out is set to one of these. */
-#define APEX_SPRITE_ENC_MONO             0  /* 0x00: single plane, raw            */
-#define APEX_SPRITE_ENC_FD               1  /* 0xFD: single plane (drawn like 0x00) */
-#define APEX_SPRITE_ENC_BICOLOR_INDIRECT 2  /* 0xFE: hdr + 2-byte ptr to plane 1 + plane 0 inline */
-#define APEX_SPRITE_ENC_BICOLOR_DIRECT   3  /* 0xFF: hdr + plane 1 + plane 0, both inline */
+#define APEX_SPRITE_ENC_MONO 0 /* 0x00: single plane, raw            */
+#define APEX_SPRITE_ENC_FD 1   /* 0xFD: single plane (drawn like 0x00) */
+#define APEX_SPRITE_ENC_BICOLOR_INDIRECT                                                           \
+    2                                    /* 0xFE: hdr + 2-byte ptr to plane 1 + plane 0 inline     \
+                                          */
+#define APEX_SPRITE_ENC_BICOLOR_DIRECT 3 /* 0xFF: hdr + plane 1 + plane 0, both inline */
 
 /* Returns 1 if src[0] is a VSI header byte (0x00, 0xFD, 0xFE, 0xFF). */
 int apexsprite_is_header(const uint8_t *src, size_t src_size);
@@ -37,15 +39,9 @@ int apexsprite_is_noheader(const uint8_t *src, size_t src_size);
    byte length (for bicolor-indirect, plane 1 lives elsewhere via the pointer
    and is not counted).  All out-pointers are optional (may be NULL).
    Returns 1 on success. */
-int apexsprite_decode(const uint8_t *src, size_t src_size,
-                      uint8_t *dest,
-                      uint8_t *header_type_out,
-                      uint8_t *vert_offset_out,
-                      uint8_t *horiz_offset_out,
-                      uint8_t *width_out,
-                      uint8_t *height_out,
-                      uint8_t *enc_type_out,
-                      size_t  *consumed_out);
+int apexsprite_decode(const uint8_t *src, size_t src_size, uint8_t *dest, uint8_t *header_type_out,
+                      uint8_t *vert_offset_out, uint8_t *horiz_offset_out, uint8_t *width_out,
+                      uint8_t *height_out, uint8_t *enc_type_out, size_t *consumed_out);
 
 /* Decode a no-header VariableSizedImage (first byte 1..128 = width in pixels).
    Format: [width_px][raw bitmap MSB-first row-major]
@@ -53,10 +49,7 @@ int apexsprite_decode(const uint8_t *src, size_t src_size,
    dest must be at least APEX_SPRITE_MAX_BYTES bytes; zeroed on entry.
    All out-pointers are optional (may be NULL).
    Returns 1 on success. */
-int apexsprite_decode_noheader(const uint8_t *src, size_t src_size,
-                               uint8_t *dest,
-                               uint8_t table_height,
-                               uint8_t *width_out,
-                               size_t  *consumed_out);
+int apexsprite_decode_noheader(const uint8_t *src, size_t src_size, uint8_t *dest,
+                               uint8_t table_height, uint8_t *width_out, size_t *consumed_out);
 
 #endif

@@ -2,20 +2,79 @@
 
 #include <ctype.h>
 #include <errno.h>
+#include <setjmp.h>
 #include <stdarg.h>
 #include <stdlib.h>
 #include <string.h>
 
 void (*apex_die_hook)(const char *msg) = NULL;
 
-void die(const char *fmt, ...)
-{
-    char msg[512];
+/* apex_try() state; thread-local so a die() on the GUI's render thread never
+   jumps into a guard set up on the UI thread. */
+static APEX_THREAD_LOCAL jmp_buf *s_try_jmp;
+static APEX_THREAD_LOCAL char *s_try_err;
+static APEX_THREAD_LOCAL size_t s_try_errsz;
+static APEX_THREAD_LOCAL const char *s_die_path;
+static APEX_THREAD_LOCAL unsigned long s_die_line;
+
+void apex_set_die_context(const char *path, unsigned long line) {
+    s_die_path = path;
+    s_die_line = line;
+}
+
+void apex_get_die_context(const char **path, unsigned long *line) {
+    *path = s_die_path;
+    *line = s_die_line;
+}
+
+int apex_try(void (*fn)(void *), void *ctx, char *err, size_t errsz) {
+    jmp_buf jb;
+    jmp_buf *prev_jmp = s_try_jmp;
+    char *prev_err = s_try_err;
+    size_t prev_errsz = s_try_errsz;
+    const char *prev_path = s_die_path;
+    unsigned long prev_line = s_die_line;
+
+    if (err && errsz) {
+        err[0] = '\0';
+    }
+    if (setjmp(jb)) {
+        s_try_jmp = prev_jmp;
+        s_try_err = prev_err;
+        s_try_errsz = prev_errsz;
+        s_die_path = prev_path; /* a parser that died did not restore it */
+        s_die_line = prev_line;
+        return 1;
+    }
+    s_try_jmp = &jb;
+    s_try_err = err;
+    s_try_errsz = errsz;
+    fn(ctx);
+    s_try_jmp = prev_jmp;
+    s_try_err = prev_err;
+    s_try_errsz = prev_errsz;
+    return 0;
+}
+
+void die(const char *fmt, ...) {
+    char text[512];
+    char msg[640];
     va_list ap;
 
     va_start(ap, fmt);
-    vsnprintf(msg, sizeof(msg), fmt, ap);
+    vsnprintf(text, sizeof(text), fmt, ap);
     va_end(ap);
+    if (s_die_path) {
+        snprintf(msg, sizeof(msg), "%s:%lu: %s", s_die_path, s_die_line, text);
+    } else {
+        snprintf(msg, sizeof(msg), "%s", text);
+    }
+    if (s_try_jmp) {
+        if (s_try_err && s_try_errsz) {
+            snprintf(s_try_err, s_try_errsz, "%s", msg);
+        }
+        longjmp(*s_try_jmp, 1);
+    }
     if (apex_die_hook) {
         apex_die_hook(msg);
         exit(1); /* hook should longjmp; this is a safety fallback */
@@ -25,8 +84,49 @@ void die(const char *fmt, ...)
     exit(1);
 }
 
-void *xmalloc(size_t size)
-{
+int apex_parse_int_arg(const char *text, long lo, long hi, long *out) {
+    char *end;
+    long v;
+
+    if (!text || !*text) {
+        return 0;
+    }
+    errno = 0;
+    v = strtol(text, &end, 0);
+    if (errno != 0 || *end != '\0' || v < lo || v > hi) {
+        return 0;
+    }
+    *out = v;
+    return 1;
+}
+
+const char *apex_path_basename(const char *path) {
+    const char *base = path;
+    const char *p;
+
+    if (!path) {
+        return "";
+    }
+    for (p = path; *p; p++) {
+        if (*p == '/' || *p == '\\' || (*p == ':' && p == path + 1)) {
+            base = p + 1;
+        }
+    }
+    return base;
+}
+
+int apex_path_is_absolute(const char *path) {
+    if (!path || !*path) {
+        return 0;
+    }
+    if (path[0] == '/' || path[0] == '\\') {
+        return 1;
+    }
+    /* "C:\..." / "C:/..." */
+    return isalpha((unsigned char)path[0]) && path[1] == ':';
+}
+
+void *xmalloc(size_t size) {
     void *p = malloc(size == 0 ? 1 : size);
     if (!p) {
         die("out of memory");
@@ -34,8 +134,7 @@ void *xmalloc(size_t size)
     return p;
 }
 
-Buffer read_file(const char *path)
-{
+Buffer read_file(const char *path) {
     FILE *f;
     long len;
     Buffer b;
@@ -64,8 +163,7 @@ Buffer read_file(const char *path)
     return b;
 }
 
-void write_file(const char *path, const uint8_t *data, size_t size)
-{
+void write_file(const char *path, const uint8_t *data, size_t size) {
     FILE *f = fopen(path, "wb");
     if (!f) {
         die("failed to open %s for writing: %s", path, strerror(errno));
@@ -78,8 +176,7 @@ void write_file(const char *path, const uint8_t *data, size_t size)
     }
 }
 
-int parse_u32(const char *text, uint32_t *out)
-{
+int parse_u32(const char *text, uint32_t *out) {
     char *end;
     unsigned long value;
     int base = 10;
@@ -111,8 +208,7 @@ int parse_u32(const char *text, uint32_t *out)
     return 1;
 }
 
-char *trim(char *s)
-{
+char *trim(char *s) {
     char *end;
 
     while (isspace((unsigned char)*s)) {

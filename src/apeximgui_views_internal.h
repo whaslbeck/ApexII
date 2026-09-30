@@ -16,6 +16,10 @@ bool str_icontains(const char *hay, const char *needle);
 /* Reads the ImGui table sort spec for the current table; returns true and fills
    (*col, *asc) when a sortable column is active. */
 bool ui_table_sort(int *col, bool *asc);
+/* For tables that sort a persistent vector in place: returns true only when
+   the sort spec changed or data_version differs from the last sorted version.
+   Sorting every frame would move rows while they are being edited. */
+bool ui_table_sort_if_changed(int *col, bool *asc, unsigned data_version);
 
 /* Three-way comparisons used by table sort comparators. */
 int ui_cmp_int(long a, long b);

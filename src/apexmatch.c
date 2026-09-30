@@ -5,45 +5,52 @@
 #include <stdlib.h>
 #include <string.h>
 
-static void usage(void)
-{
+static void usage(void) {
     fprintf(stderr,
-        "usage: apexmatch <source.rom> <source.ini> <target.rom> [options]\n"
-        "\n"
-        "Options:\n"
-        "  --min-confidence N     skip matches below N%% (default: %d)\n"
-        "  --min-instrs N         min instructions for medium-confidence matches (default: 5)\n"
-        "  --inject-paged         also inject paged-bank entries into target analysis\n"
-        "                         (default: system-bank only — safer for cross-game)\n"
-        "  --scan                 scan entire target system bank for exact matches\n"
-        "                         finds functions at different addresses (e.g. Delay_N)\n"
-        "  --output FILE          write .ini to FILE instead of stdout\n"
-        "  --stats                print match statistics to stderr\n"
-        "  --verbose              list unmatched named source functions to stderr\n",
-        APEX_MATCH_CONF_MEDIUM
-    );
-    exit(1);
+            "usage: apexmatch <source.rom> <source.ini> <target.rom> [options]\n"
+            "\n"
+            "Options:\n"
+            "  --min-confidence N     skip matches below N%% (default: %d)\n"
+            "  --min-instrs N         min instructions for medium-confidence matches (default: 5)\n"
+            "  --inject-paged         also inject paged-bank entries into target analysis\n"
+            "                         (default: system-bank only — safer for cross-game)\n"
+            "  --scan                 scan entire target system bank for exact matches\n"
+            "                         finds functions at different addresses (e.g. Delay_N)\n"
+            "  --output FILE          write .ini to FILE instead of stdout\n"
+            "  --stats                print match statistics to stderr\n"
+            "  --verbose              list unmatched named source functions to stderr\n",
+            APEX_MATCH_CONF_MEDIUM);
+    exit(2);
 }
 
-int main(int argc, char **argv)
-{
-    const char *src_rom  = NULL;
-    const char *src_ini  = NULL;
-    const char *dst_rom  = NULL;
+static int int_arg(const char *opt, const char *text, long lo, long hi) {
+    long v;
+    if (!apex_parse_int_arg(text, lo, hi, &v)) {
+        fprintf(stderr, "apexmatch: %s expects a number in %ld..%ld, got '%s'\n", opt, lo, hi,
+                text);
+        exit(2);
+    }
+    return (int)v;
+}
+
+int main(int argc, char **argv) {
+    const char *src_rom = NULL;
+    const char *src_ini = NULL;
+    const char *dst_rom = NULL;
     const char *out_path = NULL;
-    int min_conf         = APEX_MATCH_CONF_MEDIUM;
-    int min_instrs       = 5;
-    int inject_paged     = 0;
-    int scan_bank        = 0;
-    int print_stats      = 0;
-    int verbose          = 0;
+    int min_conf = APEX_MATCH_CONF_MEDIUM;
+    int min_instrs = 5;
+    int inject_paged = 0;
+    int scan_bank = 0;
+    int print_stats = 0;
+    int verbose = 0;
     int i;
 
     for (i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--min-confidence") == 0 && i + 1 < argc) {
-            min_conf = atoi(argv[++i]);
+            min_conf = int_arg("--min-confidence", argv[++i], 0, 100);
         } else if (strcmp(argv[i], "--min-instrs") == 0 && i + 1 < argc) {
-            min_instrs = atoi(argv[++i]);
+            min_instrs = int_arg("--min-instrs", argv[++i], 1, 100000);
         } else if (strcmp(argv[i], "--inject-paged") == 0) {
             inject_paged = 1;
         } else if (strcmp(argv[i], "--scan") == 0) {
@@ -54,6 +61,9 @@ int main(int argc, char **argv)
             print_stats = 1;
         } else if (strcmp(argv[i], "--verbose") == 0) {
             verbose = 1;
+        } else if (argv[i][0] == '-' && argv[i][1] != '\0') {
+            fprintf(stderr, "apexmatch: unknown option '%s'\n", argv[i]);
+            usage();
         } else if (!src_rom) {
             src_rom = argv[i];
         } else if (!src_ini) {
@@ -64,51 +74,69 @@ int main(int argc, char **argv)
             usage();
         }
     }
-    if (!src_rom || !src_ini || !dst_rom) usage();
+    if (!src_rom || !src_ini || !dst_rom)
+        usage();
 
     /* Load and analyse source project */
     ApexProject *src = apex_project_open(src_rom, src_ini);
-    if (!src) { fprintf(stderr, "error: cannot open source %s\n", src_rom); return 1; }
-    if (apex_project_analyze(src)) { fprintf(stderr, "error: source analysis failed\n"); return 1; }
+    if (!src) {
+        fprintf(stderr, "error: cannot open source %s\n", src_rom);
+        return 1;
+    }
+    if (apex_project_analyze(src)) {
+        fprintf(stderr, "error: source analysis failed\n");
+        return 1;
+    }
 
     /* Load target, inject source entry points, then analyse */
     ApexProject *dst = apex_project_open(dst_rom, NULL);
-    if (!dst) { fprintf(stderr, "error: cannot open target %s\n", dst_rom); return 1; }
+    if (!dst) {
+        fprintf(stderr, "error: cannot open target %s\n", dst_rom);
+        return 1;
+    }
 
     apex_match_inject_entries(dst, src, !inject_paged);
 
-    if (apex_project_analyze(dst)) { fprintf(stderr, "error: target analysis failed\n"); return 1; }
+    if (apex_project_analyze(dst)) {
+        fprintf(stderr, "error: target analysis failed\n");
+        return 1;
+    }
 
     /* Build fingerprint databases */
     ApexFingerprintDB *src_db = apex_fingerprint_build(src);
     ApexFingerprintDB *dst_db = apex_fingerprint_build(dst);
-    if (!src_db || !dst_db) { fprintf(stderr, "error: out of memory\n"); return 1; }
+    if (!src_db || !dst_db) {
+        fprintf(stderr, "error: out of memory\n");
+        return 1;
+    }
 
     if (print_stats || verbose) {
         size_t named = 0;
         for (i = 0; i < (int)apex_fingerprint_count(src_db); i++) {
-            if (apex_fingerprint_get(src_db, (size_t)i)->label_name) named++;
+            if (apex_fingerprint_get(src_db, (size_t)i)->label_name)
+                named++;
         }
-        fprintf(stderr, "source fingerprints: %zu  (named: %zu)\n",
-                apex_fingerprint_count(src_db), named);
+        fprintf(stderr, "source fingerprints: %zu  (named: %zu)\n", apex_fingerprint_count(src_db),
+                named);
         fprintf(stderr, "target fingerprints: %zu\n", apex_fingerprint_count(dst_db));
     }
 
     /* Phase 1: fingerprint-DB match */
     size_t result_count = 0;
-    ApexMatchResult *results = apex_match_roms(src_db, dst_db,
-                                               min_conf, min_instrs,
-                                               &result_count);
+    ApexMatchResult *results = apex_match_roms(src_db, dst_db, min_conf, min_instrs, &result_count);
 
     if (print_stats) {
         size_t exact = 0, high = 0, medium = 0;
         for (i = 0; i < (int)result_count; i++) {
-            if      (results[i].confidence >= APEX_MATCH_CONF_EXACT) exact++;
-            else if (results[i].confidence >= APEX_MATCH_CONF_HIGH)  high++;
-            else                                                       medium++;
+            if (results[i].confidence >= APEX_MATCH_CONF_EXACT)
+                exact++;
+            else if (results[i].confidence >= APEX_MATCH_CONF_HIGH)
+                high++;
+            else
+                medium++;
         }
-        fprintf(stderr, "phase1 matches: %zu  (exact=%zu  high=%zu  medium=%zu)\n",
-                result_count, exact, high, medium);
+        fprintf(stderr, "phase1 matches: %zu  (exact=%zu  high=%zu  medium=%zu)\n", result_count,
+                exact, high, medium);
     }
 
     /* Phase 2: raw system-bank scan for exact matches not found by flow */
@@ -119,20 +147,18 @@ int main(int argc, char **argv)
 
         if (scan_count > 0) {
             /* Append scan results to existing results */
-            ApexMatchResult *combined = realloc(results,
-                (result_count + scan_count) * sizeof(*results));
+            ApexMatchResult *combined =
+                realloc(results, (result_count + scan_count) * sizeof(*results));
             if (combined) {
                 results = combined;
-                memcpy(results + result_count, scan_results,
-                       scan_count * sizeof(*scan_results));
+                memcpy(results + result_count, scan_results, scan_count * sizeof(*scan_results));
                 result_count += scan_count;
             }
             apex_match_results_free(scan_results, scan_count);
         }
 
         if (print_stats) {
-            fprintf(stderr, "phase2 scan:    %zu additional exact matches\n",
-                    scan_count);
+            fprintf(stderr, "phase2 scan:    %zu additional exact matches\n", scan_count);
             fprintf(stderr, "total matches:  %zu\n", result_count);
         }
     }
@@ -145,14 +171,17 @@ int main(int argc, char **argv)
             size_t j;
             int found = 0;
 
-            if (!fp->label_name) continue;
+            if (!fp->label_name)
+                continue;
             for (j = 0; j < result_count; j++) {
-                if (results[j].src_addr == fp->addr &&
-                    results[j].src_bank == fp->bank) { found = 1; break; }
+                if (results[j].src_addr == fp->addr && results[j].src_bank == fp->bank) {
+                    found = 1;
+                    break;
+                }
             }
             if (!found) {
-                fprintf(stderr, "  unmatched: B%02x_A%04x  %s  (%u instrs)\n",
-                        fp->bank, fp->addr, fp->label_name, fp->instr_count);
+                fprintf(stderr, "  unmatched: B%02x_A%04x  %s  (%u instrs)\n", fp->bank, fp->addr,
+                        fp->label_name, fp->instr_count);
                 unmatched++;
             }
         }
@@ -163,10 +192,14 @@ int main(int argc, char **argv)
     FILE *out = stdout;
     if (out_path) {
         out = fopen(out_path, "w");
-        if (!out) { perror(out_path); return 1; }
+        if (!out) {
+            perror(out_path);
+            return 1;
+        }
     }
     apex_match_write_ini(out, results, result_count, src);
-    if (out_path) fclose(out);
+    if (out_path)
+        fclose(out);
 
     apex_match_results_free(results, result_count);
     apex_fingerprint_free(src_db);

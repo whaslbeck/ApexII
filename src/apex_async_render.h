@@ -15,8 +15,8 @@
  *   apex_project_adopt_render_cache().
  */
 
-#include <thread>
 #include <atomic>
+#include <thread>
 
 extern "C" {
 #include "apex_project.h"
@@ -24,14 +24,19 @@ extern "C" {
 }
 
 class AsyncRenderer {
-public:
+  public:
     AsyncRenderer() = default;
-    ~AsyncRenderer() { if (thread_.joinable()) thread_.join(); }
+    ~AsyncRenderer() {
+        if (thread_.joinable())
+            thread_.join();
+    }
 
     AsyncRenderer(const AsyncRenderer &) = delete;
     AsyncRenderer &operator=(const AsyncRenderer &) = delete;
 
-    bool running() const { return running_; }
+    bool running() const {
+        return running_;
+    }
 
     /* Launch a render.  Precondition: !running(). */
     void start(ApexProject *project, int emit_xrefs, int emit_explain) {
@@ -39,21 +44,22 @@ public:
             return;
         }
         project_ = project;
-        xrefs_   = emit_xrefs;
+        xrefs_ = emit_xrefs;
         explain_ = emit_explain;
-        result_  = nullptr;
+        result_ = nullptr;
         done_.store(false, std::memory_order_relaxed);
         running_ = true;
         thread_ = std::thread([this] {
-            ApexRenderedDocument *d =
-                apex_project_render_detached(project_, xrefs_, explain_);
+            ApexRenderedDocument *d = apex_project_render_detached(project_, xrefs_, explain_);
             result_ = d;
-            done_.store(true, std::memory_order_release);  /* publishes result_ */
+            done_.store(true, std::memory_order_release); /* publishes result_ */
         });
     }
 
     /* True once the worker has finished; safe to call every frame. */
-    bool poll() const { return running_ && done_.load(std::memory_order_acquire); }
+    bool poll() const {
+        return running_ && done_.load(std::memory_order_acquire);
+    }
 
     /* Join the worker and hand back the freshly rendered detached document (the
      * caller installs it via apex_project_adopt_render_cache).  Call once, after
@@ -63,17 +69,17 @@ public:
             thread_.join();
         }
         running_ = false;
-        return result_;  /* synchronized by done_ release/acquire + join */
+        return result_; /* synchronized by done_ release/acquire + join */
     }
 
-private:
-    std::thread                 thread_;
-    std::atomic<bool>           done_{false};
-    ApexRenderedDocument       *result_ = nullptr;
-    ApexProject                *project_ = nullptr;
-    int                         xrefs_ = 0;
-    int                         explain_ = 0;
-    bool                        running_ = false;
+  private:
+    std::thread thread_;
+    std::atomic<bool> done_{false};
+    ApexRenderedDocument *result_ = nullptr;
+    ApexProject *project_ = nullptr;
+    int xrefs_ = 0;
+    int explain_ = 0;
+    bool running_ = false;
 };
 
 #endif /* APEX_ASYNC_RENDER_H */

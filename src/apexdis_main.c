@@ -1,15 +1,18 @@
 #include "apex.h"
 #include "apexdis_api.h"
 
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-static void usage(void)
-{
-    die("usage: apexdis [--xref] [--explain] [--addr] <input-rom> <output-asm> [config.ini]");
+static void usage(void) {
+    /* exit 2 for usage errors, like apexini/apexmeta (1 = processing error) */
+    fputs("usage: apexdis [--xref] [--explain] [--addr] <input-rom> <output-asm> [config.ini]\n",
+          stderr);
+    exit(2);
 }
 
-int main(int argc, char **argv)
-{
+int main(int argc, char **argv) {
     ApexDisOptions options;
     int argi = 1;
 
