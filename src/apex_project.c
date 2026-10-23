@@ -1,33 +1,12 @@
 #include "apex_project.h"
 
 #include "apex_render.h"
+#include "apexdis_labels.h"
 
 #include <ctype.h>
 #include <stdlib.h>
 #include <string.h>
 
-void build_system_labels(const uint8_t *data, const VectorInfo *vectors, size_t vector_count,
-                         InlineSignatures *inline_sigs, const uint8_t *paged_rom, size_t banks,
-                         LabelSet *bank_labels, LabelSet *labels, const ConfigLabels *config_labels,
-                         const ConfigEntries *config_entries, const DataRanges *data_ranges,
-                         const ConfigOptions *options, ReferenceSet *refs,
-                         const ConfigEntries *ref_exclusions, const ConfigEntries *literals,
-                         const ConfigEntries *far_imms);
-void collect_bank_code_targets(const uint8_t *paged_rom, size_t banks,
-                               const InlineSignatures *inline_sigs, LabelSet *bank_labels,
-                               LabelSet *system_labels, const DataRanges *data_ranges,
-                               ReferenceSet *refs, const ConfigEntries *ref_exclusions,
-                               const ConfigEntries *literals, const ConfigEntries *far_imms);
-void apply_config_bank_labels(const ConfigLabels *config_labels, const uint8_t *paged_rom,
-                              size_t banks, LabelSet *bank_labels, const ConfigOptions *options);
-void apply_config_bank_entries(const ConfigEntries *config_entries, const uint8_t *paged_rom,
-                               size_t banks, LabelSet *bank_labels);
-void apply_data_range_labels(const DataRanges *data_ranges, const uint8_t *paged_rom, size_t banks,
-                             const uint8_t *system_rom, LabelSet *bank_labels,
-                             LabelSet *system_labels, ReferenceSet *refs);
-void apply_table_labels(const TableDefs *tables, const uint8_t *paged_rom, size_t banks,
-                        LabelSet *bank_labels, LabelSet *system_labels, const uint8_t *system_rom,
-                        ReferenceSet *refs);
 static void analyze_full_project(ApexProject *project);
 
 static int sprite_locate(const ApexProject *p, uint8_t bank, uint16_t addr, const uint8_t **out,
@@ -1793,6 +1772,13 @@ void apex_project_free(ApexProject *project) {
     if (!project) {
         return;
     }
+    for (i = 0; i < project->transient_labels.count; i++)
+        free(project->transient_labels.items[i].name);
+    free(project->transient_labels.items);
+    free(project->transient_entries.items);
+    for (i = 0; i < project->transient_name_count; i++)
+        free(project->transient_names[i]);
+    free(project->transient_names);
     for (i = 0; i < project->banks; i++) {
         free_label_set(&project->bank_labels[i]);
     }
@@ -2165,10 +2151,104 @@ static void analyze_full_project(ApexProject *project) {
     sort_and_dedup_refs(&project->refs);
 }
 
+/* Append the transient labels/entries to the config arrays for the length of
+   an analysis (restored by transient_detach). */
+static void transient_attach(ApexProject *p, size_t *nl, size_t *ne) {
+    size_t i;
+    *nl = p->config_labels.count;
+    *ne = p->config_entries.count;
+    if (p->transient_labels.count) {
+        size_t need = p->config_labels.count + p->transient_labels.count;
+        if (need > p->config_labels.cap) {
+            ConfigLabel *n = realloc(p->config_labels.items, need * sizeof(*n));
+            if (!n)
+                return;
+            p->config_labels.items = n;
+            p->config_labels.cap = need;
+        }
+        for (i = 0; i < p->transient_labels.count; i++)
+            p->config_labels.items[p->config_labels.count++] = p->transient_labels.items[i];
+    }
+    if (p->transient_entries.count) {
+        size_t need = p->config_entries.count + p->transient_entries.count;
+        if (need > p->config_entries.cap) {
+            ConfigEntry *n = realloc(p->config_entries.items, need * sizeof(*n));
+            if (!n)
+                return;
+            p->config_entries.items = n;
+            p->config_entries.cap = need;
+        }
+        for (i = 0; i < p->transient_entries.count; i++)
+            p->config_entries.items[p->config_entries.count++] = p->transient_entries.items[i];
+    }
+}
+
+static void transient_detach(ApexProject *p, size_t nl, size_t ne) {
+    p->config_labels.count = nl;
+    p->config_entries.count = ne;
+}
+
+static int analyze_impl(ApexProject *project);
+
 int apex_project_analyze(ApexProject *project) {
+    size_t nl, ne;
     if (!project) {
         return 1;
     }
+    transient_attach(project, &nl, &ne);
+    int rc = analyze_impl(project);
+    transient_detach(project, nl, ne);
+    return rc;
+}
+
+void apex_project_set_transient(ApexProject *p, const ConfigLabels *labels,
+                                const ConfigEntries *entries) {
+    size_t i;
+    for (i = 0; i < p->transient_labels.count; i++) {
+        char **n = realloc(p->transient_names, (p->transient_name_count + 1u) * sizeof(*n));
+        if (!n)
+            break;
+        p->transient_names = n;
+        n[p->transient_name_count++] = p->transient_labels.items[i].name;
+    }
+    free(p->transient_labels.items);
+    free(p->transient_entries.items);
+    memset(&p->transient_labels, 0, sizeof(p->transient_labels));
+    memset(&p->transient_entries, 0, sizeof(p->transient_entries));
+    if (labels && labels->count) {
+        p->transient_labels.items = xmalloc(labels->count * sizeof(ConfigLabel));
+        for (i = 0; i < labels->count; i++) {
+            p->transient_labels.items[i] = labels->items[i];
+            size_t l = strlen(labels->items[i].name);
+            p->transient_labels.items[i].name = xmalloc(l + 1u);
+            memcpy(p->transient_labels.items[i].name, labels->items[i].name, l + 1u);
+        }
+        p->transient_labels.count = p->transient_labels.cap = labels->count;
+    }
+    if (entries && entries->count) {
+        p->transient_entries.items = xmalloc(entries->count * sizeof(ConfigEntry));
+        memcpy(p->transient_entries.items, entries->items, entries->count * sizeof(ConfigEntry));
+        p->transient_entries.count = p->transient_entries.cap = entries->count;
+    }
+    apex_project_invalidate(p, APEX_DIRTY_ANALYSIS);
+}
+
+int apex_project_is_transient_label(const ApexProject *p, uint8_t bank, uint32_t addr) {
+    size_t i;
+    for (i = 0; i < p->transient_labels.count; i++) {
+        const ConfigLabel *l = &p->transient_labels.items[i];
+        if (l->addr == addr && (l->has_bank ? l->bank : 0xffu) == bank)
+            return 1;
+    }
+    for (i = 0; i < p->transient_entries.count; i++) {
+        const ConfigEntry *e = &p->transient_entries.items[i];
+        if (e->addr == addr && (e->has_bank ? e->bank : 0xffu) == bank)
+            return 1;
+    }
+    return 0;
+}
+
+static int analyze_impl(ApexProject *project) {
     if (project->analysis_ready && !(project->dirty_flags & APEX_DIRTY_ANALYSIS)) {
         return 0;
     }
@@ -2328,6 +2408,12 @@ typedef struct {
     SpecKind kind;
     const char *spec;
     int rc;
+    /* the scratch config the spec is parsed into: owned here, so validate_spec
+       frees it even when a parse error longjmps out of spec_check_run */
+    DataRanges ranges;
+    TableDefs tables;
+    InlineSignatures sigs;
+    ConfigTypes types;
 } SpecCheck;
 
 static void spec_check_run(void *ctx) {
@@ -2335,31 +2421,20 @@ static void spec_check_run(void *ctx) {
     const ApexProject *p = c->project;
 
     switch (c->kind) {
-    case SPEC_DATA: {
-        DataRanges r = {0};
-        c->rc = config_set_data_spec(&r, 0x20, 0x4000, c->spec);
-        free(r.items);
+    case SPEC_DATA:
+        c->rc = config_set_data_spec(&c->ranges, 0x20, 0x4000, c->spec);
         break;
-    }
-    case SPEC_TABLE: {
-        TableDefs t = {0};
-        c->rc = config_set_table_spec(&t, &p->schemas, 0x20, 0x4000, c->spec, &p->config_types);
-        free_table_defs(&t);
+    case SPEC_TABLE:
+        c->rc =
+            config_set_table_spec(&c->tables, &p->schemas, 0x20, 0x4000, c->spec, &p->config_types);
         break;
-    }
-    case SPEC_INLINE: {
-        InlineSignatures sigs = {0};
-        c->rc = config_set_inline_spec(&sigs, 1, 0x20, 0x4000, c->spec, &p->config_types);
-        free_inline_signatures(&sigs);
+    case SPEC_INLINE:
+        c->rc = config_set_inline_spec(&c->sigs, 1, 0x20, 0x4000, c->spec, &p->config_types);
         break;
-    }
-    case SPEC_TYPE_VALUES: {
-        ConfigTypes types = {0};
-        config_set_type(&types, "_check", TABLE_WORD, c->spec);
-        free_config_types(&types);
+    case SPEC_TYPE_VALUES:
+        config_set_type(&c->types, "_check", TABLE_WORD, c->spec);
         c->rc = 0;
         break;
-    }
     }
 }
 
@@ -2367,12 +2442,18 @@ static void spec_check_run(void *ctx) {
 static int validate_spec(ApexProject *project, SpecKind kind, const char *spec) {
     SpecCheck c;
 
+    memset(&c, 0, sizeof(c));
     c.project = project;
     c.kind = kind;
     c.spec = spec;
     c.rc = 1;
     project->last_error[0] = '\0';
-    if (apex_try(spec_check_run, &c, project->last_error, sizeof(project->last_error)) != 0) {
+    int failed = apex_try(spec_check_run, &c, project->last_error, sizeof(project->last_error));
+    free(c.ranges.items);
+    free_table_defs(&c.tables);
+    free_inline_signatures(&c.sigs);
+    free_config_types(&c.types);
+    if (failed != 0) {
         return 1;
     }
     if (c.rc != 0) {

@@ -50,13 +50,13 @@ labels_are_entries = false
 | `min_immediate_symbol` | `0x0000` | When non-zero, a `[symbols]` equate whose value is **below** this threshold is not resolved inside an **immediate** operand (`LDX #0x0014` stays a literal instead of showing `LDX #TEXT_FIELD`). Address operands (`LDA <SYM`) still resolve. Use it when small RAM/ASIC field symbols collide with counts, masks, or text numbers. |
 | `reference_counts` | `false` | Prefix each `; referenced_by` comment with the number of referencing sites — `; referenced_by (2105) …` — for prioritising the busiest routines. |
 | `hex_index_offsets` | `false` | Render 5-bit indexed offsets in hex (`LDD 0xf,U`, `-0x10,U`) to match the 8/16-bit forms, instead of signed decimal (`LDD 15,U`). The hex is emitted in minimal (no-leading-zero) form so it still re-assembles to the compact 5-bit postbyte. |
-| `instruction_addresses` | `false` | Emit a `; addr Bxx_Ayyyy` comment before every instruction, so `[literals]` / `[far_imm]` / `[imm_types]` entries can be keyed by exact address. (`apexdis --addr` forces this on for one run.) |
+| `instruction_addresses` | `false` | Emit a `; addr Bxx_Ayyyy` comment before every instruction, so `[literals]` / `[far_imm]` entries can be keyed by exact address. (`apexdis --addr` forces this on for one run.) |
 | `far_code_allow_null` | `false` | Treat a `0x0000` inline far-code pointer as the regular "no body" case — emit it plainly with no `inline_far_code_invalid` warning. |
 | `report_code_in_data` | `false` | Report-only: scan every `[data]` range for a `JSR`/`JMP`-extended opcode whose operand lands on a known routine (mislabelled code the flow analysis never reached), emitting `; WARNING code_in_data …`. See [Warnings](#warnings). |
 | `check_inline_length` | `false` | Warn when an `[inline]` length disagrees with the routine's `LDU ,S` / `LEAU N,U` / `STU ,S` return-address fixup (`; WARNING inline_length_mismatch …`) — catches a wrong inline length that would silently hide code. |
 | `report_dmd_short` | `false` | Warn when a `dmd_fullframe` range decodes to fewer bytes than the gap to the next data range **and** that gap is filled exactly by further whole planes (`; WARNING dmd_decode_short …`) — flags a 4-colour frame classified with too few planes (fix it with `dmd_fullframe[N]`). |
 
-Recommended: keep the defaults so that labels and code classification are independent and existing output is unchanged. Every option above is opt-in and off by default; the GUI toggles them under **Analysis options** in the Symbols panel, persisting them to the `.apexgui.ini` overlay.
+Recommended: keep the defaults so that labels and code classification are independent and existing output is unchanged. Every option above is opt-in and off by default; the GUI toggles them under **Analysis options** in the Symbols panel, persisting them to the `<config>.apeximgui.ini` overlay.
 
 ### `[labels]`
 
@@ -83,7 +83,7 @@ Classifies addresses as code entry points, causing the disassembler to recursive
 B38_A5100 = code
 ```
 
-The value must be `code` or may be left empty. When `labels_are_entries = false`, this is the only way to classify addresses as code other than following flow from reset vectors.
+The value must be `code` (or `entry`) or may be left empty. When `labels_are_entries = false`, this is the only way to classify addresses as code other than following flow from reset vectors.
 
 ### `[exclude_refs]`
 
@@ -171,7 +171,10 @@ Examples:
 0x8990 = far_code
 0x8123 = ptr16_data, far_data, ptr16_code, word, byte[2]
 B20_A4006 = byte
+0x8456 = far_code, flow_stop
 ```
+
+A trailing `flow_stop` token marks the routine as a tail-call helper that never returns to its caller: after the inline arguments, decoding stops instead of running on into whatever follows (e.g. `JMP_Far`-style dispatchers).
 
 Using a named type as the field kind annotates the emitted `INLINE_BYTE` or `INLINE_WORD` with the enum name (see [`[types]`](#types)):
 
@@ -375,6 +378,36 @@ B39_A4426 = "Row 1: replay level."            ; on the row at 0x4426 (header + 1
 ```
 
 The row doc renders as a `; doc …` comment on that row's `TABLE_*` line.
+
+**Typed register arguments (`@args`).** A routine doc may declare which registers carry a typed argument, using names from [`[types]`](#types):
+
+```ini
+[types]
+TYPE_SWITCH:byte = 0x2c:LEFT_RAMP
+
+[docs]
+Bff_A9123 = "Tests a switch. @args A:TYPE_SWITCH"
+Bff_A9200 = "@args A:TYPE_SWITCH, B:TYPE_LAMP"
+```
+
+Registers are `A`, `B`, `D`, `X`, `Y`, `U`; items are separated by commas or blanks and end at the end of the line. Every call (`JSR`/`BSR`/`LBSR`, or a tail `JMP`/`BRA`) of the routine is traced back through its basic block to the immediate load of the register (`LDA/LDB/LDD/LDX/LDY/LDU #imm`, `CLRA`, `CLRB`). A call through a far-call helper — an `[inline]` signature with a `far_code` field — counts as a call of the far target. The trace gives up at a label (branch target), at any other call and at any instruction that may change the register, so only certain values are reported. The load then renders with the enum equate and a note, and still reassembles to the same bytes:
+
+```asm
+    LDA #TYPE_SWITCH_LEFT_RAMP               ; arg A=LEFT_RAMP for Switch_Test
+    JSR Switch_Test
+    LDA #0x10                                ; arg A=TYPE_SWITCH:0x10 for Switch_Test
+```
+
+`apexini args <rom> <file.ini>` lists all typed values with their call sites — these register arguments plus every named-type `[inline]` field — and `apeximgui` shows the same in **Windows → Argument Values** (pick a type, select a value to see its sites, name the value, or add an `@args` declaration to the routine under the cursor). Only the first `@args` of a doc is read, and it ends at the first item that is not `REG:TYPE`.
+
+**Bit routines (`@bits`, `@bitop`).** The bit map (`apexini bits`, **Windows → Bit Map**) finds the OS's lamp / flag bit routines by their wrappers. In a bit routine's doc, `@bits 0x48:TYPE_FLAG` names the bits of matrix `0x48` (the B code; any C number form) with the values of a `[types]` type — for the sites whose wrapper declares no type of its own; several `@bits` may follow each other, the type name ends at a blank, `,` or `;`. `@bitop NAME` names the routine's operation (on, off, toggle, test ...) for the Bit Map window's column headers; without it the column shows a keyword of the routine's label (on / off / set / clear / toggle / test / query) or "test" for a routine whose callers branch on the result:
+
+```ini
+[docs]
+Bff_A9faa = "Turns a bit on. @bitop on @bits 0x48:TYPE_FLAG"
+```
+
+The Bit Map window writes `@bits` itself when a type is picked for a matrix or a bit is named.
 
 **RAM / ASIC addresses.** A doc on an address that is not part of the ROM (RAM and ASIC I/O, `0x0000`–`0x3fff`) would otherwise have no disassembly line to attach to. Such docs are emitted near the top of the output instead:
 

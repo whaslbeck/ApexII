@@ -55,7 +55,7 @@ void collect_vectors(const uint8_t *system, VectorInfo *vectors, size_t count) {
    time: O(instructions x labels) per pass.  This chained hash keeps those
    lookups O(1).  It is built lazily, extended for appended items, and dropped
    (label_set_invalidate_index) wherever items are reordered or removed. */
-#define LABEL_INDEX_NONE ((size_t) - 1)
+#define LABEL_INDEX_NONE ((size_t)-1)
 
 struct LabelAddrIndex {
     size_t nbuckets; /* power of two */
@@ -723,7 +723,7 @@ const char *config_doc_at(const ConfigDocs *docs, uint8_t bank, uint32_t addr) {
     return NULL;
 }
 
-int doc_addr_cmp(const void *pa, const void *pb) {
+static int doc_addr_cmp(const void *pa, const void *pb) {
     const ConfigDoc *a = (const ConfigDoc *)pa, *b = (const ConfigDoc *)pb;
     if (a->addr != b->addr)
         return a->addr < b->addr ? -1 : 1;

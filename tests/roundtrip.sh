@@ -1378,3 +1378,375 @@ else
     printf 'FAIL inline_detect\n%s\n' "$idt_report" >&2
     exit 1
 fi
+
+# apexini hooks: the game-hook table at 0x8001 is found up to the first invalid
+# far pointer, RTS targets count as unused, and only the dominant far-call
+# helper (plus LDX #slot) yields call sites.  Every real ROM has such a table
+# with exactly one helper.
+hk_rom="$OUT/wpc_hooks.rom"
+"$ROOT/build/apexasm" "$hk_rom" "$ROOT/tests/wpc_hooks.asm"
+hk_report=$("$ROOT/build/apexini" hooks "$hk_rom")
+hk_all=$("$ROOT/build/apexini" hooks "$hk_rom" --all)
+hk_ok=1
+printf '%s\n' "$hk_report" |
+    grep -q '^hook table: Bff_A8001, 9 slot(s), 7 unused (RTS), 4 call site(s)$' || hk_ok=0
+printf '%s\n' "$hk_report" | grep -q '^helper: Bff_A8038$' || hk_ok=0
+printf '%s\n' "$hk_report" | grep -q '^  0   Bff_A8001  B30_A4001 .* 2  ' || hk_ok=0
+printf '%s\n' "$hk_report" | grep -q '^  2   Bff_A8007  B30_A4003 .* 2  ' || hk_ok=0
+printf '%s\n' "$hk_report" | grep -q ' rts ' && hk_ok=0
+[ "$(printf '%s\n' "$hk_all" | grep -c ' rts ')" = 7 ] || hk_ok=0
+for rom in "$ROOT"/roms/*; do
+    [ -f "$rom" ] || continue
+    r=$("$ROOT/build/apexini" hooks "$rom")
+    if ! printf '%s\n' "$r" | grep -q '^hook table: Bff_A8001, [0-9]* slot' ||
+       [ "$(printf '%s\n' "$r" | grep -c '^helper: ')" != 1 ]; then
+        printf 'hooks: no table/helper in %s\n' "$rom" >&2
+        hk_ok=0
+    fi
+done
+if [ "$hk_ok" = 1 ]; then
+    printf 'PASS wpc_hooks\n'
+else
+    printf 'FAIL wpc_hooks\n%s\n' "$hk_report" >&2
+    exit 1
+fi
+
+# Typed arguments: an '@args' doc traces each call to its immediate load (enum
+# equate + arg note), an unnamed value keeps the raw operand, INCA and a branch
+# target cut the trace, LDD feeds A and B, a far-call helper resolves to its
+# far target, typed inline fields are listed by apexini args; the listing still
+# round-trips byte for byte.
+ta_rom="$OUT/typed_args.rom"
+ta_asm="$OUT/typed_args.disasm"
+"$ROOT/build/apexasm" "$ta_rom" "$ROOT/tests/typed_args.asm"
+"$ROOT/build/apexdis" "$ta_rom" "$ta_asm" "$ROOT/tests/typed_args.ini"
+ta_report=$("$ROOT/build/apexini" args "$ta_rom" "$ROOT/tests/typed_args.ini")
+ta_ok=1
+grep -q 'LDA #TYPE_SWITCH_LEFT_RAMP  *; arg A=LEFT_RAMP for SwitchTest$' "$ta_asm" || ta_ok=0
+grep -q 'LDA #0x10  *; arg A=TYPE_SWITCH:0x10 for SwitchTest$' "$ta_asm" || ta_ok=0
+grep -q 'LDD #0x2c05  *; arg A=LEFT_RAMP for SwitchLamp, arg B=LOCK_LIT for SwitchLamp$' \
+    "$ta_asm" || ta_ok=0
+grep -q 'LDA #TYPE_SWITCH_LEFT_RAMP  *; arg A=LEFT_RAMP for PagedSwitch$' "$ta_asm" || ta_ok=0
+[ "$(grep -c '; arg ' "$ta_asm")" = 4 ] || ta_ok=0
+[ "$(grep -c '^    LDA #0x2c$' "$ta_asm")" = 2 ] || ta_ok=0
+printf '%s\n' "$ta_report" | grep -q '^TYPE_SWITCH 0x2c LEFT_RAMP  3 site(s)$' || ta_ok=0
+printf '%s\n' "$ta_report" | grep -q '^TYPE_LAMP 0x05 LOCK_LIT  2 site(s)$' || ta_ok=0
+printf '%s\n' "$ta_report" | grep -q '^    inline Bff_A8029  call Bff_A8026 -> LampOn' || ta_ok=0
+if [ "$ta_ok" = 1 ] &&
+   "$ROOT/build/apexasm" "$OUT/typed_args.rebuilt" "$ta_asm" &&
+   cmp -s "$ta_rom" "$OUT/typed_args.rebuilt"; then
+    printf 'PASS typed_args\n'
+else
+    printf 'FAIL typed_args\n%s\n' "$ta_report" >&2
+    exit 1
+fi
+
+# Bit map: two bit routines found by their inline wrappers, an A wrapper and a
+# direct call with B/A loads; flags named by '@bits 0x48:TYPE_FLAG'.
+"$ROOT/build/apexasm" "$OUT/bits.rom" "$ROOT/tests/bits.asm" >/dev/null
+bm_report=$("$ROOT/build/apexini" bits "$OUT/bits.rom" "$ROOT/tests/bits.ini")
+bm_ok=1
+for want in '  [0] Bff_A801d BitOn  (2 inline wrappers)' '  [1] Bff_A801e BitTest  (2 inline wrappers)' \
+            'wrappers: 5' 'matrix 0x00 bit 0x11   1 site(s)' \
+            'matrix 0x48 bit 0x05 FLAG_BALL_SAVE  2 site(s)' '    [1] Bff_A8004  in ENTRY_SWI3' \
+            'matrix 0x48 bit 0x07 FLAG_MULTIBALL  2 site(s)' '    [0] Bff_A800e  in ENTRY_SWI3' \
+            'matrix 0x48 bit 0x09   1 site(s)'; do
+    printf '%s\n' "$bm_report" | grep -qxF -- "$want" || { bm_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# Routine card: extent, inline payloads skipped, callees with counts, callers.
+rc_start=$("$ROOT/build/apexini" card "$OUT/bits.rom" "$ROOT/tests/bits.ini" Start)
+rc_a=$("$ROOT/build/apexini" card "$OUT/bits.rom" "$ROOT/tests/bits.ini" FlagOnA)
+for want in 'routine ENTRY_SWI3  Bff_A8000-A801d  10 instructions, 1 return(s)' '  FlagOn x2' \
+            '  BitOn x1' 'calls: 5'; do
+    printf '%s\n' "$rc_start" | grep -qxF -- "$want" || { bm_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+printf '%s\n' "$rc_a" | grep -qxF '  Bff_A800e ENTRY_SWI3' || { bm_ok=0; echo "card caller" >&2; }
+if [ "$bm_ok" = 1 ]; then
+    printf 'PASS bit_map\n'
+else
+    printf 'FAIL bit_map\n%s\n%s\n' "$bm_report" "$rc_start" >&2
+    exit 1
+fi
+
+# Adjustment names from the text tables: standard (0x80 + n) and feature (n)
+# tables found by content, also with the feature table given.
+if [ -f "$ROOT/roms/addam_h4.rom" ]; then
+    an_report=$("$ROOT/build/apexini" adjnames "$ROOT/roms/addam_h4.rom")
+    an_ok=1
+    for want in ';   B38_A4f7f   79  BALLS PER GAME         <- standard adjustments' \
+                ';   B32_A5c05   33  EX. BALL PERCENT       <- feature adjustments' \
+                '	0x81:BALLS_PER_GAME' '	0x83:MAX_E_B_COUNT' '	0x15:DISABLE_BOOKCASE' \
+                'TYPE_STD_AUDIT:byte =' 'TYPE_FEATURE_AUDIT:byte ='; do
+        printf '%s\n' "$an_report" | grep -qxF -- "$want" || { an_ok=0; printf 'missing: %s\n' "$want" >&2; }
+    done
+    "$ROOT/build/apexini" adjnames "$ROOT/roms/addam_h4.rom" --feature B32_A60b2 |
+        grep -qxF ';   B32_A60b2   33  EX. BALL PERCENT       <- feature adjustments' || an_ok=0
+    if [ "$an_ok" = 1 ]; then
+        printf 'PASS adjnames\n'
+    else
+        printf 'FAIL adjnames\n' >&2
+        exit 1
+    fi
+fi
+
+# apexpatch: bytes / nop / asm-in-place / asm-in-free-space ops (with a forward
+# reference between ops) reproduce a hand-written reference image; every error
+# kind is reported; pin adds expect guards + CRC and keeps notes and code; a
+# wrong base CRC refuses to build; checksum = fix yields a valid checksum.
+pt_dir="$OUT/patch"
+rm -rf "$pt_dir"
+mkdir -p "$pt_dir"
+"$ROOT/build/apexasm" "$pt_dir/patch_base.rom" "$ROOT/tests/patch_base.asm"
+"$ROOT/build/apexasm" "$pt_dir/patch_expected.rom" "$ROOT/tests/patch_expected.asm"
+cp "$ROOT/tests/patch_base.ini" "$ROOT/tests/patch_ops.patch.ini" \
+    "$ROOT/tests/patch_errors.patch.ini" "$pt_dir/"
+pt_ok=1
+pt_check=$("$ROOT/build/apexpatch" check "$pt_dir/patch_ops.patch.ini") || pt_ok=0
+printf '%s\n' "$pt_check" | grep -q '^4 op(s), 0 error(s), 3 warning(s)$' || pt_ok=0
+printf '%s\n' "$pt_check" | grep -q 'call_new .*1 NOP byte(s) pad' || pt_ok=0
+printf '%s\n' "$pt_check" | grep -q 'new_code .*0x9000 is not inside analysed code' || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/patch_ops.patch.ini" -o "$pt_dir/patched.rom" \
+    >/dev/null || pt_ok=0
+cmp -s "$pt_dir/patched.rom" "$pt_dir/patch_expected.rom" || pt_ok=0
+pt_err=$("$ROOT/build/apexpatch" check "$pt_dir/patch_errors.patch.ini") && pt_ok=0
+for want in 'ERROR mid_insn .*inside an instruction' \
+            'ERROR wrong_expect .*original bytes are b7, expect says 99' \
+            'ERROR overlap .*overlaps op .first.' \
+            "ERROR unknown .*unknown label 'NoSuchLabel'" \
+            '^off   off ' \
+            'ERROR too_big .*code is 3 bytes, but only 2 are replaced' \
+            'warn  foreign .*PagedRoutine (bank 0x30), not mapped' \
+            '^8 op(s), 5 error(s), 1 warning(s)$'; do
+    printf '%s\n' "$pt_err" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+cp "$pt_dir/patch_ops.patch.ini" "$pt_dir/pinned.patch.ini"
+"$ROOT/build/apexpatch" pin "$pt_dir/pinned.patch.ini" | grep -q '^4 guard(s) added$' || pt_ok=0
+grep -q '^base_crc32 = 0x' "$pt_dir/pinned.patch.ini" || pt_ok=0
+grep -q '^expect = 81 0a$' "$pt_dir/pinned.patch.ini" || pt_ok=0
+grep -q '^expect = bd 81 20 42$' "$pt_dir/pinned.patch.ini" || pt_ok=0
+grep -q 'note = "new routine in free space; ; and \\"quotes\\" survive"' \
+    "$pt_dir/pinned.patch.ini" || pt_ok=0
+grep -q '^    | JSR NewThing          ; replaces JSR Helper' "$pt_dir/pinned.patch.ini" || pt_ok=0
+grep -q '^; NOP out the compare in Check$' "$pt_dir/pinned.patch.ini" || pt_ok=0
+"$ROOT/build/apexpatch" check "$pt_dir/pinned.patch.ini" | grep -q 'no expect guard' && pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/pinned.patch.ini" -o "$pt_dir/pinned.rom" >/dev/null &&
+    cmp -s "$pt_dir/pinned.rom" "$pt_dir/patch_expected.rom" || pt_ok=0
+sed 's/^base_crc32 = .*/base_crc32 = 0x12345678/' "$pt_dir/pinned.patch.ini" \
+    > "$pt_dir/badcrc.patch.ini"
+"$ROOT/build/apexpatch" check "$pt_dir/badcrc.patch.ini" | grep -q 'expects 12345678' || pt_ok=0
+sed 's/^checksum = keep/checksum = fix/' "$pt_dir/pinned.patch.ini" > "$pt_dir/fix.patch.ini"
+"$ROOT/build/apexpatch" build "$pt_dir/fix.patch.ini" -o "$pt_dir/fix.rom" >/dev/null &&
+    "$ROOT/build/apexmeta" "$pt_dir/fix.rom" --verify || pt_ok=0
+# P2: RAM variable, allocation behind a reserve, detour hook, far pointer to
+# patch code; pin pins the allocations; every allocation error is reported.
+"$ROOT/build/apexasm" "$pt_dir/patch_p2_expected.rom" "$ROOT/tests/patch_p2_expected.asm"
+cp "$ROOT/tests/patch_p2.patch.ini" "$ROOT/tests/patch_p2_errors.patch.ini" "$pt_dir/"
+"$ROOT/build/apexpatch" build "$pt_dir/patch_p2.patch.ini" -o "$pt_dir/p2.rom" >/dev/null &&
+    cmp -s "$pt_dir/p2.rom" "$pt_dir/patch_p2_expected.rom" || pt_ok=0
+"$ROOT/build/apexpatch" pin "$pt_dir/patch_p2.patch.ini" >/dev/null || pt_ok=0
+grep -q '^placed = Bff_A8016$' "$pt_dir/patch_p2.patch.ini" || pt_ok=0
+grep -q '^placed = Bff_A801c$' "$pt_dir/patch_p2.patch.ini" || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/patch_p2.patch.ini" -o "$pt_dir/p2b.rom" >/dev/null &&
+    cmp -s "$pt_dir/p2b.rom" "$pt_dir/patch_p2_expected.rom" || pt_ok=0
+"$ROOT/build/apexpatch" map "$pt_dir/patch_p2.patch.ini" |
+    grep -q '^  Bff_A8025    219 byte(s)  interior$' || pt_ok=0
+pt_p2err=$("$ROOT/build/apexpatch" check "$pt_dir/patch_p2_errors.patch.ini") && pt_ok=0
+for want in "ERROR pcrel .*PC-relative" "ERROR nobank .*no such bank" \
+            'ERROR taken .*no longer free' 'ERROR wrongbank .*that bank or the system bank' \
+            "ERROR ram_b .*overlaps RAM variable 'VarA'" '^6 op(s), 5 error(s), 0 warning(s)$'; do
+    printf '%s\n' "$pt_p2err" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# P3: typed value, string shift / in place / relocate with their references
+# rewritten, a far-referenced block moved to another bank; pin guards the old
+# string; every data-op error is reported.
+"$ROOT/build/apexasm" "$pt_dir/patch_data.rom" "$ROOT/tests/patch_data.asm"
+"$ROOT/build/apexasm" "$pt_dir/patch_data_expected.rom" "$ROOT/tests/patch_data_expected.asm"
+cp "$ROOT/tests/patch_data.ini" "$ROOT/tests/patch_data.patch.ini" \
+    "$ROOT/tests/patch_data_errors.patch.ini" "$pt_dir/"
+"$ROOT/build/apexpatch" build "$pt_dir/patch_data.patch.ini" -o "$pt_dir/data.rom" >/dev/null &&
+    cmp -s "$pt_dir/data.rom" "$pt_dir/patch_data_expected.rom" || pt_ok=0
+pt_ddiff=$("$ROOT/build/apexpatch" diff "$pt_dir/patch_data.patch.ini")
+for want in 'ref Bff_A8102 table row 1  word Bff_A810c -> Bff_A810e  ok' \
+            'ref Bff_A800f code         word Bff_A8204 -> Bff_A8014  ok' \
+            'ref Bff_A820b table row 0  far  B30_A4001 -> B31_A4002  ok'; do
+    printf '%s\n' "$pt_ddiff" | grep -qF "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+"$ROOT/build/apexpatch" pin "$pt_dir/patch_data.patch.ini" >/dev/null || pt_ok=0
+grep -q '^expect = 48 45 4c 4c 4f 00$' "$pt_dir/patch_data.patch.ini" || pt_ok=0
+grep -q '^placed = B31_A4002$' "$pt_dir/patch_data.patch.ini" || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/patch_data.patch.ini" -o "$pt_dir/data2.rom" >/dev/null &&
+    cmp -s "$pt_dir/data2.rom" "$pt_dir/patch_data_expected.rom" || pt_ok=0
+pt_derr=$("$ROOT/build/apexpatch" check "$pt_dir/patch_data_errors.patch.ini") && pt_ok=0
+for want in 'ERROR too_long .*needs 7 byte(s), the old one has 4' \
+            'ERROR no_room .*are not free' 'ERROR far_away .*cannot be rewritten automatically' \
+            'warn  far_away_ok .*1 reference(s) need a manual fix' \
+            'ERROR big .*does not fit in 1 byte' 'ERROR farval .*needs a label' \
+            'ERROR umlaut .*0xc3 cannot be part of a string' '^7 op(s), 6 error(s), 1 warning(s)$'; do
+    printf '%s\n' "$pt_derr" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# P4: DMD frames from a PBM (in place; grown and relocated behind its far
+# pointer) and a 4-level PGM (2 planes); a blob allocated under a label that a
+# ptr op uses; the frames decode back to the images; asset-op errors.
+"$ROOT/build/apexasm" "$pt_dir/patch_dmd.rom" "$ROOT/tests/patch_dmd.asm"
+cp "$ROOT/tests/patch_dmd.ini" "$ROOT/tests/patch_dmd.patch.ini" \
+    "$ROOT/tests/patch_dmd_errors.patch.ini" "$ROOT/tests/patch_dmd_a.pbm" \
+    "$ROOT/tests/patch_dmd_b.pgm" "$ROOT/tests/patch_blob.bin" "$pt_dir/"
+{ printf 'P5\n8 8\n255\n'; head -c 64 /dev/zero; } >"$pt_dir/patch_dmd_small.pgm"
+"$ROOT/build/apexpatch" build "$pt_dir/patch_dmd.patch.ini" -o "$pt_dir/dmd.rom" >/dev/null ||
+    pt_ok=0
+pt_mdiff=$("$ROOT/build/apexpatch" diff "$pt_dir/patch_dmd.patch.ini")
+for want in 'frame from patch_dmd_a.pbm: 513 -> 488 byte(s), inplace' \
+            'ref Bff_A8007 table row 1  far  B30_A4202 -> B30_A421b  ok' \
+            'ref Bff_A800a table row 2  far  B30_A420a -> B30_A4403  ok' \
+            'patch_blob.bin: 16 byte(s) at B31_A4002'; do
+    printf '%s\n' "$pt_mdiff" | grep -qF "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+for a in B30_A4001 B30_A421b; do
+    "$ROOT/build/apexdmd" "$pt_dir/dmd.rom" "$a" "$pt_dir/dmd_$a.pbm" >/dev/null &&
+        cmp -s "$pt_dir/dmd_$a.pbm" "$ROOT/tests/patch_dmd_a.pbm" || pt_ok=0
+done
+"$ROOT/build/apexdmd" --pair "$pt_dir/dmd.rom" B30_A4403 B30_A44b0 "$pt_dir/dmd_pair.pgm" \
+    >/dev/null && cmp -s "$pt_dir/dmd_pair.pgm" "$ROOT/tests/patch_dmd_b_pair.pgm" || pt_ok=0
+[ "$(od -An -tx1 -j $((0x38020)) -N3 "$pt_dir/dmd.rom" | tr -d ' ')" = 400231 ] || pt_ok=0
+# the relocated frames' old places are cleared and free again
+[ "$(od -An -tx1 -j $((0x202)) -N24 "$pt_dir/dmd.rom" | tr -d ' \n')" = "$(printf 'ff%.0s' $(seq 24))" ] ||
+    pt_ok=0
+"$ROOT/build/apexpatch" map "$pt_dir/patch_dmd.patch.ini" | grep -q 'B30_A4202' || pt_ok=0
+"$ROOT/build/apexpatch" pin "$pt_dir/patch_dmd.patch.ini" >/dev/null || pt_ok=0
+grep -q '^expect = 02 01 01 00 00 01 00 00$' "$pt_dir/patch_dmd.patch.ini" || pt_ok=0
+grep -q '^placed = B31_A4002$' "$pt_dir/patch_dmd.patch.ini" || pt_ok=0
+[ "$(grep -c '^expect = ' "$pt_dir/patch_dmd.patch.ini")" = 4 ] || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/patch_dmd.patch.ini" -o "$pt_dir/dmd2.rom" >/dev/null &&
+    cmp -s "$pt_dir/dmd2.rom" "$pt_dir/dmd.rom" || pt_ok=0
+pt_merr=$("$ROOT/build/apexpatch" check "$pt_dir/patch_dmd_errors.patch.ini") && pt_ok=0
+for want in 'ERROR too_big .*needs 488 byte(s), the old one has 8' \
+            'ERROR not_image .*not a PNG, PBM or PGM image' 'ERROR wrong_size .*is 8x8' \
+            'ERROR no_frame .*no 1-plane DMD fullframe' 'ERROR no_file .*cannot open' \
+            '^5 op(s), 5 error(s), 0 warning(s)$'; do
+    printf '%s\n' "$pt_merr" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# branch / redirect: an inverted branch, a call to another routine and one to
+# patch code (warned: the old target skipped an inline byte); errors.
+cp "$ROOT/tests/patch_branch.patch.ini" "$ROOT/tests/patch_branch_errors.patch.ini" "$pt_dir/"
+pt_br=$("$ROOT/build/apexpatch" build "$pt_dir/patch_branch.patch.ini" -o "$pt_dir/branch.rom") ||
+    pt_ok=0
+printf '%s\n' "$pt_br" | grep -q 'call2 .*the old target takes inline argument' || pt_ok=0
+[ "$(od -An -tx1 -j $((0x38005)) -N14 "$pt_dir/branch.rom" | tr -d ' \n')" = \
+  "bd812027f6bd801242c60139ff39" ] || { pt_ok=0; echo "branch bytes" >&2; }
+pt_berr=$("$ROOT/build/apexpatch" check "$pt_dir/patch_branch_errors.patch.ini") && pt_ok=0
+for want in 'ERROR not_branch .*no conditional branch' 'ERROR bad_mode .*always, never or invert' \
+            'ERROR too_far .*a short branch reaches' 'ERROR other_bank .*not mapped' \
+            'ERROR no_jump .*has no direct target' '^5 op(s), 5 error(s), 0 warning(s)$'; do
+    printf '%s\n' "$pt_berr" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# Sprite ops: a mono sprite grows and moves behind its 16-bit pointer, a
+# 4-level image fills a 0xFF sprite in place and a 0xFE sprite (its second
+# plane rewritten behind the pointer), a wider no-header image moves; errors.
+"$ROOT/build/apexasm" "$pt_dir/patch_sprite.rom" "$ROOT/tests/patch_sprite.asm" >/dev/null
+cp "$ROOT/tests/patch_sprite.ini" "$ROOT/tests/patch_sprite.patch.ini" \
+    "$ROOT/tests/patch_sprite_errors.patch.ini" "$ROOT/tests/patch_sprite_mono.pbm" \
+    "$ROOT/tests/patch_sprite_4.pgm" "$ROOT/tests/patch_sprite_nh.pbm" "$pt_dir/"
+"$ROOT/build/apexpatch" build "$pt_dir/patch_sprite.patch.ini" -o "$pt_dir/sprite.rom" \
+    >/dev/null || pt_ok=0
+[ "$(od -An -tx1 -j $((0x38004)) -N55 "$pt_dir/sprite.rom" | tr -d ' \n')" = \
+  "802b8013801c8036ffffffffffffffff00000208336655aafe00000208802855aaffffff3366ff0001020310aacc5533ffff0ce3801c70" ] ||
+    { pt_ok=0; echo "sprite bytes" >&2; }
+pt_serr=$("$ROOT/build/apexpatch" check "$pt_dir/patch_sprite_errors.patch.ini") && pt_ok=0
+for want in 'ERROR resize_fe .*a 0xFE sprite keeps its size' \
+            'ERROR height .*images are 2' 'ERROR not_sprite .*no sprite at Start' \
+            '^3 op(s), 3 error(s), 0 warning(s)$'; do
+    printf '%s\n' "$pt_serr" | grep -q "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# P5: IPS / BPS export applied to the base ROM gives the built ROM; a BPS for
+# another ROM is refused; the Markdown report lists ops, references, symbols.
+for x in ips bps; do
+    "$ROOT/build/apexpatch" export "$pt_dir/patch_dmd.patch.ini" "$pt_dir/dmd.$x" >/dev/null &&
+        "$ROOT/build/apexpatch" apply "$pt_dir/patch_dmd.rom" "$pt_dir/dmd.$x" \
+            -o "$pt_dir/dmd_$x.rom" >/dev/null &&
+        cmp -s "$pt_dir/dmd_$x.rom" "$pt_dir/dmd.rom" || { pt_ok=0; echo "export $x" >&2; }
+done
+"$ROOT/build/apexpatch" apply "$pt_dir/patch_data.rom" "$pt_dir/dmd.bps" -o "$pt_dir/x.rom" \
+    2>&1 | grep -q 'for another ROM' || pt_ok=0
+pt_rep=$("$ROOT/build/apexpatch" report "$pt_dir/patch_dmd.patch.ini")
+for want in '| Patched ROM | CRC-32 ' '| 2 | small | dmd | B30_A4202 -> B30_A421b | 496 | ok |' \
+            'ref Bff_A8007 table row 1  far  B30_A4202 -> B30_A421b  ok' \
+            '| MyBlob | B31_A4002 | data |' '| 30 | 15845 | 747 | 15098 |'; do
+    printf '%s\n' "$pt_rep" | grep -qF -- "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+# P5: the bundled snippet library; an op added from a snippet builds the same
+# ROM as the hand-written op; a missing parameter value is refused.
+pt_snips=$("$ROOT/build/apexpatch" snippets)
+for want in 'count_calls          hook  Count executions' '{VALUE}  the value in A  default 0x00'; do
+    printf '%s\n' "$pt_snips" | grep -qF -- "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+cat >"$pt_dir/snip_ref.patch.ini" <<'PEOF'
+[patch]
+base_rom = patch_base.rom
+analysis = patch_base.ini
+checksum = keep
+
+[op:timer]
+type = ram
+at = 0x0100
+label = BallSaveTimer
+
+[op:count]
+type = hook
+at = Check
+code =
+    |     INC BallSaveTimer
+PEOF
+head -10 "$pt_dir/snip_ref.patch.ini" >"$pt_dir/snip.patch.ini"
+# a snippet's "type:" is its first word ("hook ; a comment" is a hook)
+printf '; snippet: Commented\n; type: hook   ; asm or hook\n    NOP\n' >"$pt_dir/commented.asm"
+cp "$pt_dir/snip.patch.ini" "$pt_dir/snip_c.patch.ini"
+"$ROOT/build/apexpatch" add "$pt_dir/snip_c.patch.ini" "$pt_dir/commented.asm" c at=Check \
+    | grep -q '(hook from snippet commented)' || { pt_ok=0; echo "snippet type comment" >&2; }
+# a ptr is 2 or 3 bytes wide
+printf '[patch]\nbase_rom = patch_base.rom\nchecksum = keep\n[op:p]\ntype = ptr\nat = 0x9100\ntarget = 0x8000\nwidth = 1\n' \
+    >"$pt_dir/ptrw.patch.ini"
+"$ROOT/build/apexpatch" check "$pt_dir/ptrw.patch.ini" 2>&1 | grep -q '2 (word) or 3 (far) bytes' ||
+    { pt_ok=0; echo "ptr width" >&2; }
+"$ROOT/build/apexpatch" add "$pt_dir/snip.patch.ini" count_calls count at=Check \
+    VAR=BallSaveTimer >/dev/null || pt_ok=0
+grep -q '^note = snippet count_calls: Count executions$' "$pt_dir/snip.patch.ini" || pt_ok=0
+"$ROOT/build/apexpatch" add "$pt_dir/snip.patch.ini" set_ram fix at=Check 2>&1 |
+    grep -q 'VAR needs a value' || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/snip.patch.ini" -o "$pt_dir/snip1.rom" >/dev/null &&
+    "$ROOT/build/apexpatch" build "$pt_dir/snip_ref.patch.ini" -o "$pt_dir/snip2.rom" >/dev/null &&
+    cmp -s "$pt_dir/snip1.rom" "$pt_dir/snip2.rom" || { pt_ok=0; echo "snippet build" >&2; }
+# P5: rebase onto a version where Check, Helper and PagedRoutine moved: the
+# paged routine is located by its masked code pattern and becomes a target
+# entry, so routine matches work in both banks; unchanged sites stay; the
+# rebased patch builds; the target's labels come from apexmatch.
+"$ROOT/build/apexasm" "$pt_dir/patch_base_v2.rom" "$ROOT/tests/patch_base_v2.asm" >/dev/null
+cp "$ROOT/tests/patch_rebase.patch.ini" "$pt_dir/"
+pt_reb=$("$ROOT/build/apexpatch" rebase "$pt_dir/patch_rebase.patch.ini" \
+    "$pt_dir/patch_base_v2.rom" -o "$pt_dir/rebased.patch.ini") || pt_ok=0
+for want in 'check                    hook   Bff_A8100 -> Bff_A8140  (routine Check+0x0)' \
+            'paged                    bytes  B30_A4002 -> B30_A4012  (routine PagedRoutine+0x1)' \
+            'helper_arg               value  Bff_A800d -> Bff_A800d' '4 op(s), 0 not found'; do
+    printf '%s\n' "$pt_reb" | grep -qF -- "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+grep -q '^analysis = rebased.labels.ini$' "$pt_dir/rebased.patch.ini" || pt_ok=0
+# the paged routine was located in the target, analysed and matched
+grep -q '^B30_A4011 = code$' "$pt_dir/rebased.labels.ini" || pt_ok=0
+"$ROOT/build/apexpatch" build "$pt_dir/rebased.patch.ini" -o "$pt_dir/rebased.rom" >/dev/null &&
+    [ "$(od -An -tx1 -j $((0x11)) -N3 "$pt_dir/rebased.rom" | tr -d ' ')" = 860739 ] ||
+    { pt_ok=0; echo "rebased build" >&2; }
+# Free-RAM finder: the code's 0x50, the patch's ram op at 0x0100 and the
+# non-zero bytes of a RAM snapshot are used; the NVRAM area comes last.
+python3 -c "b=bytearray(0x2000); b[0x200:0x210]=b'\\x01'*16; open('$pt_dir/ramdump.bin','wb').write(b)"
+pt_ram=$("$ROOT/build/apexpatch" ram "$pt_dir/patch_p2.patch.ini" 4 --sample "$pt_dir/ramdump.bin")
+for want in '  0x0210   5616 byte(s)' '  0x0101    255 byte(s)' '  0x0051    175 byte(s)' \
+            '  0x1800   2048 byte(s)  (NVRAM area'; do
+    printf '%s\n' "$pt_ram" | grep -qF -- "$want" || { pt_ok=0; printf 'missing: %s\n' "$want" >&2; }
+done
+(cd "$pt_dir" && "$ROOT/build/patch_api_test" patch_base.rom patch_base.ini \
+    patch_ops.patch.ini) >/dev/null || pt_ok=0
+if [ "$pt_ok" = 1 ]; then
+    printf 'PASS apexpatch\n'
+else
+    printf 'FAIL apexpatch\n%s\n%s\n' "$pt_check" "$pt_err" >&2
+    exit 1
+fi

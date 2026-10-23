@@ -11,10 +11,11 @@ SRC_DIR := src
 UNAME_S := $(shell uname -s 2>/dev/null)
 
 COMMON_OBJS := $(BUILD_DIR)/cpu6809.o $(BUILD_DIR)/util.o
-APEXDIS_CORE_OBJS := $(BUILD_DIR)/apex_inline_detect.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(BUILD_DIR)/apex_nvram.o $(COMMON_OBJS)
+APEXDIS_CORE_OBJS := $(BUILD_DIR)/apex_inline_detect.o $(BUILD_DIR)/apex_wpc_hooks.o $(BUILD_DIR)/apex_args.o $(BUILD_DIR)/apex_bits.o $(BUILD_DIR)/apex_card.o $(BUILD_DIR)/apex_adjnames.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(BUILD_DIR)/apex_nvram.o $(COMMON_OBJS)
 APEXDMD_OBJS := $(COMMON_OBJS) $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o
-APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apex_inline_detect.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(BUILD_DIR)/apex_nvram.o $(COMMON_OBJS)
+APEXINI_OBJS := $(BUILD_DIR)/apexini.o $(BUILD_DIR)/apex_inline_detect.o $(BUILD_DIR)/apex_wpc_hooks.o $(BUILD_DIR)/apex_args.o $(BUILD_DIR)/apex_bits.o $(BUILD_DIR)/apex_card.o $(BUILD_DIR)/apex_adjnames.o $(BUILD_DIR)/apexdis.o $(BUILD_DIR)/apexdmd.o $(BUILD_DIR)/apexsprite.o $(BUILD_DIR)/apex_project.o $(BUILD_DIR)/apex_render.o $(BUILD_DIR)/apex_analysis.o $(BUILD_DIR)/apex_config.o $(BUILD_DIR)/apex_nvram.o $(COMMON_OBJS)
 APEXMATCH_OBJS := $(BUILD_DIR)/apexmatch.o $(BUILD_DIR)/apex_match.o $(APEXDIS_CORE_OBJS)
+APEXPATCH_OBJS := $(BUILD_DIR)/apexpatch.o $(BUILD_DIR)/apex_ips.o $(BUILD_DIR)/apex_patch.o $(BUILD_DIR)/apex_patch_report.o $(BUILD_DIR)/apex_patch_rebase.o $(BUILD_DIR)/apex_match.o $(BUILD_DIR)/apex_ramfind.o $(BUILD_DIR)/apex_snippet.o $(BUILD_DIR)/apex_png.o $(BUILD_DIR)/apex_asm.o $(APEXDIS_CORE_OBJS)
 APEXCOMPARE_OBJS := $(BUILD_DIR)/apexcompare.o $(BUILD_DIR)/apex_compare.o $(BUILD_DIR)/apex_match.o $(APEXDIS_CORE_OBJS)
 
 APEXIMGUI_SDL_CFLAGS := $(shell $(PKG_CONFIG) --cflags sdl2 2>/dev/null)
@@ -38,7 +39,18 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 	$(BUILD_DIR)/apeximgui_views.o \
 	$(BUILD_DIR)/apeximgui_views_compare.o \
 	$(BUILD_DIR)/apeximgui_views_scan.o \
+	$(BUILD_DIR)/apeximgui_views_insight.o \
 	$(BUILD_DIR)/apeximgui_views_media.o \
+	$(BUILD_DIR)/apeximgui_keys.o \
+	$(BUILD_DIR)/apeximgui_patch.o \
+	$(BUILD_DIR)/apex_patch.o \
+	$(BUILD_DIR)/apex_patch_report.o \
+	$(BUILD_DIR)/apex_snippet.o \
+	$(BUILD_DIR)/apex_ramfind.o \
+	$(BUILD_DIR)/apex_patch_rebase.o \
+	$(BUILD_DIR)/apex_png.o \
+	$(BUILD_DIR)/apex_ips.o \
+	$(BUILD_DIR)/apex_asm.o \
 	$(BUILD_DIR)/apex_pinmame.o \
 	$(BUILD_DIR)/apex_imgexport.o \
 	$(BUILD_DIR)/apex_match.o \
@@ -55,9 +67,9 @@ APEXIMGUI_OBJS := $(BUILD_DIR)/apeximgui.o \
 
 .PHONY: all clean test apexcli
 
-all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexmeta $(BUILD_DIR)/project_api_test $(BUILD_DIR)/apexdmd_test $(BUILD_DIR)/apexsprite_test $(BUILD_DIR)/sprite_scope_test
+all: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apeximgui $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexpatch $(BUILD_DIR)/apexmeta $(BUILD_DIR)/project_api_test $(BUILD_DIR)/patch_api_test $(BUILD_DIR)/apexdmd_test $(BUILD_DIR)/apexsprite_test $(BUILD_DIR)/sprite_scope_test
 
-apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexmeta
+apexcli: $(BUILD_DIR)/apexdis $(BUILD_DIR)/apexasm $(BUILD_DIR)/apextab $(BUILD_DIR)/apexdmd $(BUILD_DIR)/apexini $(BUILD_DIR)/apexmatch $(BUILD_DIR)/apexcompare $(BUILD_DIR)/apexpatch $(BUILD_DIR)/apexmeta
 
 $(BUILD_DIR):
 	mkdir -p $(BUILD_DIR)
@@ -97,6 +109,9 @@ $(BUILD_DIR)/ImGuiFileDialog.o: third_party/ImGuiFileDialog/ImGuiFileDialog.cpp 
 $(BUILD_DIR)/project_api_test.o: tests/project_api_test.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
+$(BUILD_DIR)/patch_api_test.o: tests/patch_api_test.c $(SRC_HEADERS) | $(BUILD_DIR)
+	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
+
 $(BUILD_DIR)/apexdmd_test.o: tests/apexdmd_test.c $(SRC_HEADERS) | $(BUILD_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -I$(SRC_DIR) -c $< -o $@
 
@@ -118,6 +133,9 @@ $(BUILD_DIR)/apexdmd: $(BUILD_DIR)/apexdmd_main.o $(BUILD_DIR)/apexdmd.o $(APEXD
 $(BUILD_DIR)/project_api_test: $(BUILD_DIR)/project_api_test.o $(APEXDIS_CORE_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
+$(BUILD_DIR)/patch_api_test: $(BUILD_DIR)/patch_api_test.o $(BUILD_DIR)/apex_patch.o $(BUILD_DIR)/apex_patch_report.o $(BUILD_DIR)/apex_patch_rebase.o $(BUILD_DIR)/apex_match.o $(BUILD_DIR)/apex_ramfind.o $(BUILD_DIR)/apex_snippet.o $(BUILD_DIR)/apex_png.o $(BUILD_DIR)/apex_asm.o $(APEXDIS_CORE_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
 $(BUILD_DIR)/apexdmd_test: $(BUILD_DIR)/apexdmd_test.o $(BUILD_DIR)/apexdmd.o $(COMMON_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
@@ -130,13 +148,16 @@ $(BUILD_DIR)/sprite_scope_test: $(BUILD_DIR)/sprite_scope_test.o $(APEXDIS_CORE_
 $(BUILD_DIR)/apexini: $(APEXINI_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
-$(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(COMMON_OBJS)
+$(BUILD_DIR)/apexasm: $(BUILD_DIR)/apexasm.o $(BUILD_DIR)/apex_asm.o $(COMMON_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexmatch: $(APEXMATCH_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexcompare: $(APEXCOMPARE_OBJS)
+	$(CC) $(LDFLAGS) $^ -o $@
+
+$(BUILD_DIR)/apexpatch: $(APEXPATCH_OBJS)
 	$(CC) $(LDFLAGS) $^ -o $@
 
 $(BUILD_DIR)/apexmeta: $(BUILD_DIR)/apexmeta.o

@@ -73,7 +73,11 @@ static inline void sock_set_timeout(apex_sock_t s, int ms) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
 }
 static inline bool sock_recv_timed_out(void) {
+#if EAGAIN == EWOULDBLOCK
+    return errno == EAGAIN;
+#else
     return errno == EAGAIN || errno == EWOULDBLOCK;
+#endif
 }
 #endif
 
@@ -682,7 +686,8 @@ static std::string url_encode(const char *s) {
     return o;
 }
 
-bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond) {
+bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond,
+                             long ignore) {
     char path[256];
     if (bank < 0) {
         snprintf(path, sizeof(path), "/api/debugger/breakpoints?cmd=%s&addr=0x%x", cmd, addr);
@@ -710,12 +715,14 @@ bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank,
         p += "&cond=";
         p += url_encode(cc.c_str());
     }
+    if (ignore > 0)
+        p += "&ignore=" + std::to_string(ignore);
     std::string body;
     return apex_pinmame_http_get(port, p, body);
 }
 
-bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len,
-                             int mode) {
+bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len, int mode,
+                             const char *vcond, unsigned val) {
     char path[256];
     if (bank < 0) {
         snprintf(path, sizeof(path), "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d",
@@ -725,8 +732,142 @@ bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank,
                  "/api/debugger/watchpoints?cmd=%s&addr=0x%x&len=%d&mode=%d&bank=0x%x", cmd, addr,
                  len, mode, (unsigned)bank);
     }
+    std::string p = path;
+    if (vcond && *vcond) {
+        char v[48];
+        snprintf(v, sizeof(v), "&cond=%s&val=%02x", vcond, val & 0xffu);
+        p += v;
+    }
+    std::string body;
+    return apex_pinmame_http_get(port, p, body);
+}
+
+bool apex_pinmame_point_cmd(int port, const char *cmd, int is_wp, int idx) {
+    char path[128];
+    snprintf(path, sizeof(path), "/api/debugger/points?cmd=%s&type=%s&idx=%d", cmd,
+             is_wp ? "wp" : "bp", idx);
     std::string body;
     return apex_pinmame_http_get(port, path, body);
+}
+
+bool apex_pinmame_runto(int port, unsigned addr, int bank) {
+    char path[128];
+    if (bank < 0)
+        snprintf(path, sizeof(path), "/api/debugger/control/runto?addr=0x%x", addr);
+    else
+        snprintf(path, sizeof(path), "/api/debugger/control/runto?addr=0x%x&bank=0x%x", addr,
+                 (unsigned)bank);
+    std::string body;
+    return apex_pinmame_http_get(port, path, body);
+}
+
+bool apex_pinmame_callstack(int port, std::vector<ApexPinmameFrame> &out) {
+    std::string body;
+    if (!apex_pinmame_http_get(port, "/api/debugger/callstack", body))
+        return false;
+    long v;
+    for (const std::string &o : json_objects(body, "stack")) {
+        ApexPinmameFrame f;
+        if (apex_json_int(o, "caller", v))
+            f.caller = v;
+        if (apex_json_int(o, "receiver", v))
+            f.receiver = v;
+        if (apex_json_int(o, "pc", v))
+            f.pc = v;
+        if (apex_json_int(o, "bank", v))
+            f.bank = (int)v;
+        out.push_back(f);
+    }
+    return true;
+}
+
+bool apex_pinmame_trace_clear(int port) {
+    std::string body;
+    return apex_pinmame_http_get(port, "/api/debugger/trace?cmd=clear", body);
+}
+
+bool apex_pinmame_trace_add(int port, unsigned addr, int len, int mode, int bank) {
+    char path[160];
+    if (bank < 0)
+        snprintf(path, sizeof(path), "/api/debugger/trace?cmd=add&addr=0x%x&len=%d&mode=%d", addr,
+                 len, mode);
+    else
+        snprintf(path, sizeof(path),
+                 "/api/debugger/trace?cmd=add&addr=0x%x&len=%d&mode=%d&bank=0x%x", addr, len, mode,
+                 (unsigned)bank);
+    std::string body;
+    return apex_pinmame_http_get(port, path, body);
+}
+
+bool apex_pinmame_trace_read(int port, std::vector<ApexPinmameAccess> &out, long &total,
+                             bool &has_total) {
+    std::string body;
+    if (!apex_pinmame_http_get(port, "/api/debugger/trace", body))
+        return false;
+    long v;
+    has_total = apex_json_int(body, "total", total);
+    for (const std::string &o : json_objects(body, "logs")) {
+        ApexPinmameAccess a;
+        if (apex_json_int(o, "pc", v))
+            a.pc = v;
+        if (apex_json_int(o, "bank", v))
+            a.bank = (int)v;
+        if (apex_json_int(o, "adr", v))
+            a.adr = v;
+        if (apex_json_int(o, "write", v))
+            a.write = (int)v;
+        a.has_value = apex_json_int(o, "value", a.value); /* null for reads */
+        out.push_back(a);
+    }
+    return true;
+}
+
+bool apex_pinmame_tracepoint_add(int port, unsigned addr, int bank) {
+    char path[128];
+    if (bank < 0)
+        snprintf(path, sizeof(path), "/api/debugger/tracepoints?cmd=add&addr=0x%x", addr);
+    else
+        snprintf(path, sizeof(path), "/api/debugger/tracepoints?cmd=add&addr=0x%x&bank=0x%x", addr,
+                 (unsigned)bank);
+    std::string body;
+    return apex_pinmame_http_get(port, path, body);
+}
+
+bool apex_pinmame_tracepoint_clear(int port) {
+    std::string body;
+    return apex_pinmame_http_get(port, "/api/debugger/tracepoints?cmd=clear", body);
+}
+
+bool apex_pinmame_tracepoints(int port, long &hits_total, std::vector<ApexPinmameTpEntry> &log) {
+    std::string body;
+    if (!apex_pinmame_http_get(port, "/api/debugger/tracepoints", body))
+        return false;
+    long v;
+    hits_total = 0;
+    for (const std::string &o : json_objects(body, "points"))
+        if (apex_json_int(o, "hits", v))
+            hits_total += v;
+    for (const std::string &o : json_objects(body, "log")) {
+        ApexPinmameTpEntry e;
+        if (apex_json_int(o, "pc", v))
+            e.pc = v;
+        if (apex_json_int(o, "bank", v))
+            e.bank = (int)v;
+        if (apex_json_int(o, "a", v))
+            e.a = (int)v;
+        if (apex_json_int(o, "b", v))
+            e.b = (int)v;
+        if (apex_json_int(o, "x", v))
+            e.x = v;
+        if (apex_json_int(o, "y", v))
+            e.y = v;
+        if (apex_json_int(o, "u", v))
+            e.u = v;
+        if (apex_json_int(o, "s", v))
+            e.s = v;
+        log.push_back(e);
+    }
+    return true;
 }
 
 bool apex_pinmame_input(int port, int sw, int val, int pulse_ms) {
@@ -757,6 +898,12 @@ bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out) {
             p.bank = (int)v;
         if (apex_json_int(o, "hits", v))
             p.hits = v;
+        if (apex_json_int(o, "enabled", v))
+            p.enabled = (int)v;
+        if (apex_json_int(o, "ignore", v))
+            p.ignore = v;
+        if (apex_json_int(o, "temp", v))
+            p.temp = (int)v;
         apex_json_str(o, "cond", p.cond);
         out.push_back(p);
     }
@@ -773,6 +920,8 @@ bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out) {
             p.mode = (int)v;
         if (apex_json_int(o, "len", v))
             p.len = (int)v;
+        if (apex_json_int(o, "enabled", v))
+            p.enabled = (int)v;
         apex_json_str(o, "cond", p.cond);
         out.push_back(p);
     }
@@ -780,29 +929,7 @@ bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out) {
 }
 
 bool apex_pinmame_point_delete(int port, int is_wp, int idx) {
-    std::vector<ApexPinmamePoint> pts;
-    if (!apex_pinmame_points(port, pts)) {
-        return false;
-    }
-    /* Clear the whole type, then re-add every point of that type except idx. */
-    if (is_wp) {
-        apex_pinmame_watchpoint(port, "clear", 0, -1, 1, 2);
-    } else {
-        apex_pinmame_breakpoint(port, "clear", 0, -1, nullptr);
-    }
-    for (const ApexPinmamePoint &p : pts) {
-        if (p.is_wp != is_wp || p.idx == idx) {
-            continue;
-        }
-        if (is_wp) {
-            apex_pinmame_watchpoint(port, "add", (unsigned)p.addr, p.bank, p.len > 0 ? p.len : 1,
-                                    p.mode);
-        } else {
-            apex_pinmame_breakpoint(port, "add", (unsigned)p.addr, p.bank,
-                                    p.cond.empty() ? nullptr : p.cond.c_str());
-        }
-    }
-    return true;
+    return apex_pinmame_point_cmd(port, "delete", is_wp, idx);
 }
 
 bool apex_pinmame_points_stash(int port, int is_wp, std::vector<ApexPinmamePoint> &saved) {
@@ -811,33 +938,35 @@ bool apex_pinmame_points_stash(int port, int is_wp, std::vector<ApexPinmamePoint
     if (!apex_pinmame_points(port, pts)) {
         return false;
     }
+    /* Remember the whole set (its size marks where added points start) and
+       disable the enabled ones. */
     for (const ApexPinmamePoint &p : pts) {
-        if (p.is_wp == is_wp) {
-            saved.push_back(p);
-        }
-    }
-    if (is_wp) {
-        apex_pinmame_watchpoint(port, "clear", 0, -1, 1, 2);
-    } else {
-        apex_pinmame_breakpoint(port, "clear", 0, -1, nullptr);
+        if (p.is_wp != is_wp)
+            continue;
+        saved.push_back(p);
+        if (p.enabled)
+            apex_pinmame_point_cmd(port, "toggle", is_wp, p.idx);
     }
     return true;
 }
 
 void apex_pinmame_points_restore(int port, int is_wp, const std::vector<ApexPinmamePoint> &saved) {
-    if (is_wp) {
-        apex_pinmame_watchpoint(port, "clear", 0, -1, 1, 2);
-    } else {
-        apex_pinmame_breakpoint(port, "clear", 0, -1, nullptr);
+    std::vector<ApexPinmamePoint> pts;
+    if (!apex_pinmame_points(port, pts))
+        return;
+    /* Points are appended, so everything at idx >= saved.size() was added by
+       the collector: delete from the top so the lower indices stay valid. */
+    std::vector<int> added;
+    for (const ApexPinmamePoint &p : pts) {
+        if (p.is_wp == is_wp && p.idx >= (int)saved.size())
+            added.push_back(p.idx);
     }
+    std::sort(added.rbegin(), added.rend());
+    for (int idx : added)
+        apex_pinmame_point_cmd(port, "delete", is_wp, idx);
     for (const ApexPinmamePoint &p : saved) {
-        if (is_wp) {
-            apex_pinmame_watchpoint(port, "add", (unsigned)p.addr, p.bank, p.len > 0 ? p.len : 1,
-                                    p.mode);
-        } else {
-            apex_pinmame_breakpoint(port, "add", (unsigned)p.addr, p.bank,
-                                    p.cond.empty() ? nullptr : p.cond.c_str());
-        }
+        if (p.enabled)
+            apex_pinmame_point_cmd(port, "toggle", is_wp, p.idx);
     }
 }
 

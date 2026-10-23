@@ -261,7 +261,25 @@ static bool is_dmd_fullframe_addr(const ApexProject *p, uint8_t bank, uint32_t a
             owner = dr;
         }
     }
-    return owner && owner->kind == DATA_DMD_FULLFRAME && addr < owner->addr + APEX_DMD_PAGE_BYTES;
+    if (!owner || owner->kind != DATA_DMD_FULLFRAME)
+        return false;
+    /* the frame's real extent: its planes as encoded (often far less than a
+       raw 512-byte page), so data right after a compressed frame is not DMD */
+    const uint8_t *src;
+    size_t len, ro, pos = 0;
+    if (!project_locate_rom_bytes(p, bank, owner->addr, &src, &len, &ro))
+        return addr < owner->addr + APEX_DMD_PAGE_BYTES;
+    unsigned planes = owner->length ? (unsigned)owner->length : 1u;
+    for (unsigned k = 0; k < planes && pos < len; k++) {
+        uint8_t page[APEX_DMD_PAGE_BYTES];
+        size_t used = 0;
+        if (!apexdmd_decode_fullframe(src + pos, len - pos, page, &used, nullptr))
+            break;
+        pos += used;
+    }
+    if (!pos)
+        pos = APEX_DMD_PAGE_BYTES;
+    return addr < owner->addr + pos;
 }
 
 static bool is_sprite_addr(const ApexProject *p, uint8_t bank, uint32_t addr) {
@@ -842,8 +860,8 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
         ImGui::TableSetupColumn(
             "##gutter", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoHeaderLabel,
             FA_GUTTER_W);
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(120.0f));
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f));
         /* WidthFixed (auto-fit to content) rather than WidthStretch: a stretch
            column always shrinks to the viewport, so the table never reports
            horizontal overflow and no horizontal scrollbar appears — long lines and
@@ -901,14 +919,55 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                    executed code green, never-executed code red. */
                 if (state->pinmame.cov_overlay && !state->pinmame.cov_reached.empty() &&
                     line->kind == APEX_RENDER_LINE_INSTRUCTION && line->has_location) {
+                    const PinmameState &cpm = state->pinmame;
                     uint32_t ckey = ((uint32_t)line->bank << 16) | (line->cpu_addr & 0xffff);
-                    bool reached = state->pinmame.cov_reached.count(ckey) != 0;
-                    ImU32 bg =
-                        reached
-                            ? ImGui::ColorConvertFloat4ToU32(ImVec4(0.20f, 0.70f, 0.30f, 0.16f))
-                            : ImGui::ColorConvertFloat4ToU32(ImVec4(0.70f, 0.25f, 0.20f, 0.14f));
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
-                    ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                    bool reached = cpm.cov_reached.count(ckey) != 0;
+                    ImVec4 col(0, 0, 0, 0);
+                    if (cpm.cov_view == 1) {
+                        /* diff view: amber = new since baseline, faint green = both */
+                        if (reached)
+                            col = cpm.cov_baseline.count(ckey) ? ImVec4(0.20f, 0.70f, 0.30f, 0.10f)
+                                                               : ImVec4(0.95f, 0.70f, 0.10f, 0.32f);
+                    } else if (cpm.cov_view == 2) {
+                        /* diff view: purple = executed at baseline only */
+                        if (!reached && cpm.cov_baseline.count(ckey))
+                            col = ImVec4(0.65f, 0.35f, 0.90f, 0.30f);
+                    } else {
+                        col = reached ? ImVec4(0.20f, 0.70f, 0.30f, 0.16f)
+                                      : ImVec4(0.70f, 0.25f, 0.20f, 0.14f);
+                    }
+                    if (col.w > 0.0f) {
+                        ImU32 bg = ImGui::ColorConvertFloat4ToU32(col);
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                    }
+                }
+                /* Bytes changed by the open patch: magenta tint. */
+                bool emits_bytes = line->kind == APEX_RENDER_LINE_INSTRUCTION;
+                if (line->kind == APEX_RENDER_LINE_DIRECTIVE) {
+                    size_t t = 0;
+                    while (t < line->length && (line->text[t] == ' ' || line->text[t] == '\t'))
+                        t++;
+                    emits_bytes =
+                        !(line->length - t >= 4 && (!strncmp(line->text + t, ".BANK", 5) ||
+                                                    !strncmp(line->text + t, ".ORG", 4)));
+                }
+                if (!state->patch_state.ranges.empty() && line->has_location && emits_bytes) {
+                    size_t rom_end = line->rom_addr + 1u;
+                    for (size_t nl = line_idx + 1; nl < document->line_count && nl < line_idx + 64;
+                         nl++) {
+                        if (document->lines[nl].has_location &&
+                            document->lines[nl].rom_addr > line->rom_addr) {
+                            rom_end = document->lines[nl].rom_addr;
+                            break;
+                        }
+                    }
+                    if (patch_op_at(state, line->rom_addr, rom_end) >= 0) {
+                        ImU32 bg =
+                            ImGui::ColorConvertFloat4ToU32(ImVec4(0.85f, 0.30f, 0.85f, 0.28f));
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg0, bg);
+                        ImGui::TableSetBgColor(ImGuiTableBgTarget_RowBg1, bg);
+                    }
                 }
                 if (in_block && !is_cursor) {
                     /* distinct translucent-blue background for the marked block */
@@ -1033,7 +1092,7 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         ImGui::SetKeyboardFocusHere();
                         state->inline_edit_focus = false;
                     }
-                    ImGui::SetNextItemWidth(320.0f);
+                    ImGui::SetNextItemWidth(ui_w(320.0f));
                     bool commit = ImGui::InputText(
                         "##inline_label", state->inline_edit_buf, sizeof(state->inline_edit_buf),
                         ImGuiInputTextFlags_EnterReturnsTrue | ImGuiInputTextFlags_AutoSelectAll);
@@ -1376,20 +1435,22 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                 }
 
                 if (ImGui::BeginPopup("row_context_menu")) {
-                    if (has_pointer && ImGui::MenuItem("Jump to target", "F / Enter")) {
+                    if (has_pointer && ImGui::MenuItem("Jump to target", key_hint(KEY_FOLLOW))) {
                         size_t tl;
                         if (apex_render_find_line_by_address(document, t_bank, t_addr, &tl)) {
                             select_line(state, tl, 1);
                         }
                     }
-                    if (pop_in_table && ImGui::MenuItem("Jump to table header", "Home")) {
+                    if (pop_in_table &&
+                        ImGui::MenuItem("Jump to table header", key_hint(KEY_TABLE_HEADER))) {
                         size_t tl;
                         if (apex_render_find_line_by_address(document, pop_table_bank,
                                                              pop_table_addr, &tl)) {
                             select_line(state, tl, 1);
                         }
                     }
-                    if (pop_has_loc && ImGui::MenuItem("Show incoming references", "X")) {
+                    if (pop_has_loc &&
+                        ImGui::MenuItem("Show incoming references", key_hint(KEY_XREFS))) {
                         state->request_xref_popup = true;
                         state->xref_popup_bank = pop_bank;
                         state->xref_popup_addr = pop_cpu_addr;
@@ -1422,39 +1483,41 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         }
                         ImGui::EndMenu();
                     }
+                    patch_context_menu(project, document_ptr, state, line);
                     ImGui::Separator();
-                    if (ImGui::MenuItem("Copy selection", "Ctrl+C")) {
+                    if (ImGui::MenuItem("Copy selection", key_hint(KEY_COPY))) {
                         copy_selection_to_clipboard(document, state);
                         set_status(state, "copied");
                     }
-                    if (ImGui::MenuItem("Set block start", "A")) {
+                    if (ImGui::MenuItem("Set block start", key_hint(KEY_BLOCK_START))) {
                         state->block_a = state->selected_line;
                         if (!state->block_active)
                             state->block_b = state->block_a;
                         state->block_active = true;
                     }
-                    if (ImGui::MenuItem("Set block end", "E")) {
+                    if (ImGui::MenuItem("Set block end", key_hint(KEY_BLOCK_END))) {
                         state->block_b = state->selected_line;
                         if (!state->block_active)
                             state->block_a = state->block_b;
                         state->block_active = true;
                     }
-                    if (state->block_active && ImGui::MenuItem("Clear block", "Esc")) {
+                    if (state->block_active &&
+                        ImGui::MenuItem("Clear block", key_hint(KEY_BLOCK_CLEAR))) {
                         state->block_active = false;
                     }
-                    if (ImGui::MenuItem("Mark as Code", "C")) {
+                    if (ImGui::MenuItem("Mark as Code", key_hint(KEY_MARK_CODE))) {
                         apply_code_at_selection(project, document_ptr, state);
                     }
-                    if (ImGui::MenuItem("Mark as Data", "D")) {
+                    if (ImGui::MenuItem("Mark as Data", key_hint(KEY_MARK_DATA))) {
                         char spec[32];
                         snprintf(spec, sizeof(spec), "bytes[%d]",
                                  state->edit_data_length > 0 ? state->edit_data_length : 1);
                         apply_data_at_selection(project, document_ptr, state, spec);
                     }
-                    if (ImGui::MenuItem("Mark as String", "S")) {
+                    if (ImGui::MenuItem("Mark as String", key_hint(KEY_MARK_STRING))) {
                         apply_string_at_selection(project, document_ptr, state);
                     }
-                    if (ImGui::MenuItem("Mark as Table", "T")) {
+                    if (ImGui::MenuItem("Mark as Table", key_hint(KEY_MARK_TABLE))) {
                         char spec[320] = "counted(ptr16_data)";
                         if (state->edit_schema_count > 0) {
                             char schema[256];
@@ -1470,18 +1533,18 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                         apply_table_at_selection(project, document_ptr, state, spec);
                     }
                     classify_kind_submenu(project, document_ptr, state);
-                    if (ImGui::MenuItem("Clear Classification", "Del")) {
+                    if (ImGui::MenuItem("Clear Classification", key_hint(KEY_CLEAR_KIND))) {
                         clear_kind_at_selection(project, document_ptr, state);
                     }
                     ImGui::Separator();
-                    if (ImGui::MenuItem("Edit Label", "L")) {
+                    if (ImGui::MenuItem("Edit Label", key_hint(KEY_EDIT_LABEL))) {
                         state->request_focus_label = 1;
                     }
-                    if (ImGui::MenuItem("Edit Comment", "Shift+D")) {
+                    if (ImGui::MenuItem("Edit Comment", key_hint(KEY_EDIT_DOC))) {
                         state->request_focus_doc = 1;
                     }
                     ImGui::Separator();
-                    if (pop_has_loc && ImGui::MenuItem("Add Bookmark", "B")) {
+                    if (pop_has_loc && ImGui::MenuItem("Add Bookmark", key_hint(KEY_BOOKMARK))) {
                         char n[64];
                         snprintf(n, 64, "Bookmark @ B%02x_%04x", pop_bank, pop_cpu_addr);
                         state->bookmarks.push_back({pop_bank, pop_cpu_addr, n});
@@ -1587,10 +1650,10 @@ void render_line_table(ApexProject *project, const ApexRenderedDocument **docume
                                 else
                                     fbuf[0] = '\0';
                             }
-                            ImGui::SetNextItemWidth(150.0f);
+                            ImGui::SetNextItemWidth(ui_w(150.0f));
                             ImGui::Combo("target type##farimm", &ftype, kFarTypes,
                                          IM_ARRAYSIZE(kFarTypes));
-                            ImGui::SetNextItemWidth(60.0f);
+                            ImGui::SetNextItemWidth(ui_w(60.0f));
                             ImGui::InputText("target bank (hex)##farimm", fbuf, sizeof(fbuf),
                                              ImGuiInputTextFlags_CharsHexadecimal);
                             if (pop_far_load_addr)
@@ -1734,8 +1797,8 @@ void render_label_list(const ApexRenderedDocument *document, UiState *state) {
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 120.0f, 0);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, 60.0f, 1);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(120.0f), 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f), 1);
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
         int sort_col;
@@ -1997,7 +2060,7 @@ void render_xref_popup(ApexProject *p, const ApexRenderedDocument *d, UiState *s
                                          ImGuiTableFlags_Resizable,
                                      ImVec2(400, 300))) {
             ImGui::TableSetupColumn("Source", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+            ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, ui_w(80.0f));
             ImGui::TableHeadersRow();
             int ref_id = 0;
             for (auto &r : in) {
@@ -2049,7 +2112,7 @@ void render_bookmark_list(const ApexRenderedDocument *d, UiState *s) {
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f), 0);
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f, 1);
         ImGui::TableSetupColumn(
             "Actions", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 60.0f, 2);
@@ -2139,8 +2202,8 @@ void render_global_search(const ApexRenderedDocument *d, UiState *s) {
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, 60.0f, 1);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f), 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f), 1);
         ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
         {
@@ -2473,8 +2536,8 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
     /* Search strip (rendered before the child so it sits above the hex grid). */
     {
         /* Ctrl+F focuses search when the hex panel is active. */
-        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) && ImGui::GetIO().KeyCtrl &&
-            ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+        if (ImGui::IsWindowFocused(ImGuiFocusedFlags_ChildWindows) &&
+            key_action_pressed(KEY_GLOBAL_SEARCH)) {
             s->request_focus_hex_search = 1;
         }
         if (s->request_focus_hex_search) {
@@ -2596,17 +2659,18 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 s->hex_prev_selected_line = s->selected_line;
             }
         };
-        if (ImGui::IsKeyPressed(ImGuiKey_LeftArrow))
+        /* the configurable navigation keys (Keyboard Shortcuts window) */
+        if (key_action_pressed(KEY_MOVE_LEFT))
             hex_move(-1);
-        if (ImGui::IsKeyPressed(ImGuiKey_RightArrow))
+        if (key_action_pressed(KEY_MOVE_RIGHT))
             hex_move(+1);
-        if (ImGui::IsKeyPressed(ImGuiKey_UpArrow))
+        if (key_action_pressed(KEY_MOVE_UP))
             hex_move(-(int64_t)bytes_per_row);
-        if (ImGui::IsKeyPressed(ImGuiKey_DownArrow))
+        if (key_action_pressed(KEY_MOVE_DOWN))
             hex_move(+(int64_t)bytes_per_row);
-        if (ImGui::IsKeyPressed(ImGuiKey_PageUp))
+        if (key_action_pressed(KEY_PAGE_UP))
             hex_move(-(int64_t)bytes_per_row * 16);
-        if (ImGui::IsKeyPressed(ImGuiKey_PageDown))
+        if (key_action_pressed(KEY_PAGE_DOWN))
             hex_move(+(int64_t)bytes_per_row * 16);
         /* Block hotkeys (A/E/Esc) are handled centrally in the main hotkey block
            so Escape is not swallowed by ImGui keyboard-nav in the focused child. */
@@ -2965,14 +3029,14 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
     }
     if (ImGui::BeginPopup("hex_ctx")) {
         if (ImGui::MenuItem(s->hex_has_range ? "Copy block as hex" : "Copy byte as hex",
-                            "Ctrl+C")) {
+                            key_hint(KEY_COPY))) {
             copy_hex_block_to_clipboard(p, s);
             set_status(s, "copied hex bytes");
         }
-        if (s->hex_has_range && ImGui::MenuItem("Clear block", "Esc")) {
+        if (s->hex_has_range && ImGui::MenuItem("Clear block", key_hint(KEY_BLOCK_CLEAR))) {
             s->hex_has_range = false;
         }
-        if (ImGui::MenuItem("Mark as Code", "C")) {
+        if (ImGui::MenuItem("Mark as Code", key_hint(KEY_MARK_CODE))) {
             apply_code_at_selection(p, dp, s);
         }
         if (s->hex_has_range) {
@@ -2999,17 +3063,17 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
                 apply_data_at_selection(p, dp, s, spec);
             }
         } else {
-            if (ImGui::MenuItem("Mark as Data", "D")) {
+            if (ImGui::MenuItem("Mark as Data", key_hint(KEY_MARK_DATA))) {
                 char spec[32];
                 snprintf(spec, sizeof(spec), "bytes[%d]",
                          s->edit_data_length > 0 ? s->edit_data_length : 1);
                 apply_data_at_selection(p, dp, s, spec);
             }
         }
-        if (ImGui::MenuItem("Mark as String", "S")) {
+        if (ImGui::MenuItem("Mark as String", key_hint(KEY_MARK_STRING))) {
             apply_string_at_selection(p, dp, s);
         }
-        if (ImGui::MenuItem("Mark as Table", "T")) {
+        if (ImGui::MenuItem("Mark as Table", key_hint(KEY_MARK_TABLE))) {
             char spec[320] = "counted(ptr16_data)";
             if (s->edit_schema_count > 0) {
                 char schema[256];
@@ -3023,14 +3087,14 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             apply_table_at_selection(p, dp, s, spec);
         }
         classify_kind_submenu(p, dp, s);
-        if (ImGui::MenuItem("Clear Classification", "Del")) {
+        if (ImGui::MenuItem("Clear Classification", key_hint(KEY_CLEAR_KIND))) {
             clear_kind_at_selection(p, dp, s);
         }
         ImGui::Separator();
-        if (ImGui::MenuItem("Edit Label", "L")) {
+        if (ImGui::MenuItem("Edit Label", key_hint(KEY_EDIT_LABEL))) {
             s->request_focus_label = 1;
         }
-        if (ImGui::MenuItem("Edit Comment", "Shift+D")) {
+        if (ImGui::MenuItem("Edit Comment", key_hint(KEY_EDIT_DOC))) {
             s->request_focus_doc = 1;
         }
         ImGui::Separator();
@@ -3038,12 +3102,12 @@ void render_hex_view(ApexProject *p, const ApexRenderedDocument **dp, UiState *s
             uint8_t b;
             uint32_t a;
             bool has_addr = selected_address(*dp, s, &b, &a) != 0;
-            if (has_addr && ImGui::MenuItem("Show XRefs", "X")) {
+            if (has_addr && ImGui::MenuItem("Show XRefs", key_hint(KEY_XREFS))) {
                 s->request_xref_popup = true;
                 s->xref_popup_bank = b;
                 s->xref_popup_addr = a;
             }
-            if (has_addr && ImGui::MenuItem("Add Bookmark", "B")) {
+            if (has_addr && ImGui::MenuItem("Add Bookmark", key_hint(KEY_BOOKMARK))) {
                 char n[64];
                 snprintf(n, 64, "Bookmark @ B%02x_%04x", b, a);
                 s->bookmarks.push_back({b, a, n});
@@ -3275,7 +3339,7 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
     /* No-header sprite image height applied to ptr16_spr / far_spr fields. */
     if (sprite_height) {
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(46.0f);
+        ImGui::SetNextItemWidth(ui_w(46.0f));
         ImGui::InputInt("sprH", sprite_height, 0, 0);
         if (*sprite_height < 0)
             *sprite_height = 0;
@@ -3287,7 +3351,7 @@ static bool render_field_buttons(ApexProject *p, ApexEditField *fields, int *cou
     /* named types from config — combo with search filter */
     if (p && p->config_types.count > 0) {
         static char cust_filter[64] = {};
-        ImGui::SetNextItemWidth(160.0f);
+        ImGui::SetNextItemWidth(ui_w(160.0f));
         if (ImGui::BeginCombo("##cust_type", "Custom type...", ImGuiComboFlags_HeightLarge)) {
             ImGui::SetNextItemWidth(-1.0f);
             if (ImGui::IsWindowAppearing()) {
@@ -3468,7 +3532,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp, const Origin
         apply_data_at_selection(p, dp, s, "bytes[2]");
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60);
+    ImGui::SetNextItemWidth(ui_w(60));
     if (ImGui::InputInt("##datalen", &s->edit_data_length, 0, 0)) {
         if (s->edit_data_length < 1)
             s->edit_data_length = 1;
@@ -3494,7 +3558,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp, const Origin
         apply_data_at_selection(p, dp, s, "sprite");
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(42.0f);
+    ImGui::SetNextItemWidth(ui_w(42.0f));
     ImGui::InputInt("##snhh", &s->sprite_nh_height, 0, 0);
     if (s->sprite_nh_height < 1)
         s->sprite_nh_height = 1;
@@ -3561,7 +3625,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp, const Origin
     ImGui::SeparatorText("Inline Signature");
     ImGui::TextDisabled("N:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(36);
+    ImGui::SetNextItemWidth(ui_w(36));
     ImGui::InputInt("##inln", &s->edit_field_add_count, 0, 0);
     if (s->edit_field_add_count < 1)
         s->edit_field_add_count = 1;
@@ -3606,7 +3670,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp, const Origin
         s->edit_table_is_rows = 1;
     if (s->edit_table_is_rows) {
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(160);
+        ImGui::SetNextItemWidth(ui_w(160));
         if (ImGui::InputInt("##tblrows", &s->edit_table_rows, 1, 8)) {
             if (s->edit_table_rows < 1)
                 s->edit_table_rows = 1;
@@ -3616,7 +3680,7 @@ void render_editor(ApexProject *p, const ApexRenderedDocument **dp, const Origin
     }
     ImGui::TextDisabled("N:");
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(36);
+    ImGui::SetNextItemWidth(ui_w(36));
     ImGui::InputInt("##tbln", &s->edit_field_add_count, 0, 0);
     if (s->edit_field_add_count < 1)
         s->edit_field_add_count = 1;
@@ -3731,10 +3795,10 @@ void render_hardware_window(ApexProject *project, const ApexRenderedDocument *do
     if (ImGui::BeginTable("hardware_mapping", 4,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 80.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 150.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(80.0f));
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, ui_w(150.0f));
         ImGui::TableSetupColumn("Description", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("Usage", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Usage", ImGuiTableColumnFlags_WidthFixed, ui_w(80.0f));
         ImGui::TableHeadersRow();
 
         for (auto &acc : accesses) {
@@ -3891,11 +3955,11 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_BordersInnerV,
                               ImVec2(0, 140.0f))) {
-            ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-            ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-            ImGui::TableSetupColumn("Rows", ImGuiTableColumnFlags_WidthFixed, 50.0f);
+            ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+            ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
+            ImGui::TableSetupColumn("Rows", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f));
             ImGui::TableSetupColumn("Spec", ImGuiTableColumnFlags_WidthStretch);
-            ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+            ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
             ImGui::TableHeadersRow();
             int accept_idx = -1;
             for (size_t ci = 0; ci < s->table_candidates.size(); ci++) {
@@ -3948,8 +4012,8 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
-        ImGui::TableSetupColumn("Setup", ImGuiTableColumnFlags_WidthFixed, 200.0f, 1);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f), 0);
+        ImGui::TableSetupColumn("Setup", ImGuiTableColumnFlags_WidthFixed, ui_w(200.0f), 1);
         ImGui::TableSetupColumn(
             "Rows", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 50.0f, 2);
         ImGui::TableSetupColumn(
@@ -4092,7 +4156,7 @@ void render_tables_window(ApexProject *p, const ApexRenderedDocument **dp, UiSta
         const TableDef *tt = table_def_at(s->tt_type_bank, s->tt_type_addr, &p->tables);
         ImGui::TextUnformatted("Create enum type from table strings");
         ImGui::Separator();
-        ImGui::SetNextItemWidth(220);
+        ImGui::SetNextItemWidth(ui_w(220));
         ImGui::InputText("Type name", s->tt_type_name, sizeof(s->tt_type_name));
         ImGui::RadioButton("byte", &s->tt_type_word, 0);
         ImGui::SameLine();
@@ -4306,13 +4370,13 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
                   parsed_val + parsed_len <= 0x10000u);
     }
 
-    ImGui::SetNextItemWidth(160.0f);
+    ImGui::SetNextItemWidth(ui_w(160.0f));
     ImGui::InputTextWithHint("##sym_name", "NAME", s->sym_edit_name, sizeof(s->sym_edit_name));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(90.0f);
+    ImGui::SetNextItemWidth(ui_w(90.0f));
     ImGui::InputTextWithHint("##sym_val", "0x0000", s->sym_edit_value, sizeof(s->sym_edit_value));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(70.0f);
+    ImGui::SetNextItemWidth(ui_w(70.0f));
     ImGui::InputTextWithHint("##sym_len", "len", s->sym_edit_length, sizeof(s->sym_edit_length));
     if (ImGui::IsItemHovered())
         ImGui::SetTooltip("block byte length (decimal or 0x-hex); empty = 1.\n"
@@ -4356,7 +4420,7 @@ void render_symbols_editor(ApexProject *p, const ApexRenderedDocument *document,
                               APEX_TABLE_SORT_FLAGS,
                           ImVec2(0, p->symbols.count > 0 ? 200.0f : 60.0f))) {
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f, 0);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 70.0f, 1);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f), 1);
         ImGui::TableSetupColumn(
             "##act", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 60.0f, 2);
         ImGui::TableHeadersRow();
@@ -4465,9 +4529,11 @@ void render_types_editor(ApexProject *p, UiState *s) {
     static char new_val_hex[16] = "";
     static char new_val_name[64] = "";
 
+    render_adjnames_section(p, s);
+
     /* ── Add new type ─────────────────────────────────────────── */
     ImGui::SeparatorText("New Type");
-    ImGui::SetNextItemWidth(120);
+    ImGui::SetNextItemWidth(ui_w(120));
     ImGui::InputText("Name##nt", new_type_name, sizeof(new_type_name));
     ImGui::SameLine();
     ImGui::RadioButton("byte##nt", &new_type_word, 0);
@@ -4551,10 +4617,10 @@ void render_types_editor(ApexProject *p, UiState *s) {
                     new_val_name[0] = '\0';
                 }
             } else {
-                ImGui::SetNextItemWidth(60);
+                ImGui::SetNextItemWidth(ui_w(60));
                 ImGui::InputText("hex##av", new_val_hex, sizeof(new_val_hex));
                 ImGui::SameLine();
-                ImGui::SetNextItemWidth(100);
+                ImGui::SetNextItemWidth(ui_w(100));
                 ImGui::InputText("name##av", new_val_name, sizeof(new_val_name));
                 ImGui::SameLine();
                 uint32_t parsed_val = 0;
@@ -4588,7 +4654,7 @@ void render_inline_list(ApexProject *p, const ApexRenderedDocument *d, UiState *
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 0);
         ImGui::TableSetupColumn(
             "Label", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 130.0f, 1);
         ImGui::TableSetupColumn("Inline", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
@@ -4741,10 +4807,10 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument **document_p
         uint32_t addr = e->addr;
         if (kind_filter != 0) {
             const Label *el = find_explicit_entry_label(p, bank, addr);
-            bool redundant = el && el->reached_by_flow;
-            if (kind_filter == 1 && redundant)
+            bool is_redundant = el && el->reached_by_flow;
+            if (kind_filter == 1 && is_redundant)
                 continue; /* want necessary only */
-            if (kind_filter == 2 && !redundant)
+            if (kind_filter == 2 && !is_redundant)
                 continue; /* want redundant only */
         }
         if (filter[0]) {
@@ -4765,8 +4831,8 @@ void render_entries_list(ApexProject *p, const ApexRenderedDocument **document_p
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 55.0f, 1);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 0);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(55.0f), 1);
         ImGui::TableSetupColumn(
             "Label", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort, 0.0f, 2);
         ImGui::TableHeadersRow();
@@ -4923,10 +4989,10 @@ void render_strings_list(ApexProject *p, const ApexRenderedDocument *d, UiState 
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 0);
         ImGui::TableSetupColumn(
             "Label", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 160.0f, 1);
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 85.0f, 2);
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, ui_w(85.0f), 2);
         ImGui::TableSetupColumn("Content", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
         ImGui::TableSetupColumn(
             "Refs", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 60.0f, 4);

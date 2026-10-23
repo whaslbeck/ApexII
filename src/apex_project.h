@@ -60,6 +60,14 @@ typedef struct ApexProject {
     ConfigEntries literals;     /* instruction addrs whose immediate is a literal, not an address */
     ConfigEntries ack_warnings; /* addrs whose disassembly warning was reviewed/accepted */
     ConfigEntries far_imms;     /* LDX-style instrs: .value = bank the immediate targets */
+    /* Transient labels and code entries (e.g. the code a ROM patch adds): fed to
+       the analysis like the config's, never saved.  Names owned by the arrays;
+       replaced sets park their names in transient_names until the project is
+       freed, as label sets of the last analysis may still point at them. */
+    ConfigLabels transient_labels;
+    ConfigEntries transient_entries;
+    char **transient_names;
+    size_t transient_name_count;
     ReferenceSet refs;
     LabelSet system_labels;
     LabelSet *bank_labels;
@@ -86,6 +94,12 @@ ApexProject *apex_project_clone(const ApexProject *src);
 /* Register (or clear, with fn=NULL) a listener fired once per recorded edit. */
 void apex_project_set_change_listener(ApexProject *project, ApexChangeFn fn, void *ctx);
 int apex_project_analyze(ApexProject *project);
+/* Replace the transient labels / code entries (copied; see ApexProject) and
+   invalidate the analysis.  Either may be NULL (= none). */
+void apex_project_set_transient(ApexProject *project, const ConfigLabels *labels,
+                                const ConfigEntries *entries);
+/* 1 if (bank, addr) carries a transient label or entry. */
+int apex_project_is_transient_label(const ApexProject *project, uint8_t bank, uint32_t addr);
 /* Reason the most recent rejected spec edit failed (empty if unknown). */
 const char *apex_project_last_error(const ApexProject *project);
 void apex_project_invalidate(ApexProject *project, unsigned dirty_flags);

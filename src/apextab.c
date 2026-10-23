@@ -18,7 +18,7 @@ FoundTable found_text_tables[MAX_TABLES];
 int num_found_text_tables = 0;
 uint8_t rom_bank_ids[256];  // IDs read from first byte of each 16KB physical bank
 
-bool is_valid_string(const uint8_t *rom, uint32_t size, uint32_t offset) {
+static bool is_valid_string(const uint8_t *rom, uint32_t size, uint32_t offset) {
     if (offset >= size)
         return false;
     uint32_t len = 0;
@@ -35,7 +35,7 @@ bool is_valid_string(const uint8_t *rom, uint32_t size, uint32_t offset) {
     return false;
 }
 
-uint32_t translate_ptr16(uint16_t ptr, int phys_bank, int total_banks) {
+static uint32_t translate_ptr16(uint16_t ptr, int phys_bank, int total_banks) {
     if (ptr >= 0x4000 && ptr <= 0x7FFF) {
         return (uint32_t)phys_bank * BANK_SIZE + (ptr - 0x4000);
     } else if (ptr >= 0x8000) {
@@ -52,7 +52,7 @@ uint32_t translate_ptr16(uint16_t ptr, int phys_bank, int total_banks) {
     return 0xFFFFFFFF;
 }
 
-uint32_t find_offset_by_far_ptr(uint8_t bank_id, uint16_t addr, int total_banks) {
+static uint32_t find_offset_by_far_ptr(uint8_t bank_id, uint16_t addr, int total_banks) {
     // Search which physical bank has this ID
     // Note: addr is usually 0x4000-0x7FFF for banked data
     for (int b = 0; b < total_banks; b++) {
@@ -72,7 +72,7 @@ uint32_t find_offset_by_far_ptr(uint8_t bank_id, uint16_t addr, int total_banks)
     return 0xFFFFFFFF;
 }
 
-bool is_text_table_at(const uint8_t *rom, uint32_t size, uint32_t offset, int total_banks) {
+static bool is_text_table_at(const uint8_t *rom, uint32_t size, uint32_t offset, int total_banks) {
     if (offset + 3 > size)
         return false;
     uint16_t num_rows = (rom[offset] << 8) | rom[offset + 1];
@@ -93,7 +93,7 @@ bool is_text_table_at(const uint8_t *rom, uint32_t size, uint32_t offset, int to
     return true;
 }
 
-bool is_known_text_table(uint32_t offset) {
+static bool is_known_text_table(uint32_t offset) {
     for (int i = 0; i < num_found_text_tables; i++) {
         if (found_text_tables[i].offset == offset)
             return true;

@@ -4,12 +4,17 @@
  * (see print_help() near main()).
  */
 #include "apex.h"
+#include "apex_adjnames.h"
 #include "apex_analysis.h"
+#include "apex_args.h"
+#include "apex_bits.h"
+#include "apex_card.h"
 #include "apex_config.h"
 #include "apex_inline_detect.h"
 #include "apex_nvram.h"
 #include "apex_project.h"
 #include "apex_render.h"
+#include "apex_wpc_hooks.h"
 #include "cpu6809.h"
 
 #include <ctype.h>
@@ -1584,6 +1589,428 @@ static int cmd_detect_inline(int argc, char **argv) {
     return 0;
 }
 
+/* ── hooks command ──────────────────────────────────────────────────────── */
+
+/* List the WPC game-hook table (far-code slots at 0x8001 that the OS calls
+   through a far-call helper) with each slot's target and its OS call sites. */
+static int cmd_hooks(int argc, char **argv) {
+    const char *rom = NULL, *ini = NULL;
+    int all = 0;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--all") == 0) {
+            all = 1;
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "hooks: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!rom) {
+            rom = argv[i];
+        } else if (!ini) {
+            ini = argv[i];
+        } else {
+            rom = NULL;
+            break;
+        }
+    }
+    if (!rom) {
+        fputs("usage: apexini hooks <rom> [<file.ini>] [--all]\n", stderr);
+        return 2;
+    }
+    ApexProject *p = apex_project_open(rom, ini);
+    if (!p || apex_project_analyze(p) != 0) {
+        fputs("hooks: analysis failed\n", stderr);
+        return 1;
+    }
+    ApexWpcHooks h;
+    if (apex_wpc_detect_hooks(p, &h) != 0) {
+        fputs("hooks: out of memory\n", stderr);
+        apex_project_free(p);
+        return 1;
+    }
+    if (h.count == 0) {
+        puts("no hook table found at 0x8001");
+        apex_project_free(p);
+        return 0;
+    }
+    size_t stubs = 0;
+    for (size_t i = 0; i < h.count; i++)
+        stubs += h.items[i].is_stub ? 1u : 0u;
+    printf("hook table: Bff_A%04x, %lu slot(s), %lu unused (RTS), %lu call site(s)\n",
+           APEX_WPC_HOOK_TABLE_ADDR, (unsigned long)h.count, (unsigned long)stubs,
+           (unsigned long)h.caller_count);
+    for (size_t k = 0; k < h.helper_count; k++) {
+        const char *nm = label_set_name_at((LabelSet *)&p->system_labels, h.helpers[k]);
+        if (nm && generated_any_label_name(nm))
+            nm = NULL;
+        printf("helper: Bff_A%04x%s%s\n", (unsigned)h.helpers[k], nm ? "  " : "", nm ? nm : "");
+    }
+    puts("slot  addr       target     stub  callers  name / target label / first caller");
+    size_t c = 0;
+    for (size_t i = 0; i < h.count; i++) {
+        const ApexWpcHook *hk = &h.items[i];
+        size_t first = c;
+        c += hk->caller_count;
+        if (hk->is_stub && !all)
+            continue;
+        const char *slot_nm = label_set_name_at((LabelSet *)&p->system_labels, hk->slot_addr);
+        if (slot_nm && generated_any_label_name(slot_nm))
+            slot_nm = NULL;
+        const char *tgt_nm = apex_wpc_routine_at(p, hk->target_bank, hk->target_addr, NULL);
+        uint32_t rs = 0;
+        const char *call_nm = NULL;
+        if (hk->caller_count) {
+            const ApexWpcHookCaller *cl = &h.callers[first];
+            call_nm = apex_wpc_routine_at(p, cl->bank, cl->addr, &rs);
+        }
+        printf("%3lu   Bff_A%04x  B%02x_A%04x  %-4s  %7lu  %s | %s", (unsigned long)i,
+               (unsigned)hk->slot_addr, hk->target_bank, (unsigned)hk->target_addr,
+               hk->is_stub ? "rts" : "", (unsigned long)hk->caller_count, slot_nm ? slot_nm : "-",
+               tgt_nm ? tgt_nm : "-");
+        if (hk->caller_count) {
+            const ApexWpcHookCaller *cl = &h.callers[first];
+            printf(" | B%02x_A%04x%s%s", cl->bank, (unsigned)cl->addr, call_nm ? " in " : "",
+                   call_nm ? call_nm : "");
+        }
+        putchar('\n');
+    }
+    apex_wpc_hooks_free(&h);
+    apex_project_free(p);
+    return 0;
+}
+
+/* ── args command ───────────────────────────────────────────────────────── */
+
+static int arg_site_by_type_value(const void *a, const void *b) {
+    const ApexArgSite *x = a, *y = b;
+    int c = strcmp(x->type_name, y->type_name);
+    if (c)
+        return c;
+    if (x->value != y->value)
+        return x->value < y->value ? -1 : 1;
+    if (x->bank != y->bank)
+        return x->bank < y->bank ? -1 : 1;
+    return x->call_addr < y->call_addr ? -1 : x->call_addr > y->call_addr;
+}
+
+/* Typed argument values (registers via @args docs and typed [inline] fields)
+   grouped by type and value, with every call site. */
+/* One [types] entry in the config's multi-line form. */
+static void print_type(const char *name, const char *values) {
+    printf("%s:byte =\n", name);
+    for (const char *v = values; *v;) {
+        const char *e = strstr(v, ", ");
+        size_t n = e ? (size_t)(e - v) : strlen(v);
+        printf("\t%.*s\n", (int)n, v);
+        v += n + (e ? 2 : 0);
+    }
+}
+
+static int cmd_adjnames(int argc, char **argv) {
+    const char *rom = NULL, *ini = NULL, *feature = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--feature") == 0 && i + 1 < argc) {
+            feature = argv[++i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "adjnames: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!rom) {
+            rom = argv[i];
+        } else if (!ini) {
+            ini = argv[i];
+        } else {
+            rom = NULL;
+            break;
+        }
+    }
+    if (!rom) {
+        fputs("usage: apexini adjnames <rom> [<file.ini>] [--feature Bxx_Ayyyy]\n", stderr);
+        return 2;
+    }
+    ApexProject *p = apex_project_open(rom, ini);
+    if (!p) {
+        fputs("adjnames: cannot open the ROM\n", stderr);
+        return 1;
+    }
+    ApexAdjTables t;
+    apex_adj_find_tables(p, &t);
+    if (feature) {
+        unsigned b, a;
+        int k =
+            sscanf(feature, "B%2x_A%4x", &b, &a) == 2 ? apex_adj_table_at(&t, (uint8_t)b, a) : -1;
+        if (k < 0) {
+            fprintf(stderr, "adjnames: no name table at %s (see the list)\n", feature);
+        } else {
+            t.feat_adj = k;
+            t.feat_aud =
+                k + 1 < (int)t.count && t.tables[k + 1].bank == t.tables[k].bank ? k + 1 : -1;
+        }
+    }
+    printf("; name tables (entry 0 = NULL):\n");
+    for (size_t i = 0; i < t.count; i++) {
+        const ApexNameTable *n = &t.tables[i];
+        const char *role = (int)i == t.std_adj    ? "standard adjustments"
+                           : (int)i == t.std_aud  ? "standard audits"
+                           : (int)i == t.feat_adj ? "feature adjustments"
+                           : (int)i == t.feat_aud ? "feature audits"
+                                                  : "";
+        printf(";   B%02x_A%04x %4lu  %-22s %s%s\n", n->bank, (unsigned)n->addr,
+               (unsigned long)n->count, n->count > 1 ? n->names[1] : "", *role ? "<- " : "", role);
+    }
+    if (t.feat_adj < 0)
+        puts("; feature adjustments not found unambiguously: pick the English table with "
+             "--feature");
+    puts("\n[types]");
+    char *v = apex_adj_type_values(&t, 1, -1);
+    print_type("TYPE_ADJ_INDEX", v);
+    free(v);
+    if (t.std_aud >= 0) {
+        v = apex_adj_type_values(&t, 0, t.std_aud);
+        print_type("TYPE_STD_AUDIT", v);
+        free(v);
+    }
+    if (t.feat_aud >= 0) {
+        v = apex_adj_type_values(&t, 0, t.feat_aud);
+        print_type("TYPE_FEATURE_AUDIT", v);
+        free(v);
+    }
+    int found = t.std_adj >= 0;
+    apex_adj_tables_free(&t);
+    apex_project_free(p);
+    return found ? 0 : 1;
+}
+
+/* A routine given as a label, Bxx_Ayyyy or 0xNNNN. */
+static int resolve_routine(const ApexProject *p, const char *s, uint8_t *bank, uint32_t *addr) {
+    unsigned b, a;
+    char tail;
+    if (sscanf(s, "B%2x_A%4x%c", &b, &a, &tail) == 2) {
+        *bank = (uint8_t)b;
+        *addr = a;
+        return 1;
+    }
+    if (sscanf(s, "0x%x%c", &a, &tail) == 1) {
+        *bank = a >= APEX_SYSTEM_ORG ? 0xffu : 0u;
+        *addr = a;
+        return a >= APEX_SYSTEM_ORG;
+    }
+    for (size_t i = 0; i < p->system_labels.count; i++) {
+        if (p->system_labels.items[i].name && !strcmp(p->system_labels.items[i].name, s)) {
+            *bank = 0xffu;
+            *addr = p->system_labels.items[i].addr;
+            return 1;
+        }
+    }
+    for (size_t w = 0; w < p->banks; w++) {
+        const LabelSet *ls = &p->bank_labels[w];
+        for (size_t i = 0; i < ls->count; i++) {
+            if (ls->items[i].name && !strcmp(ls->items[i].name, s)) {
+                *bank = bank_id_for_index(p->banks, (int)w);
+                *addr = ls->items[i].addr;
+                return 1;
+            }
+        }
+    }
+    return 0;
+}
+
+static const char *name_or_loc(const ApexProject *p, uint8_t bank, uint32_t addr, char *buf,
+                               size_t n) {
+    const char *nm = apex_wpc_routine_at(p, bank, addr, NULL);
+    uint32_t st = 0;
+    if (nm && apex_wpc_routine_at(p, bank, addr, &st) && st == addr)
+        return nm;
+    snprintf(buf, n, "B%02x_A%04x%s%s", bank, (unsigned)addr, nm ? " in " : "", nm ? nm : "");
+    return buf;
+}
+
+static int cmd_card(int argc, char **argv) {
+    if (argc != 3) {
+        fputs("usage: apexini card <rom> <file.ini> <routine>\n", stderr);
+        return 2;
+    }
+    ApexProject *p = apex_project_open(argv[0], argv[1]);
+    if (!p || apex_project_analyze(p) != 0) {
+        fputs("card: analysis failed\n", stderr);
+        return 1;
+    }
+    uint8_t bank;
+    uint32_t addr;
+    if (!resolve_routine(p, argv[2], &bank, &addr)) {
+        fprintf(stderr, "card: unknown routine '%s'\n", argv[2]);
+        apex_project_free(p);
+        return 1;
+    }
+    ApexRoutineCard c;
+    if (apex_routine_card(p, bank, addr, &c) != 0) {
+        fprintf(stderr, "card: no code at B%02x_A%04x\n", bank, (unsigned)addr);
+        apex_project_free(p);
+        return 1;
+    }
+    char b1[160];
+    printf("routine %s  B%02x_A%04x-A%04x  %lu instructions, %d return(s)\n",
+           name_or_loc(p, bank, addr, b1, sizeof(b1)), bank, (unsigned)c.low, (unsigned)c.high,
+           (unsigned long)c.insns, c.returns);
+    printf("callers: %lu\n", (unsigned long)c.caller_count);
+    for (size_t i = 0; i < c.caller_count; i++)
+        printf("  B%02x_A%04x %s%s\n", c.callers[i].bank, (unsigned)c.callers[i].addr,
+               c.callers[i].from_table ? "(table row) " : "",
+               apex_wpc_routine_at(p, c.callers[i].bank, c.callers[i].addr, NULL)
+                   ? apex_wpc_routine_at(p, c.callers[i].bank, c.callers[i].addr, NULL)
+                   : "");
+    printf("calls: %lu\n", (unsigned long)c.callee_count);
+    for (size_t i = 0; i < c.callee_count; i++)
+        printf("  %s%s%s x%d\n",
+               name_or_loc(p, c.callees[i].bank, c.callees[i].addr, b1, sizeof(b1)),
+               c.callees[i].far ? " (far)" : "", c.callees[i].tail ? " (jump)" : "",
+               c.callees[i].count);
+    printf("RAM: %lu\n", (unsigned long)c.ram_count);
+    for (size_t i = 0; i < c.ram_count; i++) {
+        const char *sym = NULL;
+        for (size_t k = 0; k < p->symbols.count && !sym; k++)
+            if (p->symbols.items[k].value == c.ram[i].addr)
+                sym = p->symbols.items[k].name;
+        printf("  0x%04x %-28s %s%s\n", (unsigned)c.ram[i].addr, sym ? sym : "",
+               c.ram[i].reads ? "read " : "", c.ram[i].writes ? "write" : "");
+    }
+    printf("data: %lu\n", (unsigned long)c.data_count);
+    for (size_t i = 0; i < c.data_count; i++)
+        printf("  B%02x_A%04x%s\n", c.data[i].bank, (unsigned)c.data[i].addr,
+               c.data[i].is_string ? " (string)" : "");
+    apex_routine_card_free(&c);
+    apex_project_free(p);
+    return 0;
+}
+
+/* Lamp / flag bit map (apex_bits.h). */
+static int cmd_bits(int argc, char **argv) {
+    const char *rom = NULL, *ini = NULL;
+    int matrix = -1;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--matrix") == 0 && i + 1 < argc) {
+            matrix = (int)strtol(argv[++i], NULL, 0);
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "bits: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!rom) {
+            rom = argv[i];
+        } else if (!ini) {
+            ini = argv[i];
+        } else {
+            rom = NULL;
+            break;
+        }
+    }
+    if (!rom) {
+        fputs("usage: apexini bits <rom> [<file.ini>] [--matrix 0xNN]\n", stderr);
+        return 2;
+    }
+    ApexProject *p = apex_project_open(rom, ini);
+    if (!p || apex_project_analyze(p) != 0) {
+        fputs("bits: analysis failed\n", stderr);
+        return 1;
+    }
+    ApexBitMap m;
+    if (apex_bit_map(p, &m) != 0) {
+        fputs("bits: out of memory\n", stderr);
+        apex_project_free(p);
+        return 1;
+    }
+    printf("bit routines (paths):\n");
+    for (size_t k = 0; k < m.path_count; k++) {
+        const char *n = apex_wpc_routine_at(p, m.paths[k].bank, m.paths[k].addr, NULL);
+        printf("  [%lu] B%02x_A%04x %s  (%d inline wrappers%s)\n", (unsigned long)k,
+               m.paths[k].bank, (unsigned)m.paths[k].addr, n ? n : "", m.paths[k].wrappers,
+               m.paths[k].is_test ? ", a test" : "");
+    }
+    printf("wrappers: %lu\n", (unsigned long)m.wrapper_count);
+    for (size_t i = 0; i < m.site_count;) {
+        const ApexBitSite *g = &m.sites[i];
+        size_t j = i;
+        while (j < m.site_count && m.sites[j].matrix == g->matrix && m.sites[j].bit == g->bit)
+            j++;
+        if (matrix < 0 || matrix == g->matrix) {
+            const char *en =
+                g->type_name ? config_type_enum_name(&p->config_types, g->type_name, g->bit) : NULL;
+            printf("matrix 0x%02x bit 0x%02x %s  %lu site(s)\n", g->matrix, (unsigned)g->bit,
+                   en ? en : "", (unsigned long)(j - i));
+            for (size_t k = i; k < j; k++) {
+                const ApexBitSite *s = &m.sites[k];
+                const char *cn = apex_wpc_routine_at(p, s->bank, s->call_addr, NULL);
+                printf("    [%d] B%02x_A%04x  in %s\n", s->path, s->bank, (unsigned)s->call_addr,
+                       cn ? cn : "?");
+            }
+        }
+        i = j;
+    }
+    apex_bit_map_free(&m);
+    apex_project_free(p);
+    return 0;
+}
+
+static int cmd_args(int argc, char **argv) {
+    const char *rom = NULL, *ini = NULL, *type = NULL;
+    for (int i = 0; i < argc; i++) {
+        if (strcmp(argv[i], "--type") == 0 && i + 1 < argc) {
+            type = argv[++i];
+        } else if (argv[i][0] == '-') {
+            fprintf(stderr, "args: unknown option '%s'\n", argv[i]);
+            return 2;
+        } else if (!rom) {
+            rom = argv[i];
+        } else if (!ini) {
+            ini = argv[i];
+        } else {
+            rom = NULL;
+            break;
+        }
+    }
+    if (!rom || !ini) {
+        fputs("usage: apexini args <rom> <file.ini> [--type NAME]\n", stderr);
+        return 2;
+    }
+    ApexProject *p = apex_project_open(rom, ini);
+    if (!p || apex_project_analyze(p) != 0) {
+        fputs("args: analysis failed\n", stderr);
+        return 1;
+    }
+    ApexArgSites sites;
+    if (apex_collect_arg_sites(p, 1, &sites) != 0) {
+        fputs("args: out of memory\n", stderr);
+        apex_project_free(p);
+        return 1;
+    }
+    if (sites.count > 1)
+        qsort(sites.items, sites.count, sizeof(*sites.items), arg_site_by_type_value);
+    size_t shown = 0;
+    for (size_t i = 0; i < sites.count;) {
+        const ApexArgSite *g = &sites.items[i];
+        size_t j = i;
+        while (j < sites.count && sites.items[j].value == g->value &&
+               strcmp(sites.items[j].type_name, g->type_name) == 0)
+            j++;
+        if (!type || strcmp(type, g->type_name) == 0) {
+            const char *en = config_type_enum_name(&p->config_types, g->type_name, g->value);
+            printf("%s 0x%02x %s  %lu site(s)\n", g->type_name, (unsigned)g->value, en ? en : "-",
+                   (unsigned long)(j - i));
+            for (size_t k = i; k < j; k++) {
+                const ApexArgSite *a = &sites.items[k];
+                const char *tn = apex_wpc_routine_at(p, a->target_bank, a->target_addr, NULL);
+                const char *cn = apex_wpc_routine_at(p, a->bank, a->call_addr, NULL);
+                printf("    %-6s B%02x_A%04x  call B%02x_A%04x -> %s  in %s\n",
+                       apex_arg_reg_name(a->reg), a->bank, (unsigned)a->value_addr, a->bank,
+                       (unsigned)a->call_addr, tn ? tn : "-", cn ? cn : "-");
+            }
+            shown += j - i;
+        }
+        i = j;
+    }
+    if (shown == 0)
+        puts("no typed argument sites (declare registers with '@args A:TYPE' in a routine doc, "
+             "or use a named type in an [inline] signature)");
+    apex_free_arg_sites(&sites);
+    apex_project_free(p);
+    return 0;
+}
+
 /* ── check-bounds command ───────────────────────────────────────────────── */
 
 /* Returns 1 if (has_bank, bank, addr) is a valid ROM address, 0 and prints error if not. */
@@ -2059,7 +2486,7 @@ static void print_help(FILE *out) {
         "  check <file.ini>...              Syntax-check configs; non-zero exit on any error.\n"
         "  overlaps <file.ini>             Report address conflicts and overlapping data/table "
         "ranges.\n"
-        "  merge [--override] <out.ini> <in.ini>...  Merge configs into one sorted file.\n"
+        "  merge [--override|-o] <out.ini> <in.ini>...  Merge configs into one sorted file.\n"
         "                                  --override: a later definition wins on a name\n"
         "                                  conflict (default: abort).\n"
         "  migrate <file.ini>...           Upgrade old syntax to the current format in place\n"
@@ -2082,6 +2509,23 @@ static void print_help(FILE *out) {
         "                [--replace-conflicts]  Find inline-argument routines in the system bank\n"
         "                                  (0xCF 0x7n markers + return-address walk); with\n"
         "                                  --apply, write the new signatures as an overlay.\n"
+        "  hooks <rom> [<file.ini>] [--all]  List the WPC game-hook table (far-code slots at\n"
+        "                                  0x8001 the OS calls via a far-call helper) with each\n"
+        "                                  slot's target and OS call site; --all includes unused\n"
+        "                                  (RTS) slots.\n"
+        "  args <rom> <file.ini> [--type NAME]  List typed argument values with their call\n"
+        "                                  sites: registers declared by '@args A:TYPE' in a\n"
+        "                                  routine doc (traced to their immediate load) and\n"
+        "                                  named-type [inline] fields.\n"
+        "  adjnames <rom> [<file.ini>] [--feature Bxx_Ayyyy]  Adjustment / audit names from\n"
+        "                                  the ROM's text tables, as a [types] block\n"
+        "                                  (TYPE_ADJ_INDEX: 0x80+n standard, n feature).\n"
+        "  card <rom> <file.ini> <routine>  A routine's card: extent, callers, callees, RAM\n"
+        "                                  read / written, data it refers to (routine: label,\n"
+        "                                  Bxx_Ayyyy or 0xNNNN).\n"
+        "  bits <rom> [<file.ini>] [--matrix 0xNN]  The lamp / flag bit map: the OS bit\n"
+        "                                  routines (found by their wrappers) and, per matrix and\n"
+        "                                  bit, the sites that set / clear / test it.\n"
         "  nvram-export <in.ini> <out.json> [template.json]  Export RAM [symbols]/[docs] as "
         "PinMAME\n"
         "                                  nvram-maps JSON; with a template, only names/docs are\n"
@@ -2130,6 +2574,16 @@ int main(int argc, char **argv) {
         return cmd_check_bounds(argc - 2, argv + 2);
     if (strcmp(argv[1], "detect-inline") == 0)
         return cmd_detect_inline(argc - 2, argv + 2);
+    if (strcmp(argv[1], "args") == 0)
+        return cmd_args(argc - 2, argv + 2);
+    if (strcmp(argv[1], "hooks") == 0)
+        return cmd_hooks(argc - 2, argv + 2);
+    if (strcmp(argv[1], "adjnames") == 0)
+        return cmd_adjnames(argc - 2, argv + 2);
+    if (strcmp(argv[1], "card") == 0)
+        return cmd_card(argc - 2, argv + 2);
+    if (strcmp(argv[1], "bits") == 0)
+        return cmd_bits(argc - 2, argv + 2);
     if (strcmp(argv[1], "nvram-export") == 0)
         return cmd_nvram_export(argc - 2, argv + 2);
     if (strcmp(argv[1], "nvram-import") == 0)

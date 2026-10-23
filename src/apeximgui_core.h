@@ -12,12 +12,20 @@
 #include <vector>
 
 extern "C" {
+#include "apex_adjnames.h"
 #include "apex_analysis.h"
+#include "apex_args.h"
+#include "apex_bits.h"
+#include "apex_card.h"
 #include "apex_compare.h"
 #include "apex_inline_detect.h"
 #include "apex_match.h"
+#include "apex_patch.h"
 #include "apex_project.h"
+#include "apex_ramfind.h"
 #include "apex_render.h"
+#include "apex_snippet.h"
+#include "apex_wpc_hooks.h"
 #include "apexdmd.h"
 #include "apexsprite.h"
 }
@@ -163,6 +171,220 @@ struct CompareWindowState {
     }
 };
 
+/* Game Hooks window: the WPC game-hook table (see apex_wpc_hooks.h) resolved
+   against the current labels. */
+struct HookCallerRow {
+    uint8_t bank;
+    uint32_t addr;
+    int kind; /* ApexHookCallKind */
+    std::string routine;
+};
+struct HookRow {
+    size_t slot;
+    uint32_t slot_addr;
+    uint8_t target_bank;
+    uint32_t target_addr;
+    bool stub;
+    int shared;
+    std::string slot_name;   /* label at the slot ("" if none / generated) */
+    std::string target_name; /* label at the target ("" if none) */
+    std::vector<HookCallerRow> callers;
+};
+struct HooksWindowState {
+    const void *doc_ptr = nullptr; /* staleness check against the rendered doc */
+    bool computed = false;
+    std::vector<HookRow> rows;
+    std::vector<uint32_t> helpers;
+    bool hide_stubs = true;
+    int run_filter = 0; /* 0 = all, 1 = target executed, 2 = new since coverage baseline */
+    char filter[64] = "";
+    int selected = -1; /* index into rows */
+    char name_buf[96] = "";
+};
+
+/* Patch window (apeximgui_patch.cpp): the open .patch.ini, its last build and
+   the editor buffers of the selected op. */
+struct PatchRange {
+    size_t off; /* ROM file offset */
+    size_t len;
+    int op; /* index into the patch's ops */
+};
+struct PatchUiState {
+    char path[1024] = ""; /* the .patch.ini ("" = none open) */
+    bool loaded = false;
+    bool dirty = false;
+    ApexPatch patch{};
+    ApexPatchBuild build{};
+    bool built = false;
+    std::vector<PatchRange> ranges; /* patched bytes of the last build, by offset */
+    std::vector<uint8_t> orig_rom;  /* original image (the project ROM before any swap) */
+    bool patched_view = false;      /* the project currently holds the patched bytes */
+    bool view_sync = false;         /* project bytes must be re-synced to the view */
+    bool open_pending = false;      /* session named a patch: open it once analysed */
+    int selected = -1;
+    int editor_for = -1; /* op whose fields are in the buffers below */
+    char ed_name[64] = "";
+    char ed_at[128] = "";
+    char ed_expect[512] = "";
+    char ed_bytes[512] = "";
+    char ed_code[16384] = "";
+    char ed_file[512] = "";
+    char ed_note[256] = "";
+    int ed_count = 0;
+    int ed_length = 0;
+    char ed_output[512] = "";
+    char ed_alloc[64] = "";
+    char ed_placed[32] = "";
+    char ed_target[128] = "";
+    char ed_label[64] = "";
+    int ed_width = 3;
+    char ed_value[128] = "";
+    char ed_vtype[64] = "";
+    char ed_text[512] = "";
+    int ed_mode = 0;               /* string: auto, inplace, shift, relocate;
+                                      dmd: auto, inplace, relocate */
+    int ed_planes = 0;             /* dmd: 0 = from the analysis */
+    int add_type = APEX_PATCH_ASM; /* type of the next "Add op" */
+    /* free space of the original's analysis (a patched view's would see the
+       patch code's labels); refreshed on every build in the original view */
+    ApexFreeSpace detected{};
+    bool detected_ok = false;
+    bool show_map = false;
+    /* undo: the patch as text before each change (apex_patch_to_text);
+       `snap` is the current state, edits within a second are one step */
+    std::vector<std::string> undo, redo;
+    std::string snap;
+    std::string saved; /* the text last loaded / saved: undoing back to it is clean */
+    double snap_time = 0.0;
+    bool focused = false; /* the Patch window has focus: Ctrl+Z undoes patch edits */
+    /* snippet library (apex_snippet.h), loaded when the dialog first opens */
+    std::string exe_dir;
+    ApexSnippetList snippets{};
+    bool snippets_loaded = false;
+    bool snippet_open = false;
+    int snippet_sel = 0;
+    char snippet_vals[8][128] = {};
+    char snippet_at[160] = "";
+    char snippet_alloc[64] = "";
+    char snippet_name[64] = "";
+    /* "Check run": executed / code bytes per op, from PinMAME's coverage of a
+       patched-ROM test (-1 = no code to check); cleared by every rebuild */
+    std::vector<int> cov_hit, cov_total;
+    /* data ops: a read trace on the first byte the game reads (set up by Test
+       in PinMAME, polled while it runs); per op: traced, read, reader PCs */
+    struct DataTrace {
+        int op;
+        uint8_t bank;
+        uint32_t addr;
+        bool read;
+        std::vector<long> pcs;
+    };
+    std::vector<DataTrace> data_traces;
+    bool data_trace_pending = false;
+    bool data_tracing = false;
+    double data_next = 0.0;
+    /* last rebase (Export > Rebase...): the new patch and how each op went */
+    bool rebase_open = false;
+    std::string rebase_out, rebase_labels, rebase_rom, rebase_ini;
+    std::vector<ApexRebaseOp> rebase_ops;
+    std::vector<std::string> rebase_names;
+    int rebase_failed = 0;
+    /* free-RAM finder (apex_ramfind.h): static map + RAM snapshots */
+    bool show_ram = false;
+    bool ram_ready = false;
+    bool ram_sampling = false;
+    double ram_next = 0.0;
+    int ram_min = 8;
+    ApexRamMap ram{};
+};
+
+/* Argument Values window: typed argument sites (apex_args.h) grouped by
+   type and value. */
+struct ArgValueRow {
+    uint32_t value;
+    std::string name;          /* enum name ("" if the value has none) */
+    std::vector<size_t> sites; /* indices into ArgsWindowState.sites */
+};
+struct ArgSiteRow {
+    uint8_t bank;
+    uint32_t value_addr;
+    uint32_t call_addr;
+    int reg;
+    std::string type_name;
+    uint32_t value;
+    std::string callee;
+    std::string caller;
+};
+/* Bit Map window: lamps and flags by matrix and bit (apex_bits.h). */
+struct BitsWindowState {
+    const void *doc_ptr = nullptr; /* staleness check against the rendered doc */
+    bool computed = false;
+    ApexBitMap map{};
+    std::vector<std::string> path_names; /* label of each bit routine */
+    int matrix = -1;                     /* selected B code, -1 = first */
+    int selected = -1;                   /* first site index of the selected bit */
+    char filter[64] = "";
+};
+
+/* Routine Card window (apex_card.h): the routine at the cursor, or a pinned one. */
+struct CardWindowState {
+    bool pinned = false;
+    uint8_t bank = 0;
+    uint32_t addr = 0;
+    bool valid = false;
+    const void *doc_ptr = nullptr;
+    ApexRoutineCard card{};
+    char name_buf[96] = "";
+    uint32_t name_for = 0xffffffffu; /* (bank<<16)|addr the buffer belongs to */
+};
+
+/* Event Timeline window: switches, lamp / flag operations and watched routines
+   recorded from a running PinMAME, in time order. */
+struct TimelineEvent {
+    double t;      /* seconds since the recording started */
+    int kind;      /* 0 switch, 1 bit operation, 2 watched routine, 3 note */
+    int path = -1; /* bit operation: index into the bit map's paths */
+    int matrix = 0, bit = 0, on = 0;
+    uint8_t bank = 0xff; /* code to jump to */
+    uint32_t addr = 0;
+    std::string text;
+};
+struct TimelineWatch {
+    uint8_t bank;
+    uint32_t addr;
+    std::string name;
+};
+struct TimelineState {
+    bool recording = false;
+    bool want_switches = true, want_bits = true, want_tests = false;
+    double t0 = 0.0, next_poll = 0.0;
+    long hits_seen = 0;
+    std::vector<int> sw_state; /* last switch states (index = switch number) */
+    std::vector<TimelineWatch> watches;
+    /* tracepoint index -> what it records: -1 - k = bit path k, else watch k */
+    std::vector<int> tp_role;
+    std::vector<uint32_t> tp_addr;
+    std::vector<TimelineEvent> events;
+    char filter[64] = "";
+    bool follow = true;
+    bool points_dirty = false;  /* re-install the tracepoints (watch list changed) */
+    bool hide_matrix[256] = {}; /* display filter: bit events of these matrices */
+};
+
+struct ArgsWindowState {
+    const void *doc_ptr = nullptr; /* staleness check against the rendered doc */
+    bool computed = false;
+    std::vector<ArgSiteRow> sites;
+    std::vector<std::string> type_names; /* types with at least one site */
+    int type_idx = 0;
+    std::vector<ArgValueRow> values; /* of the selected type */
+    int values_for = -1;             /* type_idx the values were built for */
+    int selected = -1;               /* index into values */
+    char name_buf[96] = "";
+    int decl_reg = 0;  /* @args form: register (A,B,D,X,Y,U) */
+    int decl_type = 0; /* @args form: index into the project's [types] */
+};
+
 struct CoverageWindowState {
     bool computed = false;
     const void *doc_ptr = nullptr; /* staleness check against the rendered doc */
@@ -181,6 +403,84 @@ struct CoverageWindowState {
     std::vector<Gap> gaps;
     int next_gap = 0; /* cursor for "jump to next gap" */
 };
+
+// --- Keyboard shortcuts (apeximgui_keys.cpp) ---
+enum KeyAction {
+    KEY_MOVE_DOWN,
+    KEY_MOVE_UP,
+    KEY_PAGE_DOWN,
+    KEY_PAGE_UP,
+    KEY_NEXT_BLOCK,
+    KEY_PREV_BLOCK,
+    KEY_FOLLOW,
+    KEY_HISTORY_BACK,
+    KEY_HISTORY_FORWARD,
+    KEY_GOTO,
+    KEY_COMMAND_PALETTE,
+    KEY_FOCUS_FILTER,
+    KEY_TABLE_HEADER,
+    KEY_MARK_CODE,
+    KEY_MARK_DATA,
+    KEY_MARK_STRING,
+    KEY_MARK_TABLE,
+    KEY_REPEAT_CLASSIFY,
+    KEY_CLEAR_KIND,
+    KEY_EDIT_LABEL,
+    KEY_EDIT_DOC,
+    KEY_BOOKMARK,
+    KEY_UNDO,
+    KEY_REDO,
+    KEY_SAVE,
+    KEY_BLOCK_START,
+    KEY_BLOCK_END,
+    KEY_BLOCK_CLEAR,
+    KEY_COPY,
+    KEY_XREFS,
+    KEY_HELP,
+    KEY_GLOBAL_SEARCH,
+    KEY_REANALYZE,
+    KEY_FULL_REANALYZE,
+    KEY_ZOOM_IN,
+    KEY_ZOOM_OUT,
+    KEY_ZOOM_RESET,
+    KEY_DMD_NEXT,
+    KEY_DMD_PREV,
+    KEY_DMD_NEXT32,
+    KEY_DMD_PREV32,
+    KEY_DMD_RESET,
+    KEY_DMD_MARK,
+    KEY_MOVE_LEFT,  /* hex editor: one byte back */
+    KEY_MOVE_RIGHT, /* hex editor: one byte on */
+    KEY_ACTION_COUNT
+};
+#define KEY_BINDINGS_PER_ACTION 2
+
+/* True when one of the action's chords was pressed this frame (exact
+   modifiers); always false while the editor captures a new binding. */
+/* A width designed for the default 13 px font, scaled to the current font
+   size (the View zoom and the monitor's DPI): fixed table columns and input
+   fields grow with the text instead of cutting it off. */
+inline float ui_w(float px) {
+    return px * ImGui::GetFontSize() / 13.0f;
+}
+
+bool key_action_pressed(KeyAction a);
+/* Centre an ImGuiFileDialog the first time it shows (call right before its
+   Display(); a closed dialog leaves the next window alone). */
+void center_file_dialog(const char *key);
+/* Current bindings as menu hint text, e.g. "Ctrl+Y / Ctrl+Shift+Z". */
+const char *key_hint(KeyAction a);
+const char *key_action_id(KeyAction a);
+const char *key_action_desc(KeyAction a);
+ImGuiKeyChord key_binding(KeyAction a, int slot);
+void key_set_binding(KeyAction a, int slot, ImGuiKeyChord chord);
+void key_reset_action(KeyAction a);
+bool key_capturing();
+/* imgui.ini persistence ([ApexII][Keys]: bindings that differ from default). */
+void keys_read_ini_line(const char *line);
+void keys_write_ini(ImGuiTextBuffer *buf);
+/* Shortcut editor (body of the Keyboard Shortcuts window). */
+void render_keys_editor();
 
 // --- Constants and Enums ---
 
@@ -345,6 +645,28 @@ struct PmHotEntry {
     uint32_t addr;
     long count;
     std::string name;
+    long base; /* hotlist: count when the baseline was taken (-1 = no baseline) */
+};
+
+/* One routine in a coverage diff: instruction PCs executed in only one of the
+   baseline and the current import, grouped by the routine containing them. */
+struct PmDiffRoutine {
+    uint8_t bank;
+    uint32_t addr;  /* routine label address (or the first PC if no label) */
+    uint32_t first; /* first differing PC */
+    int count;      /* differing PCs in this routine */
+    std::string name;
+};
+
+/* One code site that accessed a traced RAM address (RAM xref). */
+struct PmAccessEntry {
+    uint8_t bank;
+    uint32_t addr;
+    long reads = 0;
+    long writes = 0;
+    bool has_value = false; /* last written value known (newer emulators) */
+    long last_value = 0;
+    std::string name;
 };
 
 /* One live-watched RAM variable (value refreshed from the emulator each poll). */
@@ -365,9 +687,11 @@ struct PinmameState {
 
     ApexPinmame pm; /* spawned child + port */
     bool connected = false;
-    bool alive = false;     /* child process is running (set by the pump) */
-    bool external = false;  /* attached via Connect to an emulator we did not spawn */
-    bool launching = false; /* spawned, waiting for the HTTP server */
+    bool alive = false;               /* child process is running (set by the pump) */
+    bool external = false;            /* attached via Connect to an emulator we did not spawn */
+    bool launching = false;           /* spawned, waiting for the HTTP server */
+    bool resume_on_connect = false;   /* resume the game once connected (patch test) */
+    bool coverage_on_connect = false; /* patch test: clear + start coverage once connected */
 
     /* live DMD framebuffer */
     bool show_dmd = false;
@@ -398,6 +722,14 @@ struct PinmameState {
     long cov_fetched_executed = 0;
     long cov_fetched_addressable = 0;
     BackgroundJob cov_job; /* declared after its outputs: destroyed (joined) first */
+    /* Differential coverage: a saved import (e.g. "ball in play, nothing hit")
+       to compare a later one ("ball drained with ball save lit") against. */
+    std::unordered_set<uint32_t> cov_baseline; /* same keys as cov_reached */
+    long cov_baseline_executed = 0;
+    int cov_view = 0; /* 0 = all runs, 1 = new since baseline, 2 = no longer executed */
+    std::vector<PmDiffRoutine> cov_diff;
+    bool cov_diff_dirty = true;
+    const void *cov_diff_doc = nullptr; /* document cov_diff was grouped against */
     std::string status;
 
     /* breakpoints / watchpoints / halt */
@@ -408,6 +740,9 @@ struct PinmameState {
     ApexPinmameHalt last_halt; /* last SSE halt event (which bp/wp fired) */
     unsigned long last_halt_seq = 0;
     char bp_cond[64] = "";            /* optional condition for new breakpoints (e.g. A==7F) */
+    int bp_ignore = 0;                /* new breakpoints: skip this many hits */
+    int wp_vcond = 0;                 /* new watchpoints: 0 none, 1.. eq ne lt gt le ge */
+    char wp_val[8] = "";              /* new watchpoints: value for wp_vcond (hex) */
     std::map<uint32_t, long> wp_hits; /* watchpoint hit counts (API gives none), keyed by addr */
 
     /* call-frequency hotlist (via instrument counters) */
@@ -415,14 +750,19 @@ struct PinmameState {
     int hot_instrumented = 0;
     int hot_job_count = 0;
     bool hot_job_capped = false;
-    BackgroundJob hot_job; /* "Instrument routines"; declared after its outputs */
+    BackgroundJob hot_job;                 /* "Instrument routines"; declared after its outputs */
+    std::map<uint32_t, long> hot_baseline; /* (bank<<16)|addr -> count at baseline */
+    bool hot_has_baseline = false;
+    bool hot_only_new = false; /* hotlist filter: routines not called at baseline */
 
     /* dynamic RAM xref: collect the code sites that access a variable */
     char xref_addr[16] = "";
     int xref_mode = 3; /* 1=r 2=w 3=rw */
     bool xref_collecting = false;
-    std::vector<ApexPinmamePoint> xref_saved_wps; /* user's watchpoints, restored on Stop */
-    std::vector<PmHotEntry> xref_accessors;
+    /* Collected through the emulator's memory access trace (no halts). */
+    std::vector<PmAccessEntry> xref_accessors;
+    long xref_total = 0;       /* trace total already consumed */
+    double xref_next_poll = 0; /* next trace read */
 
     /* execution backtrace (recent-instruction ring, fetched on halt) */
     bool trace_enabled = false;
@@ -662,6 +1002,18 @@ struct UiState {
     CompareWindowState compare_state;
     bool show_coverage;
     CoverageWindowState coverage_state;
+    bool show_hooks;
+    HooksWindowState hooks_state;
+    bool show_args;
+    ArgsWindowState args_state;
+    bool show_bits;
+    BitsWindowState bits_state;
+    bool show_card;
+    CardWindowState card_state;
+    bool show_timeline;
+    TimelineState timeline;
+    bool show_patch;
+    PatchUiState patch_state;
     bool show_inline_list;
     bool show_entries_list;
     bool show_strings_list;
@@ -1098,6 +1450,10 @@ void render_rom_compare_window(ApexProject *project, const ApexRenderedDocument 
                                UiState *state);
 void render_coverage_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
                             UiState *state);
+void render_hooks_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                         UiState *state);
+void render_args_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state);
 
 // Analysis: Inline list, Entries list & Types editor
 void render_inline_list(ApexProject *project, const ApexRenderedDocument *document, UiState *state);
@@ -1131,6 +1487,49 @@ void render_change_log(const ApexRenderedDocument *document, UiState *state);
 // pinmame_pump runs the per-frame work (poll, halt, script, DMD fetch) once from the
 // main loop, so the live views stay updated regardless of which window is visible.
 void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* Patching (apeximgui_patch.cpp). */
+void render_patch_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                         UiState *state);
+/* Per-frame patch work: keeps the project bytes in step with the
+   Original/Patched view once no render is running. */
+void patch_pump(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* "Patch" submenu items for a disassembly line (context menu). */
+void patch_context_menu(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state, const ApexRenderedLine *line);
+/* Op index whose patched bytes cover [rom_off, rom_end), or -1. */
+int patch_op_at(const UiState *state, size_t rom_off, size_t rom_end);
+/* Main-menu "Patch" entries. */
+void patch_menu(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* Game Hooks: redirect a hook slot to new patch code (an allocated asm op in
+   the target's bank that ends by continuing at the original target, and a far
+   pointer op at the slot). */
+void patch_redirect_slot(ApexProject *project, UiState *state, uint32_t slot_addr,
+                         uint8_t target_bank, uint32_t target_addr, bool target_is_stub,
+                         const char *slot_name);
+/* Undo / redo of patch edits; patch_undo_active: the Patch window has focus
+   and a patch is open (then Ctrl+Z / Ctrl+Y go to it). */
+/* PinMAME just connected (before the game resumes): install the Check run
+   read traces of a patch test. */
+void patch_pinmame_connected(UiState *state);
+bool patch_undo_active(const UiState *state);
+/* The "Insert Snippet" window (opened from the Patch window / context menu). */
+void render_snippet_dialog(ApexProject *project, UiState *state);
+/* Insight windows (apeximgui_views_insight.cpp). */
+void render_bits_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state);
+void render_card_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state);
+void render_timeline_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                            UiState *state);
+/* Types window section: adjustment / audit names from the ROM's text tables. */
+void render_adjnames_section(ApexProject *project, UiState *state);
+/* Per-frame timeline recording (polls PinMAME while recording). */
+void timeline_pump(ApexProject *project, const ApexRenderedDocument **document_ptr, UiState *state);
+/* The rebase result window (Patch > Export > Rebase onto another ROM). */
+void render_rebase_result(ApexProject *project, UiState *state);
+void patch_undo(ApexProject *project, UiState *state, bool redo);
+/* Load the patch file remembered for this ROM (session) without UI. */
+void patch_open_path(ApexProject *project, UiState *state, const char *path);
 void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_ptr,
                     UiState *state);
 void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **document_ptr,

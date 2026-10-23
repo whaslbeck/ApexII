@@ -1,9 +1,11 @@
 #include "apex.h"
 #include "apex_analysis.h"
+#include "apex_args.h"
 #include "apex_config.h"
 #include "apex_project.h"
 #include "apex_rominfo.h"
 #include "apexdis_api.h"
+#include "apexdis_labels.h"
 #include "apexdmd.h"
 #include "apexsprite.h"
 #include "cpu6809.h"
@@ -155,6 +157,93 @@ static APEX_THREAD_LOCAL const ConfigEntries *g_render_far_imms = NULL;
 /* Opt-in render switches for the current write pass (set in write_asm_stream from
    project->options; NULL = all defaults).  See ConfigOptions in apex_config.h. */
 static APEX_THREAD_LOCAL const ConfigOptions *g_render_options = NULL;
+
+/* Typed register arguments for the current write pass (see apex_args.h): the
+   immediate load feeding an @args register of a called routine renders with the
+   enum equate and an "arg" note.  NULL when no routine declares @args. */
+static APEX_THREAD_LOCAL const ApexArgSites *g_render_args = NULL;
+static APEX_THREAD_LOCAL const ApexProject *g_render_project = NULL;
+
+/* Name of the label at (bank, addr) in the project, or NULL. */
+static const char *render_label_name(uint8_t bank, uint32_t addr) {
+    const ApexProject *p = g_render_project;
+    if (!p)
+        return NULL;
+    if (bank == 0xffu)
+        return label_set_name_at((LabelSet *)&p->system_labels, addr);
+    int bi = bank_index_for_id(p->rom.data, p->banks, bank);
+    return bi >= 0 ? label_set_name_at(&p->bank_labels[bi], addr) : NULL;
+}
+
+/* Typed-argument rendering of the instruction at (bank, addr): rewrites inst to
+   use the enum equate when the instruction is the immediate load of exactly that
+   register, and fills note with "arg REG=value for Routine".  Returns 1 if the
+   instruction feeds a typed argument. */
+static int render_arg_note(uint8_t bank, uint32_t addr, const uint8_t *op, char *inst,
+                           size_t inst_sz, char *note, size_t note_sz) {
+    size_t n;
+    const ApexArgSite *site = apex_arg_site_at(g_render_args, bank, addr, &n);
+    const ConfigTypes *types = g_render_project ? &g_render_project->config_types : NULL;
+    size_t used = 0;
+
+    if (!site)
+        return 0;
+    note[0] = '\0';
+    for (size_t i = 0; i < n; i++) {
+        const ApexArgSite *a = &site[i];
+        const char *ename = config_type_enum_name(types, a->type_name, a->value);
+        const char *tname = render_label_name(a->target_bank, a->target_addr);
+        char val[160], tgt[24];
+        if (ename)
+            snprintf(val, sizeof(val), "%s", ename);
+        else
+            snprintf(val, sizeof(val), "%s:0x%0*x", a->type_name,
+                     a->reg == APEX_ARG_REG_A || a->reg == APEX_ARG_REG_B ? 2 : 4,
+                     (unsigned)a->value);
+        if (!tname) {
+            snprintf(tgt, sizeof(tgt), "B%02x_A%04x", a->target_bank,
+                     (unsigned)a->target_addr & 0xffffu);
+            tname = tgt;
+        }
+        int w = snprintf(note + used, note_sz - used, "%sarg %s=%s for %s", i ? ", " : "",
+                         apex_arg_reg_name(a->reg), val, tname);
+        if (w < 0 || (size_t)w >= note_sz - used)
+            break;
+        used += (size_t)w;
+    }
+    /* Operand rewrite: only an immediate load of exactly this register. */
+    int load_reg = op[0] == 0x86u                       ? APEX_ARG_REG_A
+                   : op[0] == 0xc6u                     ? APEX_ARG_REG_B
+                   : op[0] == 0xccu                     ? APEX_ARG_REG_D
+                   : op[0] == 0x8eu                     ? APEX_ARG_REG_X
+                   : op[0] == 0xceu                     ? APEX_ARG_REG_U
+                   : (op[0] == 0x10u && op[1] == 0x8eu) ? APEX_ARG_REG_Y
+                                                        : -1;
+    int same = 1;
+    for (size_t i = 1; i < n; i++)
+        same = same && site[i].reg == site[0].reg && site[i].value == site[0].value &&
+               strcmp(site[i].type_name, site[0].type_name) == 0;
+    const char *ename = config_type_enum_name(types, site->type_name, site->value);
+    if (same && load_reg == site->reg && ename) {
+        char mnem[16], equ[256];
+        size_t m = 0, k = 0;
+        while (inst[m] && inst[m] != ' ' && m + 1 < sizeof(mnem)) {
+            mnem[m] = inst[m];
+            m++;
+        }
+        mnem[m] = '\0';
+        for (const char *c = site->type_name; *c && k + 1 < sizeof(equ); c++)
+            equ[k++] = (char)toupper((unsigned char)*c);
+        if (k + 1 < sizeof(equ))
+            equ[k++] = '_';
+        for (const char *c = ename; *c && k + 1 < sizeof(equ); c++)
+            equ[k++] = (char)toupper((unsigned char)*c);
+        equ[k] = '\0';
+        snprintf(inst, inst_sz, "%s #%.*s", mnem, (int)(inst_sz > m + 3u ? inst_sz - m - 3u : 0u),
+                 equ);
+    }
+    return 1;
+}
 
 /* CPU addresses in the bank being written whose labels got a definition line
    (or equate); see emit_unplaced_label_equates.  NULL outside a write pass. */
@@ -2276,12 +2365,19 @@ static void emit_db_with_labels(AsmOut *out, const uint8_t *data, size_t len, ui
                                   (unsigned)(base_addr + (uint32_t)pos) & 0xffffu);
                     }
                     ao_mark_item(out, info.size);
+                    char arg_note[320];
+                    int has_arg =
+                        g_render_args && render_arg_note(current_bank, instr_addr, data + pos, inst,
+                                                         sizeof(inst), arg_note, sizeof(arg_note));
                     if (idoc) {
                         const char *nl = strchr(idoc, '\n');
-                        if (nl)
-                            ao_printf(out, "    %-40s ; %.*s\n", inst, (int)(nl - idoc), idoc);
+                        int dl = nl ? (int)(nl - idoc) : (int)strlen(idoc);
+                        if (has_arg)
+                            ao_printf(out, "    %-40s ; %.*s | %s\n", inst, dl, idoc, arg_note);
                         else
-                            ao_printf(out, "    %-40s ; %s\n", inst, idoc);
+                            ao_printf(out, "    %-40s ; %.*s\n", inst, dl, idoc);
+                    } else if (has_arg) {
+                        ao_printf(out, "    %-40s ; %s\n", inst, arg_note);
                     } else if (paged_ambiguous) {
                         ao_printf(out, "    %-40s ; paged (bank-ambiguous)\n", inst);
                     } else {
@@ -3445,6 +3541,10 @@ static int write_asm(const ApexProject *project, AsmOut *out, int emit_xrefs, in
     g_render_acks = &project->ack_warnings;
     g_render_far_imms = &project->far_imms;
     g_render_options = &project->options;
+    ApexArgSites arg_sites;
+    g_render_project = project;
+    if (apex_collect_arg_sites(project, 0, &arg_sites) == 0 && arg_sites.count > 0)
+        g_render_args = &arg_sites;
     cpu6809_set_hex_index_offsets(project->options.hex_index_offsets);
     emit_preamble(out, project);
     ao_printf(out, ".ROM_SIZE %lu\n\n", (unsigned long)project->rom.size);
@@ -3500,6 +3600,9 @@ static int write_asm(const ApexProject *project, AsmOut *out, int emit_xrefs, in
     g_render_acks = NULL;
     g_render_far_imms = NULL;
     g_render_options = NULL;
+    g_render_args = NULL;
+    g_render_project = NULL;
+    apex_free_arg_sites(&arg_sites);
     cpu6809_set_hex_index_offsets(0);
     return 0;
 }

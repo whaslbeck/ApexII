@@ -1,0 +1,1254 @@
+#include "apex_asm.h"
+
+#include "apex.h"
+#include "cpu6809.h"
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+typedef struct {
+    char *name;
+    uint32_t value;
+    int has_far_bank;
+    uint8_t far_bank;
+} Symbol;
+
+typedef struct {
+    uint8_t *data;
+    uint8_t *written;
+    size_t size;
+    size_t paged_size;
+    int bank;
+    int has_far_bank;
+    uint8_t far_bank;
+    int pass;
+    uint32_t org;
+    unsigned fill_seen[64];
+    Symbol *symbols;
+    size_t symbol_count;
+    size_t symbol_cap;
+    /* Snippet mode (apex_asm_snippet): bytes go to snip_buf from snip_org on
+       instead of a ROM image, and undefined symbols go to the resolver. */
+    int snippet;
+    uint8_t *snip_buf;
+    size_t snip_len;
+    size_t snip_cap;
+    uint32_t snip_org;
+    ApexAsmResolveFn resolve;
+    void *resolve_ctx;
+} AsmState;
+
+static int parse_value_or_symbol(const AsmState *st, const char *text, uint32_t *value);
+
+static int starts_with_word(const char *s, const char *word) {
+    size_t n = strlen(word);
+    return strncmp(s, word, n) == 0 && (s[n] == '\0' || isspace((unsigned char)s[n]));
+}
+
+static void strip_comment(char *line) {
+    int in_string = 0;
+    int escaped = 0;
+    char *p;
+
+    for (p = line; *p; p++) {
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (in_string && *p == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && *p == ';') {
+            *p = '\0';
+            return;
+        }
+    }
+}
+
+static char *find_label_colon(char *line) {
+    int in_string = 0;
+    int escaped = 0;
+    char *p;
+
+    for (p = line; *p; p++) {
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (in_string && *p == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && *p == ':') {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+static char *find_unquoted_char(char *line, char needle) {
+    int in_string = 0;
+    int escaped = 0;
+    char *p;
+
+    for (p = line; *p; p++) {
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (in_string && *p == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = !in_string;
+            continue;
+        }
+        if (!in_string && *p == needle) {
+            return p;
+        }
+    }
+    return NULL;
+}
+
+/* The last unquoted binary '+' or '-' (one that follows an operand, not the
+   start or another operator), so that splitting there and recursing on the left
+   evaluates "a-b-c" left-associatively as (a-b)-c. */
+static char *find_last_binary_op(char *expr) {
+    int in_string = 0;
+    int escaped = 0;
+    char prev = '\0'; /* last non-space character outside strings */
+    char *last = NULL;
+    char *p;
+
+    for (p = expr; *p; p++) {
+        if (escaped) {
+            escaped = 0;
+            continue;
+        }
+        if (in_string && *p == '\\') {
+            escaped = 1;
+            continue;
+        }
+        if (*p == '"') {
+            in_string = !in_string;
+            prev = '"';
+            continue;
+        }
+        if (in_string || isspace((unsigned char)*p)) {
+            continue;
+        }
+        if ((*p == '+' || *p == '-') && prev != '\0' && prev != '+' && prev != '-' && prev != '(') {
+            last = p;
+        }
+        prev = *p;
+    }
+    return last;
+}
+
+static char *xstrdup_local(const char *s) {
+    size_t len = strlen(s) + 1;
+    char *copy = xmalloc(len);
+    memcpy(copy, s, len);
+    return copy;
+}
+
+static int valid_label_name(const char *s) {
+    if (!isalpha((unsigned char)*s) && *s != '_') {
+        return 0;
+    }
+    for (s++; *s; s++) {
+        if (!isalnum((unsigned char)*s) && *s != '_') {
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int reserved_label_name(const char *s) {
+    static const char *reserved[] = {"BANK_ID",
+                                     "FILL_TO_BANK_END",
+                                     "INLINE_BYTE",
+                                     "INLINE_WORD",
+                                     "INLINE_PTR",
+                                     "INLINE_STRING_PTR",
+                                     "INLINE_CODE_PTR",
+                                     "INLINE_TABLE_PTR",
+                                     "INLINE_FAR_CODE",
+                                     "INLINE_FAR_STRING",
+                                     "INLINE_FAR_PTR",
+                                     "INLINE_FAR_TABLE",
+                                     "INLINE_PTR_DMD_FULLFRAME",
+                                     "INLINE_FAR_DMD_FULLFRAME",
+                                     "INLINE_PTR_SPRITE",
+                                     "INLINE_FAR_SPRITE",
+                                     "INLINE_BYTES_UNTIL",
+                                     "INLINE_COUNTED_BYTES",
+                                     "TABLE_PTR",
+                                     "TABLE_FAR_CODE",
+                                     "TABLE_FAR_STRING",
+                                     "TABLE_FAR_PTR",
+                                     "TABLE_FAR_TABLE",
+                                     "TABLE_PTR_DMD_FULLFRAME",
+                                     "TABLE_FAR_DMD_FULLFRAME",
+                                     "TABLE_PTR_SPRITE",
+                                     "TABLE_FAR_SPRITE",
+                                     "FAR_CODE",
+                                     "FAR_STRING",
+                                     "FAR_PTR",
+                                     "FAR_TABLE",
+                                     "FAR_DMD_FULLFRAME",
+                                     "FAR_SPRITE",
+                                     "STRING",
+                                     "LDA",
+                                     "LDB",
+                                     "LDD",
+                                     "LDX",
+                                     "LDY",
+                                     "LDU",
+                                     "LDS",
+                                     "STA",
+                                     "STB",
+                                     "STD",
+                                     "STX",
+                                     "STY",
+                                     "STU",
+                                     "STS",
+                                     "JSR",
+                                     "JMP",
+                                     "RTS",
+                                     "RTI",
+                                     "BRA",
+                                     "BSR",
+                                     "PULS",
+                                     "PULU",
+                                     "PSHS",
+                                     "PSHU",
+                                     NULL};
+    size_t i;
+
+    for (i = 0; reserved[i]; i++) {
+        if (strcmp(s, reserved[i]) == 0) {
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void add_symbol_ex(AsmState *st, const char *name, uint32_t value, int has_far_bank,
+                          uint8_t far_bank) {
+    size_t i;
+
+    if (!valid_label_name(name)) {
+        die("invalid label name '%s'", name);
+    }
+    if (reserved_label_name(name)) {
+        die("label name '%s' collides with assembler syntax", name);
+    }
+    for (i = 0; i < st->symbol_count; i++) {
+        if (strcmp(st->symbols[i].name, name) == 0) {
+            if (st->symbols[i].value != value) {
+                die("label '%s' is defined more than once", name);
+            }
+            if (has_far_bank && st->symbols[i].has_far_bank &&
+                st->symbols[i].far_bank != far_bank) {
+                die("label '%s' is defined with conflicting banks", name);
+            }
+            if (has_far_bank) {
+                st->symbols[i].has_far_bank = 1;
+                st->symbols[i].far_bank = far_bank;
+            }
+            return;
+        }
+    }
+    if (st->symbol_count == st->symbol_cap) {
+        size_t new_cap = st->symbol_cap == 0 ? 128 : st->symbol_cap * 2;
+        Symbol *new_symbols = realloc(st->symbols, new_cap * sizeof(st->symbols[0]));
+        if (!new_symbols) {
+            die("out of memory");
+        }
+        st->symbols = new_symbols;
+        st->symbol_cap = new_cap;
+    }
+    st->symbols[st->symbol_count].name = xstrdup_local(name);
+    st->symbols[st->symbol_count].value = value;
+    st->symbols[st->symbol_count].has_far_bank = has_far_bank;
+    st->symbols[st->symbol_count].far_bank = far_bank;
+    st->symbol_count++;
+}
+
+static void add_symbol(AsmState *st, const char *name, uint32_t value) {
+    add_symbol_ex(st, name, value, 0, 0);
+}
+
+/* A symbol the source does not define, from the snippet resolver. */
+static int lookup_external(const AsmState *st, const char *name, uint32_t *value, int *has_bank,
+                           uint8_t *bank) {
+    *has_bank = 0;
+    *bank = 0;
+    return st->resolve && st->resolve(st->resolve_ctx, name, value, has_bank, bank);
+}
+
+static int lookup_symbol(const AsmState *st, const char *name, uint32_t *value) {
+    size_t i;
+    int hb;
+    uint8_t b;
+
+    for (i = 0; i < st->symbol_count; i++) {
+        if (strcmp(st->symbols[i].name, name) == 0) {
+            *value = st->symbols[i].value;
+            return 1;
+        }
+    }
+    return lookup_external(st, name, value, &hb, &b);
+}
+
+static int lookup_symbol_far_bank(const AsmState *st, const char *name, uint32_t *value,
+                                  uint32_t *bank) {
+    size_t i;
+
+    for (i = 0; i < st->symbol_count; i++) {
+        if (strcmp(st->symbols[i].name, name) == 0 && st->symbols[i].has_far_bank) {
+            *value = st->symbols[i].value;
+            *bank = st->symbols[i].far_bank;
+            return 1;
+        }
+    }
+    {
+        int hb;
+        uint8_t b;
+        if (lookup_external(st, name, value, &hb, &b) && hb) {
+            *bank = b;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+static void init_rom(AsmState *st, size_t size) {
+    if (size != 256u * 1024u && size != 512u * 1024u && size != 1024u * 1024u) {
+        die("unsupported .ROM_SIZE %lu", (unsigned long)size);
+    }
+    if (st->size != 0 && st->size != size) {
+        die("conflicting .ROM_SIZE values");
+    }
+    st->size = size;
+    st->paged_size = size - APEX_SYSTEM_SIZE;
+    if (st->pass == 1 || st->data) {
+        return;
+    }
+    st->data = xmalloc(size);
+    st->written = xmalloc(size);
+    memset(st->data, 0xff, size);
+    memset(st->written, 0, size);
+}
+
+static size_t current_offset(const AsmState *st) {
+    if (st->size == 0) {
+        die(".ROM_SIZE must appear before emitted bytes");
+    }
+    if (st->bank < 0) {
+        die(".BANK must appear before emitted bytes");
+    }
+    if (st->bank == 0x100) {
+        if (st->org < APEX_SYSTEM_ORG || st->org > 0x10000u) {
+            die("system .ORG 0x%04x is outside 0x8000-0xffff", st->org);
+        }
+        return st->paged_size + (size_t)(st->org - APEX_SYSTEM_ORG);
+    }
+    if ((size_t)st->bank >= st->paged_size / APEX_BANK_SIZE) {
+        die("bank 0x%02x is outside ROM size", st->bank);
+    }
+    if (st->org < APEX_PAGED_ORG || st->org > 0x8000u) {
+        die("paged .ORG 0x%04x is outside 0x4000-0x7fff", st->org);
+    }
+    return (size_t)st->bank * APEX_BANK_SIZE + (size_t)(st->org - APEX_PAGED_ORG);
+}
+
+static uint32_t current_limit(const AsmState *st) {
+    return st->bank == 0x100 ? 0x10000u : 0x8000u;
+}
+
+static void emit_snippet_byte(AsmState *st, uint8_t value) {
+    if (st->org >= current_limit(st)) {
+        die("write past end of bank");
+    }
+    size_t at = (size_t)(st->org - st->snip_org);
+    if (st->org < st->snip_org) {
+        die("snippet writes before its start address");
+    }
+    if (at >= st->snip_cap) {
+        size_t ncap = st->snip_cap ? st->snip_cap * 2u : 256u;
+        while (ncap <= at)
+            ncap *= 2u;
+        uint8_t *nb = realloc(st->snip_buf, ncap);
+        if (!nb) {
+            die("out of memory");
+        }
+        memset(nb + st->snip_cap, 0xff, ncap - st->snip_cap);
+        st->snip_buf = nb;
+        st->snip_cap = ncap;
+    }
+    st->snip_buf[at] = value;
+    if (at + 1u > st->snip_len) {
+        st->snip_len = at + 1u;
+    }
+    st->org++;
+}
+
+static void emit_byte(AsmState *st, uint8_t value) {
+    if (st->snippet) {
+        emit_snippet_byte(st, value);
+        return;
+    }
+    size_t off = current_offset(st);
+    if (off >= st->size || st->org >= current_limit(st)) {
+        die("write past end of bank");
+    }
+    if (st->pass == 2) {
+        if (st->written[off]) {
+            die("overlapping output: ROM offset 0x%06lx (%s 0x%04x) is written twice",
+                (unsigned long)off, st->bank == 0x100 ? "system" : "paged", st->org);
+        }
+        st->data[off] = value;
+        st->written[off] = 1;
+    }
+    st->org++;
+}
+
+static int resolve_for_cpu(void *ctx, const char *expr, uint32_t *value) {
+    return parse_value_or_symbol((const AsmState *)ctx, expr, value);
+}
+
+static void emit_for_cpu(void *ctx, uint8_t value) {
+    emit_byte((AsmState *)ctx, value);
+}
+
+static void parse_db(AsmState *st, char *args) {
+    char *p = args;
+
+    while (*p) {
+        char *start;
+        char saved;
+        uint32_t value;
+
+        while (isspace((unsigned char)*p) || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        start = p;
+        while (*p && *p != ',') {
+            p++;
+        }
+        saved = *p;
+        *p = '\0';
+        start = trim(start);
+        if (!parse_u32(start, &value) || value > 0xffu) {
+            die("invalid .DB byte '%s'", start);
+        }
+        emit_byte(st, (uint8_t)value);
+        if (saved == '\0') {
+            break;
+        }
+        *p++ = saved;
+    }
+}
+
+static int parse_value_or_symbol(const AsmState *st, const char *text, uint32_t *value) {
+    char expr[256];
+    char *op;
+    uint32_t left;
+    uint32_t right;
+
+    if (parse_u32(text, value)) {
+        return 1;
+    }
+    /* bank(LABEL): the bank byte of a far label (address in LDX, bank here). */
+    if (strncmp(text, "bank(", 5) == 0) {
+        const char *inner = text + 5;
+        const char *close = strrchr(inner, ')');
+        char name[128];
+        size_t n;
+        if (!close || close[1] != '\0') {
+            return 0;
+        }
+        n = (size_t)(close - inner);
+        if (n == 0 || n >= sizeof(name)) {
+            return 0;
+        }
+        memcpy(name, inner, n);
+        name[n] = '\0';
+        {
+            char *nm = trim(name);
+            uint32_t sa, sb;
+            /* A defined symbol wins over the generated Bxx_Ayyyy form (see
+               below): "Bcd_Add16" may be a user label, not bank 0xcd. */
+            if (lookup_symbol_far_bank(st, nm, &sa, &sb)) {
+                *value = sb;
+                return 1;
+            }
+            if (strlen(nm) == 9 && nm[0] == 'B' && nm[3] == '_' && nm[4] == 'A') {
+                char bt[5] = {'0', 'x', nm[1], nm[2], '\0'};
+                if (parse_u32(bt, value)) {
+                    return 1;
+                }
+            }
+        }
+        return 0;
+    }
+    if (snprintf(expr, sizeof(expr), "%s", text) < (int)sizeof(expr)) {
+        op = find_last_binary_op(expr);
+        if (op) {
+            char operation = *op;
+
+            *op = '\0';
+            if (parse_value_or_symbol(st, trim(expr), &left) &&
+                parse_value_or_symbol(st, trim(op + 1), &right)) {
+                *value = operation == '+' ? left + right : left - right;
+                return 1;
+            }
+        }
+    }
+    /* A defined symbol wins even when its name coincidentally matches the
+       generated Bxx_Ayyyy form (e.g. a user label "Bcd_Add16" would otherwise
+       be misread as bank 0xcd, address 0xdd16).  Only fall back to decoding the
+       generated form when no such symbol is defined (forward/cross-bank refs). */
+    if (lookup_symbol(st, text, value)) {
+        return 1;
+    }
+    if (strlen(text) == 9 && text[0] == 'B' && text[3] == '_' && text[4] == 'A') {
+        uint32_t bank;
+        char addr_text[7];
+        char bank_text[5];
+        bank_text[0] = '0';
+        bank_text[1] = 'x';
+        bank_text[2] = text[1];
+        bank_text[3] = text[2];
+        bank_text[4] = '\0';
+        addr_text[0] = '0';
+        addr_text[1] = 'x';
+        memcpy(addr_text + 2, text + 5, 4);
+        addr_text[6] = '\0';
+        if (!parse_u32(addr_text, value) || !parse_u32(bank_text, &bank)) {
+            return 0;
+        }
+        (void)bank;
+        return 1;
+    }
+    return 0;
+}
+
+static int parse_generated_bank_label(const char *text, uint32_t *addr, uint32_t *bank) {
+    char bank_text[5];
+    char addr_text[7];
+
+    if (strlen(text) != 9 || text[0] != 'B' || text[3] != '_' || text[4] != 'A') {
+        return 0;
+    }
+    bank_text[0] = '0';
+    bank_text[1] = 'x';
+    bank_text[2] = text[1];
+    bank_text[3] = text[2];
+    bank_text[4] = '\0';
+    addr_text[0] = '0';
+    addr_text[1] = 'x';
+    memcpy(addr_text + 2, text + 5, 4);
+    addr_text[6] = '\0';
+    return parse_u32(addr_text, addr) && parse_u32(bank_text, bank);
+}
+
+static void parse_dw(AsmState *st, char *args) {
+    char *p = args;
+
+    while (*p) {
+        char *start;
+        char saved;
+        uint32_t value;
+
+        while (isspace((unsigned char)*p) || *p == ',') {
+            p++;
+        }
+        if (*p == '\0') {
+            break;
+        }
+        start = p;
+        while (*p && *p != ',') {
+            p++;
+        }
+        saved = *p;
+        *p = '\0';
+        start = trim(start);
+        if (st->pass == 1) {
+            value = 0;
+        } else if (!parse_value_or_symbol(st, start, &value) || value > 0xffffu) {
+            die("invalid .DW word '%s'", start);
+        }
+        emit_byte(st, (uint8_t)(value >> 8));
+        emit_byte(st, (uint8_t)value);
+        if (saved == '\0') {
+            break;
+        }
+        *p++ = saved;
+    }
+}
+
+static void parse_table_ptr(AsmState *st, char *args) {
+    uint32_t value;
+
+    args = trim(args);
+    if (st->pass == 1) {
+        value = 0;
+    } else if (!parse_value_or_symbol(st, args, &value) || value > 0xffffu) {
+        die("invalid TABLE_PTR '%s'", args);
+    }
+    emit_byte(st, (uint8_t)(value >> 8));
+    emit_byte(st, (uint8_t)value);
+}
+
+static void parse_string(AsmState *st, char *args) {
+    char *p = trim(args);
+
+    if (*p != '"') {
+        die("invalid STRING '%s'", args);
+    }
+    p++;
+    while (*p) {
+        unsigned char ch = 0;
+
+        if (*p == '"') {
+            p++;
+            if (*trim(p) != '\0') {
+                die("unexpected trailing text after STRING");
+            }
+            emit_byte(st, 0x00);
+            return;
+        }
+        if (*p == '\\') {
+            p++;
+            if (*p == '"' || *p == '\\') {
+                ch = (unsigned char)*p++;
+            } else if (*p == 'n') {
+                ch = 0x0au;
+                p++;
+            } else if (*p == 't') {
+                ch = 0x09u;
+                p++;
+            } else if (*p == 'a') {
+                ch = 0x07u;
+                p++;
+            } else {
+                die("invalid STRING escape");
+            }
+        } else {
+            ch = (unsigned char)*p++;
+        }
+        if (ch != 0x0au && ch != 0x09u && ch != 0x07u && (ch < 0x20u || ch > 0x7fu)) {
+            die("STRING byte out of supported ASCII range");
+        }
+        emit_byte(st, ch);
+    }
+    die("unterminated STRING");
+}
+
+static void parse_string_fixed(AsmState *st, char *args) {
+    char *p = trim(args);
+
+    if (*p != '"') {
+        die("invalid STRING_FIXED '%s'", args);
+    }
+    p++;
+    while (*p) {
+        unsigned char ch = 0;
+
+        if (*p == '"') {
+            p++;
+            if (*trim(p) != '\0') {
+                die("unexpected trailing text after STRING_FIXED");
+            }
+            return;
+        }
+        if (*p == '\\') {
+            p++;
+            if (*p == '"' || *p == '\\') {
+                ch = (unsigned char)*p++;
+            } else if (*p == 'n') {
+                ch = 0x0au;
+                p++;
+            } else if (*p == 'r') {
+                ch = 0x0du;
+                p++;
+            } else if (*p == 't') {
+                ch = 0x09u;
+                p++;
+            } else if (*p == 'a') {
+                ch = 0x07u;
+                p++;
+            } else {
+                die("invalid STRING_FIXED escape");
+            }
+        } else {
+            ch = (unsigned char)*p++;
+        }
+        if (ch != 0x0au && ch != 0x0du && ch != 0x09u && ch != 0x07u &&
+            (ch < 0x20u || ch > 0x7fu)) {
+            die("STRING_FIXED byte out of supported ASCII range");
+        }
+        emit_byte(st, ch);
+    }
+    die("unterminated STRING_FIXED");
+}
+
+/* BCD <digits> — 2N decimal digits packed into N bytes (each nibble one digit). */
+static void parse_bcd(AsmState *st, char *args) {
+    char *p = trim(args);
+    size_t n = 0, i;
+    for (i = 0; p[i]; i++) {
+        if (p[i] == ' ' || p[i] == '\t')
+            break;
+        if (p[i] < '0' || p[i] > '9') {
+            die("invalid BCD digit '%c'", p[i]);
+        }
+        n++;
+    }
+    if (*trim(p + n) != '\0') {
+        die("unexpected trailing text after BCD");
+    }
+    if (n == 0 || (n & 1u)) {
+        die("BCD needs an even, non-zero number of digits");
+    }
+    for (i = 0; i < n; i += 2) {
+        emit_byte(st, (uint8_t)(((p[i] - '0') << 4) | (p[i + 1] - '0')));
+    }
+}
+
+static void parse_inline_far_code(AsmState *st, char *args) {
+    char *first;
+    char *second;
+    uint32_t addr;
+    uint32_t bank;
+
+    first = trim(args);
+    second = strchr(first, ',');
+    if (second) {
+        *second = '\0';
+        second = trim(second + 1);
+    }
+    first = trim(first);
+    if (second) {
+        if (st->pass == 1) {
+            addr = 0;
+            bank = 0;
+        } else if (!parse_value_or_symbol(st, first, &addr) ||
+                   !parse_value_or_symbol(st, second, &bank)) {
+            die("invalid INLINE_FAR_CODE '%s, %s'", first, second);
+        }
+    } else if (lookup_symbol_far_bank(st, first, &addr, &bank)) {
+        /* defined far label; checked first, as a user label may look generated */
+    } else if (parse_generated_bank_label(first, &addr, &bank)) {
+        /* generated far label (forward or cross-bank reference) */
+    } else {
+        if (st->pass == 1) {
+            addr = 0;
+            bank = 0;
+        } else {
+            die("invalid INLINE_FAR_CODE '%s'", first);
+        }
+    }
+    if (addr > 0xffffu || bank > 0xffu) {
+        die("INLINE_FAR_CODE operand out of range");
+    }
+    emit_byte(st, (uint8_t)(addr >> 8));
+    emit_byte(st, (uint8_t)addr);
+    emit_byte(st, (uint8_t)bank);
+}
+
+static void parse_table_far_code(AsmState *st, char *args) {
+    parse_inline_far_code(st, args);
+}
+
+static void fill_to_bank_end(AsmState *st) {
+    unsigned index;
+    uint32_t limit = current_limit(st);
+
+    if (st->bank < 0) {
+        die("FILL_TO_BANK_END requires .BANK");
+    }
+    index = st->bank == 0x100 ? 63u : (unsigned)st->bank;
+    if (st->pass == 2) {
+        if (index >= sizeof(st->fill_seen) / sizeof(st->fill_seen[0])) {
+            die("bank index too large for fill tracking");
+        }
+        if (st->fill_seen[index]) {
+            die("FILL_TO_BANK_END used more than once for bank");
+        }
+        st->fill_seen[index] = 1;
+    }
+    while (st->org < limit) {
+        emit_byte(st, 0xff);
+    }
+}
+
+static int parse_equate(AsmState *st, char *line) {
+    char *eq = find_unquoted_char(line, '=');
+    char *name;
+    char *expr;
+    uint32_t value;
+
+    if (!eq) {
+        return 0;
+    }
+    *eq = '\0';
+    name = trim(line);
+    expr = trim(eq + 1);
+    if (!parse_value_or_symbol(st, expr, &value)) {
+        if (st->pass == 1) {
+            return 1;
+        }
+        die("invalid equate '%s = %s'", name, expr);
+    }
+    /* An equate inside a .BANK section whose value lies in that section's CPU
+       window names a ROM address in that bank (e.g. a label inside an
+       instruction, emitted as an equate): give it the bank, like a label, so
+       INLINE_FAR_CODE / bank() can resolve it. */
+    if (st->has_far_bank && st->bank >= 0 &&
+        (st->bank == 0x100 ? (value >= APEX_SYSTEM_ORG && value <= 0xffffu)
+                           : (value >= APEX_PAGED_ORG && value < APEX_SYSTEM_ORG))) {
+        add_symbol_ex(st, name, value, 1, st->far_bank);
+    } else {
+        add_symbol(st, name, value);
+    }
+    return 1;
+}
+
+static void parse_line(AsmState *st, char *line) {
+    char *s;
+    char *colon;
+    char *space;
+    uint32_t value;
+
+    strip_comment(line);
+    s = trim(line);
+    if (*s == '\0') {
+        return;
+    }
+
+    colon = find_label_colon(s);
+    if (colon) {
+        *colon = '\0';
+        add_symbol_ex(st, trim(s), st->org, st->has_far_bank, st->far_bank);
+        s = trim(colon + 1);
+        if (*s == '\0') {
+            return;
+        }
+    } else {
+        if (parse_equate(st, s)) {
+            return;
+        }
+    }
+
+    if (st->snippet && (starts_with_word(s, ".ROM_SIZE") || starts_with_word(s, ".BANK") ||
+                        starts_with_word(s, ".ORG") || starts_with_word(s, "BANK_ID") ||
+                        strcmp(s, "FILL_TO_BANK_END") == 0)) {
+        die("'%s' is not allowed in a snippet (its location is given by the patch)", s);
+    }
+    if (starts_with_word(s, ".ROM_SIZE")) {
+        s = trim(s + strlen(".ROM_SIZE"));
+        if (!parse_u32(s, &value)) {
+            die("invalid .ROM_SIZE");
+        }
+        init_rom(st, value);
+    } else if (starts_with_word(s, ".BANK")) {
+        s = trim(s + strlen(".BANK"));
+        if (strcmp(s, "SYSTEM") == 0) {
+            st->bank = 0x100;
+            st->has_far_bank = 1;
+            st->far_bank = 0xffu;
+        } else {
+            if (!parse_u32(s, &value) || value > 0xffu) {
+                die("invalid .BANK '%s'", s);
+            }
+            st->bank = (int)value;
+            /* A user label's far bank is the canonical (computed) bank id for
+               this page, mirroring the disassembler: base = 0x3e - paged_pages
+               (0x20 for 512 KB, 0x00 for 1 MB).  The BANK_ID byte is just the
+               emitted marker and no longer defines bank identity. */
+            if (st->paged_size > 0) {
+                size_t banks = st->paged_size / APEX_BANK_SIZE;
+                st->has_far_bank = 1;
+                st->far_bank = (uint8_t)((0x3eu - banks) + value);
+            } else {
+                st->has_far_bank = 0;
+            }
+        }
+    } else if (starts_with_word(s, ".ORG")) {
+        s = trim(s + strlen(".ORG"));
+        if (!parse_u32(s, &value) || value > 0x10000u) {
+            die("invalid .ORG '%s'", s);
+        }
+        st->org = value;
+    } else if (starts_with_word(s, "BANK_ID")) {
+        s = trim(s + strlen("BANK_ID"));
+        if (!parse_u32(s, &value) || value > 0xffu) {
+            die("invalid BANK_ID '%s'", s);
+        }
+        /* BANK_ID only emits the marker byte; bank identity comes from .BANK. */
+        emit_byte(st, (uint8_t)value);
+    } else if (starts_with_word(s, "INLINE_BYTE")) {
+        s = trim(s + strlen("INLINE_BYTE"));
+        if (!parse_u32(s, &value) || value > 0xffu) {
+            die("invalid INLINE_BYTE '%s'", s);
+        }
+        emit_byte(st, (uint8_t)value);
+    } else if (starts_with_word(s, "INLINE_WORD")) {
+        s = trim(s + strlen("INLINE_WORD"));
+        if (!parse_u32(s, &value) || value > 0xffffu) {
+            die("invalid INLINE_WORD '%s'", s);
+        }
+        emit_byte(st, (uint8_t)(value >> 8));
+        emit_byte(st, (uint8_t)value);
+    } else if (starts_with_word(s, "INLINE_BYTES_UNTIL")) {
+        /* Variable-length inline payload: a terminated byte list.  The bytes
+           (including the terminator) are carried verbatim, so it assembles like
+           .DB. */
+        parse_db(st, trim(s + strlen("INLINE_BYTES_UNTIL")));
+    } else if (starts_with_word(s, "INLINE_COUNTED_BYTES")) {
+        /* Variable-length inline payload: leading count byte then that many
+           bytes, carried verbatim. */
+        parse_db(st, trim(s + strlen("INLINE_COUNTED_BYTES")));
+    } else if (starts_with_word(s, "INLINE_STRING_PTR")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_STRING_PTR")));
+    } else if (starts_with_word(s, "INLINE_CODE_PTR")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_CODE_PTR")));
+    } else if (starts_with_word(s, "INLINE_TABLE_PTR")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_TABLE_PTR")));
+    } else if (starts_with_word(s, "INLINE_PTR_DMD_FULLFRAME")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_PTR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "INLINE_PTR_SPRITE")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_PTR_SPRITE")));
+    } else if (starts_with_word(s, "INLINE_PTR")) {
+        parse_table_ptr(st, trim(s + strlen("INLINE_PTR")));
+    } else if (starts_with_word(s, "INLINE_FAR_CODE")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_CODE")));
+    } else if (starts_with_word(s, "INLINE_FAR_STRING")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_STRING")));
+    } else if (starts_with_word(s, "INLINE_FAR_TABLE")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_TABLE")));
+    } else if (starts_with_word(s, "INLINE_FAR_DMD_FULLFRAME")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "INLINE_FAR_SPRITE")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_SPRITE")));
+    } else if (starts_with_word(s, "INLINE_FAR_PTR")) {
+        parse_inline_far_code(st, trim(s + strlen("INLINE_FAR_PTR")));
+    } else if (starts_with_word(s, "FAR_STRING")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_STRING")));
+    } else if (starts_with_word(s, "FAR_TABLE")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_TABLE")));
+    } else if (starts_with_word(s, "FAR_PTR")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_PTR")));
+    } else if (starts_with_word(s, "FAR_CODE")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_CODE")));
+    } else if (starts_with_word(s, "FAR_DMD_FULLFRAME")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "FAR_SPRITE")) {
+        parse_inline_far_code(st, trim(s + strlen("FAR_SPRITE")));
+    } else if (starts_with_word(s, "TABLE_PTR_SPRITE")) {
+        parse_table_ptr(st, trim(s + strlen("TABLE_PTR_SPRITE")));
+    } else if (starts_with_word(s, "TABLE_PTR")) {
+        parse_table_ptr(st, trim(s + strlen("TABLE_PTR")));
+    } else if (starts_with_word(s, "TABLE_PTR_DMD_FULLFRAME")) {
+        parse_table_ptr(st, trim(s + strlen("TABLE_PTR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "TABLE_FAR_STRING")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_STRING")));
+    } else if (starts_with_word(s, "TABLE_FAR_TABLE")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_TABLE")));
+    } else if (starts_with_word(s, "TABLE_FAR_DMD_FULLFRAME")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_DMD_FULLFRAME")));
+    } else if (starts_with_word(s, "TABLE_FAR_SPRITE")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_SPRITE")));
+    } else if (starts_with_word(s, "TABLE_FAR_PTR")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_PTR")));
+    } else if (starts_with_word(s, "TABLE_FAR_CODE")) {
+        parse_table_far_code(st, trim(s + strlen("TABLE_FAR_CODE")));
+    } else if (starts_with_word(s, "STRING_FIXED")) {
+        parse_string_fixed(st, trim(s + strlen("STRING_FIXED")));
+    } else if (starts_with_word(s, "STRING")) {
+        parse_string(st, trim(s + strlen("STRING")));
+    } else if (starts_with_word(s, "BCD")) {
+        parse_bcd(st, trim(s + strlen("BCD")));
+    } else if (starts_with_word(s, ".DB")) {
+        parse_db(st, trim(s + strlen(".DB")));
+    } else if (starts_with_word(s, ".DW")) {
+        parse_dw(st, trim(s + strlen(".DW")));
+    } else if (strcmp(s, "FILL_TO_BANK_END") == 0) {
+        fill_to_bank_end(st);
+    } else {
+        char saved;
+        space = s;
+        while (*space && !isspace((unsigned char)*space)) {
+            space++;
+        }
+        saved = *space;
+        *space = '\0';
+        if (!cpu6809_assemble_line(s, saved ? trim(space + 1) : space, st->org, st->pass == 2,
+                                   resolve_for_cpu, emit_for_cpu, st)) {
+            die("unsupported assembly line: %s%s%s", s, saved ? " " : "",
+                saved ? trim(space + 1) : "");
+        }
+        *space = saved;
+    }
+}
+
+/* Read one whole line of any length into *buf (grown as needed).  Returns 0 at
+   end of file.  A fixed buffer would silently cut long lines, e.g. a large
+   INLINE_BYTES_UNTIL span, and drop the rest of the bytes. */
+static int read_source_line(FILE *f, char **buf, size_t *cap) {
+    size_t len = 0;
+    int ch;
+
+    while ((ch = fgetc(f)) != EOF) {
+        if (len + 2u > *cap) {
+            size_t ncap = *cap ? *cap * 2u : 8192u;
+            char *nb = realloc(*buf, ncap);
+            if (!nb) {
+                die("out of memory");
+            }
+            *buf = nb;
+            *cap = ncap;
+        }
+        (*buf)[len++] = (char)ch;
+        if (ch == '\n') {
+            break;
+        }
+    }
+    if (len == 0) {
+        return 0;
+    }
+    (*buf)[len] = '\0';
+    return 1;
+}
+
+static void assemble_file(AsmState *st, const char *path) {
+    FILE *f = fopen(path, "r");
+    char *line = NULL;
+    size_t cap = 0;
+    unsigned long lineno = 0;
+
+    if (!f) {
+        die("failed to open %s", path);
+    }
+    while (read_source_line(f, &line, &cap)) {
+        apex_set_die_context(path, ++lineno); /* errors report path:line */
+        parse_line(st, line);
+    }
+    apex_set_die_context(NULL, 0);
+    if (ferror(f)) {
+        die("failed to read %s", path);
+    }
+    free(line);
+    fclose(f);
+}
+
+static void reset_location(AsmState *st, int pass) {
+    st->bank = -1;
+    st->has_far_bank = 0;
+    st->org = 0;
+    st->pass = pass;
+    memset(st->fill_seen, 0, sizeof(st->fill_seen));
+}
+
+static void free_state(AsmState *st) {
+    size_t i;
+    for (i = 0; i < st->symbol_count; i++) {
+        free(st->symbols[i].name);
+    }
+    free(st->symbols);
+    free(st->data);
+    free(st->written);
+    free(st->snip_buf);
+}
+
+typedef struct {
+    AsmState *st;
+    const char *const *paths;
+    size_t count;
+} FilesJob;
+
+static void run_files(void *ctx) {
+    FilesJob *j = ctx;
+    size_t i;
+
+    reset_location(j->st, 1);
+    for (i = 0; i < j->count; i++) {
+        assemble_file(j->st, j->paths[i]);
+    }
+    if (j->st->size == 0) {
+        die("no .ROM_SIZE was assembled");
+    }
+    reset_location(j->st, 2);
+    for (i = 0; i < j->count; i++) {
+        assemble_file(j->st, j->paths[i]);
+    }
+    if (!j->st->data) {
+        die("second pass did not allocate ROM");
+    }
+}
+
+int apex_asm_files(const char *const *paths, size_t count, uint8_t **rom, size_t *rom_size,
+                   char *err, size_t errsz) {
+    AsmState st;
+    FilesJob j;
+
+    memset(&st, 0, sizeof(st));
+    j.st = &st;
+    j.paths = paths;
+    j.count = count;
+    *rom = NULL;
+    *rom_size = 0;
+    if (apex_try(run_files, &j, err, errsz) != 0) {
+        free_state(&st);
+        return 1;
+    }
+    *rom = st.data;
+    *rom_size = st.size;
+    st.data = NULL;
+    free_state(&st);
+    return 0;
+}
+
+typedef struct {
+    AsmState *st;
+    const char *text;
+    uint8_t bank;
+    uint32_t org;
+    int sizing;
+} SnippetJob;
+
+/* Assemble the snippet text once (one pass). */
+static void snippet_pass(SnippetJob *j, int pass) {
+    AsmState *st = j->st;
+    const char *p = j->text;
+    unsigned long lineno = 0;
+    char *line = NULL;
+    size_t cap = 0;
+
+    st->pass = pass;
+    st->org = j->org;
+    st->snip_len = 0;
+    while (*p) {
+        const char *nl = strchr(p, '\n');
+        size_t n = nl ? (size_t)(nl - p) : strlen(p);
+        if (n + 1u > cap) {
+            cap = n + 64u;
+            char *nb = realloc(line, cap);
+            if (!nb) {
+                free(line);
+                die("out of memory");
+            }
+            line = nb;
+        }
+        memcpy(line, p, n);
+        line[n] = '\0';
+        apex_set_die_context("line", ++lineno);
+        parse_line(st, line);
+        p += n + (nl ? 1u : 0u);
+    }
+    apex_set_die_context(NULL, 0);
+    free(line);
+}
+
+static void run_snippet(void *ctx) {
+    SnippetJob *j = ctx;
+    AsmState *st = j->st;
+
+    if (j->bank == 0xffu) {
+        if (j->org < APEX_SYSTEM_ORG || j->org > 0xffffu) {
+            die("system bank address 0x%04x is outside 0x8000-0xffff", (unsigned)j->org);
+        }
+        st->bank = 0x100;
+    } else {
+        if (j->org < APEX_PAGED_ORG || j->org >= APEX_SYSTEM_ORG) {
+            die("paged bank address 0x%04x is outside 0x4000-0x7fff", (unsigned)j->org);
+        }
+        if (st->paged_size == 0 || j->bank < 0x3eu - st->paged_size / APEX_BANK_SIZE) {
+            die("bank 0x%02x is not in this ROM", j->bank);
+        }
+        st->bank = (int)(j->bank - (0x3eu - st->paged_size / APEX_BANK_SIZE));
+    }
+    st->has_far_bank = 1;
+    st->far_bank = j->bank;
+    snippet_pass(j, 1);
+    if (!j->sizing) {
+        size_t size1 = st->snip_len;
+        snippet_pass(j, 2);
+        if (st->snip_len != size1) {
+            die("snippet size changed between passes (%lu -> %lu bytes); a forward "
+                "reference changed an addressing mode",
+                (unsigned long)size1, (unsigned long)st->snip_len);
+        }
+    }
+}
+
+int apex_asm_snippet(const char *text, uint8_t bank, uint32_t org, size_t rom_size,
+                     ApexAsmResolveFn resolve, void *ctx, int sizing, ApexAsmSnippet *out,
+                     char *err, size_t errsz) {
+    AsmState st;
+    SnippetJob j;
+    size_t i;
+
+    memset(out, 0, sizeof(*out));
+    memset(&st, 0, sizeof(st));
+    st.snippet = 1;
+    st.snip_org = org;
+    st.size = rom_size;
+    st.paged_size = rom_size >= APEX_SYSTEM_SIZE ? rom_size - APEX_SYSTEM_SIZE : 0;
+    st.resolve = resolve;
+    st.resolve_ctx = ctx;
+    j.st = &st;
+    j.text = text ? text : "";
+    j.bank = bank;
+    j.org = org;
+    j.sizing = sizing;
+    if (apex_try(run_snippet, &j, err, errsz) != 0) {
+        free_state(&st);
+        return 1;
+    }
+    out->size = st.snip_len;
+    out->bytes = xmalloc(st.snip_len ? st.snip_len : 1u);
+    if (st.snip_len)
+        memcpy(out->bytes, st.snip_buf, st.snip_len);
+    if (st.symbol_count) {
+        out->labels = xmalloc(st.symbol_count * sizeof(*out->labels));
+        for (i = 0; i < st.symbol_count; i++) {
+            out->labels[i].name = st.symbols[i].name;
+            out->labels[i].addr = st.symbols[i].value;
+            st.symbols[i].name = NULL;
+        }
+        out->label_count = st.symbol_count;
+    }
+    free_state(&st);
+    return 0;
+}
+
+void apex_asm_snippet_free(ApexAsmSnippet *snippet) {
+    size_t i;
+    if (!snippet)
+        return;
+    for (i = 0; i < snippet->label_count; i++)
+        free(snippet->labels[i].name);
+    free(snippet->labels);
+    free(snippet->bytes);
+    memset(snippet, 0, sizeof(*snippet));
+}

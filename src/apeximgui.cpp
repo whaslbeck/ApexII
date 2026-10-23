@@ -49,12 +49,16 @@ static void register_view_settings_handler(void) {
     h.TypeName = "ApexII";
     h.TypeHash = ImHashStr("ApexII");
     h.ReadOpenFn = [](ImGuiContext *, ImGuiSettingsHandler *, const char *name) -> void * {
+        if (strcmp(name, "Keys") == 0)
+            return (void *)2;
         return strcmp(name, "View") == 0 ? (void *)1 : NULL;
     };
-    h.ReadLineFn = [](ImGuiContext *, ImGuiSettingsHandler *, void *, const char *line) {
+    h.ReadLineFn = [](ImGuiContext *, ImGuiSettingsHandler *, void *entry, const char *line) {
         float v;
         int iv;
-        if (sscanf(line, "FontScale=%f", &v) == 1) {
+        if (entry == (void *)2) {
+            keys_read_ini_line(line);
+        } else if (sscanf(line, "FontScale=%f", &v) == 1) {
             g_ui_font_scale = clampf(v, FONT_SCALE_MIN, FONT_SCALE_MAX);
         } else if (sscanf(line, "ShowWarnings=%d", &iv) == 1) {
             g_show_warnings = iv != 0;
@@ -67,8 +71,83 @@ static void register_view_settings_handler(void) {
         buf->appendf("FontScale=%.3f\n", g_ui_font_scale);
         buf->appendf("ShowWarnings=%d\n", g_show_warnings);
         buf->appendf("ShowFlowBreaks=%d\n\n", g_show_flow_breaks);
+        keys_write_ini(buf);
     };
     ImGui::AddSettingsHandler(&h);
+}
+
+/* Default dock area of every dockable window.  Used by Reset Layout (and the
+   first run without imgui.ini) to build the layout, and at startup to dock a
+   window a saved imgui.ini does not know yet (one added in a newer version)
+   next to the windows of its area instead of leaving it floating. */
+enum DockArea { DOCK_MAIN, DOCK_LEFT, DOCK_RIGHT, DOCK_BOTTOM };
+static const struct {
+    const char *name;
+    DockArea area;
+} k_dock_layout[] = {
+    {"Disassembly", DOCK_MAIN},
+    {"Navigator", DOCK_LEFT},
+    {"Banks", DOCK_LEFT},
+    {"Labels", DOCK_LEFT},
+    {"Bookmarks", DOCK_LEFT},
+    {"Transitions", DOCK_LEFT},
+    {"Details", DOCK_RIGHT},
+    {"DMD", DOCK_RIGHT},
+    {"DMD Frames", DOCK_BOTTOM},
+    {"Edit", DOCK_RIGHT},
+    {"ROM Info", DOCK_RIGHT},
+    {"Match from Reference", DOCK_BOTTOM},
+    {"ROM Compare", DOCK_BOTTOM},
+    {"Coverage", DOCK_BOTTOM},
+    {"Game Hooks", DOCK_BOTTOM},
+    {"Bit Map", DOCK_BOTTOM},
+    {"Routine Card", DOCK_RIGHT},
+    {"Event Timeline", DOCK_BOTTOM},
+    {"Argument Values", DOCK_BOTTOM},
+    {"Patch", DOCK_BOTTOM},
+    {"Call Graph", DOCK_BOTTOM},
+    {"References", DOCK_BOTTOM},
+    {"Hardware", DOCK_BOTTOM},
+    {"Tables", DOCK_BOTTOM},
+    {"Hex", DOCK_BOTTOM},
+    {"Sprites", DOCK_BOTTOM},
+    {"Sprite Gallery", DOCK_BOTTOM},
+    {"Inline Sigs", DOCK_BOTTOM},
+    {"Code Entries", DOCK_BOTTOM},
+    {"Strings", DOCK_BOTTOM},
+    {"Symbols", DOCK_BOTTOM},
+    {"Types", DOCK_BOTTOM},
+    {"Pattern Search", DOCK_BOTTOM},
+    {"RAM References", DOCK_BOTTOM},
+    {"Immediate Loads", DOCK_BOTTOM},
+    {"Change Log", DOCK_BOTTOM},
+    {"PinMAME (dynamic)", DOCK_BOTTOM},
+    {"PinMAME · DMD", DOCK_BOTTOM},
+    {"PinMAME · Switches", DOCK_BOTTOM},
+    {"PinMAME · Coverage", DOCK_BOTTOM},
+    {"Ref Exclusions", DOCK_BOTTOM},
+    {"Code Candidates", DOCK_BOTTOM},
+    {"Inline Detection (prime bank)", DOCK_BOTTOM},
+    {"Warnings", DOCK_BOTTOM},
+    {"Flow Breaks", DOCK_BOTTOM},
+    {"Global Search", DOCK_BOTTOM},
+    {"ROM Map", DOCK_RIGHT},
+};
+
+/* Dock every window of k_dock_layout that has no saved settings into the node
+   of the first window of the same area that has one.  Runs once, after the
+   saved layout (imgui.ini) is loaded. */
+static void dock_unknown_windows(void) {
+    ImGuiID area_node[4] = {0, 0, 0, 0};
+    for (const auto &w : k_dock_layout) {
+        ImGuiWindowSettings *ws = ImGui::FindWindowSettingsByID(ImHashStr(w.name));
+        if (!area_node[w.area] && ws && ws->DockId && ImGui::DockBuilderGetNode(ws->DockId))
+            area_node[w.area] = ws->DockId;
+    }
+    for (const auto &w : k_dock_layout) {
+        if (!ImGui::FindWindowSettingsByID(ImHashStr(w.name)) && area_node[w.area])
+            ImGui::DockBuilderDockWindow(w.name, area_node[w.area]);
+    }
 }
 
 static void handle_fatal_signal(int sig) {
@@ -232,6 +311,18 @@ int main(int argc, char **argv) {
     bool want_nvram_export = false;
     char rom_path[1024] = "";
     char config_path[1024] = "";
+    char cli_patch[1024] = "";
+
+    /* --patch FILE: open this patch file (e.g. a rebased patch) */
+    for (int i = 1; i + 1 < argc; i++) {
+        if (!strcmp(argv[i], "--patch")) {
+            snprintf(cli_patch, sizeof(cli_patch), "%s", argv[i + 1]);
+            for (int k = i; k + 2 <= argc; k++)
+                argv[k] = argv[k + 2];
+            argc -= 2;
+            break;
+        }
+    }
 
     if (argc == 3) {
         strncpy(rom_path, argv[1], 1023);
@@ -243,7 +334,7 @@ int main(int argc, char **argv) {
         load_global_session(rom_path, config_path);
         /* If session also empty, rom_path stays ""; picker runs below */
     } else {
-        fprintf(stderr, "usage: %s ROM [CONFIG]\n", argv[0]);
+        fprintf(stderr, "usage: %s ROM [CONFIG] [--patch FILE]\n", argv[0]);
         return 2;
     }
 
@@ -251,6 +342,10 @@ int main(int argc, char **argv) {
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_TIMER) != 0) {
         fprintf(stderr, "SDL_Init failed: %s\n", SDL_GetError());
         return 1;
+    }
+    if (char *base = SDL_GetBasePath()) { /* the bundled snippet library */
+        state.patch_state.exe_dir = base;
+        SDL_free(base);
     }
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
@@ -367,6 +462,12 @@ int main(int argc, char **argv) {
     state.show_match_window = false;
     state.show_rom_compare = false;
     state.show_coverage = false;
+    state.show_hooks = false;
+    state.show_bits = false;
+    state.show_card = false;
+    state.show_timeline = false;
+    state.show_args = false;
+    state.show_patch = false;
     state.match_state.scan_enabled = true;
     state.match_state.min_confidence = APEX_MATCH_CONF_MEDIUM;
     state.show_inline_list = false;
@@ -409,6 +510,11 @@ int main(int argc, char **argv) {
 
     /* Restore session state after defaults are set so saved values win. */
     load_rom_session(rom_path, &state, document);
+    if (cli_patch[0]) {
+        snprintf(state.patch_state.path, sizeof(state.patch_state.path), "%s", cli_patch);
+        state.patch_state.open_pending = true;
+        state.show_patch = true;
+    }
 
     /* Default the PinMAME rom dir to ~/.pinmame if the session didn't restore one. */
     if (state.pinmame.rompath[0] == '\0') {
@@ -552,7 +658,7 @@ int main(int argc, char **argv) {
 
             if (ImGui::BeginMainMenuBar()) {
                 if (ImGui::BeginMenu("File")) {
-                    if (ImGui::MenuItem("Save Overlay", "Ctrl+S")) {
+                    if (ImGui::MenuItem("Save Overlay", key_hint(KEY_SAVE))) {
                         state.request_save_overlay = 1;
                     }
                     if (ImGui::MenuItem("Save INI As...")) {
@@ -566,13 +672,13 @@ int main(int argc, char **argv) {
                         want_nvram_export = true;
                     }
                     ImGui::Separator();
-                    if (ImGui::MenuItem("Re-analyze", "F5")) {
+                    if (ImGui::MenuItem("Re-analyze", key_hint(KEY_REANALYZE))) {
                         uint8_t cur_b = 0xffu;
                         uint32_t cur_a = 0u;
                         selected_address(document, &state, &cur_b, &cur_a);
                         rerender_and_reselect(project, &document, &state, cur_b, cur_a);
                     }
-                    if (ImGui::MenuItem("Force Full Re-analyze", "Shift+F5")) {
+                    if (ImGui::MenuItem("Force Full Re-analyze", key_hint(KEY_FULL_REANALYZE))) {
                         uint8_t cur_b = 0xffu;
                         uint32_t cur_a = 0u;
                         selected_address(document, &state, &cur_b, &cur_a);
@@ -611,7 +717,8 @@ int main(int argc, char **argv) {
                         snprintf(rlbl, sizeof(rlbl), "Redo %s", rl);
                     else
                         snprintf(rlbl, sizeof(rlbl), "Redo");
-                    if (ImGui::MenuItem(ulbl, "Ctrl+Z", false, apex_project_can_undo(project))) {
+                    if (ImGui::MenuItem(ulbl, key_hint(KEY_UNDO), false,
+                                        apex_project_can_undo(project))) {
                         uint8_t cb = 0xffu;
                         uint32_t ca = 0u;
                         selected_address(document, &state, &cb, &ca);
@@ -620,7 +727,8 @@ int main(int argc, char **argv) {
                             rerender_and_reselect(project, &document, &state, cb, ca);
                         }
                     }
-                    if (ImGui::MenuItem(rlbl, "Ctrl+Y", false, apex_project_can_redo(project))) {
+                    if (ImGui::MenuItem(rlbl, key_hint(KEY_REDO), false,
+                                        apex_project_can_redo(project))) {
                         uint8_t cb = 0xffu;
                         uint32_t ca = 0u;
                         selected_address(document, &state, &cb, &ca);
@@ -632,10 +740,11 @@ int main(int argc, char **argv) {
                     ImGui::EndMenu();
                 }
                 if (ImGui::BeginMenu("Windows")) {
-                    ImGui::MenuItem("Navigator", "N", &state.show_navigator);
-                    ImGui::MenuItem("Disassembly", "D", &state.show_disasm);
-                    ImGui::MenuItem("Hex Inspector", "H", &state.show_hex);
-                    ImGui::MenuItem("Global Search", "Ctrl+F", &state.show_search_window);
+                    ImGui::MenuItem("Navigator", NULL, &state.show_navigator);
+                    ImGui::MenuItem("Disassembly", NULL, &state.show_disasm);
+                    ImGui::MenuItem("Hex Inspector", NULL, &state.show_hex);
+                    ImGui::MenuItem("Global Search", key_hint(KEY_GLOBAL_SEARCH),
+                                    &state.show_search_window);
                     ImGui::Separator();
                     ImGui::MenuItem("Banks", NULL, &state.show_banks);
                     ImGui::MenuItem("Labels", NULL, &state.show_labels);
@@ -647,6 +756,12 @@ int main(int argc, char **argv) {
                     ImGui::MenuItem("Match from Reference", NULL, &state.show_match_window);
                     ImGui::MenuItem("ROM Compare", NULL, &state.show_rom_compare);
                     ImGui::MenuItem("Coverage", NULL, &state.show_coverage);
+                    ImGui::MenuItem("Game Hooks", NULL, &state.show_hooks);
+                    ImGui::MenuItem("Bit Map", NULL, &state.show_bits);
+                    ImGui::MenuItem("Routine Card", NULL, &state.show_card);
+                    ImGui::MenuItem("Event Timeline", NULL, &state.show_timeline);
+                    ImGui::MenuItem("Argument Values", NULL, &state.show_args);
+                    ImGui::MenuItem("Patch", NULL, &state.show_patch);
                     ImGui::MenuItem("Call Graph", NULL, &state.show_call_graph);
                     ImGui::MenuItem("Hardware", NULL, &state.show_hardware);
                     ImGui::MenuItem("Tables", NULL, &state.show_tables);
@@ -684,22 +799,23 @@ int main(int argc, char **argv) {
                     }
                     ImGui::Separator();
                     ImGui::TextDisabled("Font");
-                    ImGui::SetNextItemWidth(180.0f);
+                    ImGui::SetNextItemWidth(ui_w(180.0f));
                     float fs = g_ui_font_scale;
                     if (ImGui::SliderFloat("##fontscale", &fs, FONT_SCALE_MIN, FONT_SCALE_MAX,
                                            "Zoom %.2fx")) {
                         set_ui_font_scale(fs);
                     }
-                    if (ImGui::MenuItem("Zoom In", "Ctrl++"))
+                    if (ImGui::MenuItem("Zoom In", key_hint(KEY_ZOOM_IN)))
                         set_ui_font_scale(g_ui_font_scale + FONT_SCALE_STEP);
-                    if (ImGui::MenuItem("Zoom Out", "Ctrl+-"))
+                    if (ImGui::MenuItem("Zoom Out", key_hint(KEY_ZOOM_OUT)))
                         set_ui_font_scale(g_ui_font_scale - FONT_SCALE_STEP);
-                    if (ImGui::MenuItem("Reset Zoom", "Ctrl+0"))
+                    if (ImGui::MenuItem("Reset Zoom", key_hint(KEY_ZOOM_RESET)))
                         set_ui_font_scale(1.0f);
                     ImGui::EndMenu();
                 }
+                patch_menu(project, &document, &state);
                 if (ImGui::BeginMenu("Help")) {
-                    if (ImGui::MenuItem("Show Shortcuts", "H")) {
+                    if (ImGui::MenuItem("Keyboard Shortcuts", key_hint(KEY_HELP))) {
                         state.show_help = !state.show_help;
                     }
                     ImGui::EndMenu();
@@ -729,50 +845,19 @@ int main(int argc, char **argv) {
                 ImGuiID dock_bottom_id = ImGui::DockBuilderSplitNode(dock_main_id, ImGuiDir_Down,
                                                                      0.30f, NULL, &dock_main_id);
 
-                ImGui::DockBuilderDockWindow("Disassembly", dock_main_id);
-                ImGui::DockBuilderDockWindow("Navigator", dock_left_id);
-                ImGui::DockBuilderDockWindow("Banks", dock_left_id);
-                ImGui::DockBuilderDockWindow("Labels", dock_left_id);
-                ImGui::DockBuilderDockWindow("Bookmarks", dock_left_id);
-                ImGui::DockBuilderDockWindow("Transitions", dock_left_id);
-                ImGui::DockBuilderDockWindow("Details", dock_right_id);
-                ImGui::DockBuilderDockWindow("DMD", dock_right_id);
-                ImGui::DockBuilderDockWindow("DMD Frames", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Edit", dock_right_id);
-                ImGui::DockBuilderDockWindow("ROM Info", dock_right_id);
-                ImGui::DockBuilderDockWindow("Match from Reference", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("ROM Compare", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Coverage", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Call Graph", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("References", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Hardware", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Tables", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Hex", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Sprites", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Sprite Gallery", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Inline Sigs", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Code Entries", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Strings", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Symbols", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Types", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Pattern Search", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("RAM References", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Immediate Loads", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Change Log", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("PinMAME (dynamic)", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("PinMAME · DMD", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("PinMAME · Switches", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("PinMAME · Coverage", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Ref Exclusions", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Code Candidates", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Inline Detection (prime bank)", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Warnings", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Flow Breaks", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("Global Search", dock_bottom_id);
-                ImGui::DockBuilderDockWindow("ROM Map", dock_right_id);
+                const ImGuiID area_ids[4] = {dock_main_id, dock_left_id, dock_right_id,
+                                             dock_bottom_id};
+                for (const auto &w : k_dock_layout)
+                    ImGui::DockBuilderDockWindow(w.name, area_ids[w.area]);
 
                 ImGui::DockBuilderFinish(dockspace_id);
                 state.request_layout_reset = false;
+            } else {
+                static bool unknown_docked = false;
+                if (!unknown_docked) {
+                    unknown_docked = true;
+                    dock_unknown_windows();
+                }
             }
 
             if (state.show_navigator) {
@@ -1034,6 +1119,32 @@ int main(int argc, char **argv) {
                 render_coverage_window(project, &document, &state);
                 ImGui::End();
             }
+            timeline_pump(project, &document, &state);
+            if (state.show_timeline) {
+                ImGui::Begin("Event Timeline", &state.show_timeline);
+                render_timeline_window(project, &document, &state);
+                ImGui::End();
+            }
+            if (state.show_card) {
+                ImGui::Begin("Routine Card", &state.show_card);
+                render_card_window(project, &document, &state);
+                ImGui::End();
+            }
+            if (state.show_bits) {
+                ImGui::Begin("Bit Map", &state.show_bits);
+                render_bits_window(project, &document, &state);
+                ImGui::End();
+            }
+            if (state.show_hooks) {
+                ImGui::Begin("Game Hooks", &state.show_hooks);
+                render_hooks_window(project, &document, &state);
+                ImGui::End();
+            }
+            if (state.show_args) {
+                ImGui::Begin("Argument Values", &state.show_args);
+                render_args_window(project, &document, &state);
+                ImGui::End();
+            }
             if (state.show_inline_list) {
                 ImGui::Begin("Inline Sigs", &state.show_inline_list);
                 render_inline_list(project, document, &state);
@@ -1071,6 +1182,14 @@ int main(int argc, char **argv) {
             }
             /* Per-frame PinMAME work runs once, regardless of which windows are open. */
             pinmame_pump(project, &document, &state);
+            patch_pump(project, &document, &state);
+            if (state.show_patch) {
+                ImGui::Begin("Patch", &state.show_patch);
+                render_patch_window(project, &document, &state);
+                ImGui::End();
+            }
+            render_snippet_dialog(project, &state);
+            render_rebase_result(project, &state);
             if (state.show_pinmame) {
                 ImGui::Begin("PinMAME (dynamic)", &state.show_pinmame);
                 render_pinmame(project, &document, &state);
@@ -1220,99 +1339,12 @@ int main(int argc, char **argv) {
             }
 
             if (state.show_help) {
-                ImGui::SetNextWindowSize(ImVec2(480, 0), ImGuiCond_FirstUseEver);
+                ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                                        ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
+                ImGui::SetNextWindowSize(ImVec2(820, 640), ImGuiCond_FirstUseEver);
                 ImGui::Begin("Keyboard Shortcuts", &state.show_help);
 
-                auto krow = [](const char *keys, const char *desc) {
-                    ImGui::TableNextRow();
-                    ImGui::TableSetColumnIndex(0);
-                    ImGui::TextDisabled("%s", keys);
-                    ImGui::TableSetColumnIndex(1);
-                    ImGui::TextUnformatted(desc);
-                };
-                constexpr ImGuiTableFlags kTableFlags =
-                    ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX;
-
-                ImGui::SeparatorText("Navigate");
-                if (ImGui::BeginTable("##nav", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("J / Down Arrow", "Move selection down");
-                    krow("K / Up Arrow", "Move selection up");
-                    krow("N / P", "Next / prev block boundary");
-                    krow("F / Enter", "Follow link / jump to target");
-                    krow("[ / ]", "History back / forward");
-                    krow("Alt+\xe2\x86\x90 / Alt+\xe2\x86\x92", "History back / forward (alt)");
-                    krow("G", "Go to address");
-                    krow("Ctrl+P", "Command palette (jump to label / address)");
-                    krow("/", "Focus filter bar");
-                    ImGui::EndTable();
-                }
-
-                ImGui::SeparatorText("Classify");
-                if (ImGui::BeginTable("##cls", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("C", "Mark as code");
-                    krow("D", "Mark as data");
-                    krow("S", "Mark as string");
-                    krow("T", "Mark as table (uses current schema)");
-                    krow("1", "Repeat last classification");
-                    krow("Del", "Clear classification");
-                    ImGui::EndTable();
-                }
-
-                ImGui::SeparatorText("Edit");
-                if (ImGui::BeginTable("##edt", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("L", "Edit label");
-                    krow("Double-click", "Rename a label in place (Enter commits, Esc cancels)");
-                    krow("Shift+D", "Edit comment / doc");
-                    krow("B", "Add bookmark");
-                    krow("Home", "Jump to table header (inside a table)");
-                    ImGui::EndTable();
-                }
-
-                ImGui::SeparatorText("Block selection (copy / range)");
-                if (ImGui::BeginTable("##blk", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("A", "Set block start (at cursor)");
-                    krow("E", "Set block end (at cursor)");
-                    krow("Esc", "Clear block");
-                    krow("Shift+Click", "Set / extend block");
-                    krow("Ctrl+C", "Copy block (disasm lines, or hex bytes in hex view)");
-                    ImGui::EndTable();
-                }
-
-                ImGui::SeparatorText("View");
-                if (ImGui::BeginTable("##viw", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("X", "Show incoming XRefs");
-                    krow("H", "Show / hide this window");
-                    krow("Ctrl+F", "Global search");
-                    krow("Ctrl+C", "Copy selection");
-                    krow("Ctrl+S", "Save config overlay");
-                    krow("Ctrl+Z", "Undo last edit");
-                    krow("Ctrl+Y", "Redo");
-                    krow("F5", "Re-analyze");
-                    krow("Shift+F5", "Force full re-analyze");
-                    krow("Ctrl +/-", "Font zoom in / out");
-                    krow("Ctrl+0", "Reset font zoom");
-                    ImGui::EndTable();
-                }
-
-                ImGui::SeparatorText("DMD Scrub");
-                if (ImGui::BeginTable("##dmd", 2, kTableFlags)) {
-                    ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 140.0f);
-                    ImGui::TableSetupColumn("##d", ImGuiTableColumnFlags_WidthStretch);
-                    krow("+ / -", "Advance / rewind 1 byte (Shift: 32)");
-                    krow("0", "Reset offset");
-                    krow("M", "Mark DMD fullframe at current offset");
-                    ImGui::EndTable();
-                }
+                render_keys_editor();
 
                 ImGui::SeparatorText("Tips");
                 ImGui::BulletText("Hex View: click byte to inspect; syncs with disassembly.");
@@ -1324,6 +1356,14 @@ int main(int argc, char **argv) {
                     "Change Log: audit trail of every edit this session; click to jump.");
                 ImGui::BulletText(
                     "PinMAME: spawn a headless xpinmamed and import execution coverage.");
+                ImGui::BulletText("PinMAME Coverage: set a baseline, trigger a feature, import "
+                                  "again and view only the new code.");
+                ImGui::BulletText(
+                    "Game Hooks: the OS-to-game far-call slots at 0x8001 with their OS callers.");
+                ImGui::BulletText("Argument Values: every call site per typed value; declare "
+                                  "register args with '@args A:TYPE' in a routine doc.");
+                ImGui::BulletText("Patch: right-click an instruction -> Patch (NOP, branch, asm, "
+                                  "bytes); the Patch window builds, exports and runs it.");
                 ImGui::BulletText(
                     "Double-click a label token in a ; referenced_by line to navigate.");
 
@@ -1331,21 +1371,19 @@ int main(int argc, char **argv) {
             }
 
             /* Command palette — openable from anywhere, even while a field is focused. */
-            if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_P)) {
+            if (key_action_pressed(KEY_COMMAND_PALETTE)) {
                 state.request_command_palette = true;
             }
 
+            /* Global hotkeys (user-configurable, see apeximgui_keys.cpp).  A chord
+               matches only with exactly its modifiers, so plain-key commands do not
+               also fire on Ctrl/Alt chords. */
             if (!io.WantTextInput) {
-                /* Single-key commands must not also fire on Ctrl/Alt/Super chords
-                   (Ctrl+D would mark data, Ctrl+P jump as well as open the
-                   palette).  Shift stays allowed (Shift+D, Shift+F5, ...). */
-                auto plain_key = [&io](ImGuiKey k) {
-                    return !io.KeyCtrl && !io.KeyAlt && !io.KeySuper && ImGui::IsKeyPressed(k);
-                };
-                if (io.KeyCtrl &&
-                    (ImGui::IsKeyPressed(ImGuiKey_Z) || ImGui::IsKeyPressed(ImGuiKey_Y))) {
-                    bool redo = ImGui::IsKeyPressed(ImGuiKey_Y) ||
-                                (ImGui::IsKeyPressed(ImGuiKey_Z) && io.KeyShift);
+                bool undo = key_action_pressed(KEY_UNDO);
+                bool redo = key_action_pressed(KEY_REDO);
+                if ((undo || redo) && patch_undo_active(&state)) {
+                    patch_undo(project, &state, redo);
+                } else if (undo || redo) {
                     uint8_t cb = 0xffu;
                     uint32_t ca = 0u;
                     selected_address(document, &state, &cb, &ca);
@@ -1355,40 +1393,38 @@ int main(int argc, char **argv) {
                         rerender_and_reselect(project, &document, &state, cb, ca);
                     }
                 }
-                if (plain_key(ImGuiKey_H)) {
+                if (key_action_pressed(KEY_HELP)) {
                     state.show_help = !state.show_help;
                 }
-                if (plain_key(ImGuiKey_G)) {
+                if (key_action_pressed(KEY_GOTO)) {
                     state.request_focus_goto = 1;
                 }
-                if (plain_key(ImGuiKey_Slash)) {
+                if (key_action_pressed(KEY_FOCUS_FILTER)) {
                     state.request_focus_filter = 1;
                 }
-                if (plain_key(ImGuiKey_L)) {
+                if (key_action_pressed(KEY_EDIT_LABEL)) {
                     state.request_focus_label = 1;
                 }
-                if (plain_key(ImGuiKey_D)) {
-                    if (io.KeyShift) {
-                        state.request_focus_doc = 1;
-                    } else {
-                        uint8_t b;
-                        uint32_t a;
-                        if (selected_address(document, &state, &b, &a)) {
-                            char spec[32];
-                            snprintf(spec, sizeof(spec), "bytes[%d]",
-                                     state.edit_data_length > 0 ? state.edit_data_length : 1);
-                            apply_data_at_selection(project, &document, &state, spec);
-                        }
+                if (key_action_pressed(KEY_EDIT_DOC)) {
+                    state.request_focus_doc = 1;
+                }
+                if (key_action_pressed(KEY_MARK_DATA)) {
+                    uint8_t b;
+                    uint32_t a;
+                    if (selected_address(document, &state, &b, &a)) {
+                        char spec[32];
+                        snprintf(spec, sizeof(spec), "bytes[%d]",
+                                 state.edit_data_length > 0 ? state.edit_data_length : 1);
+                        apply_data_at_selection(project, &document, &state, spec);
                     }
                 }
-                if (ImGui::IsKeyPressed(ImGuiKey_S)) {
-                    if (io.KeyCtrl) {
-                        state.request_save_overlay = 1;
-                    } else {
-                        apply_string_at_selection(project, &document, &state);
-                    }
+                if (key_action_pressed(KEY_SAVE)) {
+                    state.request_save_overlay = 1;
                 }
-                if (plain_key(ImGuiKey_T)) {
+                if (key_action_pressed(KEY_MARK_STRING)) {
+                    apply_string_at_selection(project, &document, &state);
+                }
+                if (key_action_pressed(KEY_MARK_TABLE)) {
                     char spec[320] = "counted(ptr16_data)";
                     if (state.edit_schema_count > 0) {
                         char schema[256];
@@ -1403,29 +1439,23 @@ int main(int argc, char **argv) {
                     }
                     apply_table_at_selection(project, &document, &state, spec);
                 }
-                /* Ctrl +/-/0 = font zoom; the same keys without Ctrl drive DMD scrub. */
-                bool key_plus =
-                    ImGui::IsKeyPressed(ImGuiKey_Equal) || ImGui::IsKeyPressed(ImGuiKey_KeypadAdd);
-                bool key_minus = ImGui::IsKeyPressed(ImGuiKey_Minus) ||
-                                 ImGui::IsKeyPressed(ImGuiKey_KeypadSubtract);
-                bool key_zero =
-                    ImGui::IsKeyPressed(ImGuiKey_0) || ImGui::IsKeyPressed(ImGuiKey_Keypad0);
-                if (io.KeyCtrl) {
-                    if (key_plus)
-                        set_ui_font_scale(g_ui_font_scale + FONT_SCALE_STEP);
-                    if (key_minus)
-                        set_ui_font_scale(g_ui_font_scale - FONT_SCALE_STEP);
-                    if (key_zero)
-                        set_ui_font_scale(1.0f);
-                } else {
-                    if (key_plus)
-                        state.dmd_scrub_offset += io.KeyShift ? 32 : 1;
-                    if (key_minus)
-                        state.dmd_scrub_offset -= io.KeyShift ? 32 : 1;
-                    if (key_zero)
-                        state.dmd_scrub_offset = 0;
-                }
-                if (plain_key(ImGuiKey_M)) {
+                if (key_action_pressed(KEY_ZOOM_IN))
+                    set_ui_font_scale(g_ui_font_scale + FONT_SCALE_STEP);
+                if (key_action_pressed(KEY_ZOOM_OUT))
+                    set_ui_font_scale(g_ui_font_scale - FONT_SCALE_STEP);
+                if (key_action_pressed(KEY_ZOOM_RESET))
+                    set_ui_font_scale(1.0f);
+                if (key_action_pressed(KEY_DMD_NEXT))
+                    state.dmd_scrub_offset += 1;
+                if (key_action_pressed(KEY_DMD_NEXT32))
+                    state.dmd_scrub_offset += 32;
+                if (key_action_pressed(KEY_DMD_PREV))
+                    state.dmd_scrub_offset -= 1;
+                if (key_action_pressed(KEY_DMD_PREV32))
+                    state.dmd_scrub_offset -= 32;
+                if (key_action_pressed(KEY_DMD_RESET))
+                    state.dmd_scrub_offset = 0;
+                if (key_action_pressed(KEY_DMD_MARK)) {
                     uint8_t b;
                     uint32_t a;
                     if (selected_address(document, &state, &b, &a)) {
@@ -1443,20 +1473,18 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if ((io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_LeftArrow)) ||
-                    ImGui::IsKeyPressed(ImGuiKey_LeftBracket)) {
+                if (key_action_pressed(KEY_HISTORY_BACK)) {
                     history_jump(&state, 1);
                 }
-                if ((io.KeyAlt && ImGui::IsKeyPressed(ImGuiKey_RightArrow)) ||
-                    ImGui::IsKeyPressed(ImGuiKey_RightBracket)) {
+                if (key_action_pressed(KEY_HISTORY_FORWARD)) {
                     history_jump(&state, 0);
                 }
                 /* Explicit block selection (for copy / range ops), decoupled from the
-                   cursor: A sets the start, E the end, Esc clears.  Handled centrally
-                   (not in the hex child render) so ImGui keyboard-nav does not swallow
-                   Escape.  Routes to the hex byte block or the disassembly line block
-                   depending on which view is focused. */
-                if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_A)) {
+                   cursor: start, end, clear.  Handled centrally (not in the hex child
+                   render) so ImGui keyboard-nav does not swallow Escape.  Routes to
+                   the hex byte block or the disassembly line block depending on
+                   which view is focused. */
+                if (key_action_pressed(KEY_BLOCK_START)) {
                     if (state.hex_window_focused) {
                         state.hex_anchor_offset = state.hex_selected_offset;
                         if (!state.hex_has_range)
@@ -1468,9 +1496,9 @@ int main(int argc, char **argv) {
                             state.block_b = state.block_a;
                         state.block_active = true;
                     }
-                    set_status(&state, "block start set (E = end, Esc = clear)");
+                    set_status(&state, "block start set");
                 }
-                if (!io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_E)) {
+                if (key_action_pressed(KEY_BLOCK_END)) {
                     if (state.hex_window_focused) {
                         state.hex_block_end = state.hex_selected_offset;
                         if (!state.hex_has_range)
@@ -1482,31 +1510,26 @@ int main(int argc, char **argv) {
                             state.block_a = state.block_b;
                         state.block_active = true;
                     }
-                    set_status(&state, "block end set (Ctrl+C copies the block)");
+                    set_status(&state, "block end set");
                 }
-                /* Raw key state (GetKeyData) bypasses ImGui key-ownership, which the
-                   keyboard-nav system claims for Escape while a child window is
-                   focused — that is why IsKeyPressed(Escape) was swallowed in hex. */
-                {
-                    const ImGuiKeyData *esc = ImGui::GetKeyData(ImGuiKey_Escape);
-                    bool esc_pressed = esc && esc->Down && esc->DownDuration == 0.0f;
-                    if (esc_pressed) {
-                        /* Route to the hex block when hex is the active view. Use the
-                           sticky hex_is_edit_target rather than hex_window_focused:
-                           keyboard-nav consumes Escape to defocus the focused hex
-                           child that same frame, so hex_window_focused would already
-                           read false here (why Esc silently missed in the hex view). */
-                        if ((state.hex_is_edit_target || state.hex_window_focused) &&
-                            state.hex_has_range) {
-                            state.hex_has_range = false;
-                            set_status(&state, "block cleared");
-                        } else if (state.block_active) {
-                            state.block_active = false;
-                            set_status(&state, "block cleared");
-                        }
+                /* key_action_pressed reads Escape from the raw key state: keyboard-nav
+                   claims its ownership while a child window (hex) is focused. */
+                if (key_action_pressed(KEY_BLOCK_CLEAR)) {
+                    /* Route to the hex block when hex is the active view. Use the
+                       sticky hex_is_edit_target rather than hex_window_focused:
+                       keyboard-nav consumes Escape to defocus the focused hex
+                       child that same frame, so hex_window_focused would already
+                       read false here (why Esc silently missed in the hex view). */
+                    if ((state.hex_is_edit_target || state.hex_window_focused) &&
+                        state.hex_has_range) {
+                        state.hex_has_range = false;
+                        set_status(&state, "block cleared");
+                    } else if (state.block_active) {
+                        state.block_active = false;
+                        set_status(&state, "block cleared");
                     }
                 }
-                if (plain_key(ImGuiKey_B)) {
+                if (key_action_pressed(KEY_BOOKMARK)) {
                     uint8_t b;
                     uint32_t a;
                     if (selected_address(document, &state, &b, &a)) {
@@ -1517,10 +1540,10 @@ int main(int argc, char **argv) {
                     }
                 }
                 if (!state.hex_window_focused) {
-                    if (plain_key(ImGuiKey_J) || ImGui::IsKeyPressed(ImGuiKey_DownArrow)) {
+                    if (key_action_pressed(KEY_MOVE_DOWN)) {
                         move_selection_relative(document, &state, 1);
                     }
-                    if (plain_key(ImGuiKey_K) || ImGui::IsKeyPressed(ImGuiKey_UpArrow)) {
+                    if (key_action_pressed(KEY_MOVE_UP)) {
                         move_selection_relative(document, &state, -1);
                     }
                     int page = (int)(ImGui::GetIO().DisplaySize.y /
@@ -1528,35 +1551,34 @@ int main(int argc, char **argv) {
                                4;
                     if (page < 5)
                         page = 5;
-                    if (ImGui::IsKeyPressed(ImGuiKey_PageDown)) {
+                    if (key_action_pressed(KEY_PAGE_DOWN)) {
                         move_selection_relative(document, &state, page);
                     }
-                    if (ImGui::IsKeyPressed(ImGuiKey_PageUp)) {
+                    if (key_action_pressed(KEY_PAGE_UP)) {
                         move_selection_relative(document, &state, -page);
                     }
                 }
-                if (plain_key(ImGuiKey_N)) {
+                if (key_action_pressed(KEY_NEXT_BLOCK)) {
                     jump_primary_transition(document, &state, 1);
                 }
-                if (plain_key(ImGuiKey_P)) {
+                if (key_action_pressed(KEY_PREV_BLOCK)) {
                     jump_primary_transition(document, &state, 0);
                 }
-                if (plain_key(ImGuiKey_1) || plain_key(ImGuiKey_Keypad1)) {
+                if (key_action_pressed(KEY_REPEAT_CLASSIFY)) {
                     repeat_last_classify(project, &document, &state);
                 }
-                if (ImGui::IsKeyPressed(ImGuiKey_C)) {
-                    if (io.KeyCtrl) {
-                        if (state.hex_window_focused) {
-                            copy_hex_block_to_clipboard(project, &state);
-                            set_status(&state, "copied hex bytes");
-                        } else {
-                            copy_selection_to_clipboard(document, &state);
-                        }
+                if (key_action_pressed(KEY_COPY)) {
+                    if (state.hex_window_focused) {
+                        copy_hex_block_to_clipboard(project, &state);
+                        set_status(&state, "copied hex bytes");
                     } else {
-                        apply_code_at_selection(project, &document, &state);
+                        copy_selection_to_clipboard(document, &state);
                     }
                 }
-                if (plain_key(ImGuiKey_X)) {
+                if (key_action_pressed(KEY_MARK_CODE)) {
+                    apply_code_at_selection(project, &document, &state);
+                }
+                if (key_action_pressed(KEY_XREFS)) {
                     if (state.selected_line < document->line_count) {
                         const auto *l = &document->lines[state.selected_line];
                         if (l->has_location) {
@@ -1566,37 +1588,40 @@ int main(int argc, char **argv) {
                         }
                     }
                 }
-                if (plain_key(ImGuiKey_Delete)) {
+                if (key_action_pressed(KEY_CLEAR_KIND)) {
                     clear_kind_at_selection(project, &document, &state);
                 }
-                if (ImGui::IsKeyPressed(ImGuiKey_F5)) {
+                bool reanalyze = key_action_pressed(KEY_REANALYZE);
+                bool full_reanalyze = key_action_pressed(KEY_FULL_REANALYZE);
+                if (reanalyze || full_reanalyze) {
                     uint8_t cur_b = 0xffu;
                     uint32_t cur_a = 0u;
                     selected_address(document, &state, &cur_b, &cur_a);
-                    if (io.KeyShift)
+                    if (full_reanalyze)
                         apex_project_invalidate(project, APEX_DIRTY_ANALYSIS);
                     rerender_and_reselect(project, &document, &state, cur_b, cur_a);
                 }
-                if (ImGui::IsKeyPressed(ImGuiKey_F) || ImGui::IsKeyPressed(ImGuiKey_Enter)) {
-                    if (io.KeyCtrl && ImGui::IsKeyPressed(ImGuiKey_F)) {
-                        state.show_search_window = true;
-                        state.request_focus_global_search = 1;
-                    } else if (state.selected_line < document->line_count) {
-                        const auto *l = &document->lines[state.selected_line];
-                        uint8_t tb;
-                        uint32_t ta;
-                        int tf;
-                        size_t tli;
-                        if (resolve_pointer_target(project, l, &tb, &ta, &tf) &&
-                            apex_render_find_line_by_address(document, tb, ta, &tli)) {
-                            select_line(&state, tli, 1);
-                        } else {
-                            follow_selected_link(document, &state);
-                        }
+                /* In the hex view the search key focuses the hex search instead
+                   (handled there). */
+                if (!state.hex_window_focused && key_action_pressed(KEY_GLOBAL_SEARCH)) {
+                    state.show_search_window = true;
+                    state.request_focus_global_search = 1;
+                }
+                if (key_action_pressed(KEY_FOLLOW) && state.selected_line < document->line_count) {
+                    const auto *l = &document->lines[state.selected_line];
+                    uint8_t tb;
+                    uint32_t ta;
+                    int tf;
+                    size_t tli;
+                    if (resolve_pointer_target(project, l, &tb, &ta, &tf) &&
+                        apex_render_find_line_by_address(document, tb, ta, &tli)) {
+                        select_line(&state, tli, 1);
+                    } else {
+                        follow_selected_link(document, &state);
                     }
                 }
-                /* Home inside a table: jump to the table header (start). */
-                if (ImGui::IsKeyPressed(ImGuiKey_Home) &&
+                /* Inside a table: jump to the table header (start). */
+                if (key_action_pressed(KEY_TABLE_HEADER) &&
                     state.selected_line < document->line_count) {
                     const auto *l = &document->lines[state.selected_line];
                     uint8_t tb;
@@ -1658,6 +1683,7 @@ int main(int argc, char **argv) {
                 ImGuiFileDialog::Instance()->OpenDialog("SaveIniAs", "Save INI As", ".ini", cfg);
                 want_save_ini_as = false;
             }
+            center_file_dialog("SaveIniAs");
             if (ImGuiFileDialog::Instance()->Display("SaveIniAs", ImGuiWindowFlags_NoCollapse,
                                                      ImVec2(600, 400))) {
                 if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -1679,6 +1705,7 @@ int main(int argc, char **argv) {
                                                         ".json", cfg);
                 want_nvram_import = false;
             }
+            center_file_dialog("NvramImport");
             if (ImGuiFileDialog::Instance()->Display("NvramImport", ImGuiWindowFlags_NoCollapse,
                                                      ImVec2(600, 400))) {
                 if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -1693,6 +1720,8 @@ int main(int argc, char **argv) {
                 ImGuiFileDialog::Instance()->Close();
             }
             if (state.show_nvram_import) {
+                ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(),
+                                        ImGuiCond_FirstUseEver, ImVec2(0.5f, 0.5f));
                 ImGui::SetNextWindowSize(ImVec2(680, 460), ImGuiCond_FirstUseEver);
                 if (ImGui::Begin("Import RAM Map", &state.show_nvram_import)) {
                     render_nvram_import_window(project, &document, &state);
@@ -1712,6 +1741,7 @@ int main(int argc, char **argv) {
                                                         ".json", cfg);
                 want_nvram_export = false;
             }
+            center_file_dialog("NvramExport");
             if (ImGuiFileDialog::Instance()->Display("NvramExport", ImGuiWindowFlags_NoCollapse,
                                                      ImVec2(600, 400))) {
                 if (ImGuiFileDialog::Instance()->IsOk()) {

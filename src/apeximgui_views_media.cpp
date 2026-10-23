@@ -22,7 +22,7 @@ void render_dmd_list_window(const ApexProject *p, const ApexRenderedDocument *d,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 0);
         ImGui::TableSetupColumn(
             "Label", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort, 0.0f, 1);
         ImGui::TableHeadersRow();
@@ -778,10 +778,10 @@ void render_sprite_list_window(ApexProject *p, const ApexRenderedDocument **dp, 
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f, 0);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 60.0f, 1);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
-        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed, 60.0f, 3);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 0);
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f), 1);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 2);
+        ImGui::TableSetupColumn("Tbl/Img", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f), 3);
         ImGui::TableSetupColumn(
             "Label", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort, 0.0f, 4);
         ImGui::TableHeadersRow();
@@ -1024,8 +1024,8 @@ void render_sprite_gallery_window(ApexProject *p, const ApexRenderedDocument **d
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableSetupColumn("Image", ImGuiTableColumnFlags_WidthFixed, kImgW + 6.0f);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 110.0f);
-        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, 55.0f);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f));
+        ImGui::TableSetupColumn("Size", ImGuiTableColumnFlags_WidthFixed, ui_w(55.0f));
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
@@ -1145,7 +1145,7 @@ void render_rom_info(ApexProject *p, const ApexRenderedDocument *document, UiSta
 
     if (ImGui::BeginTable("##rominfo", 2,
                           ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_PadOuterX)) {
-        ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+        ImGui::TableSetupColumn("##k", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f));
         ImGui::TableSetupColumn("##v", ImGuiTableColumnFlags_WidthStretch);
 
         auto row = [&](const char *label, const char *value) {

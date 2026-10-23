@@ -497,3 +497,95 @@ int apexdmd_write_pair_pgm(const char *path, const uint8_t *plane0, const uint8_
     fclose(out);
     return 1;
 }
+
+/* ---- encoding ---- */
+
+/* The plane's bytes in the order a decoder of `type` writes them. */
+static void plane_sequence(const uint8_t *plane, uint8_t type, uint8_t *seq) {
+    size_t i;
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++) {
+        if (type == 0x01u) { /* columns: row = i % 32, column byte = i / 32 */
+            size_t row = i % APEX_DMD_HEIGHT, col = i / APEX_DMD_HEIGHT;
+            seq[i] = plane[row * APEX_DMD_ROW_BYTES + col];
+        } else {
+            seq[i] = plane[i];
+        }
+    }
+}
+
+size_t apexdmd_encode_plane(const uint8_t *plane, uint8_t type, uint8_t *out) {
+    uint8_t seq[APEX_DMD_PAGE_BYTES];
+    unsigned freq[256] = {0};
+    size_t i, n = 0;
+    unsigned special = 0;
+
+    out[n++] = type;
+    if (type == 0x00u) {
+        memcpy(out + n, plane, APEX_DMD_PAGE_BYTES);
+        return n + APEX_DMD_PAGE_BYTES;
+    }
+    plane_sequence(plane, type, seq);
+    /* the flag byte: the value used least (a literal equal to it must be
+       written as a run) */
+    for (i = 0; i < APEX_DMD_PAGE_BYTES; i++)
+        freq[seq[i]]++;
+    for (i = 1; i < 256; i++) {
+        if (freq[i] < freq[special])
+            special = (unsigned)i;
+    }
+    out[n++] = (uint8_t)special;
+    for (i = 0; i < APEX_DMD_PAGE_BYTES;) {
+        size_t run = 1;
+        while (i + run < APEX_DMD_PAGE_BYTES && seq[i + run] == seq[i] && run < 256u)
+            run++;
+        if (run >= 4u || seq[i] == special) {
+            out[n++] = (uint8_t)special;
+            out[n++] = (uint8_t)(run == 256u ? 0u : run); /* 0 = 256 */
+            out[n++] = seq[i];
+            i += run;
+        } else {
+            out[n++] = seq[i++];
+        }
+    }
+    return n;
+}
+
+size_t apexdmd_encode_best(const uint8_t *plane, uint8_t *out, uint8_t *type_out) {
+    uint8_t tmp[APEX_DMD_ENCODE_MAX];
+    static const uint8_t types[3] = {0x00u, 0x02u, 0x01u};
+    size_t best = 0;
+    int k;
+    for (k = 0; k < 3; k++) {
+        size_t n = apexdmd_encode_plane(plane, types[k], tmp);
+        if (!best || n < best) {
+            best = n;
+            memcpy(out, tmp, n);
+            if (type_out)
+                *type_out = types[k];
+        }
+    }
+    return best;
+}
+
+void apexdmd_planes_from_gray(const uint8_t *gray, int nplanes, int bright, uint8_t *planes) {
+    size_t y, x;
+    memset(planes, 0, (size_t)nplanes * APEX_DMD_PAGE_BYTES);
+    for (y = 0; y < APEX_DMD_HEIGHT; y++) {
+        for (x = 0; x < APEX_DMD_WIDTH; x++) {
+            unsigned v = gray[y * APEX_DMD_WIDTH + x];
+            size_t byte = y * APEX_DMD_ROW_BYTES + x / 8u;
+            uint8_t bit = (uint8_t)(1u << (x % 8u)); /* leftmost pixel = bit 0 */
+            if (nplanes < 2) {
+                if (v >= 128u)
+                    planes[byte] |= bit;
+                continue;
+            }
+            unsigned level = (v * 3u + 127u) / 255u; /* 0..3 */
+            int dim = bright ? 0 : 1;
+            if (level & 1u)
+                planes[(size_t)dim * APEX_DMD_PAGE_BYTES + byte] |= bit;
+            if (level & 2u)
+                planes[(size_t)bright * APEX_DMD_PAGE_BYTES + byte] |= bit;
+        }
+    }
+}

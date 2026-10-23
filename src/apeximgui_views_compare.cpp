@@ -166,7 +166,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
     MatchWindowState &ms = state->match_state;
 
     /* --- Path inputs with Browse buttons --- */
-    ImGui::SetNextItemWidth(-100.0f);
+    ImGui::SetNextItemWidth(-ui_w(100.0f));
     ImGui::InputText("Ref ROM", ms.ref_rom_path, sizeof(ms.ref_rom_path));
     ImGui::SameLine();
     if (ImGui::Button("Browse##brom")) {
@@ -175,6 +175,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
         ImGuiFileDialog::Instance()->OpenDialog("MatchRefRom", "Select Reference ROM", ".rom,.bin",
                                                 cfg);
     }
+    center_file_dialog("MatchRefRom");
     if (ImGuiFileDialog::Instance()->Display("MatchRefRom", ImGuiWindowFlags_NoCollapse,
                                              ImVec2(600, 400))) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -184,7 +185,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
         ImGuiFileDialog::Instance()->Close();
     }
 
-    ImGui::SetNextItemWidth(-100.0f);
+    ImGui::SetNextItemWidth(-ui_w(100.0f));
     ImGui::InputText("Ref INI", ms.ref_ini_path, sizeof(ms.ref_ini_path));
     ImGui::SameLine();
     if (ImGui::Button("Browse##bini")) {
@@ -192,6 +193,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
         cfg.path = ms.ref_ini_path[0] ? ms.ref_ini_path : ".";
         ImGuiFileDialog::Instance()->OpenDialog("MatchRefIni", "Select Reference INI", ".ini", cfg);
     }
+    center_file_dialog("MatchRefIni");
     if (ImGuiFileDialog::Instance()->Display("MatchRefIni", ImGuiWindowFlags_NoCollapse,
                                              ImVec2(600, 400))) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -204,7 +206,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
     /* --- Options --- */
     ImGui::Checkbox("System scan (--scan)", &ms.scan_enabled);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(50.0f);
+    ImGui::SetNextItemWidth(ui_w(50.0f));
     ImGui::InputInt("Min conf%", &ms.min_confidence);
     ms.min_confidence = std::max(0, std::min(100, ms.min_confidence));
     ImGui::SameLine();
@@ -339,7 +341,7 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
     }
 
     /* --- Filter bar --- */
-    ImGui::SetNextItemWidth(150.0f);
+    ImGui::SetNextItemWidth(ui_w(150.0f));
     ImGui::InputText("##matchfilter", ms.filter, sizeof(ms.filter));
     ImGui::SameLine();
     ImGui::RadioButton("All", &ms.show_mode, 0);
@@ -355,9 +357,9 @@ void render_match_window(ApexProject *project, const ApexRenderedDocument **docu
 
     if (ImGui::BeginTable("match_results", 4, kMatchTblFlags)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 16.0f);
-        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 52.0f);
-        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, 105.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui_w(16.0f));
+        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, ui_w(52.0f));
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, ui_w(105.0f));
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
 
@@ -588,11 +590,11 @@ void render_rom_compare_window(ApexProject *project, const ApexRenderedDocument 
 
     ImGui::TextDisabled("Compare the current ROM (A) against another version (B).");
 
-    ImGui::SetNextItemWidth(-160.0f);
+    ImGui::SetNextItemWidth(-ui_w(160.0f));
     ImGui::InputText("ROM B", cs.rom_b_path, sizeof(cs.rom_b_path));
     compare_browse("CmpRomB", "Select ROM B", ".rom,.bin", cs.rom_b_path, sizeof(cs.rom_b_path));
 
-    ImGui::SetNextItemWidth(-160.0f);
+    ImGui::SetNextItemWidth(-ui_w(160.0f));
     ImGui::InputText("INI B (opt)", cs.ini_b_path, sizeof(cs.ini_b_path));
     compare_browse("CmpIniB", "Select ROM B config", ".ini", cs.ini_b_path, sizeof(cs.ini_b_path));
 
@@ -604,7 +606,7 @@ void render_rom_compare_window(ApexProject *project, const ApexRenderedDocument 
     ImGui::SameLine();
     ImGui::Checkbox("Inject paged", &cs.inject_paged);
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(60.0f);
+    ImGui::SetNextItemWidth(ui_w(60.0f));
     ImGui::InputInt("Min instrs", &cs.min_instrs, 0, 0);
     if (cs.min_instrs < 1)
         cs.min_instrs = 1;
@@ -690,11 +692,11 @@ void render_rom_compare_window(ApexProject *project, const ApexRenderedDocument 
                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                               APEX_TABLE_SORT_FLAGS)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 72.0f, 0);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 50.0f, 1);
-        ImGui::TableSetupColumn("A", ImGuiTableColumnFlags_WidthFixed, 86.0f, 2);
-        ImGui::TableSetupColumn("B", ImGuiTableColumnFlags_WidthFixed, 86.0f, 3);
-        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, 200.0f, 4);
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, ui_w(72.0f), 0);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f), 1);
+        ImGui::TableSetupColumn("A", ImGuiTableColumnFlags_WidthFixed, ui_w(86.0f), 2);
+        ImGui::TableSetupColumn("B", ImGuiTableColumnFlags_WidthFixed, ui_w(86.0f), 3);
+        ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthFixed, ui_w(200.0f), 4);
         ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch, 0.0f, 5);
         ImGui::TableHeadersRow();
 
@@ -877,7 +879,7 @@ void render_coverage_window(ApexProject *project, const ApexRenderedDocument **d
         refresh = true;
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(70.0f);
+    ImGui::SetNextItemWidth(ui_w(70.0f));
     if (ImGui::InputInt("min gap", &cv.min_gap, 1, 8)) {
         if (cv.min_gap < 1)
             cv.min_gap = 1;
@@ -930,9 +932,9 @@ void render_coverage_window(ApexProject *project, const ApexRenderedDocument **d
                               ImGuiTableFlags_ScrollY | ImGuiTableFlags_Resizable |
                               APEX_TABLE_SORT_FLAGS)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.0f, 0);
-        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, 70.0f, 1);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
+        ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f), 0);
+        ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f), 1);
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 2);
         ImGui::TableSetupColumn("ROM off", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
         ImGui::TableHeadersRow();
 

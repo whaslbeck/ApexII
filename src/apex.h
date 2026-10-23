@@ -24,7 +24,14 @@ typedef struct {
 #endif
 
 extern void (*apex_die_hook)(const char *msg);
-void die(const char *fmt, ...);
+/* die() never returns (it exits, or longjmps to apex_try / the die hook): the
+   compiler may then rely on it, e.g. for variables set on every other path. */
+#if defined(__GNUC__) || defined(__clang__)
+#define APEX_NORETURN __attribute__((noreturn))
+#else
+#define APEX_NORETURN
+#endif
+APEX_NORETURN void die(const char *fmt, ...);
 /* Run fn(ctx); a die() inside it returns 1 (message copied to err) instead of
    exiting.  Memory fn allocated before the die() is leaked, so only use it
    around parsers that have not yet mutated caller state. */

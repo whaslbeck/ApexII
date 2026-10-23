@@ -697,23 +697,23 @@ std::vector<RefEntry> find_incoming_refs(const ApexProject *p, const ApexRendere
                           r.kind ? r.kind : "", r.row_index, r.row_cpu_addr});
         }
     }
-    std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank)
-            return a.bank < b.bank;
-        if (a.cpu_addr != b.cpu_addr)
-            return a.cpu_addr < b.cpu_addr;
-        if (a.kind != b.kind)
-            return a.kind < b.kind;
-        return a.row_index < b.row_index;
+    std::sort(rs.begin(), rs.end(), [](const RefEntry &x, const RefEntry &y) {
+        if (x.bank != y.bank)
+            return x.bank < y.bank;
+        if (x.cpu_addr != y.cpu_addr)
+            return x.cpu_addr < y.cpu_addr;
+        if (x.kind != y.kind)
+            return x.kind < y.kind;
+        return x.row_index < y.row_index;
     });
     /* Collapse multiple references from the same source+kind into one (e.g. a
        text table that points at the same string from several rows) — they all
        navigate to the same source line, so distinct row indices are just noise
        and would also produce duplicate-looking popup rows. */
     rs.erase(std::unique(rs.begin(), rs.end(),
-                         [](const RefEntry &a, const RefEntry &b) {
-                             return a.bank == b.bank && a.cpu_addr == b.cpu_addr &&
-                                    a.kind == b.kind;
+                         [](const RefEntry &x, const RefEntry &y) {
+                             return x.bank == y.bank && x.cpu_addr == y.cpu_addr &&
+                                    x.kind == y.kind;
                          }),
              rs.end());
     return rs;
@@ -758,17 +758,17 @@ std::vector<RefEntry> find_outgoing_refs(const ApexProject *p, const ApexRendere
                           r.kind ? r.kind : "", -1, 0u});
         }
     }
-    std::sort(rs.begin(), rs.end(), [](const RefEntry &a, const RefEntry &b) {
-        if (a.bank != b.bank)
-            return a.bank < b.bank;
-        if (a.cpu_addr != b.cpu_addr)
-            return a.cpu_addr < b.cpu_addr;
-        return a.kind < b.kind;
+    std::sort(rs.begin(), rs.end(), [](const RefEntry &x, const RefEntry &y) {
+        if (x.bank != y.bank)
+            return x.bank < y.bank;
+        if (x.cpu_addr != y.cpu_addr)
+            return x.cpu_addr < y.cpu_addr;
+        return x.kind < y.kind;
     });
     rs.erase(std::unique(rs.begin(), rs.end(),
-                         [](const RefEntry &a, const RefEntry &b) {
-                             return a.bank == b.bank && a.cpu_addr == b.cpu_addr &&
-                                    a.kind == b.kind;
+                         [](const RefEntry &x, const RefEntry &y) {
+                             return x.bank == y.bank && x.cpu_addr == y.cpu_addr &&
+                                    x.kind == y.kind;
                          }),
              rs.end());
     return rs;
@@ -1435,7 +1435,8 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             "show_code_candidates=%d\nshow_inline_detect=%d\n"
             "show_strings_list=%d\nshow_sprite_gallery=%d\n"
             "show_rom_info=%d\nshow_match_window=%d\nshow_rom_compare=%d\n"
-            "show_coverage=%d\n",
+            "show_coverage=%d\nshow_hooks=%d\nshow_args=%d\nshow_patch=%d\nshow_bits=%d\nshow_card="
+            "%d\nshow_timeline=%d\n",
             s->show_navigator, s->show_disasm, s->show_labels, s->show_banks, s->show_bookmarks,
             s->show_transitions, s->show_details, s->show_refs, s->show_dmd, s->show_edit,
             s->show_hex, s->show_call_graph, s->show_hardware, s->show_tables, s->show_types_editor,
@@ -1445,10 +1446,13 @@ void save_session(const char *rp, const char *cp, const UiState *s, const ApexRe
             s->show_search_window, s->show_rom_map, s->show_dmd_list, s->show_sprite_list,
             s->show_flow_arrows, s->show_symbols_editor, s->show_code_candidates,
             s->show_inline_detect, s->show_strings_list, s->show_sprite_gallery, s->show_rom_info,
-            s->show_match_window, s->show_rom_compare, s->show_coverage);
+            s->show_match_window, s->show_rom_compare, s->show_coverage, s->show_hooks,
+            s->show_args, s->show_patch, s->show_bits, s->show_card, s->show_timeline);
     /* PinMAME integration config (paths/port kept as separate key=value lines). */
     fprintf(f, "pinmame_bin=%s\npinmame_rompath=%s\npinmame_game=%s\npinmame_port=%d\n",
             s->pinmame.bin_path, s->pinmame.rompath, s->pinmame.game, s->pinmame.port);
+    if (s->patch_state.loaded || s->patch_state.open_pending)
+        fprintf(f, "patch_path=%s\n", s->patch_state.path);
     if (!others.empty()) {
         fputc('\n', f);
         fputs(others.c_str(), f);
@@ -1597,6 +1601,22 @@ void load_rom_session(const char *rp, UiState *s, const ApexRenderedDocument *d)
             s->show_rom_compare = atoi(l + 17) != 0;
         } else if (strncmp(l, "show_coverage=", 14) == 0) {
             s->show_coverage = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_timeline=", 14) == 0) {
+            s->show_timeline = atoi(l + 14) != 0;
+        } else if (strncmp(l, "show_card=", 10) == 0) {
+            s->show_card = atoi(l + 10) != 0;
+        } else if (strncmp(l, "show_bits=", 10) == 0) {
+            s->show_bits = atoi(l + 10) != 0;
+        } else if (strncmp(l, "show_hooks=", 11) == 0) {
+            s->show_hooks = atoi(l + 11) != 0;
+        } else if (strncmp(l, "show_args=", 10) == 0) {
+            s->show_args = atoi(l + 10) != 0;
+        } else if (strncmp(l, "show_patch=", 11) == 0) {
+            s->show_patch = atoi(l + 11) != 0;
+        } else if (strncmp(l, "patch_path=", 11) == 0) {
+            snprintf(s->patch_state.path, sizeof(s->patch_state.path), "%s", l + 11);
+            s->patch_state.path[strcspn(s->patch_state.path, "\r\n")] = '\0';
+            s->patch_state.open_pending = s->patch_state.path[0] != '\0';
         } else if (strncmp(l, "show_pattern_search=", 20) == 0) {
             s->show_pattern_search = atoi(l + 20) != 0;
         } else if (strncmp(l, "show_ram_refs=", 14) == 0) {
@@ -3049,30 +3069,30 @@ int write_delta_overlay(const ApexProject *p, const OriginalSnapshot *s, const c
 
     /* collect new or changed types */
     for (size_t i = 0; i < p->config_types.count; i++) {
-        const ConfigType *ct = &p->config_types.items[i];
+        const ConfigType *cty = &p->config_types.items[i];
         const SnapshotType *orig = nullptr;
         for (auto &snt : s->types) {
-            if (snt.name == ct->name) {
+            if (snt.name == cty->name) {
                 orig = &snt;
                 break;
             }
         }
-        bool changed = !orig || (int)(ct->kind == TABLE_WORD) != orig->is_word ||
-                       ct->value_count != orig->values.size();
+        bool changed = !orig || (int)(cty->kind == TABLE_WORD) != orig->is_word ||
+                       cty->value_count != orig->values.size();
         if (!changed && orig) {
-            for (size_t j = 0; j < ct->value_count && !changed; j++) {
-                if (ct->values[j].value != orig->values[j].value ||
-                    orig->values[j].name != ct->values[j].name) {
+            for (size_t j = 0; j < cty->value_count && !changed; j++) {
+                if (cty->values[j].value != orig->values[j].value ||
+                    orig->values[j].name != cty->values[j].name) {
                     changed = true;
                 }
             }
         }
         if (changed) {
             SnapshotType stype;
-            stype.name = ct->name;
-            stype.is_word = (ct->kind == TABLE_WORD) ? 1 : 0;
-            for (size_t j = 0; j < ct->value_count; j++) {
-                stype.values.push_back({ct->values[j].value, ct->values[j].name});
+            stype.name = cty->name;
+            stype.is_word = (cty->kind == TABLE_WORD) ? 1 : 0;
+            for (size_t j = 0; j < cty->value_count; j++) {
+                stype.values.push_back({cty->values[j].value, cty->values[j].name});
             }
             ctype.push_back(std::move(stype));
         }

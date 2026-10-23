@@ -99,7 +99,29 @@ struct ApexPinmamePoint {
     long hits = 0;
     int mode = 0;     /* watchpoints: 1=r 2=w 3=rw */
     int len = 1;      /* watchpoints: byte length */
-    std::string cond; /* condition expression, if any */
+    std::string cond; /* condition: "A==7F" (bp) or "==05" (wp value condition) */
+    int enabled = 1;
+    long ignore = 0; /* breakpoints: hits skipped before halting */
+    int temp = 0;    /* breakpoints: run-to helper */
+};
+
+/* One frame of /api/debugger/callstack (tracked by the emulator at every
+   JSR/BSR/interrupt): `caller` called `receiver`; `pc` is the return address. */
+struct ApexPinmameFrame {
+    long caller = 0;
+    long receiver = 0;
+    long pc = 0;
+    int bank = -1;
+};
+
+/* One logged access of the memory trace (/api/debugger/trace). */
+struct ApexPinmameAccess {
+    long pc = 0;
+    int bank = -1;
+    long adr = 0;
+    int write = 0;
+    bool has_value = false; /* newer emulators log the written value */
+    long value = 0;
 };
 
 /* One switch from /api/switches. */
@@ -117,8 +139,39 @@ bool apex_pinmame_control(int port, const char *cmd);
 
 /* Add/clear a bank-aware breakpoint or watchpoint.  cmd is "add" or "clear"
    (clear ignores the other args).  bank < 0 omits the bank (system window). */
-bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond);
-bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len, int mode);
+bool apex_pinmame_breakpoint(int port, const char *cmd, unsigned addr, int bank, const char *cond,
+                             long ignore = 0);
+/* vcond (eq|ne|lt|gt|le|ge, NULL = none) halts only when the byte at addr
+   compares true against val. */
+bool apex_pinmame_watchpoint(int port, const char *cmd, unsigned addr, int bank, int len, int mode,
+                             const char *vcond = nullptr, unsigned val = 0);
+/* Toggle (enable/disable) or delete one point: cmd "toggle" | "delete". */
+bool apex_pinmame_point_cmd(int port, const char *cmd, int is_wp, int idx);
+/* Run until addr (temporary breakpoint; bank < 0 = any). */
+bool apex_pinmame_runto(int port, unsigned addr, int bank);
+/* The emulator's call stack, outermost first. */
+bool apex_pinmame_callstack(int port, std::vector<ApexPinmameFrame> &out);
+/* Memory access trace: clear (ranges + log), add a range, read the log.
+   `total` counts all accesses since the last clear; has_total is false for
+   older emulators that do not report it. */
+bool apex_pinmame_trace_clear(int port);
+bool apex_pinmame_trace_add(int port, unsigned addr, int len, int mode, int bank);
+bool apex_pinmame_trace_read(int port, std::vector<ApexPinmameAccess> &out, long &total,
+                             bool &has_total);
+
+/* Tracepoints (/api/debugger/tracepoints): at each listed address the
+   emulator logs a register snapshot (ring of 512) and runs on.  `hits` is the
+   cumulative count per point, so the newest (sum of hits - previous sum) log
+   entries are new since the last read. */
+struct ApexPinmameTpEntry {
+    long pc = 0;
+    int bank = -1;
+    int a = 0, b = 0;
+    long x = 0, y = 0, u = 0, s = 0;
+};
+bool apex_pinmame_tracepoint_add(int port, unsigned addr, int bank);
+bool apex_pinmame_tracepoint_clear(int port);
+bool apex_pinmame_tracepoints(int port, long &hits_total, std::vector<ApexPinmameTpEntry> &log);
 
 /* Inject a switch: val 0/1; pulse_ms > 0 holds for that long then restores. */
 bool apex_pinmame_input(int port, int sw, int val, int pulse_ms);
@@ -127,14 +180,13 @@ bool apex_pinmame_input(int port, int sw, int val, int pulse_ms);
 bool apex_pinmame_points(int port, std::vector<ApexPinmamePoint> &out);
 bool apex_pinmame_switches(int port, std::vector<ApexPinmameSwitch> &out);
 
-/* Delete one point by (type, idx).  The remote debugger only supports add|clear,
-   so this clears that type and re-adds the others (preserving addr/bank/cond and,
-   for watchpoints, len/mode). */
+/* Delete one point by (type, idx). */
 bool apex_pinmame_point_delete(int port, int is_wp, int idx);
 
-/* Temporarily replace all points of one type: stash the current ones into
-   `saved`, clear the type (a collector then adds its own temporary point), and
-   later restore exactly the stashed set. */
+/* Temporarily silence all points of one type while a collector adds its own:
+   stash disables the enabled ones (recorded in `saved`); restore deletes every
+   point added since and re-enables the recorded ones, so hit counts, ignore
+   counts and conditions survive. */
 bool apex_pinmame_points_stash(int port, int is_wp, std::vector<ApexPinmamePoint> &saved);
 void apex_pinmame_points_restore(int port, int is_wp, const std::vector<ApexPinmamePoint> &saved);
 

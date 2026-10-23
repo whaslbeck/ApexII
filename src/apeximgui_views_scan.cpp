@@ -17,7 +17,7 @@ void render_pattern_search(ApexProject *project, const ApexRenderedDocument **do
         state->request_focus_pattern_search = 0;
     }
     ImGui::TextUnformatted("Pattern (hex bytes, ?? = wildcard):");
-    ImGui::SetNextItemWidth(-80.0f);
+    ImGui::SetNextItemWidth(-ui_w(80.0f));
     bool run = ImGui::InputText("##pat", state->pattern_search_input, 128,
                                 ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
@@ -33,8 +33,8 @@ void render_pattern_search(ApexProject *project, const ApexRenderedDocument **do
     if (ImGui::BeginTable("pat_results", 3,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("ROM Offset", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("CPU Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("ROM Offset", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+        ImGui::TableSetupColumn("CPU Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
         ImGui::TableSetupColumn("Bytes", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
@@ -92,7 +92,7 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
         state->request_focus_ram_refs = 0;
     }
     ImGui::TextUnformatted("RAM address ($XX, $XXXX, or hex):");
-    ImGui::SetNextItemWidth(-80.0f);
+    ImGui::SetNextItemWidth(-ui_w(80.0f));
     bool run = ImGui::InputText("##ramaddr", state->ram_ref_input, 32,
                                 ImGuiInputTextFlags_EnterReturnsTrue);
     ImGui::SameLine();
@@ -116,8 +116,8 @@ void render_ram_refs(const ApexProject *project, const ApexRenderedDocument *doc
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
-        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, 50.0f, 1);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 0);
+        ImGui::TableSetupColumn("Block", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f), 1);
         ImGui::TableSetupColumn("Text", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
         {
@@ -234,10 +234,10 @@ void render_imm_loads(ApexProject *project, const ApexRenderedDocument **documen
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS)) {
-        ImGui::TableSetupColumn("Instr", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
-        ImGui::TableSetupColumn("Op", ImGuiTableColumnFlags_WidthFixed, 48.0f, 1);
-        ImGui::TableSetupColumn("Imm", ImGuiTableColumnFlags_WidthFixed, 72.0f, 2);
-        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, 110.0f, 3);
+        ImGui::TableSetupColumn("Instr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 0);
+        ImGui::TableSetupColumn("Op", ImGuiTableColumnFlags_WidthFixed, ui_w(48.0f), 1);
+        ImGui::TableSetupColumn("Imm", ImGuiTableColumnFlags_WidthFixed, ui_w(72.0f), 2);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f), 3);
         ImGui::TableSetupColumn("Label", ImGuiTableColumnFlags_WidthStretch, 0.0f, 4);
         ImGui::TableHeadersRow();
 
@@ -416,8 +416,8 @@ void render_change_log(const ApexRenderedDocument *document, UiState *state) {
     if (ImGui::BeginTable("change_log", 3,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 54.0f);
-        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ui_w(54.0f));
+        ImGui::TableSetupColumn("Action", ImGuiTableColumnFlags_WidthFixed, ui_w(120.0f));
         ImGui::TableSetupColumn("Where", ImGuiTableColumnFlags_WidthStretch, 0.0f);
         ImGui::TableHeadersRow();
 
@@ -527,6 +527,7 @@ static void pinmame_finish_coverage_import(const ApexRenderedDocument *doc, Pinm
         pm.cov_reached.insert(((uint32_t)pr.first << 16) | (pr.second & 0xffff));
     }
     pm.cov_fetched.clear();
+    pm.cov_diff_dirty = true;
     char msg[128];
     snprintf(msg, sizeof(msg), "coverage: %ld executed, %zu run(s)", pm.cov_executed,
              pm.cov_runs.size());
@@ -605,8 +606,30 @@ static bool pm_is_return_addr(const ApexRenderedDocument *doc, uint8_t bank, uin
 static void pm_build_callstack(const ApexProject *p, const ApexRenderedDocument *doc,
                                PinmameState &pm) {
     pm.callstack.clear();
+    if (!doc)
+        return;
+    /* The emulator tracks every call: use its stack (innermost first); the
+       stack scan below is the fallback for emulators without the endpoint. */
+    std::vector<ApexPinmameFrame> frames_api;
+    if (apex_pinmame_callstack(pm.port, frames_api)) {
+        /* Older emulators do not prune frames by S: show the innermost 32. */
+        size_t lo = frames_api.size() > 32 ? frames_api.size() - 32 : 0;
+        for (size_t i = frames_api.size(); i-- > lo;) {
+            const ApexPinmameFrame &f = frames_api[i];
+            uint32_t ret = (uint32_t)f.pc & 0xffffu;
+            uint8_t rb = ret >= 0x8000u ? 0xffu : (uint8_t)(f.bank & 0xff);
+            uint32_t recv = (uint32_t)f.receiver & 0xffffu;
+            uint8_t vb = recv >= 0x8000u ? 0xffu : (uint8_t)(f.bank & 0xff);
+            std::string nm = pm_routine_name(doc, rb, ret);
+            std::string rn = pm_routine_name(doc, vb, recv);
+            if (!rn.empty())
+                nm += (nm.empty() ? "-> " : " -> ") + rn;
+            pm.callstack.push_back({rb, ret, 0, nm, -1});
+        }
+        return;
+    }
     unsigned sp = (unsigned)pm.cpu.sp & 0xffffu;
-    if (!doc || sp == 0)
+    if (sp == 0)
         return;
     std::vector<uint8_t> buf;
     if (!apex_pinmame_memory(pm.port, sp, 64, -1, buf))
@@ -639,7 +662,7 @@ static void pm_build_callstack(const ApexProject *p, const ApexRenderedDocument 
         }
         if (!found)
             continue;
-        pm.callstack.push_back({hit, v, 0, pm_routine_name(doc, hit, v)});
+        pm.callstack.push_back({hit, v, 0, pm_routine_name(doc, hit, v), -1});
         frames++;
         off++; /* consumed a 2-byte return address */
     }
@@ -654,7 +677,7 @@ static void pm_bump(std::vector<PmHotEntry> &v, uint8_t bank, uint32_t addr,
             return;
         }
     }
-    v.push_back({bank, addr, 1, name});
+    v.push_back({bank, addr, 1, name, -1});
 }
 
 /* Parse the switch-control mini-script (one op per line) into PmScriptOp[]. */
@@ -700,6 +723,61 @@ static void pm_parse_script(const char *src, std::vector<PmScriptOp> &ops) {
     }
 }
 
+/* RAM xref: fold new memory-trace log entries into the accessor list.  With
+   a `total` (newer emulators) only the entries since the last read are new;
+   otherwise the log is consumed and the range traced again. */
+static void pm_poll_xref_trace(const ApexRenderedDocument *doc, PinmameState &pm) {
+    std::vector<ApexPinmameAccess> log;
+    long total = 0;
+    bool has_total = false;
+    if (!apex_pinmame_trace_read(pm.port, log, total, has_total))
+        return;
+    size_t first = 0;
+    if (has_total) {
+        long fresh = total - pm.xref_total;
+        if (fresh < 0)
+            fresh = (long)log.size();
+        first = (size_t)fresh >= log.size() ? 0 : log.size() - (size_t)fresh;
+        pm.xref_total = total;
+    } else {
+        unsigned a = (unsigned)strtoul(pm.xref_addr, nullptr, 16);
+        apex_pinmame_trace_clear(pm.port);
+        apex_pinmame_trace_add(pm.port, a, 1, pm.xref_mode, -1);
+    }
+    for (size_t i = first; i < log.size(); i++) {
+        const ApexPinmameAccess &a = log[i];
+        /* older emulators log every access whatever the mode: filter here */
+        if ((a.write && !(pm.xref_mode & 2)) || (!a.write && !(pm.xref_mode & 1)))
+            continue;
+        uint8_t b = (a.pc >= 0x8000) ? 0xffu : (uint8_t)(a.bank & 0xff);
+        uint32_t pc = (uint32_t)a.pc & 0xffffu;
+        PmAccessEntry *e = nullptr;
+        for (PmAccessEntry &x : pm.xref_accessors) {
+            if (x.bank == b && x.addr == pc) {
+                e = &x;
+                break;
+            }
+        }
+        if (!e) {
+            PmAccessEntry n;
+            n.bank = b;
+            n.addr = pc;
+            n.name = pm_routine_name(doc, b, pc);
+            pm.xref_accessors.push_back(n);
+            e = &pm.xref_accessors.back();
+        }
+        if (a.write) {
+            e->writes++;
+            if (a.has_value) {
+                e->has_value = true;
+                e->last_value = a.value;
+            }
+        } else {
+            e->reads++;
+        }
+    }
+}
+
 /* Optional PinMAME dynamic-analysis panel: configure & spawn a headless
    xpinmamed, watch live CPU/bank state, import execution coverage as a
    missed-code worklist, set bank-aware breakpoints/watchpoints, and drive
@@ -723,12 +801,7 @@ void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_pt
         if (apex_pinmame_get_halt(pm.pm, h) && h.seq != pm.last_halt_seq) {
             pm.last_halt = h;
             pm.last_halt_seq = h.seq;
-            if (pm.xref_collecting && h.reason == "wp") {
-                uint8_t b = (h.pc >= 0x8000) ? 0xffu : (uint8_t)(h.bank & 0xff);
-                pm_bump(pm.xref_accessors, b, (uint32_t)h.pc,
-                        pm_routine_name(document, b, (uint32_t)h.pc));
-                apex_pinmame_control(pm.port, "resume");
-            } else if (pm.jmp_collecting && h.reason == "bp" && (uint32_t)h.pc == pm.jmp_pc) {
+            if (pm.jmp_collecting && h.reason == "bp" && (uint32_t)h.pc == pm.jmp_pc) {
                 apex_pinmame_control(pm.port, "step");
                 ApexPinmameCpu c;
                 ApexPinmameInfo ni;
@@ -767,6 +840,10 @@ void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_pt
             }
         }
         double now = ImGui::GetTime();
+        if (pm.xref_collecting && pm.connected && now >= pm.xref_next_poll) {
+            pm.xref_next_poll = now + 0.25;
+            pm_poll_xref_trace(document, pm);
+        }
         if (now >= pm.next_poll && !pm.poll_job.running()) {
             pm.next_poll = now + 0.5;
             std::vector<std::pair<uint32_t, int>> keys;
@@ -822,7 +899,18 @@ void pinmame_pump(ApexProject *project, const ApexRenderedDocument **document_pt
                 if (pm.launching) {
                     pm.launching = false;
                     pm.status = "connected";
+                    patch_pinmame_connected(state); /* data-op traces, before resuming */
+                    if (pm.coverage_on_connect) {
+                        apex_pinmame_coverage_cmd(pm.port, "clear");
+                        apex_pinmame_coverage_cmd(pm.port, "start");
+                        pm.coverage_on_connect = false;
+                    }
+                    if (pm.resume_on_connect) {
+                        apex_pinmame_control(pm.port, "resume");
+                        pm.resumed = true;
+                    }
                 }
+                pm.resume_on_connect = false;
             }
         }
         if ((pm.show_dmd || pm.dmd_recording) && pm.connected && !pm.dmd_job.running()) {
@@ -948,6 +1036,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             pm.port = 8080;
     }
     /* Rom-zip picker: derive rom dir + game name (basename without .zip). */
+    center_file_dialog("PmRomZip");
     if (ImGuiFileDialog::Instance()->Display("PmRomZip", ImGuiWindowFlags_NoCollapse,
                                              ImVec2(560, 360))) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -1019,6 +1108,26 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         ImGui::SameLine();
         if (ImGui::Button("Step"))
             apex_pinmame_control(pm.port, "step");
+        ImGui::SameLine();
+        if (ImGui::Button("Step over"))
+            apex_pinmame_control(pm.port, "stepover");
+        ImGui::SameLine();
+        if (ImGui::Button("Step out"))
+            apex_pinmame_control(pm.port, "stepout");
+        ImGui::SameLine();
+        if (ImGui::Button("Run to selection") && state->selected_line < document->line_count) {
+            const ApexRenderedLine *l = &document->lines[state->selected_line];
+            if (l->has_location) {
+                int bank = (l->cpu_addr >= 0x8000u) ? -1 : (int)l->bank;
+                if (apex_pinmame_runto(pm.port, l->cpu_addr, bank))
+                    pm.resumed = true;
+            }
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Reset"))
+            apex_pinmame_control(pm.port, "reset");
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Reset the machine (F3): NVRAM, breakpoints and pause state stay");
     }
 
     if (pm.alive && pm.connected) {
@@ -1067,7 +1176,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             if (l->has_location) {
                 int bank = (l->cpu_addr >= 0x8000u) ? -1 : (int)l->bank; /* system takes no bank */
                 if (apex_pinmame_breakpoint(pm.port, "add", l->cpu_addr, bank,
-                                            pm.bp_cond[0] ? pm.bp_cond : nullptr))
+                                            pm.bp_cond[0] ? pm.bp_cond : nullptr, pm.bp_ignore))
                     pm.status = "breakpoint added at selection";
             }
         }
@@ -1075,26 +1184,45 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
     ImGui::SameLine();
     if (ImGui::Button("Clear BPs"))
         apex_pinmame_breakpoint(pm.port, "clear", 0, -1, nullptr);
-    ImGui::SetNextItemWidth(160);
+    ImGui::SetNextItemWidth(ui_w(160));
     ImGui::InputTextWithHint("##bpcond", "condition e.g. A==7F", pm.bp_cond, sizeof(pm.bp_cond));
     ImGui::SameLine();
-    ImGui::TextDisabled("(applies to new breakpoints; REG ==/!=/</> HEX)");
+    ImGui::SetNextItemWidth(ui_w(90));
+    ImGui::InputInt("ignore##bpign", &pm.bp_ignore);
+    if (pm.bp_ignore < 0)
+        pm.bp_ignore = 0;
+    ImGui::SameLine();
+    ImGui::TextDisabled("(new breakpoints: REG ==/!=/</> HEX; skip N hits)");
     {
         static char wp_addr[16] = "";
         const char *modes[] = {"read", "write", "rw"};
         int mi = pm.wp_mode - 1;
         if (mi < 0 || mi > 2)
             mi = 1;
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(ui_w(90));
         ImGui::InputText("RAM addr (hex)", wp_addr, sizeof(wp_addr));
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(70);
+        ImGui::SetNextItemWidth(ui_w(70));
         ImGui::Combo("##wpmode", &mi, modes, 3);
         pm.wp_mode = mi + 1;
         ImGui::SameLine();
+        const char *vconds[] = {"any value", "==", "!=", "<", ">", "<=", ">="};
+        static const char *vcond_api[] = {nullptr, "eq", "ne", "lt", "gt", "le", "ge"};
+        ImGui::SetNextItemWidth(ui_w(90));
+        ImGui::Combo("##wpvcond", &pm.wp_vcond, vconds, 7);
+        if (pm.wp_vcond > 0) {
+            ImGui::SameLine();
+            ImGui::SetNextItemWidth(ui_w(40));
+            ImGui::InputText("##wpval", pm.wp_val, sizeof(pm.wp_val));
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Halt only when the byte at the address compares true\n"
+                              "(e.g. write == 05: the write that sets it to 5)");
+        ImGui::SameLine();
         if (ImGui::Button("Add watch") && wp_addr[0]) {
             unsigned a = (unsigned)strtoul(wp_addr, nullptr, 16);
-            apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.wp_mode);
+            apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.wp_mode, vcond_api[pm.wp_vcond],
+                                    (unsigned)strtoul(pm.wp_val, nullptr, 16));
             pm.wp_hits[a & 0xffff] = 0; /* fresh hit count */
         }
         ImGui::SameLine();
@@ -1142,23 +1270,30 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
     }
 
     if (!pm.points.empty() &&
-        ImGui::BeginTable("pm_points", 5, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV,
+        ImGui::BeginTable("pm_points", 6, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, 90))) {
-        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 40.0f);
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 48.0f);
+        ImGui::TableSetupColumn("On", ImGuiTableColumnFlags_WidthFixed, ui_w(26.0f));
+        ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, ui_w(40.0f));
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, ui_w(48.0f));
         ImGui::TableSetupColumn("Info", ImGuiTableColumnFlags_WidthStretch, 0.0f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 40.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui_w(40.0f));
         ImGui::TableHeadersRow();
         const char *wpmode[] = {"?", "read", "write", "rw"};
-        int del_wp = -1, del_idx = -1;
+        int del_wp = -1, del_idx = -1, tog_wp = -1, tog_idx = -1;
         int prow = 0;
         for (const ApexPinmamePoint &pt : pm.points) {
             ImGui::PushID(prow++);
             ImGui::TableNextRow();
             ImGui::TableSetColumnIndex(0);
-            ImGui::TextUnformatted(pt.is_wp ? "WP" : "BP");
+            bool on = pt.enabled != 0;
+            if (ImGui::Checkbox("##on", &on)) {
+                tog_wp = pt.is_wp;
+                tog_idx = pt.idx;
+            }
             ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(pt.is_wp ? "WP" : pt.temp ? "run" : "BP");
+            ImGui::TableSetColumnIndex(2);
             uint8_t db = (pt.bank < 0) ? 0xffu : (uint8_t)pt.bank;
             ImGui::Text("B%02x_A%04x", db, (unsigned)pt.addr & 0xffff);
             ImGui::TableSetColumnIndex(2);
@@ -1168,10 +1303,15 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
                 hits = (it != pm.wp_hits.end()) ? it->second : 0;
             }
             ImGui::Text("%ld", hits);
-            ImGui::TableSetColumnIndex(3);
-            if (pt.is_wp)
-                ImGui::TextDisabled("%s", wpmode[(pt.mode >= 1 && pt.mode <= 3) ? pt.mode : 0]);
             ImGui::TableSetColumnIndex(4);
+            if (pt.is_wp)
+                ImGui::TextDisabled("%s%s%s", wpmode[(pt.mode >= 1 && pt.mode <= 3) ? pt.mode : 0],
+                                    pt.cond.empty() ? "" : "  value ", pt.cond.c_str());
+            else if (!pt.cond.empty() || pt.ignore)
+                ImGui::TextDisabled("%s%s%s", pt.cond.c_str(),
+                                    pt.ignore ? (pt.cond.empty() ? "ignore " : "  ignore ") : "",
+                                    pt.ignore ? std::to_string(pt.ignore).c_str() : "");
+            ImGui::TableSetColumnIndex(5);
             if (ImGui::SmallButton("del")) {
                 del_wp = pt.is_wp;
                 del_idx = pt.idx;
@@ -1183,15 +1323,19 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             apex_pinmame_point_delete(pm.port, del_wp, del_idx);
             pm.next_poll = 0.0; /* refresh the list immediately */
         }
+        if (tog_idx >= 0) {
+            apex_pinmame_point_cmd(pm.port, "toggle", tog_wp, tog_idx);
+            pm.next_poll = 0.0;
+        }
     }
 
     /* ---- Live RAM watch (values resolved to NVRAM symbols) ---- */
     ImGui::SeparatorText("RAM watch");
     ImGui::BeginDisabled(!alive || !pm.connected);
-    ImGui::SetNextItemWidth(90);
+    ImGui::SetNextItemWidth(ui_w(90));
     ImGui::InputText("addr (hex)##watch", pm.watch_addr, sizeof(pm.watch_addr));
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(90);
+    ImGui::SetNextItemWidth(ui_w(90));
     ImGui::Combo("##wsize", &pm.watch_size,
                  "1 byte\0"
                  "2 bytes\0");
@@ -1208,10 +1352,10 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
     if (!pm.watches.empty() &&
         ImGui::BeginTable("pm_watch", 4, ImGuiTableFlags_RowBg | ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, 110))) {
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(64.0f));
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f);
-        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, 120.0f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 80.0f);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, ui_w(120.0f));
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui_w(80.0f));
         ImGui::TableHeadersRow();
         const char *wml = (pm.wp_mode == 1) ? "r" : (pm.wp_mode == 3) ? "rw" : "w";
         int del = -1;
@@ -1259,7 +1403,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_BordersInnerV,
                               ImVec2(0, 110))) {
-            ImGui::TableSetupColumn("Return", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Return", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
             ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
             ImGui::TableHeadersRow();
             for (size_t i = 0; i < pm.callstack.size(); i++) {
@@ -1302,8 +1446,8 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
                                                ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                                    ImGuiTableFlags_BordersInnerV,
                                                ImVec2(0, 150))) {
-        ImGui::TableSetupColumn("PC", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("A B X", ImGuiTableColumnFlags_WidthFixed, 120.0f);
+        ImGui::TableSetupColumn("PC", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+        ImGui::TableSetupColumn("A B X", ImGuiTableColumnFlags_WidthFixed, ui_w(120.0f));
         ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
         ImGui::TableHeadersRow();
         int shown = (int)pm.trace.size();
@@ -1344,10 +1488,10 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         if (mi < 0 || mi > 2)
             mi = 2;
         ImGui::BeginDisabled(!alive || !pm.connected || pm.xref_collecting);
-        ImGui::SetNextItemWidth(90);
+        ImGui::SetNextItemWidth(ui_w(90));
         ImGui::InputText("addr (hex)##xref", pm.xref_addr, sizeof(pm.xref_addr));
         ImGui::SameLine();
-        ImGui::SetNextItemWidth(70);
+        ImGui::SetNextItemWidth(ui_w(70));
         ImGui::Combo("##xrefmode", &mi, modes, 3);
         pm.xref_mode = mi + 1;
         ImGui::EndDisabled();
@@ -1355,50 +1499,63 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
         if (!pm.xref_collecting) {
             ImGui::BeginDisabled(!alive || !pm.connected || pm.xref_addr[0] == 0);
             if (ImGui::Button("Collect accessors")) {
+                /* The emulator's memory access trace logs every access while the
+                   game keeps running -- no halts, and newer emulators log the
+                   written values. */
                 unsigned a = (unsigned)strtoul(pm.xref_addr, nullptr, 16);
-                /* Only our temporary watchpoint may fire while collecting; the
-                   user's watchpoints are stashed and put back on Stop. */
-                apex_pinmame_points_stash(pm.port, 1, pm.xref_saved_wps);
-                apex_pinmame_watchpoint(pm.port, "add", a, -1, 1, pm.xref_mode);
+                apex_pinmame_trace_clear(pm.port);
+                apex_pinmame_trace_add(pm.port, a, 1, pm.xref_mode, -1);
                 pm.xref_accessors.clear();
+                pm.xref_total = 0;
+                pm.xref_next_poll = 0;
                 pm.xref_collecting = true;
                 apex_pinmame_control(pm.port, "resume");
+                pm.resumed = true;
             }
             ImGui::EndDisabled();
         } else {
             if (ImGui::Button("Stop")) {
+                pm_poll_xref_trace(document, pm);
                 pm.xref_collecting = false;
-                apex_pinmame_control(pm.port, "pause");
-                apex_pinmame_points_restore(pm.port, 1, pm.xref_saved_wps);
+                apex_pinmame_trace_clear(pm.port);
             }
             ImGui::SameLine();
             ImGui::TextColored(ImVec4(0.5f, 0.9f, 0.5f, 1.0f), "collecting… %zu site(s)",
                                pm.xref_accessors.size());
         }
         if (!pm.xref_accessors.empty() &&
-            ImGui::BeginTable("pm_xref", 3,
+            ImGui::BeginTable("pm_xref", 5,
                               ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                   ImGuiTableFlags_BordersInnerV,
                               ImVec2(0, 110))) {
-            ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-            ImGui::TableSetupColumn("PC", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+            ImGui::TableSetupColumn("Reads", ImGuiTableColumnFlags_WidthFixed, ui_w(56.0f));
+            ImGui::TableSetupColumn("Writes", ImGuiTableColumnFlags_WidthFixed, ui_w(56.0f));
+            ImGui::TableSetupColumn("Last", ImGuiTableColumnFlags_WidthFixed, ui_w(40.0f));
+            ImGui::TableSetupColumn("PC", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
             ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
             ImGui::TableHeadersRow();
             for (size_t i = 0; i < pm.xref_accessors.size(); i++) {
-                const PmHotEntry &e = pm.xref_accessors[i];
+                const PmAccessEntry &e = pm.xref_accessors[i];
                 ImGui::PushID((int)i);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
                 char cb[24];
-                snprintf(cb, sizeof(cb), "%ld", e.count);
+                snprintf(cb, sizeof(cb), "%ld", e.reads);
                 if (ImGui::Selectable(cb, false, ImGuiSelectableFlags_SpanAllColumns)) {
                     size_t li;
                     if (apex_render_find_line_by_address(document, e.bank, e.addr, &li))
                         select_line(state, li, 1);
                 }
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                ImGui::Text("%ld", e.writes);
                 ImGui::TableSetColumnIndex(2);
+                if (e.has_value)
+                    ImGui::Text("%02lx", (unsigned long)e.last_value & 0xff);
+                else
+                    ImGui::TextDisabled("-");
+                ImGui::TableSetColumnIndex(3);
+                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                ImGui::TableSetColumnIndex(4);
                 ImGui::TextUnformatted(e.name.c_str());
                 ImGui::PopID();
             }
@@ -1415,7 +1572,7 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
             snprintf(pm.jmp_addr, sizeof(pm.jmp_addr), "%04x", l->cpu_addr & 0xffff);
     }
     ImGui::SameLine();
-    ImGui::SetNextItemWidth(90);
+    ImGui::SetNextItemWidth(ui_w(90));
     ImGui::InputText("jump addr (hex)", pm.jmp_addr, sizeof(pm.jmp_addr));
     ImGui::EndDisabled();
     ImGui::SameLine();
@@ -1453,8 +1610,8 @@ void render_pinmame(ApexProject *project, const ApexRenderedDocument **document_
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, 110))) {
-        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+        ImGui::TableSetupColumn("Hits", ImGuiTableColumnFlags_WidthFixed, ui_w(56.0f));
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
         ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f);
         ImGui::TableHeadersRow();
         for (size_t i = 0; i < pm.jmp_targets.size(); i++) {
@@ -1547,6 +1704,7 @@ void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **docum
         ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "REC  %ld frame(s)", pm.dmd_rec_frames);
     }
     /* Save-PNG dialog */
+    center_file_dialog("PmDmdPng");
     if (ImGuiFileDialog::Instance()->Display("PmDmdPng", ImGuiWindowFlags_NoCollapse,
                                              ImVec2(560, 360))) {
         if (ImGuiFileDialog::Instance()->IsOk() && have_frame) {
@@ -1567,6 +1725,7 @@ void render_pinmame_dmd(ApexProject *project, const ApexRenderedDocument **docum
         ImGuiFileDialog::Instance()->Close();
     }
     /* Record-GIF dialog */
+    center_file_dialog("PmDmdGif");
     if (ImGuiFileDialog::Instance()->Display("PmDmdGif", ImGuiWindowFlags_NoCollapse,
                                              ImVec2(560, 360))) {
         if (ImGuiFileDialog::Instance()->IsOk()) {
@@ -1628,10 +1787,10 @@ void render_pinmame_switches(ApexProject *project, const ApexRenderedDocument **
                                                   ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                                                       ImGuiTableFlags_BordersInnerV,
                                                   ImVec2(0, 200))) {
-        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, 34.0f);
-        ImGui::TableSetupColumn("Col/Row", ImGuiTableColumnFlags_WidthFixed, 54.0f);
+        ImGui::TableSetupColumn("#", ImGuiTableColumnFlags_WidthFixed, ui_w(34.0f));
+        ImGui::TableSetupColumn("Col/Row", ImGuiTableColumnFlags_WidthFixed, ui_w(54.0f));
         ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 0.0f);
-        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, 100.0f);
+        ImGui::TableSetupColumn("", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f));
         ImGui::TableHeadersRow();
         ImGuiListClipper clip;
         clip.Begin((int)pm.switches.size());
@@ -1688,6 +1847,54 @@ void render_pinmame_switches(ApexProject *project, const ApexRenderedDocument **
     }
 }
 
+/* Group the PCs executed in only one of baseline and current import (view 1:
+   new since the baseline, view 2: no longer executed) by containing routine,
+   so "what runs only when the ball save fires" is a short list of routines. */
+static void pm_compute_cov_diff(const ApexRenderedDocument *doc, PinmameState &pm) {
+    pm.cov_diff.clear();
+    pm.cov_diff_dirty = false;
+    pm.cov_diff_doc = doc;
+    if (pm.cov_view == 0 || !doc)
+        return;
+    const std::unordered_set<uint32_t> &from = pm.cov_view == 1 ? pm.cov_reached : pm.cov_baseline;
+    const std::unordered_set<uint32_t> &other = pm.cov_view == 1 ? pm.cov_baseline : pm.cov_reached;
+    std::vector<uint32_t> keys;
+    for (uint32_t k : from) {
+        if (!other.count(k))
+            keys.push_back(k);
+    }
+    std::sort(keys.begin(), keys.end());
+    std::map<uint32_t, size_t> by_routine;
+    for (uint32_t k : keys) {
+        uint8_t bank = (uint8_t)(k >> 16);
+        uint32_t addr = k & 0xffffu;
+        uint32_t raddr = addr;
+        std::string name;
+        size_t li;
+        if (find_routine_start(doc, bank, addr, &li) && doc->lines[li].bank == bank) {
+            raddr = doc->lines[li].cpu_addr;
+            name.assign(doc->lines[li].text, doc->lines[li].length);
+            size_t colon = name.find(':');
+            if (colon != std::string::npos)
+                name.erase(colon);
+        }
+        uint32_t rk = ((uint32_t)bank << 16) | raddr;
+        auto it = by_routine.find(rk);
+        if (it == by_routine.end()) {
+            PmDiffRoutine r;
+            r.bank = bank;
+            r.addr = raddr;
+            r.first = addr;
+            r.count = 1;
+            r.name = name;
+            by_routine[rk] = pm.cov_diff.size();
+            pm.cov_diff.push_back(r);
+        } else {
+            pm.cov_diff[it->second].count++;
+        }
+    }
+}
+
 /* ---- PinMAME · Coverage window (coverage import/overlay + call hotlist) ---- */
 void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **document_ptr,
                              UiState *state) {
@@ -1714,11 +1921,119 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
         ImGui::Text("executed %ld / %ld bytes (%.1f%%)", pm.cov_executed, pm.cov_addressable,
                     100.0 * (double)pm.cov_executed / (double)pm.cov_addressable);
     }
-    ImGui::Checkbox("Only runs not classified as code (missed code)", &pm.cov_only_noncode);
-    ImGui::SameLine();
     ImGui::Checkbox("overlay in disasm", &pm.cov_overlay);
-    if (pm.cov_overlay && !pm.cov_reached.empty())
-        ImGui::TextDisabled("disasm: green = executed, red = never executed (import first)");
+
+    /* Differential coverage: baseline = one import, diff = a later one. */
+    ImGui::SeparatorText("Differential coverage");
+    ImGui::BeginDisabled(pm.cov_reached.empty());
+    if (ImGui::Button("Set baseline from import")) {
+        pm.cov_baseline = pm.cov_reached;
+        pm.cov_baseline_executed = (long)pm.cov_reached.size();
+        pm.cov_diff_dirty = true;
+    }
+    ImGui::EndDisabled();
+    ImGui::SameLine();
+    ImGui::BeginDisabled(pm.cov_baseline.empty());
+    if (ImGui::Button("Drop baseline")) {
+        pm.cov_baseline.clear();
+        pm.cov_baseline_executed = 0;
+        pm.cov_view = 0;
+        pm.cov_diff_dirty = true;
+    }
+    ImGui::EndDisabled();
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("1. Start + play the reference situation, Import, Set baseline\n"
+                          "2. Clear, Start, trigger the feature (switch script), Import\n"
+                          "3. View \"new since baseline\": only code the feature ran");
+    if (!pm.cov_baseline.empty())
+        ImGui::TextDisabled("baseline: %ld instruction(s)", pm.cov_baseline_executed);
+    ImGui::BeginDisabled(pm.cov_baseline.empty());
+    int prev_view = pm.cov_view;
+    ImGui::RadioButton("all runs", &pm.cov_view, 0);
+    ImGui::SameLine();
+    ImGui::RadioButton("new since baseline", &pm.cov_view, 1);
+    ImGui::SameLine();
+    ImGui::RadioButton("no longer executed", &pm.cov_view, 2);
+    ImGui::EndDisabled();
+    if (pm.cov_baseline.empty())
+        pm.cov_view = 0;
+    if (pm.cov_view != prev_view)
+        pm.cov_diff_dirty = true;
+    if (pm.cov_overlay && !pm.cov_reached.empty()) {
+        if (pm.cov_view == 1)
+            ImGui::TextDisabled("disasm: amber = new since baseline, green = executed in both");
+        else if (pm.cov_view == 2)
+            ImGui::TextDisabled("disasm: purple = executed at baseline only");
+        else
+            ImGui::TextDisabled("disasm: green = executed, red = never executed");
+    }
+
+    if (pm.cov_view != 0) {
+        if (pm.cov_diff_dirty || pm.cov_diff_doc != document)
+            pm_compute_cov_diff(document, pm);
+        int pcs = 0;
+        for (const PmDiffRoutine &r : pm.cov_diff)
+            pcs += r.count;
+        ImGui::Text("%d instruction(s) in %zu routine(s)", pcs, pm.cov_diff.size());
+        if (ImGui::BeginTable("pm_cov_diff", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                  ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
+                                  APEX_TABLE_SORT_FLAGS,
+                              ImVec2(0, 220))) {
+            ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f, 0);
+            ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 1);
+            ImGui::TableSetupColumn("PCs", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f), 2);
+            ImGui::TableSetupColumn("First", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 3);
+            ImGui::TableHeadersRow();
+            int sc;
+            bool asc;
+            if (ui_table_sort(&sc, &asc)) {
+                std::stable_sort(
+                    pm.cov_diff.begin(), pm.cov_diff.end(),
+                    [&](const PmDiffRoutine &a, const PmDiffRoutine &b) {
+                        int c = 0;
+                        if (sc == 0)
+                            c = a.name.compare(b.name);
+                        else if (sc == 2)
+                            c = ui_cmp_int(a.count, b.count);
+                        else {
+                            uint32_t ka = ((uint32_t)a.bank << 16) | (sc == 1 ? a.addr : a.first);
+                            uint32_t kb = ((uint32_t)b.bank << 16) | (sc == 1 ? b.addr : b.first);
+                            c = ui_cmp_u32(ka, kb);
+                        }
+                        return asc ? c < 0 : c > 0;
+                    });
+            }
+            ImGuiListClipper dclip;
+            dclip.Begin((int)pm.cov_diff.size());
+            while (dclip.Step()) {
+                for (int row = dclip.DisplayStart; row < dclip.DisplayEnd; row++) {
+                    const PmDiffRoutine &r = pm.cov_diff[(size_t)row];
+                    ImGui::PushID(row);
+                    ImGui::TableNextRow();
+                    ImGui::TableSetColumnIndex(0);
+                    char nb[160];
+                    snprintf(nb, sizeof(nb), "%s", r.name.empty() ? "(no label)" : r.name.c_str());
+                    if (ImGui::Selectable(nb, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                        size_t li;
+                        if (apex_render_find_line_by_address(document, r.bank, r.first, &li))
+                            select_line(state, li, 1);
+                    }
+                    ImGui::TableSetColumnIndex(1);
+                    ImGui::Text("B%02x_A%04x", r.bank, (unsigned)r.addr & 0xffff);
+                    ImGui::TableSetColumnIndex(2);
+                    ImGui::Text("%d", r.count);
+                    ImGui::TableSetColumnIndex(3);
+                    ImGui::Text("B%02x_A%04x", r.bank, (unsigned)r.first & 0xffff);
+                    ImGui::PopID();
+                }
+            }
+            ImGui::EndTable();
+        }
+    }
+
+    ImGui::SeparatorText("Executed runs");
+    ImGui::Checkbox("Only runs not classified as code (missed code)", &pm.cov_only_noncode);
 
     std::vector<size_t> view;
     for (size_t i = 0; i < pm.cov_runs.size(); i++) {
@@ -1732,9 +2047,9 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, 150))) {
-        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, 56.0f);
-        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, 64.0f);
+        ImGui::TableSetupColumn("Start", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+        ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, ui_w(56.0f));
+        ImGui::TableSetupColumn("Kind", ImGuiTableColumnFlags_WidthFixed, ui_w(64.0f));
         ImGui::TableSetupColumn("Go", ImGuiTableColumnFlags_WidthStretch, 0.0f);
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
@@ -1818,6 +2133,7 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
             e.bank = (c.bank < 0) ? 0xffu : (uint8_t)c.bank;
             e.addr = (uint32_t)c.addr;
             e.count = c.count;
+            e.base = -1;
             size_t li;
             if (apex_render_find_line_by_address(document, e.bank, e.addr, &li)) {
                 for (size_t j = li; j < document->line_count && document->lines[j].bank == e.bank &&
@@ -1833,27 +2149,74 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
                     }
                 }
             }
+            if (pm.hot_has_baseline) {
+                auto it = pm.hot_baseline.find(((uint32_t)e.bank << 16) | (e.addr & 0xffff));
+                e.base = it != pm.hot_baseline.end() ? it->second : 0;
+            }
             pm.hotlist.push_back(e);
         }
+        /* With a baseline, the routines called most since then come first. */
         std::sort(pm.hotlist.begin(), pm.hotlist.end(),
-                  [](const PmHotEntry &a, const PmHotEntry &b) { return a.count > b.count; });
+                  [](const PmHotEntry &a, const PmHotEntry &b) {
+                      long da = a.base >= 0 ? a.count - a.base : a.count;
+                      long db = b.base >= 0 ? b.count - b.base : b.count;
+                      return da > db;
+                  });
     }
     ImGui::SameLine();
     if (ImGui::Button("Reset counts"))
         apex_pinmame_instrument(pm.port, "clear", 0, -1);
+    ImGui::SameLine();
+    if (ImGui::Button("Set baseline")) {
+        /* Snapshot the current counters; the hotlist then shows the delta. */
+        std::vector<ApexPinmameCount> cs;
+        apex_pinmame_instrument_read(pm.port, cs);
+        pm.hot_baseline.clear();
+        for (const ApexPinmameCount &c : cs) {
+            uint8_t b = (c.bank < 0) ? 0xffu : (uint8_t)c.bank;
+            pm.hot_baseline[((uint32_t)b << 16) | ((uint32_t)c.addr & 0xffff)] = c.count;
+        }
+        pm.hot_has_baseline = true;
+        for (PmHotEntry &e : pm.hotlist) {
+            auto it = pm.hot_baseline.find(((uint32_t)e.bank << 16) | (e.addr & 0xffff));
+            e.base = it != pm.hot_baseline.end() ? it->second : 0;
+        }
+    }
+    if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+        ImGui::SetTooltip("Snapshot the counters now; Read hotlist then shows the calls made "
+                          "since (delta column)");
     ImGui::EndDisabled();
+    if (pm.hot_has_baseline) {
+        ImGui::SameLine();
+        if (ImGui::SmallButton("drop")) {
+            pm.hot_has_baseline = false;
+            pm.hot_baseline.clear();
+            pm.hot_only_new = false;
+            for (PmHotEntry &e : pm.hotlist)
+                e.base = -1;
+        }
+        ImGui::SameLine();
+        ImGui::Checkbox("only routines not called at baseline", &pm.hot_only_new);
+    }
     if (pm.hot_instrumented)
         ImGui::TextDisabled("%d routine(s) instrumented; run the game, then Read hotlist",
                             pm.hot_instrumented);
 
+    std::vector<size_t> hview;
+    for (size_t i = 0; i < pm.hotlist.size(); i++) {
+        if (pm.hot_only_new && pm.hotlist[i].base != 0)
+            continue;
+        hview.push_back(i);
+    }
     if (!pm.hotlist.empty() &&
-        ImGui::BeginTable("pm_hot", 3,
+        ImGui::BeginTable("pm_hot", 4,
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV |
                               APEX_TABLE_SORT_FLAGS,
                           ImVec2(0, 200))) {
-        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, 90.0f, 0);
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f, 1);
+        ImGui::TableSetupColumn("Count", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 0);
+        ImGui::TableSetupColumn("Delta", ImGuiTableColumnFlags_WidthFixed, ui_w(80.0f), 3);
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 1);
         ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch, 0.0f, 2);
         ImGui::TableHeadersRow();
         int sc;
@@ -1864,6 +2227,9 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
                                  int c = 0;
                                  if (sc == 0)
                                      c = ui_cmp_int(a.count, b.count);
+                                 else if (sc == 3)
+                                     c = ui_cmp_int(a.base >= 0 ? a.count - a.base : a.count,
+                                                    b.base >= 0 ? b.count - b.base : b.count);
                                  else if (sc == 1)
                                      c = ui_cmp_u32(((uint32_t)a.bank << 16) | (a.addr & 0xffff),
                                                     ((uint32_t)b.bank << 16) | (b.addr & 0xffff));
@@ -1871,12 +2237,18 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
                                      c = a.name.compare(b.name);
                                  return asc ? c < 0 : c > 0;
                              });
+            hview.clear();
+            for (size_t i = 0; i < pm.hotlist.size(); i++) {
+                if (pm.hot_only_new && pm.hotlist[i].base != 0)
+                    continue;
+                hview.push_back(i);
+            }
         }
         ImGuiListClipper clip;
-        clip.Begin((int)pm.hotlist.size());
+        clip.Begin((int)hview.size());
         while (clip.Step()) {
             for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
-                const PmHotEntry &e = pm.hotlist[(size_t)row];
+                const PmHotEntry &e = pm.hotlist[hview[(size_t)row]];
                 ImGui::PushID(row);
                 ImGui::TableNextRow();
                 ImGui::TableSetColumnIndex(0);
@@ -1888,8 +2260,15 @@ void render_pinmame_coverage(ApexProject *project, const ApexRenderedDocument **
                         select_line(state, li, 1);
                 }
                 ImGui::TableSetColumnIndex(1);
-                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                if (e.base < 0)
+                    ImGui::TextDisabled("-");
+                else if (e.base == 0)
+                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.15f, 1.0f), "+%ld new", e.count);
+                else
+                    ImGui::Text("+%ld", e.count - e.base);
                 ImGui::TableSetColumnIndex(2);
+                ImGui::Text("B%02x_A%04x", e.bank, e.addr & 0xffff);
+                ImGui::TableSetColumnIndex(3);
                 ImGui::TextUnformatted(e.name.c_str());
                 ImGui::PopID();
             }
@@ -1935,9 +2314,9 @@ void render_code_candidates(ApexProject *project, const ApexRenderedDocument **d
                            ImVec2(0, 0)))
         return;
 
-    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, 48.0f, 0);
-    ImGui::TableSetupColumn("T", ImGuiTableColumnFlags_WidthFixed, 18.0f, 1);
-    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f, 2);
+    ImGui::TableSetupColumn("Score", ImGuiTableColumnFlags_WidthFixed, ui_w(48.0f), 0);
+    ImGui::TableSetupColumn("T", ImGuiTableColumnFlags_WidthFixed, ui_w(18.0f), 1);
+    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f), 2);
     ImGui::TableSetupColumn("Preview", ImGuiTableColumnFlags_WidthStretch, 0.0f, 3);
     ImGui::TableSetupColumn(
         "##act", ImGuiTableColumnFlags_WidthFixed | ImGuiTableColumnFlags_NoSort, 100.0f, 4);
@@ -2158,10 +2537,10 @@ void render_warnings_view(ApexProject *project, const ApexRenderedDocument **doc
                                ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                            ImVec2(0, 0)))
         return;
-    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, 190.0f);
-    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Type", ImGuiTableColumnFlags_WidthFixed, ui_w(190.0f));
+    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
     ImGui::TableSetupColumn("Detail", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("##ack", ImGuiTableColumnFlags_WidthFixed, 70.0f);
+    ImGui::TableSetupColumn("##ack", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
     ImGui::TableHeadersRow();
 
     /* Deferred ack toggle: applied after the loop so we never rerender (which
@@ -2355,9 +2734,9 @@ void render_flow_breaks_view(ApexProject *project, const ApexRenderedDocument **
                                ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                            ImVec2(0, 0)))
         return;
-    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 90.0f);
+    ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
     ImGui::TableSetupColumn("Last instruction", ImGuiTableColumnFlags_WidthStretch);
-    ImGui::TableSetupColumn("Runs into", ImGuiTableColumnFlags_WidthFixed, 110.0f);
+    ImGui::TableSetupColumn("Runs into", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f));
     ImGui::TableHeadersRow();
 
     for (size_t i = 0; i < state->flow_breaks.size(); i++) {
@@ -2498,9 +2877,9 @@ void render_nvram_import_window(ApexProject *project, const ApexRenderedDocument
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
                           ImVec2(0, -ImGui::GetFrameHeightWithSpacing() - 4.0f))) {
-        ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, 24.0f);
-        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, 60.0f);
-        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("##sel", ImGuiTableColumnFlags_WidthFixed, ui_w(24.0f));
+        ImGui::TableSetupColumn("Addr", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f));
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthFixed, ui_w(170.0f));
         ImGui::TableSetupColumn("Doc / conflict", ImGuiTableColumnFlags_WidthStretch);
         ImGui::TableHeadersRow();
         for (size_t i = 0; i < rows.size(); i++) {
@@ -2706,15 +3085,15 @@ void render_inline_detect(ApexProject *project, const ApexRenderedDocument **doc
                           ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
                               ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV)) {
         ImGui::TableSetupScrollFreeze(0, 1);
-        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthFixed, 90.0f);
-        ImGui::TableSetupColumn("Src", ImGuiTableColumnFlags_WidthFixed, 30.0f);
-        ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, 30.0f);
-        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, 55.0f);
-        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, 70.0f);
-        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, 50.0f);
-        ImGui::TableSetupColumn("Detected", ImGuiTableColumnFlags_WidthFixed, 170.0f);
+        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthFixed, ui_w(90.0f));
+        ImGui::TableSetupColumn("Src", ImGuiTableColumnFlags_WidthFixed, ui_w(30.0f));
+        ImGui::TableSetupColumn("Len", ImGuiTableColumnFlags_WidthFixed, ui_w(30.0f));
+        ImGui::TableSetupColumn("Conf", ImGuiTableColumnFlags_WidthFixed, ui_w(55.0f));
+        ImGui::TableSetupColumn("Status", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f));
+        ImGui::TableSetupColumn("Detected", ImGuiTableColumnFlags_WidthFixed, ui_w(170.0f));
         ImGui::TableSetupColumn("Configured / note", ImGuiTableColumnFlags_WidthStretch);
-        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, 60.0f);
+        ImGui::TableSetupColumn("##act", ImGuiTableColumnFlags_WidthFixed, ui_w(60.0f));
         ImGui::TableHeadersRow();
         ImGuiListClipper clipper;
         clipper.Begin((int)rows.size());
@@ -2804,7 +3183,7 @@ void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **do
                            ImVec2(0, 0))) {
         return;
     }
-    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, 100.f, 0);
+    ImGui::TableSetupColumn("Address", ImGuiTableColumnFlags_WidthFixed, ui_w(100.f), 0);
     ImGui::TableSetupColumn(
         "Label", ImGuiTableColumnFlags_WidthStretch | ImGuiTableColumnFlags_NoSort, 0.0f, 1);
     ImGui::TableSetupColumn(
@@ -2884,4 +3263,662 @@ void render_ref_exclusions(ApexProject *project, const ApexRenderedDocument **do
         state->overlay_dirty = true;
         set_status(state, "ref exclusion removed");
     }
+}
+
+/* ---- Game Hooks window ---- */
+
+/* Resolve the detected hook table against the current document: slot/target
+   labels and the routine around each OS call site. */
+static void hooks_compute(ApexProject *project, const ApexRenderedDocument *doc, UiState *state,
+                          HooksWindowState &hs) {
+    hs.rows.clear();
+    hs.helpers.clear();
+    hs.computed = true;
+    hs.doc_ptr = doc;
+    ApexWpcHooks h;
+    if (apex_wpc_detect_hooks(project, &h) != 0)
+        return;
+    for (size_t k = 0; k < h.helper_count; k++)
+        hs.helpers.push_back(h.helpers[k]);
+    size_t c = 0;
+    for (size_t i = 0; i < h.count; i++) {
+        const ApexWpcHook &hk = h.items[i];
+        HookRow r;
+        r.slot = i;
+        r.slot_addr = hk.slot_addr;
+        r.target_bank = hk.target_bank;
+        r.target_addr = hk.target_addr;
+        r.stub = hk.is_stub != 0;
+        r.shared = hk.shared;
+        r.slot_name = label_at_address(doc, state, 0xffu, hk.slot_addr);
+        if (generated_any_label_name(r.slot_name.c_str()))
+            r.slot_name.clear();
+        r.target_name = label_at_address(doc, state, hk.target_bank, hk.target_addr);
+        for (size_t n = 0; n < hk.caller_count; n++, c++) {
+            const ApexWpcHookCaller &cl = h.callers[c];
+            HookCallerRow cr;
+            cr.bank = cl.bank;
+            cr.addr = cl.addr;
+            cr.kind = cl.kind;
+            size_t li;
+            if (find_routine_start(doc, cl.bank, cl.addr, &li) && doc->lines[li].bank == cl.bank) {
+                cr.routine.assign(doc->lines[li].text, doc->lines[li].length);
+                size_t colon = cr.routine.find(':');
+                if (colon != std::string::npos)
+                    cr.routine.erase(colon);
+            }
+            r.callers.push_back(cr);
+        }
+        hs.rows.push_back(r);
+    }
+    apex_wpc_hooks_free(&h);
+    if (hs.selected >= (int)hs.rows.size())
+        hs.selected = -1;
+}
+
+static void hooks_jump(const ApexRenderedDocument *doc, UiState *state, uint8_t bank,
+                       uint32_t addr) {
+    size_t li;
+    if (apex_render_find_line_by_address(doc, bank, addr, &li))
+        select_line(state, li, 1);
+}
+
+/* PinMAME state of a hook target: 0 = no coverage, 1 = not executed,
+   2 = executed, 3 = executed and new since the coverage baseline. */
+static int hook_run_state(const PinmameState &pm, const HookRow &r) {
+    if (pm.cov_reached.empty())
+        return 0;
+    uint32_t key = ((uint32_t)r.target_bank << 16) | (r.target_addr & 0xffff);
+    if (!pm.cov_reached.count(key))
+        return 1;
+    if (!pm.cov_baseline.empty() && !pm.cov_baseline.count(key))
+        return 3;
+    return 2;
+}
+
+void render_hooks_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                         UiState *state) {
+    const ApexRenderedDocument *document = *document_ptr;
+    HooksWindowState &hs = state->hooks_state;
+    if (!document)
+        return;
+    if (!hs.computed || hs.doc_ptr != document)
+        hooks_compute(project, document, state, hs);
+
+    if (hs.rows.empty()) {
+        ImGui::TextWrapped("No game-hook table found: the system bank has no run of far "
+                           "pointers at 0x8001.");
+        return;
+    }
+    size_t stubs = 0, called = 0;
+    for (const HookRow &r : hs.rows) {
+        stubs += r.stub ? 1u : 0u;
+        called += r.callers.empty() ? 0u : 1u;
+    }
+    ImGui::Text("Hook table Bff_A%04x: %zu slots, %zu used by the game, %zu unused (RTS)",
+                APEX_WPC_HOOK_TABLE_ADDR, hs.rows.size(), hs.rows.size() - stubs, stubs);
+    ImGui::SameLine();
+    ImGui::TextDisabled("(?)");
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("The OS calls game code only through these 3-byte far pointers\n"
+                          "(JSR far-call helper + inline slot address).  The OS caller tells\n"
+                          "what a hook means; redirecting a slot hooks that event without\n"
+                          "touching OS code.  Slot order is fixed per OS version.");
+    std::string helpers;
+    for (uint32_t a : hs.helpers) {
+        std::string nm = label_at_address(document, state, 0xffu, a);
+        char b[32];
+        snprintf(b, sizeof(b), "Bff_A%04x", (unsigned)a);
+        helpers += helpers.empty() ? "" : ", ";
+        helpers += (nm.empty() || generated_any_label_name(nm.c_str())) ? b : nm;
+    }
+    ImGui::TextDisabled("far-call helper: %s  |  %zu slot(s) with an OS call site found",
+                        helpers.empty() ? "-" : helpers.c_str(), called);
+    if (ImGui::Button("Refresh"))
+        hooks_compute(project, document, state, hs);
+    ImGui::SameLine();
+    /* Offer the table only while the slots are unclassified (a hand-made
+       per-slot far_code classification must not be overlaid). */
+    if (!table_def_at(0xffu, APEX_WPC_HOOK_TABLE_ADDR, &project->tables) &&
+        !data_range_at(0xffu, APEX_WPC_HOOK_TABLE_ADDR, &project->data_ranges)) {
+        if (ImGui::Button("Classify as far_code table")) {
+            char spec[48];
+            snprintf(spec, sizeof(spec), "rows[%zu](far_code)", hs.rows.size());
+            if (apex_project_set_table(project, 0xffu, APEX_WPC_HOOK_TABLE_ADDR, spec) == 0) {
+                state->overlay_dirty = true;
+                rerender_and_reselect(project, document_ptr, state, 0xffu,
+                                      APEX_WPC_HOOK_TABLE_ADDR);
+                set_status(state, "hook table classified");
+                return;
+            }
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("Add [tables] Bff_A8001 = rows[N](far_code), so every hook target\n"
+                              "becomes a code entry and the slots render as far pointers.");
+        ImGui::SameLine();
+    }
+    ImGui::Checkbox("hide unused (RTS)", &hs.hide_stubs);
+    ImGui::SameLine();
+    ImGui::SetNextItemWidth(ui_w(160.0f));
+    ImGui::InputTextWithHint("##hookfilter", "filter names", hs.filter, sizeof(hs.filter));
+    const PinmameState &pm = state->pinmame;
+    if (!pm.cov_reached.empty()) {
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(ui_w(170.0f));
+        const char *runs[] = {"all slots", "target executed", "new since baseline"};
+        ImGui::Combo("##hookrun", &hs.run_filter, runs, pm.cov_baseline.empty() ? 2 : 3);
+    } else {
+        hs.run_filter = 0;
+    }
+
+    std::vector<size_t> view;
+    for (size_t i = 0; i < hs.rows.size(); i++) {
+        const HookRow &r = hs.rows[i];
+        if (hs.hide_stubs && r.stub)
+            continue;
+        int run = hook_run_state(pm, r);
+        if (hs.run_filter == 1 && run < 2)
+            continue;
+        if (hs.run_filter == 2 && run != 3)
+            continue;
+        if (hs.filter[0]) {
+            bool hit = str_icontains(r.slot_name.c_str(), hs.filter) ||
+                       str_icontains(r.target_name.c_str(), hs.filter);
+            for (const HookCallerRow &cr : r.callers)
+                hit = hit || str_icontains(cr.routine.c_str(), hs.filter);
+            if (!hit)
+                continue;
+        }
+        view.push_back(i);
+    }
+
+    float detail_h = hs.selected >= 0 ? 190.0f : 0.0f;
+    if (ImGui::BeginTable("hooks", 6,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+                          ImVec2(0, -detail_h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Slot", ImGuiTableColumnFlags_WidthFixed, ui_w(110.0f));
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+        ImGui::TableSetupColumn("Target", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("OS call site", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableSetupColumn("Calls", ImGuiTableColumnFlags_WidthFixed, ui_w(44.0f));
+        ImGui::TableSetupColumn("Run", ImGuiTableColumnFlags_WidthFixed, ui_w(44.0f));
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin((int)view.size());
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                size_t ri = view[(size_t)row];
+                const HookRow &r = hs.rows[ri];
+                ImGui::PushID((int)ri);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char sb[32];
+                snprintf(sb, sizeof(sb), "%3zu  %04x", r.slot, (unsigned)r.slot_addr);
+                if (ImGui::Selectable(sb, hs.selected == (int)ri,
+                                      ImGuiSelectableFlags_SpanAllColumns |
+                                          ImGuiSelectableFlags_AllowDoubleClick)) {
+                    hs.selected = (int)ri;
+                    snprintf(hs.name_buf, sizeof(hs.name_buf), "%s", r.slot_name.c_str());
+                    if (ImGui::IsMouseDoubleClicked(0))
+                        hooks_jump(document, state, r.target_bank, r.target_addr);
+                    else
+                        hooks_jump(document, state, 0xffu, r.slot_addr);
+                }
+                ImGui::TableSetColumnIndex(1);
+                if (r.slot_name.empty())
+                    ImGui::TextDisabled("-");
+                else
+                    ImGui::TextUnformatted(r.slot_name.c_str());
+                ImGui::TableSetColumnIndex(2);
+                if (r.stub)
+                    ImGui::TextDisabled("RTS (unused)");
+                else if (!r.target_name.empty())
+                    ImGui::TextUnformatted(r.target_name.c_str());
+                else
+                    ImGui::Text("B%02x_A%04x", r.target_bank, (unsigned)r.target_addr);
+                if (r.shared > 1 && !r.stub && ImGui::IsItemHovered())
+                    ImGui::SetTooltip("target shared by %d slots", r.shared);
+                ImGui::TableSetColumnIndex(3);
+                if (r.callers.empty()) {
+                    ImGui::TextDisabled("-");
+                } else {
+                    const HookCallerRow &cr = r.callers[0];
+                    if (cr.routine.empty())
+                        ImGui::Text("B%02x_A%04x", cr.bank, (unsigned)cr.addr);
+                    else
+                        ImGui::TextUnformatted(cr.routine.c_str());
+                    if (r.callers.size() > 1 && ImGui::IsItemHovered()) {
+                        std::string tip;
+                        for (const HookCallerRow &o : r.callers) {
+                            char b[24];
+                            snprintf(b, sizeof(b), "B%02x_A%04x  ", o.bank, (unsigned)o.addr);
+                            tip += b;
+                            tip += o.routine.empty() ? "-" : o.routine;
+                            tip += "\n";
+                        }
+                        ImGui::SetTooltip("%s", tip.c_str());
+                    }
+                }
+                ImGui::TableSetColumnIndex(4);
+                ImGui::Text("%zu", r.callers.size());
+                ImGui::TableSetColumnIndex(5);
+                switch (hook_run_state(pm, r)) {
+                case 1:
+                    ImGui::TextDisabled("no");
+                    break;
+                case 2:
+                    ImGui::TextColored(ImVec4(0.35f, 0.80f, 0.40f, 1.0f), "yes");
+                    break;
+                case 3:
+                    ImGui::TextColored(ImVec4(0.95f, 0.75f, 0.15f, 1.0f), "NEW");
+                    break;
+                default:
+                    ImGui::TextDisabled("-");
+                    break;
+                }
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    if (hs.selected < 0 || hs.selected >= (int)hs.rows.size())
+        return;
+    const HookRow &r = hs.rows[(size_t)hs.selected];
+    ImGui::SeparatorText("Selected hook");
+    ImGui::Text("slot %zu at Bff_A%04x  ->  B%02x_A%04x", r.slot, (unsigned)r.slot_addr,
+                r.target_bank, (unsigned)r.target_addr);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("slot"))
+        hooks_jump(document, state, 0xffu, r.slot_addr);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("target"))
+        hooks_jump(document, state, r.target_bank, r.target_addr);
+    ImGui::SameLine();
+    if (ImGui::SmallButton("Redirect to new code (patch)")) {
+        patch_redirect_slot(project, state, r.slot_addr, r.target_bank, r.target_addr, r.stub,
+                            r.slot_name.empty() ? nullptr : r.slot_name.c_str());
+        return;
+    }
+    if (ImGui::IsItemHovered())
+        ImGui::SetTooltip("Adds a patch: new code in the target's bank that continues at the\n"
+                          "original target, and a far pointer at the slot to it");
+    ImGui::SetNextItemWidth(ui_w(260.0f));
+    bool enter =
+        ImGui::InputTextWithHint("##hookname", "slot label, e.g. Hook_EndOfBall", hs.name_buf,
+                                 sizeof(hs.name_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+    ImGui::SameLine();
+    if ((ImGui::Button("Label slot") || enter) && hs.name_buf[0]) {
+        uint32_t sa = r.slot_addr;
+        if (apex_project_set_label(project, 1, 0xffu, sa, hs.name_buf) == 0) {
+            state->overlay_dirty = true;
+            rerender_and_reselect(project, document_ptr, state, 0xffu, sa);
+            set_status(state, "hook slot labelled");
+        } else {
+            set_status(state, apex_project_last_error(project));
+        }
+        return; /* rows are rebuilt against the new document next frame */
+    }
+    if (ImGui::BeginTable("hook_callers", 3,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_BordersInnerV,
+                          ImVec2(0, 0))) {
+        ImGui::TableSetupColumn("Call site", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f));
+        ImGui::TableSetupColumn("How", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
+        ImGui::TableSetupColumn("Routine", ImGuiTableColumnFlags_WidthStretch);
+        ImGui::TableHeadersRow();
+        for (size_t i = 0; i < r.callers.size(); i++) {
+            const HookCallerRow &cr = r.callers[i];
+            ImGui::PushID((int)i);
+            ImGui::TableNextRow();
+            ImGui::TableSetColumnIndex(0);
+            char b[32];
+            snprintf(b, sizeof(b), "B%02x_A%04x", cr.bank, (unsigned)cr.addr);
+            if (ImGui::Selectable(b, false, ImGuiSelectableFlags_SpanAllColumns))
+                hooks_jump(document, state, cr.bank, cr.addr);
+            ImGui::TableSetColumnIndex(1);
+            ImGui::TextUnformatted(cr.kind == APEX_HOOK_CALL_LDX ? "LDX #" : "far call");
+            ImGui::TableSetColumnIndex(2);
+            ImGui::TextUnformatted(cr.routine.empty() ? "-" : cr.routine.c_str());
+            ImGui::PopID();
+        }
+        ImGui::EndTable();
+    }
+}
+
+/* ---- Argument Values window ---- */
+
+static std::string args_routine_name(const ApexRenderedDocument *doc, uint8_t bank, uint32_t addr) {
+    size_t li;
+    if (!find_routine_start(doc, bank, addr, &li) || doc->lines[li].bank != bank)
+        return "";
+    std::string nm(doc->lines[li].text, doc->lines[li].length);
+    size_t colon = nm.find(':');
+    if (colon != std::string::npos)
+        nm.erase(colon);
+    return nm;
+}
+
+static void args_compute(ApexProject *project, const ApexRenderedDocument *doc, UiState *state,
+                         ArgsWindowState &as) {
+    std::string keep_type = as.type_idx >= 0 && as.type_idx < (int)as.type_names.size()
+                                ? as.type_names[as.type_idx]
+                                : "";
+    as.sites.clear();
+    as.type_names.clear();
+    as.values.clear();
+    as.values_for = -1;
+    as.computed = true;
+    as.doc_ptr = doc;
+    ApexArgSites raw;
+    if (apex_collect_arg_sites(project, 1, &raw) != 0)
+        return;
+    for (size_t i = 0; i < raw.count; i++) {
+        const ApexArgSite &a = raw.items[i];
+        ArgSiteRow r;
+        r.bank = a.bank;
+        r.value_addr = a.value_addr;
+        r.call_addr = a.call_addr;
+        r.reg = a.reg;
+        r.type_name = a.type_name;
+        r.value = a.value;
+        r.callee = label_at_address(doc, state, a.target_bank, a.target_addr);
+        if (r.callee.empty()) {
+            char b[24];
+            snprintf(b, sizeof(b), "B%02x_A%04x", a.target_bank, (unsigned)a.target_addr);
+            r.callee = b;
+        }
+        r.caller = args_routine_name(doc, a.bank, a.call_addr);
+        as.sites.push_back(r);
+        if (std::find(as.type_names.begin(), as.type_names.end(), r.type_name) ==
+            as.type_names.end())
+            as.type_names.push_back(r.type_name);
+    }
+    apex_free_arg_sites(&raw);
+    std::sort(as.type_names.begin(), as.type_names.end());
+    as.type_idx = 0;
+    for (size_t i = 0; i < as.type_names.size(); i++) {
+        if (as.type_names[i] == keep_type)
+            as.type_idx = (int)i;
+    }
+}
+
+static void args_build_values(const ApexProject *project, ArgsWindowState &as) {
+    as.values.clear();
+    as.values_for = as.type_idx;
+    if (as.type_idx < 0 || as.type_idx >= (int)as.type_names.size())
+        return;
+    const std::string &tn = as.type_names[(size_t)as.type_idx];
+    std::map<uint32_t, size_t> idx;
+    for (size_t i = 0; i < as.sites.size(); i++) {
+        if (as.sites[i].type_name != tn)
+            continue;
+        auto it = idx.find(as.sites[i].value);
+        if (it == idx.end()) {
+            ArgValueRow v;
+            v.value = as.sites[i].value;
+            const char *en =
+                config_type_enum_name(&project->config_types, tn.c_str(), as.sites[i].value);
+            v.name = en ? en : "";
+            idx[v.value] = as.values.size();
+            as.values.push_back(v);
+            it = idx.find(as.sites[i].value);
+        }
+        as.values[it->second].sites.push_back(i);
+    }
+    std::sort(as.values.begin(), as.values.end(),
+              [](const ArgValueRow &a, const ArgValueRow &b) { return a.value < b.value; });
+    if (as.selected >= (int)as.values.size())
+        as.selected = -1;
+}
+
+/* The [docs] entry at (bank, addr) as configured (its has_bank form), if any. */
+static const ConfigDoc *args_find_doc(const ApexProject *p, uint8_t bank, uint32_t addr) {
+    for (size_t i = 0; i < p->docs.count; i++) {
+        const ConfigDoc *d = &p->docs.items[i];
+        if (d->addr == addr &&
+            ((d->has_bank && d->bank == bank) || (!d->has_bank && bank == 0xffu)))
+            return d;
+    }
+    return nullptr;
+}
+
+/* "@args" declaration form for the routine under the disassembly cursor. */
+static void args_declare_form(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                              UiState *state, ArgsWindowState &as) {
+    const ApexRenderedDocument *doc = *document_ptr;
+    ImGui::SeparatorText("Declare register argument");
+    size_t li;
+    if (state->selected_line >= doc->line_count || !doc->lines[state->selected_line].has_location ||
+        !find_routine_start(doc, doc->lines[state->selected_line].bank,
+                            doc->lines[state->selected_line].cpu_addr, &li)) {
+        ImGui::TextDisabled("Place the disassembly cursor in a routine to declare its @args.");
+        return;
+    }
+    const ApexRenderedLine &rl = doc->lines[li];
+    uint8_t bank = rl.bank;
+    uint32_t addr = rl.cpu_addr;
+    std::string rname = args_routine_name(doc, bank, addr);
+    const ConfigDoc *cd = args_find_doc(project, bank, addr);
+    std::string text = cd && cd->text ? cd->text : "";
+    char buf[256];
+    const char *types[6];
+    int n = apex_parse_args_doc(text.c_str(), buf, sizeof(buf), types);
+    ImGui::Text("Routine %s (B%02x_A%04x)", rname.c_str(), bank, (unsigned)addr);
+    if (n > 0) {
+        std::string cur;
+        for (int r = 0; r < 6; r++) {
+            if (types[r]) {
+                cur += cur.empty() ? "" : ", ";
+                cur += apex_arg_reg_name(r);
+                cur += ":";
+                cur += types[r];
+            }
+        }
+        ImGui::SameLine();
+        ImGui::TextDisabled("@args %s", cur.c_str());
+    }
+    if (project->config_types.count == 0) {
+        ImGui::TextDisabled("Define a type first (Windows -> Types).");
+        return;
+    }
+    const char *regs[] = {"A", "B", "D", "X", "Y", "U"};
+    ImGui::SetNextItemWidth(ui_w(60.0f));
+    ImGui::Combo("##argreg", &as.decl_reg, regs, 6);
+    ImGui::SameLine();
+    if (as.decl_type >= (int)project->config_types.count)
+        as.decl_type = 0;
+    ImGui::SetNextItemWidth(ui_w(240.0f));
+    if (ImGui::BeginCombo("##argtype", project->config_types.items[as.decl_type].name)) {
+        for (size_t i = 0; i < project->config_types.count; i++) {
+            if (ImGui::Selectable(project->config_types.items[i].name, (int)i == as.decl_type))
+                as.decl_type = (int)i;
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Add @args")) {
+        /* Rewrite the declaration with the new register (replacing its old type). */
+        std::string item =
+            std::string(regs[as.decl_reg]) + ":" + project->config_types.items[as.decl_type].name;
+        types[as.decl_reg] = nullptr;
+        std::string decl = "@args " + item;
+        for (int r = 0; r < 6; r++) {
+            if (types[r])
+                decl += std::string(", ") + apex_arg_reg_name(r) + ":" + types[r];
+        }
+        size_t at = text.find("@args");
+        if (at != std::string::npos) {
+            size_t end = text.find('\n', at);
+            text.replace(at, end == std::string::npos ? std::string::npos : end - at, decl);
+        } else {
+            text += text.empty() ? decl : " " + decl;
+        }
+        int has_bank = cd ? cd->has_bank : 1;
+        if (apex_project_set_doc(project, has_bank, bank, addr, text.c_str()) == 0) {
+            state->overlay_dirty = true;
+            rerender_and_reselect(project, document_ptr, state, bank, addr);
+            set_status(state, "@args declared");
+        } else {
+            set_status(state, apex_project_last_error(project));
+        }
+    }
+}
+
+void render_args_window(ApexProject *project, const ApexRenderedDocument **document_ptr,
+                        UiState *state) {
+    const ApexRenderedDocument *document = *document_ptr;
+    ArgsWindowState &as = state->args_state;
+    if (!document)
+        return;
+    if (!as.computed || as.doc_ptr != document)
+        args_compute(project, document, state, as);
+    if (as.values_for != as.type_idx)
+        args_build_values(project, as);
+
+    ImGui::TextDisabled("Typed values passed to routines: registers declared with '@args A:TYPE'"
+                        " in a routine doc, and named-type [inline] fields.");
+    if (as.type_names.empty()) {
+        ImGui::TextWrapped("No typed argument sites yet.");
+        args_declare_form(project, document_ptr, state, as);
+        return;
+    }
+    ImGui::SetNextItemWidth(ui_w(260.0f));
+    if (ImGui::BeginCombo("Type", as.type_names[(size_t)as.type_idx].c_str())) {
+        for (size_t i = 0; i < as.type_names.size(); i++) {
+            if (ImGui::Selectable(as.type_names[i].c_str(), (int)i == as.type_idx)) {
+                as.type_idx = (int)i;
+                as.selected = -1;
+            }
+        }
+        ImGui::EndCombo();
+    }
+    ImGui::SameLine();
+    size_t named = 0;
+    for (const ArgValueRow &v : as.values)
+        named += v.name.empty() ? 0u : 1u;
+    ImGui::Text("%zu value(s), %zu named", as.values.size(), named);
+    ImGui::SameLine();
+    if (ImGui::Button("Refresh"))
+        args_compute(project, document, state, as);
+
+    float detail_h = as.selected >= 0 ? 200.0f : 110.0f;
+    if (ImGui::BeginTable("argvals", 4,
+                          ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                              ImGuiTableFlags_Resizable | ImGuiTableFlags_BordersInnerV,
+                          ImVec2(0, -detail_h))) {
+        ImGui::TableSetupScrollFreeze(0, 1);
+        ImGui::TableSetupColumn("Value", ImGuiTableColumnFlags_WidthFixed, ui_w(70.0f));
+        ImGui::TableSetupColumn("Name", ImGuiTableColumnFlags_WidthStretch, 1.2f);
+        ImGui::TableSetupColumn("Sites", ImGuiTableColumnFlags_WidthFixed, ui_w(44.0f));
+        ImGui::TableSetupColumn("Passed to", ImGuiTableColumnFlags_WidthStretch, 1.6f);
+        ImGui::TableHeadersRow();
+        ImGuiListClipper clip;
+        clip.Begin((int)as.values.size());
+        while (clip.Step()) {
+            for (int row = clip.DisplayStart; row < clip.DisplayEnd; row++) {
+                const ArgValueRow &v = as.values[(size_t)row];
+                ImGui::PushID(row);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char vb[16];
+                snprintf(vb, sizeof(vb), v.value > 0xffu ? "0x%04x" : "0x%02x", (unsigned)v.value);
+                if (ImGui::Selectable(vb, as.selected == row,
+                                      ImGuiSelectableFlags_SpanAllColumns)) {
+                    as.selected = row;
+                    snprintf(as.name_buf, sizeof(as.name_buf), "%s", v.name.c_str());
+                }
+                ImGui::TableSetColumnIndex(1);
+                if (v.name.empty())
+                    ImGui::TextDisabled("-");
+                else
+                    ImGui::TextUnformatted(v.name.c_str());
+                ImGui::TableSetColumnIndex(2);
+                ImGui::Text("%zu", v.sites.size());
+                ImGui::TableSetColumnIndex(3);
+                std::vector<std::string> callees;
+                for (size_t si : v.sites) {
+                    if (std::find(callees.begin(), callees.end(), as.sites[si].callee) ==
+                        callees.end())
+                        callees.push_back(as.sites[si].callee);
+                }
+                std::string joined;
+                for (const std::string &c : callees)
+                    joined += (joined.empty() ? "" : ", ") + c;
+                ImGui::TextUnformatted(joined.c_str());
+                ImGui::PopID();
+            }
+        }
+        ImGui::EndTable();
+    }
+
+    if (as.selected >= 0 && as.selected < (int)as.values.size()) {
+        const ArgValueRow &v = as.values[(size_t)as.selected];
+        const std::string &tn = as.type_names[(size_t)as.type_idx];
+        ImGui::SetNextItemWidth(ui_w(240.0f));
+        bool enter =
+            ImGui::InputTextWithHint("##argname", "enum name, e.g. LEFT_RAMP", as.name_buf,
+                                     sizeof(as.name_buf), ImGuiInputTextFlags_EnterReturnsTrue);
+        ImGui::SameLine();
+        if ((ImGui::Button("Name value") || enter) && as.name_buf[0]) {
+            /* Rebuild the type's value list with this value (re)named. */
+            const ConfigType *ct = find_config_type(&project->config_types, tn.c_str());
+            if (ct) {
+                const char *vfmt = ct->kind == TABLE_WORD ? "0x%04x:" : "0x%02x:";
+                std::string vs;
+                char tmp[16];
+                for (size_t i = 0; i < ct->value_count; i++) {
+                    if (ct->values[i].value == v.value)
+                        continue;
+                    snprintf(tmp, sizeof(tmp), vfmt, (unsigned)ct->values[i].value);
+                    vs += (vs.empty() ? "" : ", ") + std::string(tmp) + ct->values[i].name;
+                }
+                snprintf(tmp, sizeof(tmp), vfmt, (unsigned)v.value);
+                vs += (vs.empty() ? "" : ", ") + std::string(tmp) + as.name_buf;
+                if (apex_project_set_type(project, tn.c_str(), ct->kind == TABLE_WORD,
+                                          vs.c_str()) == 0) {
+                    state->overlay_dirty = true;
+                    as.values_for = -1; /* names changed */
+                    set_status(state, "value named");
+                } else {
+                    set_status(state, apex_project_last_error(project));
+                }
+            }
+        }
+        if (ImGui::BeginTable("argsites", 4,
+                              ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollY |
+                                  ImGuiTableFlags_BordersInnerV,
+                              ImVec2(0, 120.0f))) {
+            ImGui::TableSetupColumn("Site", ImGuiTableColumnFlags_WidthFixed, ui_w(100.0f));
+            ImGui::TableSetupColumn("How", ImGuiTableColumnFlags_WidthFixed, ui_w(50.0f));
+            ImGui::TableSetupColumn("Passed to", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableSetupColumn("In routine", ImGuiTableColumnFlags_WidthStretch, 1.0f);
+            ImGui::TableHeadersRow();
+            for (size_t k = 0; k < v.sites.size(); k++) {
+                const ArgSiteRow &r = as.sites[v.sites[k]];
+                ImGui::PushID((int)k);
+                ImGui::TableNextRow();
+                ImGui::TableSetColumnIndex(0);
+                char b[24];
+                snprintf(b, sizeof(b), "B%02x_A%04x", r.bank, (unsigned)r.value_addr);
+                if (ImGui::Selectable(b, false, ImGuiSelectableFlags_SpanAllColumns)) {
+                    size_t li;
+                    if (apex_render_find_line_by_address(document, r.bank, r.value_addr, &li) ||
+                        apex_render_find_line_by_address(document, r.bank, r.call_addr, &li))
+                        select_line(state, li, 1);
+                }
+                ImGui::TableSetColumnIndex(1);
+                ImGui::TextUnformatted(apex_arg_reg_name(r.reg));
+                ImGui::TableSetColumnIndex(2);
+                ImGui::TextUnformatted(r.callee.c_str());
+                ImGui::TableSetColumnIndex(3);
+                ImGui::TextUnformatted(r.caller.empty() ? "-" : r.caller.c_str());
+                ImGui::PopID();
+            }
+            ImGui::EndTable();
+        }
+    }
+    args_declare_form(project, document_ptr, state, as);
 }
